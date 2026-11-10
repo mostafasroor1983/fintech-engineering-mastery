@@ -1,0 +1,320 @@
+{
+  "id": "track-08",
+  "sequence": 8,
+  "title": "High Availability, Reliability & Resilience",
+  "shortTitle": "Reliability Engineering",
+  "slug": "reliability",
+  "color": "#14b8a6",
+  "colorMuted": "rgba(20, 184, 166, 0.15)",
+  "description": "Circuit breakers, bulkheads, chaos engineering, multi-region architecture, disaster recovery, SLO/SLA design, and error budget management.",
+  "difficulty": "advanced",
+  "estimatedHours": 27,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-08-lesson-01",
+      "sequence": 1,
+      "title": "SLOs and Error Budgets — Reliability Engineering for Finance",
+      "slug": "slo-error-budgets",
+      "path": "content/tracks/track-08-reliability/lesson-01-slo-error-budgets/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "SLO",
+        "SLA",
+        "error-budget",
+        "SLI",
+        "reliability"
+      ]
+    },
+    {
+      "id": "track-08-lesson-02",
+      "sequence": 2,
+      "title": "Circuit Breaker Pattern — Failing Fast and Recovering",
+      "slug": "circuit-breaker",
+      "path": "content/tracks/track-08-reliability/lesson-02-circuit-breaker/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "circuit-breaker",
+        "Resilience4j",
+        "CLOSED",
+        "OPEN",
+        "HALF_OPEN"
+      ]
+    },
+    {
+      "id": "track-08-lesson-03",
+      "sequence": 3,
+      "title": "Bulkhead Pattern — Isolating Failures with Thread Pools",
+      "slug": "bulkhead-pattern",
+      "path": "content/tracks/track-08-reliability/lesson-03-bulkhead/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "bulkhead",
+        "thread-pool",
+        "semaphore",
+        "isolation",
+        "Resilience4j"
+      ]
+    },
+    {
+      "id": "track-08-lesson-04",
+      "sequence": 4,
+      "title": "Retry Patterns — Exponential Backoff and Jitter",
+      "slug": "retry-patterns",
+      "path": "content/tracks/track-08-reliability/lesson-04-retry-patterns/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "retry",
+        "exponential-backoff",
+        "jitter",
+        "idempotency",
+        "Resilience4j"
+      ]
+    },
+    {
+      "id": "track-08-lesson-05",
+      "sequence": 5,
+      "title": "Timeout Engineering — Cascading Failure Prevention",
+      "slug": "timeout-engineering",
+      "path": "content/tracks/track-08-reliability/lesson-05-timeout-engineering/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "timeout",
+        "cascading-failure",
+        "deadline",
+        "read-timeout",
+        "connect-timeout"
+      ]
+    },
+    {
+      "id": "track-08-lesson-06",
+      "sequence": 6,
+      "title": "Chaos Engineering — GameDay and Failure Injection",
+      "slug": "chaos-engineering",
+      "path": "content/tracks/track-08-reliability/lesson-06-chaos-engineering/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "chaos-engineering",
+        "GameDay",
+        "Chaos-Monkey",
+        "failure-injection",
+        "resilience-testing"
+      ]
+    },
+    {
+      "id": "track-08-lesson-07",
+      "sequence": 7,
+      "title": "Multi-Region Active-Active Architecture",
+      "slug": "multi-region-active-active",
+      "path": "content/tracks/track-08-reliability/lesson-07-multi-region/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "active-active",
+        "multi-region",
+        "geo-replication",
+        "conflict-resolution",
+        "latency"
+      ]
+    },
+    {
+      "id": "track-08-lesson-08",
+      "sequence": 8,
+      "title": "Disaster Recovery — RTO, RPO, and Financial Continuity",
+      "slug": "disaster-recovery",
+      "path": "content/tracks/track-08-reliability/lesson-08-disaster-recovery/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "disaster-recovery",
+        "RTO",
+        "RPO",
+        "failover",
+        "BCP"
+      ]
+    },
+    {
+      "id": "track-08-lesson-09",
+      "sequence": 9,
+      "title": "Load Shedding — Graceful Degradation Under Pressure",
+      "slug": "load-shedding",
+      "path": "content/tracks/track-08-reliability/lesson-09-load-shedding/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "load-shedding",
+        "graceful-degradation",
+        "priority-queue",
+        "admission-control"
+      ]
+    },
+    {
+      "id": "track-08-lesson-10",
+      "sequence": 10,
+      "title": "Health Checks — Liveness, Readiness, and Startup Probes",
+      "slug": "health-checks",
+      "path": "content/tracks/track-08-reliability/lesson-10-health-checks/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "health-check",
+        "liveness",
+        "readiness",
+        "startup-probe",
+        "Actuator"
+      ]
+    },
+    {
+      "id": "track-08-lesson-11",
+      "sequence": 11,
+      "title": "Database High Availability — PostgreSQL HA Patterns",
+      "slug": "database-ha",
+      "path": "content/tracks/track-08-reliability/lesson-11-database-ha/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "PostgreSQL",
+        "HA",
+        "Patroni",
+        "replication",
+        "failover"
+      ]
+    },
+    {
+      "id": "track-08-lesson-12",
+      "sequence": 12,
+      "title": "Kafka High Availability — Replication and Partition Leadership",
+      "slug": "kafka-ha",
+      "path": "content/tracks/track-08-reliability/lesson-12-kafka-ha/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "HA",
+        "replication-factor",
+        "ISR",
+        "leader-election"
+      ]
+    },
+    {
+      "id": "track-08-lesson-13",
+      "sequence": 13,
+      "title": "Rate Limiting for Reliability — Protecting Downstream Services",
+      "slug": "rate-limiting-reliability",
+      "path": "content/tracks/track-08-reliability/lesson-13-rate-limiting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "rate-limiting",
+        "token-bucket",
+        "sliding-window",
+        "downstream-protection"
+      ]
+    },
+    {
+      "id": "track-08-lesson-14",
+      "sequence": 14,
+      "title": "Fallback Patterns — Static, Cached, and Degraded Responses",
+      "slug": "fallback-patterns",
+      "path": "content/tracks/track-08-reliability/lesson-14-fallback-patterns/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "fallback",
+        "cache",
+        "static-response",
+        "degraded-mode",
+        "Resilience4j"
+      ]
+    },
+    {
+      "id": "track-08-lesson-15",
+      "sequence": 15,
+      "title": "Incident Management — On-Call Engineering in Finance",
+      "slug": "incident-management",
+      "path": "content/tracks/track-08-reliability/lesson-15-incident-management/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "incident-management",
+        "on-call",
+        "PagerDuty",
+        "runbook",
+        "escalation"
+      ]
+    },
+    {
+      "id": "track-08-lesson-16",
+      "sequence": 16,
+      "title": "Post-Incident Reviews — Blameless Culture and RCA",
+      "slug": "post-incident-review",
+      "path": "content/tracks/track-08-reliability/lesson-16-post-incident-review/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "post-incident",
+        "blameless",
+        "RCA",
+        "five-whys",
+        "action-items"
+      ]
+    },
+    {
+      "id": "track-08-lesson-17",
+      "sequence": 17,
+      "title": "Reliability Testing — Load, Soak, and Spike Testing",
+      "slug": "reliability-testing",
+      "path": "content/tracks/track-08-reliability/lesson-17-reliability-testing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "load-testing",
+        "soak-testing",
+        "spike-testing",
+        "Gatling",
+        "k6"
+      ]
+    },
+    {
+      "id": "track-08-lesson-18",
+      "sequence": 18,
+      "title": "Principal Engineer's Reliability Decision Framework",
+      "slug": "reliability-decision-framework",
+      "path": "content/tracks/track-08-reliability/lesson-18-reliability-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "reliability",
+        "trade-offs",
+        "staff-engineer",
+        "SLO"
+      ]
+    }
+  ]
+}

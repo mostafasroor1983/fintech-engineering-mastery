@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Engineering Mastery — Principal Software Engineer development program for Staff and Principal roles in banking and FinTech.">
+  <meta name="theme-color" content="#161b22">
+
+  <title>Engineering Mastery</title>
+
+  <!-- Favicon (inline SVG data URI) -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23f97316'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='monospace' font-size='14' font-weight='700' fill='white'%3EEM%3C/text%3E%3C/svg%3E">
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="assets/css/main.css">
+  <link rel="stylesheet" href="assets/css/lesson.css">
+  <link rel="stylesheet" href="assets/css/lab.css">
+
+  <!-- CDN Libraries (loaded before our scripts) -->
+  <!-- Prism.js — syntax highlighting (no bundled theme; lesson.css provides tokens) -->
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-java.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-sql.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-yaml.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-json.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-xml-doc.min.js" defer></script>
+  <!-- marked.js — Markdown renderer -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@14.1.3/marked.min.js" defer></script>
+  <!-- js-yaml — YAML frontmatter parser -->
+  <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js" defer></script>
+  <!-- Mermaid.js — architecture and sequence diagrams -->
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js" defer></script>
+  <!-- lunr.js — full-text search index -->
+  <script src="https://cdn.jsdelivr.net/npm/lunr@2.3.9/lunr.min.js" defer></script>
+  <!-- KaTeX — mathematical notation (CSS only loaded here; JS loaded on demand) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+
+  <!-- Open Graph -->
+  <meta property="og:title"       content="Engineering Mastery">
+  <meta property="og:description" content="Principal Software Engineer development program — Banking and FinTech.">
+  <meta property="og:type"        content="website">
+</head>
+<body>
+
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+
+  <div id="app-shell">
+
+    <!-- Top Bar -->
+    <header id="top-bar" role="banner">
+      <!-- Rendered by app.js -->
+    </header>
+
+    <div id="app-body">
+
+      <!-- Sidebar Navigation -->
+      <nav id="sidebar" role="navigation" aria-label="Main navigation">
+        <!-- Rendered by app.js -->
+      </nav>
+
+      <!-- Main Content (router injects pages here) -->
+      <main id="main-content" role="main" aria-live="polite" tabindex="-1">
+        <div class="loading-wrap">
+          <div class="spinner"></div>
+          <span style="color:var(--text-muted);font-size:var(--text-sm)">Loading Engineering Mastery&hellip;</span>
+        </div>
+      </main>
+
+    </div><!-- /#app-body -->
+
+  </div><!-- /#app-shell -->
+
+  <!-- Scripts (load order: progress → router → app → renderer → lab → search) -->
+  <script src="assets/js/progress.js" defer></script>
+  <script src="assets/js/router.js" defer></script>
+  <script src="assets/js/app.js" defer></script>
+  <script src="assets/js/renderer.js" defer></script>
+  <script src="assets/js/lab.js" defer></script>
+  <script src="assets/js/capstone.js" defer></script>
+  <script src="assets/js/search.js" defer></script>
+
+</body>
+</html>

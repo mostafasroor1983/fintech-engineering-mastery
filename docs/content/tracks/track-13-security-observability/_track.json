@@ -1,0 +1,356 @@
+{
+  "id": "track-13",
+  "sequence": 13,
+  "title": "Security, Observability & Production Engineering",
+  "shortTitle": "Security & Observability",
+  "slug": "security-observability",
+  "color": "#ec4899",
+  "colorMuted": "rgba(236, 72, 153, 0.15)",
+  "description": "OpenTelemetry, distributed tracing, Prometheus/Grafana, JVM diagnostics, security engineering, incident management, and production readiness for financial systems.",
+  "difficulty": "advanced",
+  "estimatedHours": 30,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-13-lesson-01",
+      "sequence": 1,
+      "title": "OpenTelemetry — Instrumentation for Financial Services",
+      "slug": "opentelemetry",
+      "path": "content/tracks/track-13-security-observability/lesson-01-opentelemetry/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "OpenTelemetry",
+        "OTEL",
+        "traces",
+        "metrics",
+        "logs"
+      ]
+    },
+    {
+      "id": "track-13-lesson-02",
+      "sequence": 2,
+      "title": "Distributed Tracing — Causality, Sampling, and Analysis",
+      "slug": "distributed-tracing",
+      "path": "content/tracks/track-13-security-observability/lesson-02-distributed-tracing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "distributed-tracing",
+        "Jaeger",
+        "Zipkin",
+        "sampling",
+        "correlation-id"
+      ]
+    },
+    {
+      "id": "track-13-lesson-03",
+      "sequence": 3,
+      "title": "Prometheus and PromQL — Metrics for Financial Systems",
+      "slug": "prometheus-promql",
+      "path": "content/tracks/track-13-security-observability/lesson-03-prometheus/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "Prometheus",
+        "PromQL",
+        "counter",
+        "histogram",
+        "alerting"
+      ]
+    },
+    {
+      "id": "track-13-lesson-04",
+      "sequence": 4,
+      "title": "Grafana Dashboards — Visualising Financial System Health",
+      "slug": "grafana-dashboards",
+      "path": "content/tracks/track-13-security-observability/lesson-04-grafana/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "Grafana",
+        "dashboard",
+        "panels",
+        "variables",
+        "alerting"
+      ]
+    },
+    {
+      "id": "track-13-lesson-05",
+      "sequence": 5,
+      "title": "Structured Logging — Correlation and Search at Scale",
+      "slug": "structured-logging",
+      "path": "content/tracks/track-13-security-observability/lesson-05-structured-logging/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "structured-logging",
+        "JSON",
+        "correlation-id",
+        "ELK",
+        "Loki"
+      ]
+    },
+    {
+      "id": "track-13-lesson-06",
+      "sequence": 6,
+      "title": "JVM Diagnostics — Thread Dumps and Heap Analysis in Production",
+      "slug": "jvm-diagnostics",
+      "path": "content/tracks/track-13-security-observability/lesson-06-jvm-diagnostics/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "JVM-diagnostics",
+        "thread-dump",
+        "heap-dump",
+        "JFR",
+        "jcmd"
+      ]
+    },
+    {
+      "id": "track-13-lesson-07",
+      "sequence": 7,
+      "title": "SLO-Based Alerting — Burn Rate and Alert Fatigue",
+      "slug": "slo-alerting",
+      "path": "content/tracks/track-13-security-observability/lesson-07-slo-alerting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "SLO",
+        "alerting",
+        "burn-rate",
+        "multi-window",
+        "alert-fatigue"
+      ]
+    },
+    {
+      "id": "track-13-lesson-08",
+      "sequence": 8,
+      "title": "Incident Response — On-Call Playbooks and Runbooks",
+      "slug": "incident-response",
+      "path": "content/tracks/track-13-security-observability/lesson-08-incident-response/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "incident-response",
+        "runbook",
+        "playbook",
+        "P1",
+        "escalation"
+      ]
+    },
+    {
+      "id": "track-13-lesson-09",
+      "sequence": 9,
+      "title": "Zero-Trust Security — Identity-Based Access for Microservices",
+      "slug": "zero-trust-security",
+      "path": "content/tracks/track-13-security-observability/lesson-09-zero-trust/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "zero-trust",
+        "mTLS",
+        "SPIFFE",
+        "identity",
+        "least-privilege"
+      ]
+    },
+    {
+      "id": "track-13-lesson-10",
+      "sequence": 10,
+      "title": "OAuth2 and JWT — Token-Based Authentication Patterns",
+      "slug": "oauth2-jwt",
+      "path": "content/tracks/track-13-security-observability/lesson-10-oauth2-jwt/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "OAuth2",
+        "JWT",
+        "OIDC",
+        "token-validation",
+        "PKCE"
+      ]
+    },
+    {
+      "id": "track-13-lesson-11",
+      "sequence": 11,
+      "title": "API Security — Rate Limiting, Input Validation, and WAF",
+      "slug": "api-security",
+      "path": "content/tracks/track-13-security-observability/lesson-11-api-security/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "API-security",
+        "WAF",
+        "input-validation",
+        "rate-limiting",
+        "OWASP"
+      ]
+    },
+    {
+      "id": "track-13-lesson-12",
+      "sequence": 12,
+      "title": "mTLS in Practice — Certificate Rotation and SPIFFE",
+      "slug": "mtls-spiffe",
+      "path": "content/tracks/track-13-security-observability/lesson-12-mtls/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "mTLS",
+        "SPIFFE",
+        "SVID",
+        "certificate-rotation",
+        "Istio"
+      ]
+    },
+    {
+      "id": "track-13-lesson-13",
+      "sequence": 13,
+      "title": "OWASP Top 10 — Financial Services Threat Landscape",
+      "slug": "owasp-top-10",
+      "path": "content/tracks/track-13-security-observability/lesson-13-owasp/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "OWASP",
+        "injection",
+        "XSS",
+        "SSRF",
+        "broken-auth"
+      ]
+    },
+    {
+      "id": "track-13-lesson-14",
+      "sequence": 14,
+      "title": "Penetration Testing — Financial API Security Assessment",
+      "slug": "penetration-testing",
+      "path": "content/tracks/track-13-security-observability/lesson-14-pentest/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "penetration-testing",
+        "DAST",
+        "SAST",
+        "threat-modelling",
+        "STRIDE"
+      ]
+    },
+    {
+      "id": "track-13-lesson-15",
+      "sequence": 15,
+      "title": "SIEM and Security Events — Correlating Financial Logs",
+      "slug": "siem",
+      "path": "content/tracks/track-13-security-observability/lesson-15-siem/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "SIEM",
+        "security-events",
+        "correlation",
+        "Splunk",
+        "detection"
+      ]
+    },
+    {
+      "id": "track-13-lesson-16",
+      "sequence": 16,
+      "title": "Data Encryption — At-Rest and In-Transit for Finance",
+      "slug": "data-encryption",
+      "path": "content/tracks/track-13-security-observability/lesson-16-encryption/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "encryption",
+        "AES",
+        "TLS",
+        "at-rest",
+        "in-transit"
+      ]
+    },
+    {
+      "id": "track-13-lesson-17",
+      "sequence": 17,
+      "title": "Key Management — HSM, KMS, and Envelope Encryption",
+      "slug": "key-management",
+      "path": "content/tracks/track-13-security-observability/lesson-17-key-management/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "KMS",
+        "HSM",
+        "envelope-encryption",
+        "key-rotation",
+        "AWS-KMS"
+      ]
+    },
+    {
+      "id": "track-13-lesson-18",
+      "sequence": 18,
+      "title": "Secure Coding Practices — Java Security Anti-Patterns",
+      "slug": "secure-coding",
+      "path": "content/tracks/track-13-security-observability/lesson-18-secure-coding/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "secure-coding",
+        "SQL-injection",
+        "deserialization",
+        "XXE",
+        "Java"
+      ]
+    },
+    {
+      "id": "track-13-lesson-19",
+      "sequence": 19,
+      "title": "Production Readiness Checklist — Launching Financial Services",
+      "slug": "production-readiness",
+      "path": "content/tracks/track-13-security-observability/lesson-19-production-readiness/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "production-readiness",
+        "PRR",
+        "launch-checklist",
+        "runbook",
+        "DR-test"
+      ]
+    },
+    {
+      "id": "track-13-lesson-20",
+      "sequence": 20,
+      "title": "Principal Engineer's Security & Observability Decision Framework",
+      "slug": "security-observability-framework",
+      "path": "content/tracks/track-13-security-observability/lesson-20-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "security",
+        "observability",
+        "trade-offs",
+        "staff-engineer"
+      ]
+    }
+  ]
+}

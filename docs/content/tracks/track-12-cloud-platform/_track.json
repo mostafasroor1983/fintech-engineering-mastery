@@ -1,0 +1,288 @@
+{
+  "id": "track-12",
+  "sequence": 12,
+  "title": "Cloud, Infrastructure & Platform Engineering",
+  "shortTitle": "Cloud & Platform",
+  "slug": "cloud-platform",
+  "color": "#3b82f6",
+  "colorMuted": "rgba(59, 130, 246, 0.15)",
+  "description": "Kubernetes orchestration, Docker containerization, cloud architecture patterns, GitOps, service mesh, and platform engineering for financial services.",
+  "difficulty": "advanced",
+  "estimatedHours": 24,
+  "status": "published",
+  "priority": "medium",
+  "lessons": [
+    {
+      "id": "track-12-lesson-01",
+      "sequence": 1,
+      "title": "Kubernetes for Financial Services — Architecture and Workloads",
+      "slug": "kubernetes-financial",
+      "path": "content/tracks/track-12-cloud-platform/lesson-01-kubernetes-financial/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "Kubernetes",
+        "K8s",
+        "deployment",
+        "pod",
+        "namespace"
+      ]
+    },
+    {
+      "id": "track-12-lesson-02",
+      "sequence": 2,
+      "title": "Pod Scheduling — Affinity, Taints, and Resource Requests",
+      "slug": "pod-scheduling",
+      "path": "content/tracks/track-12-cloud-platform/lesson-02-pod-scheduling/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "pod-scheduling",
+        "affinity",
+        "taint",
+        "toleration",
+        "resource-quota"
+      ]
+    },
+    {
+      "id": "track-12-lesson-03",
+      "sequence": 3,
+      "title": "Kubernetes Networking — CNI, Services, and Ingress",
+      "slug": "kubernetes-networking",
+      "path": "content/tracks/track-12-cloud-platform/lesson-03-k8s-networking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "CNI",
+        "Service",
+        "Ingress",
+        "NetworkPolicy",
+        "Calico"
+      ]
+    },
+    {
+      "id": "track-12-lesson-04",
+      "sequence": 4,
+      "title": "Helm and GitOps — Declarative Infrastructure with ArgoCD",
+      "slug": "helm-gitops",
+      "path": "content/tracks/track-12-cloud-platform/lesson-04-helm-gitops/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Helm",
+        "GitOps",
+        "ArgoCD",
+        "Flux",
+        "declarative"
+      ]
+    },
+    {
+      "id": "track-12-lesson-05",
+      "sequence": 5,
+      "title": "Service Mesh — Istio Traffic Management and Observability",
+      "slug": "service-mesh-istio",
+      "path": "content/tracks/track-12-cloud-platform/lesson-05-service-mesh/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "Istio",
+        "service-mesh",
+        "mTLS",
+        "traffic-management",
+        "Envoy"
+      ]
+    },
+    {
+      "id": "track-12-lesson-06",
+      "sequence": 6,
+      "title": "Container Security — Image Scanning and Pod Security",
+      "slug": "container-security",
+      "path": "content/tracks/track-12-cloud-platform/lesson-06-container-security/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "container-security",
+        "Trivy",
+        "PSP",
+        "seccomp",
+        "non-root"
+      ]
+    },
+    {
+      "id": "track-12-lesson-07",
+      "sequence": 7,
+      "title": "Secret Management — Vault and External Secrets Operator",
+      "slug": "secret-management",
+      "path": "content/tracks/track-12-cloud-platform/lesson-07-secret-management/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "secrets",
+        "HashiCorp-Vault",
+        "ESO",
+        "rotation",
+        "encryption-at-rest"
+      ]
+    },
+    {
+      "id": "track-12-lesson-08",
+      "sequence": 8,
+      "title": "Cloud-Native Storage — Persistent Volumes and StatefulSets",
+      "slug": "cloud-native-storage",
+      "path": "content/tracks/track-12-cloud-platform/lesson-08-storage/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "PVC",
+        "StatefulSet",
+        "StorageClass",
+        "CSI",
+        "EBS"
+      ]
+    },
+    {
+      "id": "track-12-lesson-09",
+      "sequence": 9,
+      "title": "Auto-Scaling — HPA, VPA, and KEDA for Financial Loads",
+      "slug": "auto-scaling",
+      "path": "content/tracks/track-12-cloud-platform/lesson-09-auto-scaling/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "HPA",
+        "VPA",
+        "KEDA",
+        "auto-scaling",
+        "event-driven-scaling"
+      ]
+    },
+    {
+      "id": "track-12-lesson-10",
+      "sequence": 10,
+      "title": "Multi-Cluster Kubernetes — Federation and Workload Distribution",
+      "slug": "multi-cluster",
+      "path": "content/tracks/track-12-cloud-platform/lesson-10-multi-cluster/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "multi-cluster",
+        "federation",
+        "fleet",
+        "workload-distribution",
+        "DR"
+      ]
+    },
+    {
+      "id": "track-12-lesson-11",
+      "sequence": 11,
+      "title": "Cloud Cost Engineering — FinOps for Financial Platforms",
+      "slug": "cloud-cost",
+      "path": "content/tracks/track-12-cloud-platform/lesson-11-cloud-cost/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "FinOps",
+        "cloud-cost",
+        "spot-instances",
+        "reserved-instances",
+        "right-sizing"
+      ]
+    },
+    {
+      "id": "track-12-lesson-12",
+      "sequence": 12,
+      "title": "Platform Engineering — Internal Developer Platform Design",
+      "slug": "platform-engineering",
+      "path": "content/tracks/track-12-cloud-platform/lesson-12-platform-engineering/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "platform-engineering",
+        "IDP",
+        "developer-experience",
+        "golden-path",
+        "paved-road"
+      ]
+    },
+    {
+      "id": "track-12-lesson-13",
+      "sequence": 13,
+      "title": "CI/CD Pipelines — Secure Delivery for Financial Services",
+      "slug": "cicd-pipelines",
+      "path": "content/tracks/track-12-cloud-platform/lesson-13-cicd/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "CI/CD",
+        "GitHub-Actions",
+        "Tekton",
+        "SAST",
+        "DAST"
+      ]
+    },
+    {
+      "id": "track-12-lesson-14",
+      "sequence": 14,
+      "title": "Canary and Blue-Green Deployments — Zero-Downtime Releases",
+      "slug": "canary-deployments",
+      "path": "content/tracks/track-12-cloud-platform/lesson-14-canary/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "canary",
+        "blue-green",
+        "rolling-update",
+        "traffic-split",
+        "Argo-Rollouts"
+      ]
+    },
+    {
+      "id": "track-12-lesson-15",
+      "sequence": 15,
+      "title": "Disaster Recovery on Kubernetes — Backup and Restore",
+      "slug": "k8s-disaster-recovery",
+      "path": "content/tracks/track-12-cloud-platform/lesson-15-k8s-dr/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "K8s-DR",
+        "Velero",
+        "backup",
+        "restore",
+        "RTO"
+      ]
+    },
+    {
+      "id": "track-12-lesson-16",
+      "sequence": 16,
+      "title": "Principal Engineer's Cloud Architecture Decision Framework",
+      "slug": "cloud-decision-framework",
+      "path": "content/tracks/track-12-cloud-platform/lesson-16-cloud-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "cloud",
+        "trade-offs",
+        "staff-engineer",
+        "platform"
+      ]
+    }
+  ]
+}

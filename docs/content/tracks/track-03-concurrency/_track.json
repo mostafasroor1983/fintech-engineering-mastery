@@ -1,0 +1,482 @@
+{
+  "id": "track-03",
+  "sequence": 3,
+  "title": "Concurrency & Thread Safety Engineering",
+  "shortTitle": "Concurrency",
+  "slug": "concurrency",
+  "color": "#f97316",
+  "colorMuted": "rgba(249, 115, 22, 0.15)",
+  "description": "Java Memory Model, thread safety, synchronization primitives, atomic operations, lock-free algorithms, virtual threads, and concurrent financial data processing.",
+  "difficulty": "advanced",
+  "estimatedHours": 42,
+  "status": "published",
+  "priority": "critical",
+  "lessons": [
+    {
+      "id": "track-03-lesson-01",
+      "sequence": 1,
+      "title": "The Java Memory Model — Fundamentals",
+      "slug": "jmm-fundamentals",
+      "path": "content/tracks/track-03-concurrency/lesson-01-jmm-fundamentals/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "JMM",
+        "memory-model",
+        "visibility",
+        "happens-before",
+        "volatile"
+      ]
+    },
+    {
+      "id": "track-03-lesson-02",
+      "sequence": 2,
+      "title": "Thread Safety — Design Principles and Immutability",
+      "slug": "thread-safety-design",
+      "path": "content/tracks/track-03-concurrency/lesson-02-thread-safety-design/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "thread-safety",
+        "immutability",
+        "stateless",
+        "records",
+        "final-fields"
+      ]
+    },
+    {
+      "id": "track-03-lesson-03",
+      "sequence": 3,
+      "title": "Synchronization — synchronized, ReentrantLock, StampedLock",
+      "slug": "synchronization-primitives",
+      "path": "content/tracks/track-03-concurrency/lesson-03-synchronization-primitives/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "synchronized",
+        "ReentrantLock",
+        "ReadWriteLock",
+        "StampedLock",
+        "Condition"
+      ]
+    },
+    {
+      "id": "track-03-lesson-04",
+      "sequence": 4,
+      "title": "Atomic Operations — AtomicLong, CAS, and Lock-Free Algorithms",
+      "slug": "atomic-operations",
+      "path": "content/tracks/track-03-concurrency/lesson-04-atomic-operations/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "AtomicLong",
+        "AtomicReference",
+        "CAS",
+        "LongAdder",
+        "lock-free"
+      ]
+    },
+    {
+      "id": "track-03-lesson-05",
+      "sequence": 5,
+      "title": "The ABA Problem and AtomicStampedReference",
+      "slug": "aba-problem",
+      "path": "content/tracks/track-03-concurrency/lesson-05-aba-problem/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tags": [
+        "ABA",
+        "AtomicStampedReference",
+        "CAS",
+        "lock-free"
+      ]
+    },
+    {
+      "id": "track-03-lesson-06",
+      "sequence": 6,
+      "title": "Concurrent Collections — ConcurrentHashMap, BlockingQueue, CopyOnWrite",
+      "slug": "concurrent-collections",
+      "path": "content/tracks/track-03-concurrency/lesson-06-concurrent-collections/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "ConcurrentHashMap",
+        "BlockingQueue",
+        "CopyOnWriteArrayList",
+        "concurrent-collections"
+      ]
+    },
+    {
+      "id": "track-03-lesson-07",
+      "sequence": 7,
+      "title": "Race Conditions in Financial Systems — Detection and Prevention",
+      "slug": "race-conditions-financial",
+      "path": "content/tracks/track-03-concurrency/lesson-07-race-conditions-financial/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 95,
+      "status": "published",
+      "tags": [
+        "race-conditions",
+        "data-races",
+        "lost-updates",
+        "financial-integrity"
+      ]
+    },
+    {
+      "id": "track-03-lesson-08",
+      "sequence": 8,
+      "title": "Deadlocks, Livelocks, and Starvation",
+      "slug": "deadlocks-livelocks",
+      "path": "content/tracks/track-03-concurrency/lesson-08-deadlocks-livelocks/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "deadlock",
+        "livelock",
+        "starvation",
+        "lock-ordering",
+        "thread-dump"
+      ]
+    },
+    {
+      "id": "track-03-lesson-09",
+      "sequence": 9,
+      "title": "False Sharing and CPU Cache Line Contention",
+      "slug": "false-sharing",
+      "path": "content/tracks/track-03-concurrency/lesson-09-false-sharing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tags": [
+        "false-sharing",
+        "cache-line",
+        "padding",
+        "JMH",
+        "performance"
+      ]
+    },
+    {
+      "id": "track-03-lesson-10",
+      "sequence": 10,
+      "title": "Thread Pool Design — ThreadPoolExecutor and ForkJoinPool",
+      "slug": "thread-pool-design",
+      "path": "content/tracks/track-03-concurrency/lesson-10-thread-pool-design/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "ThreadPoolExecutor",
+        "ForkJoinPool",
+        "thread-pool-sizing",
+        "queue-capacity",
+        "rejection-policy"
+      ]
+    },
+    {
+      "id": "track-03-lesson-11",
+      "sequence": 11,
+      "title": "CompletableFuture — Asynchronous Pipelines and Composition",
+      "slug": "completable-future",
+      "path": "content/tracks/track-03-concurrency/lesson-11-completable-future/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 95,
+      "status": "published",
+      "tags": [
+        "CompletableFuture",
+        "async-pipeline",
+        "thenApply",
+        "thenCompose",
+        "exceptionally"
+      ]
+    },
+    {
+      "id": "track-03-lesson-12",
+      "sequence": 12,
+      "title": "Virtual Threads — Java 21 Fundamentals",
+      "slug": "virtual-threads",
+      "path": "content/tracks/track-03-concurrency/lesson-12-virtual-threads/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "virtual-threads",
+        "java-21",
+        "thread-per-request",
+        "Project-Loom"
+      ]
+    },
+    {
+      "id": "track-03-lesson-13",
+      "sequence": 13,
+      "title": "Virtual Thread Pinning — Synchronized Blocks and Carrier Threads",
+      "slug": "virtual-thread-pinning",
+      "path": "content/tracks/track-03-concurrency/lesson-13-virtual-thread-pinning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "virtual-threads",
+        "pinning",
+        "synchronized",
+        "ReentrantLock",
+        "java-21"
+      ]
+    },
+    {
+      "id": "track-03-lesson-14",
+      "sequence": 14,
+      "title": "Structured Concurrency — Java 21",
+      "slug": "structured-concurrency",
+      "path": "content/tracks/track-03-concurrency/lesson-14-structured-concurrency/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "structured-concurrency",
+        "java-21",
+        "StructuredTaskScope",
+        "subtasks"
+      ]
+    },
+    {
+      "id": "track-03-lesson-15",
+      "sequence": 15,
+      "title": "Scoped Values — Java 21",
+      "slug": "scoped-values",
+      "path": "content/tracks/track-03-concurrency/lesson-15-scoped-values/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tags": [
+        "scoped-values",
+        "java-21",
+        "ScopedValue",
+        "thread-local",
+        "context-propagation"
+      ]
+    },
+    {
+      "id": "track-03-lesson-16",
+      "sequence": 16,
+      "title": "Testing Concurrency — JUnit, jcstress, and Thread Safety Verification",
+      "slug": "testing-concurrency",
+      "path": "content/tracks/track-03-concurrency/lesson-16-testing-concurrency/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "jcstress",
+        "concurrency-testing",
+        "race-detection",
+        "JUnit",
+        "stress-testing"
+      ]
+    },
+    {
+      "id": "track-03-lesson-17",
+      "sequence": 17,
+      "title": "JMH Microbenchmarking for Concurrent Code",
+      "slug": "jmh-benchmarking",
+      "path": "content/tracks/track-03-concurrency/lesson-17-jmh-benchmarking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "JMH",
+        "benchmarking",
+        "microbenchmark",
+        "throughput",
+        "latency"
+      ]
+    },
+    {
+      "id": "track-03-lesson-18",
+      "sequence": 18,
+      "title": "Thread Dump Analysis and Deadlock Diagnosis",
+      "slug": "thread-dump-analysis",
+      "path": "content/tracks/track-03-concurrency/lesson-18-thread-dump-analysis/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "thread-dump",
+        "deadlock-detection",
+        "JVM-diagnostics",
+        "jstack",
+        "VisualVM"
+      ]
+    },
+    {
+      "id": "track-03-lesson-19",
+      "sequence": 19,
+      "title": "Lock Contention and Throughput Analysis",
+      "slug": "lock-contention",
+      "path": "content/tracks/track-03-concurrency/lesson-19-lock-contention/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "lock-contention",
+        "throughput",
+        "monitor-contention",
+        "async-profiler"
+      ]
+    },
+    {
+      "id": "track-03-lesson-20",
+      "sequence": 20,
+      "title": "Thread Pool Exhaustion in Payment Systems",
+      "slug": "thread-pool-exhaustion",
+      "path": "content/tracks/track-03-concurrency/lesson-20-thread-pool-exhaustion/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "thread-pool-exhaustion",
+        "bulkhead",
+        "executor-isolation",
+        "back-pressure"
+      ]
+    },
+    {
+      "id": "track-03-lesson-21",
+      "sequence": 21,
+      "title": "Concurrent Balance Management Patterns",
+      "slug": "concurrent-balance-management",
+      "path": "content/tracks/track-03-concurrency/lesson-21-concurrent-balance-management/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "balance-management",
+        "optimistic-locking",
+        "pessimistic-locking",
+        "SELECT-FOR-UPDATE"
+      ]
+    },
+    {
+      "id": "track-03-lesson-22",
+      "sequence": 22,
+      "title": "Safe Publication and Object Construction",
+      "slug": "safe-publication",
+      "path": "content/tracks/track-03-concurrency/lesson-22-safe-publication/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "safe-publication",
+        "final-fields",
+        "constructor-safety",
+        "JMM"
+      ]
+    },
+    {
+      "id": "track-03-lesson-23",
+      "sequence": 23,
+      "title": "Memory Barriers and Instruction Reordering",
+      "slug": "memory-barriers",
+      "path": "content/tracks/track-03-concurrency/lesson-23-memory-barriers/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "memory-barriers",
+        "instruction-reordering",
+        "acquire-release",
+        "JMM-internals"
+      ]
+    },
+    {
+      "id": "track-03-lesson-24",
+      "sequence": 24,
+      "title": "Semaphores, Latches, Barriers, and Phasers",
+      "slug": "synchronizers",
+      "path": "content/tracks/track-03-concurrency/lesson-24-synchronizers/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Semaphore",
+        "CountDownLatch",
+        "CyclicBarrier",
+        "Phaser",
+        "synchronizers"
+      ]
+    },
+    {
+      "id": "track-03-lesson-25",
+      "sequence": 25,
+      "title": "Context Propagation in Async and Reactive Systems",
+      "slug": "context-propagation",
+      "path": "content/tracks/track-03-concurrency/lesson-25-context-propagation/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "context-propagation",
+        "MDC",
+        "SecurityContext",
+        "ThreadLocal",
+        "Micrometer"
+      ]
+    },
+    {
+      "id": "track-03-lesson-26",
+      "sequence": 26,
+      "title": "The Java Memory Model — Advanced: Fences, Final Fields, Unsafe",
+      "slug": "jmm-advanced",
+      "path": "content/tracks/track-03-concurrency/lesson-26-jmm-advanced/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "JMM-advanced",
+        "VarHandle",
+        "Unsafe",
+        "fence",
+        "acquire-release"
+      ]
+    },
+    {
+      "id": "track-03-lesson-27",
+      "sequence": 27,
+      "title": "Concurrency Patterns in Financial Services",
+      "slug": "concurrency-patterns-fintech",
+      "path": "content/tracks/track-03-concurrency/lesson-27-concurrency-patterns-fintech/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "concurrency-patterns",
+        "financial",
+        "idempotency",
+        "event-ordering",
+        "partitioning"
+      ]
+    },
+    {
+      "id": "track-03-lesson-28",
+      "sequence": 28,
+      "title": "Principal Engineer's Concurrency Decision Framework",
+      "slug": "concurrency-decision-framework",
+      "path": "content/tracks/track-03-concurrency/lesson-28-concurrency-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "architecture",
+        "trade-offs",
+        "staff-engineer",
+        "principal-engineer"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,390 @@
+{
+  "id": "track-09",
+  "sequence": 9,
+  "title": "Performance Engineering & JVM Internals",
+  "shortTitle": "Performance Engineering",
+  "slug": "performance",
+  "color": "#84cc16",
+  "colorMuted": "rgba(132, 204, 22, 0.15)",
+  "description": "JVM internals, garbage collection analysis, JMH benchmarking, memory profiling, database query optimization, and tuning high-throughput financial services.",
+  "difficulty": "advanced",
+  "estimatedHours": 33,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-09-lesson-01",
+      "sequence": 1,
+      "title": "JVM Internals — Memory Model, Class Loading, and JIT",
+      "slug": "jvm-internals",
+      "path": "content/tracks/track-09-performance/lesson-01-jvm-internals/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "JVM",
+        "memory-model",
+        "class-loading",
+        "JIT",
+        "bytecode"
+      ]
+    },
+    {
+      "id": "track-09-lesson-02",
+      "sequence": 2,
+      "title": "Garbage Collection Analysis — Reading GC Logs",
+      "slug": "gc-analysis",
+      "path": "content/tracks/track-09-performance/lesson-02-gc-analysis/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "GC",
+        "G1GC",
+        "ZGC",
+        "GC-log",
+        "pause-time"
+      ]
+    },
+    {
+      "id": "track-09-lesson-03",
+      "sequence": 3,
+      "title": "GC Tuning — G1GC and ZGC for Low-Latency Finance",
+      "slug": "gc-tuning",
+      "path": "content/tracks/track-09-performance/lesson-03-gc-tuning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "GC-tuning",
+        "G1GC",
+        "ZGC",
+        "heap-sizing",
+        "latency"
+      ]
+    },
+    {
+      "id": "track-09-lesson-04",
+      "sequence": 4,
+      "title": "JMH Benchmarking — Measuring Performance Correctly",
+      "slug": "jmh-benchmarking",
+      "path": "content/tracks/track-09-performance/lesson-04-jmh-benchmarking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "JMH",
+        "benchmarking",
+        "warm-up",
+        "throughput",
+        "latency"
+      ]
+    },
+    {
+      "id": "track-09-lesson-05",
+      "sequence": 5,
+      "title": "CPU Profiling — Finding Hot Methods with async-profiler",
+      "slug": "cpu-profiling",
+      "path": "content/tracks/track-09-performance/lesson-05-cpu-profiling/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "CPU-profiling",
+        "async-profiler",
+        "flame-graph",
+        "JFR",
+        "hot-method"
+      ]
+    },
+    {
+      "id": "track-09-lesson-06",
+      "sequence": 6,
+      "title": "Memory Profiling — Heap Analysis and Leak Detection",
+      "slug": "memory-profiling",
+      "path": "content/tracks/track-09-performance/lesson-06-memory-profiling/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "memory-profiling",
+        "heap-dump",
+        "MAT",
+        "object-retention",
+        "memory-leak"
+      ]
+    },
+    {
+      "id": "track-09-lesson-07",
+      "sequence": 7,
+      "title": "JDBC Tuning — Connection Pools and Batch Operations",
+      "slug": "jdbc-tuning",
+      "path": "content/tracks/track-09-performance/lesson-07-jdbc-tuning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "JDBC",
+        "HikariCP",
+        "batch-insert",
+        "prepared-statement",
+        "connection-pool"
+      ]
+    },
+    {
+      "id": "track-09-lesson-08",
+      "sequence": 8,
+      "title": "Query Optimization — EXPLAIN ANALYZE and Index Usage",
+      "slug": "query-optimization",
+      "path": "content/tracks/track-09-performance/lesson-08-query-optimization/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "query-optimization",
+        "EXPLAIN",
+        "index",
+        "sequential-scan",
+        "PostgreSQL"
+      ]
+    },
+    {
+      "id": "track-09-lesson-09",
+      "sequence": 9,
+      "title": "Index Design — B-Tree, Hash, and Partial Indexes",
+      "slug": "index-design",
+      "path": "content/tracks/track-09-performance/lesson-09-index-design/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "index",
+        "B-tree",
+        "hash-index",
+        "partial-index",
+        "covering-index"
+      ]
+    },
+    {
+      "id": "track-09-lesson-10",
+      "sequence": 10,
+      "title": "Application Caching — Strategies, Invalidation, and TTL",
+      "slug": "application-caching",
+      "path": "content/tracks/track-09-performance/lesson-10-application-caching/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "caching",
+        "Cache-Aside",
+        "Write-Through",
+        "TTL",
+        "invalidation"
+      ]
+    },
+    {
+      "id": "track-09-lesson-11",
+      "sequence": 11,
+      "title": "Redis Performance — Pipelining, Scripting, and Data Structures",
+      "slug": "redis-performance",
+      "path": "content/tracks/track-09-performance/lesson-11-redis-performance/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "Redis",
+        "pipelining",
+        "Lua",
+        "data-structures",
+        "latency"
+      ]
+    },
+    {
+      "id": "track-09-lesson-12",
+      "sequence": 12,
+      "title": "Kafka Producer Tuning — Batching, Compression, and Throughput",
+      "slug": "kafka-tuning",
+      "path": "content/tracks/track-09-performance/lesson-12-kafka-tuning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "producer-tuning",
+        "batching",
+        "compression",
+        "throughput"
+      ]
+    },
+    {
+      "id": "track-09-lesson-13",
+      "sequence": 13,
+      "title": "HTTP/2 and gRPC Performance — Connection Multiplexing",
+      "slug": "http2-grpc-performance",
+      "path": "content/tracks/track-09-performance/lesson-13-http2-grpc/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "HTTP2",
+        "gRPC",
+        "multiplexing",
+        "stream",
+        "header-compression"
+      ]
+    },
+    {
+      "id": "track-09-lesson-14",
+      "sequence": 14,
+      "title": "Thread Pool Sizing — Little's Law and Optimal Concurrency",
+      "slug": "thread-pool-sizing",
+      "path": "content/tracks/track-09-performance/lesson-14-thread-pool-sizing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "thread-pool",
+        "Little's-law",
+        "queuing-theory",
+        "executor",
+        "sizing"
+      ]
+    },
+    {
+      "id": "track-09-lesson-15",
+      "sequence": 15,
+      "title": "Virtual Threads Performance — Benchmarking Java 21",
+      "slug": "virtual-threads-performance",
+      "path": "content/tracks/track-09-performance/lesson-15-virtual-threads-performance/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "virtual-threads",
+        "java-21",
+        "benchmarking",
+        "pinning",
+        "carrier-thread"
+      ]
+    },
+    {
+      "id": "track-09-lesson-16",
+      "sequence": 16,
+      "title": "Gatling Load Testing — Realistic Financial Scenarios",
+      "slug": "gatling-load-testing",
+      "path": "content/tracks/track-09-performance/lesson-16-gatling-load-testing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Gatling",
+        "load-testing",
+        "simulation",
+        "percentiles",
+        "throughput"
+      ]
+    },
+    {
+      "id": "track-09-lesson-17",
+      "sequence": 17,
+      "title": "Flame Graphs — Visualising CPU and Memory Hotspots",
+      "slug": "flame-graphs",
+      "path": "content/tracks/track-09-performance/lesson-17-flame-graphs/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "flame-graph",
+        "async-profiler",
+        "CPU",
+        "allocation",
+        "visualisation"
+      ]
+    },
+    {
+      "id": "track-09-lesson-18",
+      "sequence": 18,
+      "title": "Memory Layout — Object Padding, Cache Lines, and False Sharing",
+      "slug": "memory-layout",
+      "path": "content/tracks/track-09-performance/lesson-18-memory-layout/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "memory-layout",
+        "cache-line",
+        "false-sharing",
+        "padding",
+        "jol"
+      ]
+    },
+    {
+      "id": "track-09-lesson-19",
+      "sequence": 19,
+      "title": "Database Partitioning — Range, Hash, and List Strategies",
+      "slug": "db-partitioning-performance",
+      "path": "content/tracks/track-09-performance/lesson-19-db-partitioning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "partitioning",
+        "range-partition",
+        "hash-partition",
+        "pruning",
+        "PostgreSQL"
+      ]
+    },
+    {
+      "id": "track-09-lesson-20",
+      "sequence": 20,
+      "title": "Reactive vs Blocking — Performance Profile Comparison",
+      "slug": "reactive-vs-blocking-perf",
+      "path": "content/tracks/track-09-performance/lesson-20-reactive-vs-blocking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "reactive",
+        "blocking",
+        "throughput",
+        "latency",
+        "JMH"
+      ]
+    },
+    {
+      "id": "track-09-lesson-21",
+      "sequence": 21,
+      "title": "Network I/O Tuning — TCP, Keepalive, and Buffer Sizing",
+      "slug": "network-io-tuning",
+      "path": "content/tracks/track-09-performance/lesson-21-network-io-tuning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "TCP",
+        "keepalive",
+        "buffer-size",
+        "Nagle",
+        "socket-timeout"
+      ]
+    },
+    {
+      "id": "track-09-lesson-22",
+      "sequence": 22,
+      "title": "Principal Engineer's Performance Decision Framework",
+      "slug": "performance-decision-framework",
+      "path": "content/tracks/track-09-performance/lesson-22-performance-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "performance",
+        "trade-offs",
+        "staff-engineer",
+        "bottleneck"
+      ]
+    }
+  ]
+}

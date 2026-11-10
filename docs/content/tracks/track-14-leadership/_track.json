@@ -1,0 +1,254 @@
+{
+  "id": "track-14",
+  "sequence": 14,
+  "title": "Staff & Principal Engineering Leadership",
+  "shortTitle": "Engineering Leadership",
+  "slug": "leadership",
+  "color": "#64748b",
+  "colorMuted": "rgba(100, 116, 139, 0.15)",
+  "description": "Technical strategy, RFC process, architectural decision-making, mentoring senior engineers, cross-team influence, and the Staff/Principal engineer operating model.",
+  "difficulty": "principal",
+  "estimatedHours": 21,
+  "status": "published",
+  "priority": "medium",
+  "lessons": [
+    {
+      "id": "track-14-lesson-01",
+      "sequence": 1,
+      "title": "The Staff & Principal Engineer Operating Model",
+      "slug": "principal-operating-model",
+      "path": "content/tracks/track-14-leadership/lesson-01-principal-operating-model/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "staff-engineer",
+        "principal-engineer",
+        "operating-model",
+        "scope",
+        "impact"
+      ]
+    },
+    {
+      "id": "track-14-lesson-02",
+      "sequence": 2,
+      "title": "Technical Strategy — Defining a 2-Year Engineering Roadmap",
+      "slug": "technical-strategy",
+      "path": "content/tracks/track-14-leadership/lesson-02-technical-strategy/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "technical-strategy",
+        "roadmap",
+        "OKR",
+        "vision",
+        "alignment"
+      ]
+    },
+    {
+      "id": "track-14-lesson-03",
+      "sequence": 3,
+      "title": "The RFC Process — Driving Technical Decisions at Scale",
+      "slug": "rfc-process",
+      "path": "content/tracks/track-14-leadership/lesson-03-rfc-process/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "RFC",
+        "technical-decision",
+        "proposal",
+        "review",
+        "consensus"
+      ]
+    },
+    {
+      "id": "track-14-lesson-04",
+      "sequence": 4,
+      "title": "ADRs in Practice — Building an Architecture Decision Culture",
+      "slug": "adr-practice",
+      "path": "content/tracks/track-14-leadership/lesson-04-adr-practice/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "ADR",
+        "architecture-decision",
+        "culture",
+        "documentation",
+        "MADR"
+      ]
+    },
+    {
+      "id": "track-14-lesson-05",
+      "sequence": 5,
+      "title": "Managing Technical Debt — Prioritisation and Paydown",
+      "slug": "technical-debt",
+      "path": "content/tracks/track-14-leadership/lesson-05-technical-debt/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "technical-debt",
+        "prioritisation",
+        "paydown",
+        "cruft",
+        "refactoring"
+      ]
+    },
+    {
+      "id": "track-14-lesson-06",
+      "sequence": 6,
+      "title": "Engineering Metrics — DORA, SPACE, and DevEx",
+      "slug": "engineering-metrics",
+      "path": "content/tracks/track-14-leadership/lesson-06-engineering-metrics/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "DORA",
+        "SPACE",
+        "DevEx",
+        "deployment-frequency",
+        "lead-time"
+      ]
+    },
+    {
+      "id": "track-14-lesson-07",
+      "sequence": 7,
+      "title": "Mentoring Senior Engineers — Growing Technical Talent",
+      "slug": "mentoring",
+      "path": "content/tracks/track-14-leadership/lesson-07-mentoring/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "mentoring",
+        "coaching",
+        "growth",
+        "feedback",
+        "1:1"
+      ]
+    },
+    {
+      "id": "track-14-lesson-08",
+      "sequence": 8,
+      "title": "Cross-Team Influence — Driving Change Without Authority",
+      "slug": "cross-team-influence",
+      "path": "content/tracks/track-14-leadership/lesson-08-cross-team/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "influence",
+        "cross-team",
+        "stakeholder",
+        "alignment",
+        "narrative"
+      ]
+    },
+    {
+      "id": "track-14-lesson-09",
+      "sequence": 9,
+      "title": "Technical Reviews — Code, Design, and Architecture Reviews",
+      "slug": "technical-reviews",
+      "path": "content/tracks/track-14-leadership/lesson-09-technical-reviews/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "code-review",
+        "design-review",
+        "architecture-review",
+        "feedback",
+        "standards"
+      ]
+    },
+    {
+      "id": "track-14-lesson-10",
+      "sequence": 10,
+      "title": "Technology Radar — Assess, Trial, Adopt, Hold",
+      "slug": "technology-radar",
+      "path": "content/tracks/track-14-leadership/lesson-10-technology-radar/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "technology-radar",
+        "ThoughtWorks",
+        "assess",
+        "adopt",
+        "hold"
+      ]
+    },
+    {
+      "id": "track-14-lesson-11",
+      "sequence": 11,
+      "title": "Incident Leadership — Command and Communication",
+      "slug": "incident-leadership",
+      "path": "content/tracks/track-14-leadership/lesson-11-incident-leadership/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "incident-leadership",
+        "incident-commander",
+        "communication",
+        "postmortem",
+        "blameless"
+      ]
+    },
+    {
+      "id": "track-14-lesson-12",
+      "sequence": 12,
+      "title": "Build vs Buy vs Open Source — The Principal Decision",
+      "slug": "build-vs-buy",
+      "path": "content/tracks/track-14-leadership/lesson-12-build-vs-buy/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "build-vs-buy",
+        "open-source",
+        "make-or-buy",
+        "vendor",
+        "total-cost"
+      ]
+    },
+    {
+      "id": "track-14-lesson-13",
+      "sequence": 13,
+      "title": "Technical Interviewing — Hiring for Principal-Level Roles",
+      "slug": "technical-interviewing",
+      "path": "content/tracks/track-14-leadership/lesson-13-interviewing/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "interviewing",
+        "system-design",
+        "hiring",
+        "evaluation",
+        "bar-raiser"
+      ]
+    },
+    {
+      "id": "track-14-lesson-14",
+      "sequence": 14,
+      "title": "Career Framework — Navigating the Principal Engineer Path",
+      "slug": "career-framework",
+      "path": "content/tracks/track-14-leadership/lesson-14-career-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "career",
+        "levelling",
+        "promotion",
+        "IC-track",
+        "scope"
+      ]
+    }
+  ]
+}

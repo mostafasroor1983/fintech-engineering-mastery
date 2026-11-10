@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Engineering Mastery</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23f97316'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='monospace' font-size='14' font-weight='700' fill='white'%3EEM%3C/text%3E%3C/svg%3E">
+  <style>
+    /* Minimal styles for the redirect splash — main CSS loads at index.html */
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }
+    .wrap { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+    .mark { width: 48px; height: 48px; background: #f97316; border-radius: 10px;
+            display: flex; align-items: center; justify-content: center;
+            font-family: monospace; font-size: 16px; font-weight: 700; color: #fff; }
+    h1 { font-size: 1rem; color: #8b949e; font-weight: 400; margin: 0; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="mark">EM</div>
+    <h1>Redirecting&hellip;</h1>
+  </div>
+  <script>
+    // GitHub Pages 404 → preserve SPA hash routing
+    // Redirect to index.html and restore the path as a hash fragment
+    (function () {
+      var path = window.location.pathname;
+      var search = window.location.search;
+      var hash = window.location.hash;
+
+      // If the path is just the root or has no meaningful sub-path, go home
+      if (!path || path === '/' || path === '/index.html') {
+        window.location.replace('/');
+        return;
+      }
+
+      // Convert path segments to a hash route
+      // e.g., /curriculum/track/track-03 → index.html#/curriculum/track/track-03
+      var route = path.replace(/^\//, '');
+      var base  = window.location.origin + '/';
+      window.location.replace(base + '#/' + route + (search || '') + (hash || ''));
+    }());
+  </script>
+</body>
+</html>

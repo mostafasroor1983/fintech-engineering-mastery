@@ -1,0 +1,321 @@
+{
+  "id": "track-07",
+  "sequence": 7,
+  "title": "Financial Crime, Compliance & Risk Engineering",
+  "shortTitle": "Financial Crime & Compliance",
+  "slug": "financial-crime",
+  "color": "#f59e0b",
+  "colorMuted": "rgba(245, 158, 11, 0.15)",
+  "description": "AML screening, KYC workflows, sanctions list processing, fraud detection systems, regulatory reporting, and compliance-driven architecture at scale.",
+  "difficulty": "advanced",
+  "estimatedHours": 27,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-07-lesson-01",
+      "sequence": 1,
+      "title": "AML Architecture — Anti-Money Laundering Systems Design",
+      "slug": "aml-architecture",
+      "path": "content/tracks/track-07-financial-crime/lesson-01-aml-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "AML",
+        "money-laundering",
+        "typologies",
+        "transaction-monitoring",
+        "regulatory"
+      ]
+    },
+    {
+      "id": "track-07-lesson-02",
+      "sequence": 2,
+      "title": "KYC Engine — Know Your Customer Data Architecture",
+      "slug": "kyc-engine",
+      "path": "content/tracks/track-07-financial-crime/lesson-02-kyc-engine/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "KYC",
+        "identity-verification",
+        "document-checks",
+        "CDD",
+        "EDD"
+      ]
+    },
+    {
+      "id": "track-07-lesson-03",
+      "sequence": 3,
+      "title": "Sanctions Screening — OFAC, UN, and EU List Processing",
+      "slug": "sanctions-screening",
+      "path": "content/tracks/track-07-financial-crime/lesson-03-sanctions-screening/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "sanctions",
+        "OFAC",
+        "fuzzy-matching",
+        "screening",
+        "SDN"
+      ]
+    },
+    {
+      "id": "track-07-lesson-04",
+      "sequence": 4,
+      "title": "Fraud Detection — Rule Engine Architecture",
+      "slug": "fraud-rule-engine",
+      "path": "content/tracks/track-07-financial-crime/lesson-04-fraud-rule-engine/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "fraud-detection",
+        "rule-engine",
+        "Drools",
+        "decision-table",
+        "real-time"
+      ]
+    },
+    {
+      "id": "track-07-lesson-05",
+      "sequence": 5,
+      "title": "ML-Based Fraud Scoring — Feature Engineering for Payments",
+      "slug": "ml-fraud-scoring",
+      "path": "content/tracks/track-07-financial-crime/lesson-05-ml-fraud-scoring/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "ML",
+        "fraud-scoring",
+        "feature-engineering",
+        "model-serving",
+        "latency"
+      ]
+    },
+    {
+      "id": "track-07-lesson-06",
+      "sequence": 6,
+      "title": "PEP Screening — Politically Exposed Persons Detection",
+      "slug": "pep-screening",
+      "path": "content/tracks/track-07-financial-crime/lesson-06-pep-screening/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "PEP",
+        "screening",
+        "watchlist",
+        "enhanced-due-diligence",
+        "risk-rating"
+      ]
+    },
+    {
+      "id": "track-07-lesson-07",
+      "sequence": 7,
+      "title": "Regulatory Reporting — STR, SAR, and CTR Automation",
+      "slug": "regulatory-reporting",
+      "path": "content/tracks/track-07-financial-crime/lesson-07-regulatory-reporting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "STR",
+        "SAR",
+        "CTR",
+        "regulatory-reporting",
+        "automation"
+      ]
+    },
+    {
+      "id": "track-07-lesson-08",
+      "sequence": 8,
+      "title": "GDPR Engineering — Data Privacy by Design",
+      "slug": "gdpr-engineering",
+      "path": "content/tracks/track-07-financial-crime/lesson-08-gdpr-engineering/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "GDPR",
+        "data-privacy",
+        "right-to-erasure",
+        "consent",
+        "data-minimisation"
+      ]
+    },
+    {
+      "id": "track-07-lesson-09",
+      "sequence": 9,
+      "title": "PCI DSS Architecture — Cardholder Data Environment Design",
+      "slug": "pci-dss-architecture",
+      "path": "content/tracks/track-07-financial-crime/lesson-09-pci-dss/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "PCI-DSS",
+        "CDE",
+        "tokenisation",
+        "encryption",
+        "network-segmentation"
+      ]
+    },
+    {
+      "id": "track-07-lesson-10",
+      "sequence": 10,
+      "title": "Currency Transaction Reporting — CTF Systems at Scale",
+      "slug": "ctf-systems",
+      "path": "content/tracks/track-07-financial-crime/lesson-10-ctf-systems/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "CTF",
+        "currency-transaction",
+        "threshold-monitoring",
+        "structuring-detection"
+      ]
+    },
+    {
+      "id": "track-07-lesson-11",
+      "sequence": 11,
+      "title": "Risk Scoring Engines — Customer and Transaction Risk",
+      "slug": "risk-scoring",
+      "path": "content/tracks/track-07-financial-crime/lesson-11-risk-scoring/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "risk-scoring",
+        "customer-risk",
+        "transaction-risk",
+        "risk-matrix",
+        "dynamic"
+      ]
+    },
+    {
+      "id": "track-07-lesson-12",
+      "sequence": 12,
+      "title": "Alert Management — Investigation Workflow Systems",
+      "slug": "alert-management",
+      "path": "content/tracks/track-07-financial-crime/lesson-12-alert-management/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "alert-management",
+        "case-management",
+        "investigation",
+        "triage",
+        "workflow"
+      ]
+    },
+    {
+      "id": "track-07-lesson-13",
+      "sequence": 13,
+      "title": "SAR Filing — Suspicious Activity Report Automation",
+      "slug": "sar-filing",
+      "path": "content/tracks/track-07-financial-crime/lesson-13-sar-filing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "SAR",
+        "filing",
+        "automation",
+        "narrative-generation",
+        "FinCEN"
+      ]
+    },
+    {
+      "id": "track-07-lesson-14",
+      "sequence": 14,
+      "title": "Network Analysis — Graph-Based Money Laundering Detection",
+      "slug": "network-analysis",
+      "path": "content/tracks/track-07-financial-crime/lesson-14-network-analysis/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "graph-analysis",
+        "network",
+        "Neo4j",
+        "smurfing",
+        "layering"
+      ]
+    },
+    {
+      "id": "track-07-lesson-15",
+      "sequence": 15,
+      "title": "Compliance Data Architecture — Auditability at Scale",
+      "slug": "compliance-data",
+      "path": "content/tracks/track-07-financial-crime/lesson-15-compliance-data/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "compliance-data",
+        "audit-trail",
+        "immutability",
+        "retention",
+        "data-lineage"
+      ]
+    },
+    {
+      "id": "track-07-lesson-16",
+      "sequence": 16,
+      "title": "RegTech Integration — Third-Party Screening APIs",
+      "slug": "regtech-integration",
+      "path": "content/tracks/track-07-financial-crime/lesson-16-regtech-integration/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "RegTech",
+        "API-integration",
+        "LexisNexis",
+        "Refinitiv",
+        "resilience"
+      ]
+    },
+    {
+      "id": "track-07-lesson-17",
+      "sequence": 17,
+      "title": "Audit Trail Engineering — Tamper-Evident Event Logs",
+      "slug": "audit-trail",
+      "path": "content/tracks/track-07-financial-crime/lesson-17-audit-trail/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "audit-trail",
+        "tamper-evident",
+        "hash-chain",
+        "immutable-log",
+        "compliance"
+      ]
+    },
+    {
+      "id": "track-07-lesson-18",
+      "sequence": 18,
+      "title": "Principal Engineer's Compliance Architecture Decision Framework",
+      "slug": "compliance-decision-framework",
+      "path": "content/tracks/track-07-financial-crime/lesson-18-compliance-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "compliance",
+        "architecture",
+        "trade-offs",
+        "staff-engineer"
+      ]
+    }
+  ]
+}

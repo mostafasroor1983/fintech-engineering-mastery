@@ -1,0 +1,343 @@
+{
+  "id": "track-01",
+  "sequence": 1,
+  "title": "Advanced Software Architecture",
+  "shortTitle": "Architecture",
+  "slug": "architecture",
+  "color": "#6366f1",
+  "colorMuted": "rgba(99, 102, 241, 0.15)",
+  "description": "Evolutionary architecture, architectural decision records, design patterns, C4 model, domain-driven design, and system design for large-scale financial platforms.",
+  "difficulty": "advanced",
+  "estimatedHours": 30,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-01-lesson-01",
+      "sequence": 1,
+      "title": "Evolutionary Architecture — Fitness Functions and Technical Debt",
+      "slug": "evolutionary-architecture",
+      "path": "content/tracks/track-01-architecture/lesson-01-evolutionary-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "evolutionary-architecture",
+        "fitness-functions",
+        "technical-debt",
+        "ADR"
+      ]
+    },
+    {
+      "id": "track-01-lesson-02",
+      "sequence": 2,
+      "title": "Architectural Decision Records — The ADR Practice",
+      "slug": "architectural-decision-records",
+      "path": "content/tracks/track-01-architecture/lesson-02-adr-practice/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tags": [
+        "ADR",
+        "decision-records",
+        "architecture-documentation"
+      ]
+    },
+    {
+      "id": "track-01-lesson-03",
+      "sequence": 3,
+      "title": "The C4 Model — Communicating Architecture",
+      "slug": "c4-model",
+      "path": "content/tracks/track-01-architecture/lesson-03-c4-model/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "C4",
+        "architecture-diagrams",
+        "context",
+        "container",
+        "component"
+      ]
+    },
+    {
+      "id": "track-01-lesson-04",
+      "sequence": 4,
+      "title": "Domain-Driven Design — Strategic Patterns",
+      "slug": "ddd-strategic",
+      "path": "content/tracks/track-01-architecture/lesson-04-ddd-strategic/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "DDD",
+        "bounded-context",
+        "ubiquitous-language",
+        "context-mapping"
+      ]
+    },
+    {
+      "id": "track-01-lesson-05",
+      "sequence": 5,
+      "title": "Domain-Driven Design — Tactical Patterns",
+      "slug": "ddd-tactical",
+      "path": "content/tracks/track-01-architecture/lesson-05-ddd-tactical/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "DDD",
+        "aggregate",
+        "entity",
+        "value-object",
+        "repository",
+        "domain-service"
+      ]
+    },
+    {
+      "id": "track-01-lesson-06",
+      "sequence": 6,
+      "title": "Hexagonal Architecture — Ports and Adapters",
+      "slug": "hexagonal-architecture",
+      "path": "content/tracks/track-01-architecture/lesson-06-hexagonal-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "hexagonal",
+        "ports-and-adapters",
+        "clean-architecture",
+        "dependency-inversion"
+      ]
+    },
+    {
+      "id": "track-01-lesson-07",
+      "sequence": 7,
+      "title": "Event-Driven Architecture Patterns",
+      "slug": "event-driven-architecture",
+      "path": "content/tracks/track-01-architecture/lesson-07-event-driven-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "event-driven",
+        "event-sourcing",
+        "CQRS",
+        "domain-events"
+      ]
+    },
+    {
+      "id": "track-01-lesson-08",
+      "sequence": 8,
+      "title": "CQRS — Command Query Responsibility Segregation",
+      "slug": "cqrs-pattern",
+      "path": "content/tracks/track-01-architecture/lesson-08-cqrs-pattern/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "CQRS",
+        "command",
+        "query",
+        "read-model",
+        "write-model"
+      ]
+    },
+    {
+      "id": "track-01-lesson-09",
+      "sequence": 9,
+      "title": "API Design — REST, GraphQL, and gRPC in Financial Services",
+      "slug": "api-design",
+      "path": "content/tracks/track-01-architecture/lesson-09-api-design/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "REST",
+        "GraphQL",
+        "gRPC",
+        "API-design",
+        "OpenAPI"
+      ]
+    },
+    {
+      "id": "track-01-lesson-10",
+      "sequence": 10,
+      "title": "Microservices vs Monolith — The Architecture Decision",
+      "slug": "microservices-vs-monolith",
+      "path": "content/tracks/track-01-architecture/lesson-10-microservices-vs-monolith/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "microservices",
+        "monolith",
+        "modular-monolith",
+        "strangler-fig"
+      ]
+    },
+    {
+      "id": "track-01-lesson-11",
+      "sequence": 11,
+      "title": "Service Mesh — Istio and Envoy in Financial Services",
+      "slug": "service-mesh",
+      "path": "content/tracks/track-01-architecture/lesson-11-service-mesh/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "service-mesh",
+        "Istio",
+        "Envoy",
+        "mTLS",
+        "traffic-management"
+      ]
+    },
+    {
+      "id": "track-01-lesson-12",
+      "sequence": 12,
+      "title": "Data Architecture for Financial Systems",
+      "slug": "data-architecture",
+      "path": "content/tracks/track-01-architecture/lesson-12-data-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "data-architecture",
+        "data-mesh",
+        "data-lake",
+        "analytical-platform"
+      ]
+    },
+    {
+      "id": "track-01-lesson-13",
+      "sequence": 13,
+      "title": "Contract Testing — Consumer-Driven Contracts with Pact",
+      "slug": "contract-testing",
+      "path": "content/tracks/track-01-architecture/lesson-13-contract-testing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "contract-testing",
+        "Pact",
+        "consumer-driven",
+        "API-compatibility"
+      ]
+    },
+    {
+      "id": "track-01-lesson-14",
+      "sequence": 14,
+      "title": "Rate Limiting, Throttling, and Back Pressure",
+      "slug": "rate-limiting",
+      "path": "content/tracks/track-01-architecture/lesson-14-rate-limiting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "rate-limiting",
+        "throttling",
+        "back-pressure",
+        "token-bucket",
+        "leaky-bucket"
+      ]
+    },
+    {
+      "id": "track-01-lesson-15",
+      "sequence": 15,
+      "title": "Feature Flags and Progressive Delivery in Banking",
+      "slug": "feature-flags",
+      "path": "content/tracks/track-01-architecture/lesson-15-feature-flags/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "feature-flags",
+        "progressive-delivery",
+        "canary",
+        "LaunchDarkly"
+      ]
+    },
+    {
+      "id": "track-01-lesson-16",
+      "sequence": 16,
+      "title": "Multi-Tenancy Architecture in FinTech Platforms",
+      "slug": "multi-tenancy",
+      "path": "content/tracks/track-01-architecture/lesson-16-multi-tenancy/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "multi-tenancy",
+        "tenant-isolation",
+        "data-partitioning",
+        "SaaS"
+      ]
+    },
+    {
+      "id": "track-01-lesson-17",
+      "sequence": 17,
+      "title": "API Gateway and Backend-for-Frontend Patterns",
+      "slug": "api-gateway-bff",
+      "path": "content/tracks/track-01-architecture/lesson-17-api-gateway-bff/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "API-gateway",
+        "BFF",
+        "aggregation",
+        "authentication",
+        "routing"
+      ]
+    },
+    {
+      "id": "track-01-lesson-18",
+      "sequence": 18,
+      "title": "Zero-Trust Security Architecture",
+      "slug": "zero-trust-architecture",
+      "path": "content/tracks/track-01-architecture/lesson-18-zero-trust/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "zero-trust",
+        "mTLS",
+        "identity",
+        "least-privilege"
+      ]
+    },
+    {
+      "id": "track-01-lesson-19",
+      "sequence": 19,
+      "title": "Strangler Fig and Incremental Migration Patterns",
+      "slug": "strangler-fig-migration",
+      "path": "content/tracks/track-01-architecture/lesson-19-strangler-fig/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "strangler-fig",
+        "migration",
+        "legacy-modernisation",
+        "anti-corruption-layer"
+      ]
+    },
+    {
+      "id": "track-01-lesson-20",
+      "sequence": 20,
+      "title": "Principal Engineer's Architecture Decision Framework",
+      "slug": "architecture-decision-framework",
+      "path": "content/tracks/track-01-architecture/lesson-20-architecture-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "architecture-trade-offs",
+        "staff-engineer",
+        "principal-engineer"
+      ]
+    }
+  ]
+}

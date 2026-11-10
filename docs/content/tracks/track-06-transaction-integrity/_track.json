@@ -1,0 +1,423 @@
+{
+  "id": "track-06",
+  "sequence": 6,
+  "title": "Financial Transaction Integrity & Ledger Engineering",
+  "shortTitle": "Transaction Integrity",
+  "slug": "transaction-integrity",
+  "color": "#ef4444",
+  "colorMuted": "rgba(239, 68, 68, 0.15)",
+  "description": "Idempotency, dual-write problems, Outbox pattern, double-entry ledger engineering, concurrent balance management, and preventing financial data corruption.",
+  "difficulty": "principal",
+  "estimatedHours": 36,
+  "status": "published",
+  "priority": "critical",
+  "lessons": [
+    {
+      "id": "track-06-lesson-01",
+      "sequence": 1,
+      "title": "Double-Entry Ledger \u2014 Architecture and Invariants",
+      "slug": "double-entry-ledger",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-01-double-entry-ledger/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "double-entry",
+        "ledger",
+        "accounting",
+        "journal-entries",
+        "T-accounts"
+      ]
+    },
+    {
+      "id": "track-06-lesson-02",
+      "sequence": 2,
+      "title": "Scenario A \u2014 Concurrent Withdrawals and Lost Updates",
+      "slug": "scenario-a-concurrent-withdrawals",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-02-scenario-a-concurrent-withdrawals/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 100,
+      "status": "published",
+      "tags": [
+        "race-condition",
+        "lost-update",
+        "SELECT-FOR-UPDATE",
+        "optimistic-locking",
+        "concurrent-withdrawals"
+      ]
+    },
+    {
+      "id": "track-06-lesson-03",
+      "sequence": 3,
+      "title": "Scenario B \u2014 Duplicate Payment Detection and Idempotency",
+      "slug": "scenario-b-duplicate-payment",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-03-scenario-b-duplicate-payment/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 95,
+      "status": "published",
+      "tags": [
+        "idempotency",
+        "duplicate-payment",
+        "idempotency-key",
+        "at-least-once",
+        "deduplication"
+      ]
+    },
+    {
+      "id": "track-06-lesson-04",
+      "sequence": 4,
+      "title": "Scenario C \u2014 Double Spending Prevention",
+      "slug": "scenario-c-double-spending",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-04-scenario-c-double-spending/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "double-spending",
+        "funds-reservation",
+        "hold",
+        "atomic-debit",
+        "SELECT-FOR-UPDATE"
+      ]
+    },
+    {
+      "id": "track-06-lesson-05",
+      "sequence": 5,
+      "title": "Scenario D \u2014 Concurrent Ledger Posting",
+      "slug": "scenario-d-concurrent-ledger-posting",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-05-scenario-d-concurrent-ledger-posting/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "ledger-posting",
+        "concurrent-writes",
+        "serialization",
+        "SERIALIZABLE",
+        "partitioning"
+      ]
+    },
+    {
+      "id": "track-06-lesson-06",
+      "sequence": 6,
+      "title": "Scenario E \u2014 Partial Payment Failure and Compensation",
+      "slug": "scenario-e-partial-payment-failure",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-06-scenario-e-partial-payment-failure/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 95,
+      "status": "published",
+      "tags": [
+        "partial-failure",
+        "compensation",
+        "rollback",
+        "saga",
+        "funds-reservation"
+      ]
+    },
+    {
+      "id": "track-06-lesson-07",
+      "sequence": 7,
+      "title": "Scenario F \u2014 Database and Kafka Dual-Write",
+      "slug": "scenario-f-dual-write",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-07-scenario-f-dual-write/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 95,
+      "status": "published",
+      "tags": [
+        "dual-write",
+        "outbox-pattern",
+        "transactional-outbox",
+        "Kafka",
+        "consistency"
+      ]
+    },
+    {
+      "id": "track-06-lesson-08",
+      "sequence": 8,
+      "title": "Scenario G \u2014 Duplicate Kafka Delivery and Consumer Idempotency",
+      "slug": "scenario-g-duplicate-kafka-delivery",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-08-scenario-g-duplicate-kafka/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "exactly-once",
+        "at-least-once",
+        "consumer-idempotency",
+        "deduplication"
+      ]
+    },
+    {
+      "id": "track-06-lesson-09",
+      "sequence": 9,
+      "title": "Scenario H \u2014 Out-of-Order Event Processing",
+      "slug": "scenario-h-out-of-order-events",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-09-scenario-h-out-of-order/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "event-ordering",
+        "out-of-order",
+        "sequence-numbers",
+        "event-sourcing",
+        "Kafka"
+      ]
+    },
+    {
+      "id": "track-06-lesson-10",
+      "sequence": 10,
+      "title": "Scenario I \u2014 Reconciliation Mismatches",
+      "slug": "scenario-i-reconciliation-mismatch",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-10-scenario-i-reconciliation/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "reconciliation",
+        "mismatch",
+        "external-reconciliation",
+        "audit",
+        "shadow-ledger"
+      ]
+    },
+    {
+      "id": "track-06-lesson-11",
+      "sequence": 11,
+      "title": "Scenario J \u2014 Concurrent Balance Updates at Scale",
+      "slug": "scenario-j-concurrent-balance-updates",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-11-scenario-j-concurrent-balance/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 95,
+      "status": "published",
+      "tags": [
+        "concurrent-balance",
+        "hot-account",
+        "queue-serialization",
+        "partitioning",
+        "CRDT"
+      ]
+    },
+    {
+      "id": "track-06-lesson-12",
+      "sequence": 12,
+      "title": "Idempotency \u2014 Design Patterns and Implementation",
+      "slug": "idempotency-patterns",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-12-idempotency-patterns/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "idempotency",
+        "idempotency-key",
+        "UNIQUE-constraint",
+        "Redis",
+        "distributed-idempotency"
+      ]
+    },
+    {
+      "id": "track-06-lesson-13",
+      "sequence": 13,
+      "title": "The Transactional Outbox Pattern",
+      "slug": "transactional-outbox",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-13-transactional-outbox/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "outbox-pattern",
+        "transactional-outbox",
+        "CDC",
+        "Debezium",
+        "reliable-messaging"
+      ]
+    },
+    {
+      "id": "track-06-lesson-14",
+      "sequence": 14,
+      "title": "Saga Pattern \u2014 Distributed Transaction Management",
+      "slug": "saga-pattern",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-14-saga-pattern/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 95,
+      "status": "published",
+      "tags": [
+        "saga",
+        "choreography",
+        "orchestration",
+        "compensation",
+        "distributed-transactions"
+      ]
+    },
+    {
+      "id": "track-06-lesson-15",
+      "sequence": 15,
+      "title": "Two-Phase Commit vs Saga \u2014 When to Use Each",
+      "slug": "2pc-vs-saga",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-15-2pc-vs-saga/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "2PC",
+        "saga",
+        "distributed-transactions",
+        "trade-offs",
+        "XA"
+      ]
+    },
+    {
+      "id": "track-06-lesson-16",
+      "sequence": 16,
+      "title": "Optimistic Locking \u2014 Version Columns and CAS",
+      "slug": "optimistic-locking",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-16-optimistic-locking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "optimistic-locking",
+        "@Version",
+        "CAS",
+        "retry",
+        "conflict-detection"
+      ]
+    },
+    {
+      "id": "track-06-lesson-17",
+      "sequence": 17,
+      "title": "Pessimistic Locking \u2014 SELECT FOR UPDATE and Advisory Locks",
+      "slug": "pessimistic-locking",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-17-pessimistic-locking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "pessimistic-locking",
+        "SELECT-FOR-UPDATE",
+        "advisory-locks",
+        "deadlock",
+        "PostgreSQL"
+      ]
+    },
+    {
+      "id": "track-06-lesson-18",
+      "sequence": 18,
+      "title": "Event Sourcing for Financial Ledgers",
+      "slug": "event-sourcing-ledgers",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-18-event-sourcing-ledgers/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "event-sourcing",
+        "append-only",
+        "event-store",
+        "snapshot",
+        "audit-trail"
+      ]
+    },
+    {
+      "id": "track-06-lesson-19",
+      "sequence": 19,
+      "title": "CQRS in Payment Systems",
+      "slug": "cqrs-payments",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-19-cqrs-payments/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "CQRS",
+        "command-query",
+        "read-model",
+        "eventual-consistency",
+        "payments"
+      ]
+    },
+    {
+      "id": "track-06-lesson-20",
+      "sequence": 20,
+      "title": "Database Transactions and JVM Concurrency Interaction",
+      "slug": "db-jvm-concurrency",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-20-db-jvm-concurrency/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "isolation-levels",
+        "MVCC",
+        "JPA",
+        "Spring-Transaction",
+        "Hibernate"
+      ]
+    },
+    {
+      "id": "track-06-lesson-21",
+      "sequence": 21,
+      "title": "Financial Audit Trails and Immutable Ledger Design",
+      "slug": "audit-trails",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-21-audit-trails/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "audit-trail",
+        "immutable-ledger",
+        "append-only",
+        "compliance",
+        "tamper-evidence"
+      ]
+    },
+    {
+      "id": "track-06-lesson-22",
+      "sequence": 22,
+      "title": "Balance Reconciliation Strategies",
+      "slug": "balance-reconciliation",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-22-balance-reconciliation/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "reconciliation",
+        "balance-check",
+        "day-end",
+        "batch-reconciliation",
+        "shadow-balance"
+      ]
+    },
+    {
+      "id": "track-06-lesson-23",
+      "sequence": 23,
+      "title": "Compensating Transactions and Financial Reversals",
+      "slug": "compensating-transactions",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-23-compensating-transactions/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "compensation",
+        "reversal",
+        "refund",
+        "CAMT.056",
+        "ISO-20022"
+      ]
+    },
+    {
+      "id": "track-06-lesson-24",
+      "sequence": 24,
+      "title": "Principal Engineer's Financial Integrity Decision Framework",
+      "slug": "integrity-decision-framework",
+      "path": "content/tracks/track-06-transaction-integrity/lesson-24-integrity-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "trade-offs",
+        "correctness-vs-performance",
+        "staff-engineer"
+      ]
+    }
+  ]
+}

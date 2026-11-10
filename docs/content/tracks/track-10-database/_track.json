@@ -1,0 +1,390 @@
+{
+  "id": "track-10",
+  "sequence": 10,
+  "title": "Database & Data Architecture",
+  "shortTitle": "Database Architecture",
+  "slug": "database",
+  "color": "#06b6d4",
+  "colorMuted": "rgba(6, 182, 212, 0.15)",
+  "description": "ACID properties, MVCC, transaction isolation levels, row-level locking, optimistic/pessimistic locking, PostgreSQL internals, and financial database design.",
+  "difficulty": "advanced",
+  "estimatedHours": 33,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-10-lesson-01",
+      "sequence": 1,
+      "title": "ACID Properties — Atomicity, Consistency, Isolation, Durability",
+      "slug": "acid-properties",
+      "path": "content/tracks/track-10-database/lesson-01-acid-properties/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "ACID",
+        "atomicity",
+        "consistency",
+        "isolation",
+        "durability"
+      ]
+    },
+    {
+      "id": "track-10-lesson-02",
+      "sequence": 2,
+      "title": "Transaction Isolation Levels — Read Anomalies and Fixes",
+      "slug": "isolation-levels",
+      "path": "content/tracks/track-10-database/lesson-02-isolation-levels/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "isolation-levels",
+        "dirty-read",
+        "phantom",
+        "serializable",
+        "read-committed"
+      ]
+    },
+    {
+      "id": "track-10-lesson-03",
+      "sequence": 3,
+      "title": "MVCC — Multi-Version Concurrency Control Deep Dive",
+      "slug": "mvcc",
+      "path": "content/tracks/track-10-database/lesson-03-mvcc/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "MVCC",
+        "versioning",
+        "snapshot-isolation",
+        "vacuum",
+        "bloat"
+      ]
+    },
+    {
+      "id": "track-10-lesson-04",
+      "sequence": 4,
+      "title": "PostgreSQL Locking — Row, Page, and Advisory Locks",
+      "slug": "postgresql-locking",
+      "path": "content/tracks/track-10-database/lesson-04-postgresql-locking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "PostgreSQL",
+        "locking",
+        "row-lock",
+        "advisory-lock",
+        "deadlock"
+      ]
+    },
+    {
+      "id": "track-10-lesson-05",
+      "sequence": 5,
+      "title": "Index Strategies — B-Tree, GIN, GiST, and BRIN",
+      "slug": "index-strategies",
+      "path": "content/tracks/track-10-database/lesson-05-index-strategies/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "index",
+        "B-tree",
+        "GIN",
+        "BRIN",
+        "covering-index"
+      ]
+    },
+    {
+      "id": "track-10-lesson-06",
+      "sequence": 6,
+      "title": "Table Partitioning — Range and Hash for Financial Data",
+      "slug": "table-partitioning",
+      "path": "content/tracks/track-10-database/lesson-06-partitioning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "partitioning",
+        "range-partition",
+        "hash-partition",
+        "pruning",
+        "archival"
+      ]
+    },
+    {
+      "id": "track-10-lesson-07",
+      "sequence": 7,
+      "title": "Database Sharding — Horizontal Scaling Strategies",
+      "slug": "sharding",
+      "path": "content/tracks/track-10-database/lesson-07-sharding/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "sharding",
+        "horizontal-scaling",
+        "shard-key",
+        "re-sharding",
+        "Vitess"
+      ]
+    },
+    {
+      "id": "track-10-lesson-08",
+      "sequence": 8,
+      "title": "Read Replicas — Query Routing and Lag Management",
+      "slug": "read-replicas",
+      "path": "content/tracks/track-10-database/lesson-08-read-replicas/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "read-replica",
+        "replication-lag",
+        "query-routing",
+        "consistency",
+        "CQRS"
+      ]
+    },
+    {
+      "id": "track-10-lesson-09",
+      "sequence": 9,
+      "title": "Schema Evolution — Zero-Downtime Migrations",
+      "slug": "schema-evolution",
+      "path": "content/tracks/track-10-database/lesson-09-schema-evolution/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "schema-evolution",
+        "Flyway",
+        "Liquibase",
+        "online-migration",
+        "backward-compatible"
+      ]
+    },
+    {
+      "id": "track-10-lesson-10",
+      "sequence": 10,
+      "title": "Connection Pooling — PgBouncer and HikariCP Tuning",
+      "slug": "connection-pooling",
+      "path": "content/tracks/track-10-database/lesson-10-connection-pooling/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "connection-pool",
+        "PgBouncer",
+        "HikariCP",
+        "max-pool-size",
+        "transaction-mode"
+      ]
+    },
+    {
+      "id": "track-10-lesson-11",
+      "sequence": 11,
+      "title": "WAL and CDC — Change Data Capture with Debezium",
+      "slug": "wal-cdc",
+      "path": "content/tracks/track-10-database/lesson-11-wal-cdc/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "WAL",
+        "CDC",
+        "Debezium",
+        "logical-replication",
+        "streaming"
+      ]
+    },
+    {
+      "id": "track-10-lesson-12",
+      "sequence": 12,
+      "title": "JSONB and Semi-Structured Data in PostgreSQL",
+      "slug": "jsonb-semi-structured",
+      "path": "content/tracks/track-10-database/lesson-12-jsonb/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "JSONB",
+        "semi-structured",
+        "index",
+        "GIN",
+        "document-store"
+      ]
+    },
+    {
+      "id": "track-10-lesson-13",
+      "sequence": 13,
+      "title": "Time-Series Data — TimescaleDB and Hypertables",
+      "slug": "time-series-data",
+      "path": "content/tracks/track-10-database/lesson-13-time-series/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "time-series",
+        "TimescaleDB",
+        "hypertable",
+        "compression",
+        "continuous-aggregate"
+      ]
+    },
+    {
+      "id": "track-10-lesson-14",
+      "sequence": 14,
+      "title": "Audit Tables — Temporal Tables and History Tracking",
+      "slug": "audit-tables",
+      "path": "content/tracks/track-10-database/lesson-14-audit-tables/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "audit",
+        "temporal-table",
+        "history",
+        "bitemporal",
+        "trigger"
+      ]
+    },
+    {
+      "id": "track-10-lesson-15",
+      "sequence": 15,
+      "title": "Database Testing — Property-Based and Integration Testing",
+      "slug": "database-testing",
+      "path": "content/tracks/track-10-database/lesson-15-database-testing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "database-testing",
+        "Testcontainers",
+        "property-based",
+        "integration-testing",
+        "migration-testing"
+      ]
+    },
+    {
+      "id": "track-10-lesson-16",
+      "sequence": 16,
+      "title": "Query Plan Analysis — EXPLAIN, ANALYZE, and Visualisation",
+      "slug": "query-plan-analysis",
+      "path": "content/tracks/track-10-database/lesson-16-query-plan/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "EXPLAIN",
+        "ANALYZE",
+        "query-plan",
+        "cost-model",
+        "visualisation"
+      ]
+    },
+    {
+      "id": "track-10-lesson-17",
+      "sequence": 17,
+      "title": "Distributed PostgreSQL — Citus and Distributed Queries",
+      "slug": "distributed-postgresql",
+      "path": "content/tracks/track-10-database/lesson-17-distributed-postgresql/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "Citus",
+        "distributed",
+        "co-location",
+        "cross-shard",
+        "PostgreSQL"
+      ]
+    },
+    {
+      "id": "track-10-lesson-18",
+      "sequence": 18,
+      "title": "Data Archival — Cold Storage and Tiered Data Management",
+      "slug": "data-archival",
+      "path": "content/tracks/track-10-database/lesson-18-data-archival/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "archival",
+        "cold-storage",
+        "data-lifecycle",
+        "tiering",
+        "S3"
+      ]
+    },
+    {
+      "id": "track-10-lesson-19",
+      "sequence": 19,
+      "title": "Backup and Recovery — Point-in-Time Recovery for Finance",
+      "slug": "backup-recovery",
+      "path": "content/tracks/track-10-database/lesson-19-backup-recovery/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "backup",
+        "PITR",
+        "pg_basebackup",
+        "WAL-archiving",
+        "recovery"
+      ]
+    },
+    {
+      "id": "track-10-lesson-20",
+      "sequence": 20,
+      "title": "Database Benchmarking — pgbench and Custom Workloads",
+      "slug": "db-benchmarking",
+      "path": "content/tracks/track-10-database/lesson-20-db-benchmarking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "pgbench",
+        "benchmarking",
+        "TPS",
+        "workload-simulation",
+        "latency"
+      ]
+    },
+    {
+      "id": "track-10-lesson-21",
+      "sequence": 21,
+      "title": "NewSQL — CockroachDB and Google Spanner Architecture",
+      "slug": "newsql",
+      "path": "content/tracks/track-10-database/lesson-21-newsql/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "NewSQL",
+        "CockroachDB",
+        "Spanner",
+        "serializable",
+        "geo-partitioning"
+      ]
+    },
+    {
+      "id": "track-10-lesson-22",
+      "sequence": 22,
+      "title": "Principal Engineer's Database Decision Framework",
+      "slug": "database-decision-framework",
+      "path": "content/tracks/track-10-database/lesson-22-database-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "database",
+        "trade-offs",
+        "staff-engineer",
+        "selection"
+      ]
+    }
+  ]
+}

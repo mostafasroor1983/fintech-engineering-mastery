@@ -1,0 +1,377 @@
+{
+  "id": "track-02",
+  "sequence": 2,
+  "title": "Distributed Systems Engineering",
+  "shortTitle": "Distributed Systems",
+  "slug": "distributed-systems",
+  "color": "#0ea5e9",
+  "colorMuted": "rgba(14, 165, 233, 0.15)",
+  "description": "CAP theorem, distributed consensus, consistency models, clock synchronization, partition tolerance, and designing fault-tolerant distributed financial systems.",
+  "difficulty": "advanced",
+  "estimatedHours": 33,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-02-lesson-01",
+      "sequence": 1,
+      "title": "The CAP Theorem — Consistency, Availability, Partition Tolerance",
+      "slug": "cap-theorem",
+      "path": "content/tracks/track-02-distributed-systems/lesson-01-cap-theorem/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "CAP",
+        "consistency",
+        "availability",
+        "partition-tolerance",
+        "PACELC"
+      ]
+    },
+    {
+      "id": "track-02-lesson-02",
+      "sequence": 2,
+      "title": "Consistency Models — Strong, Eventual, and Causal",
+      "slug": "consistency-models",
+      "path": "content/tracks/track-02-distributed-systems/lesson-02-consistency-models/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "consistency",
+        "linearisability",
+        "eventual-consistency",
+        "causal-consistency"
+      ]
+    },
+    {
+      "id": "track-02-lesson-03",
+      "sequence": 3,
+      "title": "Distributed Clocks — Lamport, Vector Clocks, and TrueTime",
+      "slug": "distributed-clocks",
+      "path": "content/tracks/track-02-distributed-systems/lesson-03-distributed-clocks/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Lamport-clock",
+        "vector-clock",
+        "TrueTime",
+        "clock-sync",
+        "NTP"
+      ]
+    },
+    {
+      "id": "track-02-lesson-04",
+      "sequence": 4,
+      "title": "Leader Election — Paxos, Raft, and ZooKeeper",
+      "slug": "leader-election",
+      "path": "content/tracks/track-02-distributed-systems/lesson-04-leader-election/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "Paxos",
+        "Raft",
+        "ZooKeeper",
+        "leader-election",
+        "consensus"
+      ]
+    },
+    {
+      "id": "track-02-lesson-05",
+      "sequence": 5,
+      "title": "Consensus in Financial Systems — Practical Applications",
+      "slug": "consensus-financial",
+      "path": "content/tracks/track-02-distributed-systems/lesson-05-consensus-financial/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "consensus",
+        "financial-systems",
+        "etcd",
+        "distributed-commit"
+      ]
+    },
+    {
+      "id": "track-02-lesson-06",
+      "sequence": 6,
+      "title": "Two-Phase Commit and XA Transactions",
+      "slug": "two-phase-commit",
+      "path": "content/tracks/track-02-distributed-systems/lesson-06-two-phase-commit/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "2PC",
+        "XA",
+        "distributed-transaction",
+        "coordinator",
+        "blocking"
+      ]
+    },
+    {
+      "id": "track-02-lesson-07",
+      "sequence": 7,
+      "title": "Replication Strategies — Leader-Follower, Multi-Leader, Leaderless",
+      "slug": "replication-strategies",
+      "path": "content/tracks/track-02-distributed-systems/lesson-07-replication-strategies/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "replication",
+        "leader-follower",
+        "multi-leader",
+        "leaderless",
+        "quorum"
+      ]
+    },
+    {
+      "id": "track-02-lesson-08",
+      "sequence": 8,
+      "title": "Distributed Caching — Redis Cluster Architecture",
+      "slug": "distributed-caching",
+      "path": "content/tracks/track-02-distributed-systems/lesson-08-distributed-caching/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Redis",
+        "distributed-cache",
+        "cache-coherence",
+        "cluster",
+        "consistent-hashing"
+      ]
+    },
+    {
+      "id": "track-02-lesson-09",
+      "sequence": 9,
+      "title": "Distributed Locks — Redlock and Advisory Locks",
+      "slug": "distributed-locks",
+      "path": "content/tracks/track-02-distributed-systems/lesson-09-distributed-locks/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "distributed-lock",
+        "Redlock",
+        "advisory-lock",
+        "fencing-token"
+      ]
+    },
+    {
+      "id": "track-02-lesson-10",
+      "sequence": 10,
+      "title": "Split-Brain and Network Partition Handling",
+      "slug": "split-brain-partitions",
+      "path": "content/tracks/track-02-distributed-systems/lesson-10-split-brain/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "split-brain",
+        "network-partition",
+        "fencing",
+        "STONITH"
+      ]
+    },
+    {
+      "id": "track-02-lesson-11",
+      "sequence": 11,
+      "title": "Service Discovery and Health Checking",
+      "slug": "service-discovery",
+      "path": "content/tracks/track-02-distributed-systems/lesson-11-service-discovery/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "service-discovery",
+        "Consul",
+        "Eureka",
+        "health-check",
+        "DNS"
+      ]
+    },
+    {
+      "id": "track-02-lesson-12",
+      "sequence": 12,
+      "title": "Gossip Protocols and Epidemic Algorithms",
+      "slug": "gossip-protocols",
+      "path": "content/tracks/track-02-distributed-systems/lesson-12-gossip-protocols/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "gossip",
+        "epidemic-algorithm",
+        "Cassandra",
+        "membership"
+      ]
+    },
+    {
+      "id": "track-02-lesson-13",
+      "sequence": 13,
+      "title": "Quorum-Based Systems and Read/Write Quorums",
+      "slug": "quorum-systems",
+      "path": "content/tracks/track-02-distributed-systems/lesson-13-quorum-systems/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "quorum",
+        "read-quorum",
+        "write-quorum",
+        "ROWA",
+        "replication"
+      ]
+    },
+    {
+      "id": "track-02-lesson-14",
+      "sequence": 14,
+      "title": "Idempotency in Distributed Financial Systems",
+      "slug": "distributed-idempotency",
+      "path": "content/tracks/track-02-distributed-systems/lesson-14-distributed-idempotency/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "idempotency",
+        "distributed",
+        "at-least-once",
+        "exactly-once"
+      ]
+    },
+    {
+      "id": "track-02-lesson-15",
+      "sequence": 15,
+      "title": "Event Sourcing in Distributed Systems",
+      "slug": "distributed-event-sourcing",
+      "path": "content/tracks/track-02-distributed-systems/lesson-15-event-sourcing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "event-sourcing",
+        "append-only",
+        "event-store",
+        "snapshot"
+      ]
+    },
+    {
+      "id": "track-02-lesson-16",
+      "sequence": 16,
+      "title": "Exactly-Once Semantics in Distributed Systems",
+      "slug": "exactly-once-semantics",
+      "path": "content/tracks/track-02-distributed-systems/lesson-16-exactly-once/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "exactly-once",
+        "idempotency",
+        "deduplication",
+        "transactional-outbox"
+      ]
+    },
+    {
+      "id": "track-02-lesson-17",
+      "sequence": 17,
+      "title": "Distributed Rate Limiting Architectures",
+      "slug": "distributed-rate-limiting",
+      "path": "content/tracks/track-02-distributed-systems/lesson-17-distributed-rate-limiting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "rate-limiting",
+        "token-bucket",
+        "sliding-window",
+        "Redis",
+        "distributed"
+      ]
+    },
+    {
+      "id": "track-02-lesson-18",
+      "sequence": 18,
+      "title": "Cross-Region Active-Active Architecture",
+      "slug": "active-active-multi-region",
+      "path": "content/tracks/track-02-distributed-systems/lesson-18-active-active/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "active-active",
+        "multi-region",
+        "geo-replication",
+        "conflict-resolution"
+      ]
+    },
+    {
+      "id": "track-02-lesson-19",
+      "sequence": 19,
+      "title": "Distributed Tracing — Causality and Correlation",
+      "slug": "distributed-tracing",
+      "path": "content/tracks/track-02-distributed-systems/lesson-19-distributed-tracing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "distributed-tracing",
+        "OpenTelemetry",
+        "Jaeger",
+        "correlation-id"
+      ]
+    },
+    {
+      "id": "track-02-lesson-20",
+      "sequence": 20,
+      "title": "Chaos Engineering for Distributed Financial Systems",
+      "slug": "chaos-engineering",
+      "path": "content/tracks/track-02-distributed-systems/lesson-20-chaos-engineering/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "chaos-engineering",
+        "fault-injection",
+        "resilience-testing",
+        "GameDay"
+      ]
+    },
+    {
+      "id": "track-02-lesson-21",
+      "sequence": 21,
+      "title": "The Byzantine Generals Problem in Financial Systems",
+      "slug": "byzantine-fault-tolerance",
+      "path": "content/tracks/track-02-distributed-systems/lesson-21-byzantine-fault-tolerance/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "Byzantine",
+        "BFT",
+        "fault-tolerance",
+        "trust"
+      ]
+    },
+    {
+      "id": "track-02-lesson-22",
+      "sequence": 22,
+      "title": "Principal Engineer's Distributed Systems Decision Framework",
+      "slug": "distributed-systems-decision-framework",
+      "path": "content/tracks/track-02-distributed-systems/lesson-22-distributed-systems-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "distributed-systems",
+        "trade-offs",
+        "staff-engineer"
+      ]
+    }
+  ]
+}

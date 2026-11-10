@@ -1,0 +1,393 @@
+{
+  "id": "track-05",
+  "sequence": 5,
+  "title": "Banking & Financial Systems Architecture",
+  "shortTitle": "Banking Systems",
+  "slug": "banking-systems",
+  "color": "#10b981",
+  "colorMuted": "rgba(16, 185, 129, 0.15)",
+  "description": "Core banking architecture, payment processing, SWIFT MT/MX, ISO 20022, real-time payments, FX, settlement, and cross-border payment systems.",
+  "difficulty": "advanced",
+  "estimatedHours": 33,
+  "status": "published",
+  "priority": "critical",
+  "lessons": [
+    {
+      "id": "track-05-lesson-01",
+      "sequence": 1,
+      "title": "Core Banking Architecture \u2014 System of Record Design",
+      "slug": "core-banking-architecture",
+      "path": "content/tracks/track-05-banking-systems/lesson-01-core-banking-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "core-banking",
+        "system-of-record",
+        "account-management",
+        "general-ledger",
+        "architecture"
+      ]
+    },
+    {
+      "id": "track-05-lesson-02",
+      "sequence": 2,
+      "title": "Payment Processing Architecture",
+      "slug": "payment-processing-architecture",
+      "path": "content/tracks/track-05-banking-systems/lesson-02-payment-processing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "payment-processing",
+        "payment-flow",
+        "authorisation",
+        "clearing",
+        "settlement"
+      ]
+    },
+    {
+      "id": "track-05-lesson-03",
+      "sequence": 3,
+      "title": "Double-Entry Accounting \u2014 The Foundation of Financial Systems",
+      "slug": "double-entry-accounting",
+      "path": "content/tracks/track-05-banking-systems/lesson-03-double-entry-accounting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "double-entry",
+        "accounting",
+        "debits-credits",
+        "general-ledger",
+        "chart-of-accounts"
+      ]
+    },
+    {
+      "id": "track-05-lesson-04",
+      "sequence": 4,
+      "title": "Account Management \u2014 Types, States, and Lifecycle",
+      "slug": "account-management",
+      "path": "content/tracks/track-05-banking-systems/lesson-04-account-management/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "account-types",
+        "account-lifecycle",
+        "current-account",
+        "savings",
+        "loan-account"
+      ]
+    },
+    {
+      "id": "track-05-lesson-05",
+      "sequence": 5,
+      "title": "Funds Reservation, Holds, and Settlement",
+      "slug": "funds-reservation-settlement",
+      "path": "content/tracks/track-05-banking-systems/lesson-05-funds-reservation/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "funds-reservation",
+        "hold",
+        "authorisation",
+        "settlement",
+        "clearing"
+      ]
+    },
+    {
+      "id": "track-05-lesson-06",
+      "sequence": 6,
+      "title": "SWIFT MT Message Format \u2014 Architecture and Key Messages",
+      "slug": "swift-mt-messages",
+      "path": "content/tracks/track-05-banking-systems/lesson-06-swift-mt/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "SWIFT",
+        "MT103",
+        "MT202",
+        "MT940",
+        "correspondent-banking",
+        "SWIFT-network"
+      ]
+    },
+    {
+      "id": "track-05-lesson-07",
+      "sequence": 7,
+      "title": "ISO 20022 \u2014 The Next Generation of Financial Messaging",
+      "slug": "iso-20022",
+      "path": "content/tracks/track-05-banking-systems/lesson-07-iso-20022/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "ISO-20022",
+        "MX-messages",
+        "pacs.008",
+        "pain.001",
+        "CBPR+",
+        "migration"
+      ]
+    },
+    {
+      "id": "track-05-lesson-08",
+      "sequence": 8,
+      "title": "Real-Time Payment Systems \u2014 Faster Payments, SEPA Instant, RTP",
+      "slug": "real-time-payments",
+      "path": "content/tracks/track-05-banking-systems/lesson-08-real-time-payments/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "real-time-payments",
+        "Faster-Payments",
+        "SEPA-Instant",
+        "RTP",
+        "latency"
+      ]
+    },
+    {
+      "id": "track-05-lesson-09",
+      "sequence": 9,
+      "title": "Cross-Border Payments and Correspondent Banking",
+      "slug": "cross-border-payments",
+      "path": "content/tracks/track-05-banking-systems/lesson-09-cross-border-payments/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "cross-border",
+        "correspondent-banking",
+        "nostro-vostro",
+        "SWIFT-GPI",
+        "FX"
+      ]
+    },
+    {
+      "id": "track-05-lesson-10",
+      "sequence": 10,
+      "title": "Foreign Exchange (FX) Systems Architecture",
+      "slug": "fx-systems",
+      "path": "content/tracks/track-05-banking-systems/lesson-10-fx-systems/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "FX",
+        "foreign-exchange",
+        "currency-conversion",
+        "spot-rate",
+        "FX-exposure"
+      ]
+    },
+    {
+      "id": "track-05-lesson-11",
+      "sequence": 11,
+      "title": "Payment Routing, Netting, and Batch Processing",
+      "slug": "payment-routing",
+      "path": "content/tracks/track-05-banking-systems/lesson-11-payment-routing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "payment-routing",
+        "netting",
+        "batch-processing",
+        "BACS",
+        "ACH"
+      ]
+    },
+    {
+      "id": "track-05-lesson-12",
+      "sequence": 12,
+      "title": "Financial Reconciliation Architecture",
+      "slug": "reconciliation-architecture",
+      "path": "content/tracks/track-05-banking-systems/lesson-12-reconciliation/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "reconciliation",
+        "nostro-reconciliation",
+        "day-end",
+        "break-management"
+      ]
+    },
+    {
+      "id": "track-05-lesson-13",
+      "sequence": 13,
+      "title": "AML \u2014 Anti-Money Laundering Systems Architecture",
+      "slug": "aml-architecture",
+      "path": "content/tracks/track-05-banking-systems/lesson-13-aml/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "AML",
+        "transaction-monitoring",
+        "suspicious-activity",
+        "STR",
+        "FATF"
+      ]
+    },
+    {
+      "id": "track-05-lesson-14",
+      "sequence": 14,
+      "title": "KYC \u2014 Know Your Customer Architecture and CDD",
+      "slug": "kyc-architecture",
+      "path": "content/tracks/track-05-banking-systems/lesson-14-kyc/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "KYC",
+        "CDD",
+        "EDD",
+        "identity-verification",
+        "PEP",
+        "onboarding"
+      ]
+    },
+    {
+      "id": "track-05-lesson-15",
+      "sequence": 15,
+      "title": "Sanctions Screening \u2014 Architecture and Performance",
+      "slug": "sanctions-screening",
+      "path": "content/tracks/track-05-banking-systems/lesson-15-sanctions-screening/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "sanctions",
+        "OFAC",
+        "screening",
+        "fuzzy-matching",
+        "false-positive"
+      ]
+    },
+    {
+      "id": "track-05-lesson-16",
+      "sequence": 16,
+      "title": "Fraud Detection Architecture",
+      "slug": "fraud-detection",
+      "path": "content/tracks/track-05-banking-systems/lesson-16-fraud-detection/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "fraud-detection",
+        "real-time-scoring",
+        "rules-engine",
+        "ML",
+        "velocity-checks"
+      ]
+    },
+    {
+      "id": "track-05-lesson-17",
+      "sequence": 17,
+      "title": "Regulatory Reporting Architecture \u2014 MiFID II, Basel III",
+      "slug": "regulatory-reporting",
+      "path": "content/tracks/track-05-banking-systems/lesson-17-regulatory-reporting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "regulatory-reporting",
+        "MiFID-II",
+        "Basel-III",
+        "data-lineage",
+        "reporting-pipeline"
+      ]
+    },
+    {
+      "id": "track-05-lesson-18",
+      "sequence": 18,
+      "title": "Card Payment Processing \u2014 Authorisation, Clearing, Settlement",
+      "slug": "card-payments",
+      "path": "content/tracks/track-05-banking-systems/lesson-18-card-payments/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "card-payments",
+        "Visa",
+        "Mastercard",
+        "authorisation",
+        "EMV",
+        "tokenisation"
+      ]
+    },
+    {
+      "id": "track-05-lesson-19",
+      "sequence": 19,
+      "title": "Digital Wallet Architecture",
+      "slug": "digital-wallet",
+      "path": "content/tracks/track-05-banking-systems/lesson-19-digital-wallet/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "digital-wallet",
+        "e-money",
+        "stored-value",
+        "tokenisation",
+        "PSD2"
+      ]
+    },
+    {
+      "id": "track-05-lesson-20",
+      "sequence": 20,
+      "title": "Open Banking, PSD2, and API Architecture",
+      "slug": "open-banking-psd2",
+      "path": "content/tracks/track-05-banking-systems/lesson-20-open-banking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "open-banking",
+        "PSD2",
+        "AISP",
+        "PISP",
+        "consent-management",
+        "CDR"
+      ]
+    },
+    {
+      "id": "track-05-lesson-21",
+      "sequence": 21,
+      "title": "High-Throughput Payment Platform Design",
+      "slug": "high-throughput-payments",
+      "path": "content/tracks/track-05-banking-systems/lesson-21-high-throughput-payments/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 95,
+      "status": "published",
+      "tags": [
+        "high-throughput",
+        "10K-TPS",
+        "partitioning",
+        "back-pressure",
+        "performance"
+      ]
+    },
+    {
+      "id": "track-05-lesson-22",
+      "sequence": 22,
+      "title": "Principal Engineer's Banking Systems Decision Framework",
+      "slug": "banking-decision-framework",
+      "path": "content/tracks/track-05-banking-systems/lesson-22-banking-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "architecture-decisions",
+        "trade-offs",
+        "staff-engineer"
+      ]
+    }
+  ]
+}

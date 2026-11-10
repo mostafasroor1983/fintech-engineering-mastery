@@ -1,0 +1,355 @@
+{
+  "id": "track-04",
+  "sequence": 4,
+  "title": "Asynchronous & Reactive Systems Engineering",
+  "shortTitle": "Async & Reactive",
+  "slug": "async-reactive",
+  "color": "#a855f7",
+  "colorMuted": "rgba(168, 85, 247, 0.15)",
+  "description": "CompletableFuture, Project Reactor, Spring WebFlux, context propagation, backpressure, and designing asynchronous payment processing pipelines.",
+  "difficulty": "advanced",
+  "estimatedHours": 30,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-04-lesson-01",
+      "sequence": 1,
+      "title": "CompletableFuture — Asynchronous Pipelines in Java",
+      "slug": "completable-future",
+      "path": "content/tracks/track-04-async-reactive/lesson-01-completable-future/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "CompletableFuture",
+        "async",
+        "java",
+        "thread-pool",
+        "pipeline"
+      ]
+    },
+    {
+      "id": "track-04-lesson-02",
+      "sequence": 2,
+      "title": "Project Reactor — Mono and Flux Fundamentals",
+      "slug": "reactor-fundamentals",
+      "path": "content/tracks/track-04-async-reactive/lesson-02-reactor-fundamentals/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "Reactor",
+        "Mono",
+        "Flux",
+        "reactive",
+        "publisher-subscriber"
+      ]
+    },
+    {
+      "id": "track-04-lesson-03",
+      "sequence": 3,
+      "title": "Spring WebFlux — Non-Blocking Web Services",
+      "slug": "spring-webflux",
+      "path": "content/tracks/track-04-async-reactive/lesson-03-spring-webflux/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "WebFlux",
+        "Netty",
+        "RouterFunction",
+        "non-blocking",
+        "reactive-web"
+      ]
+    },
+    {
+      "id": "track-04-lesson-04",
+      "sequence": 4,
+      "title": "Backpressure — Controlling Data Flow Under Load",
+      "slug": "backpressure",
+      "path": "content/tracks/track-04-async-reactive/lesson-04-backpressure/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "backpressure",
+        "overflow",
+        "request-n",
+        "drop",
+        "buffer"
+      ]
+    },
+    {
+      "id": "track-04-lesson-05",
+      "sequence": 5,
+      "title": "Reactive Streams Specification and TCK",
+      "slug": "reactive-streams-spec",
+      "path": "content/tracks/track-04-async-reactive/lesson-05-reactive-streams-spec/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "reactive-streams",
+        "TCK",
+        "Publisher",
+        "Subscriber",
+        "Subscription"
+      ]
+    },
+    {
+      "id": "track-04-lesson-06",
+      "sequence": 6,
+      "title": "Error Handling and Retry in Reactive Pipelines",
+      "slug": "reactive-error-handling",
+      "path": "content/tracks/track-04-async-reactive/lesson-06-reactive-error-handling/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "error-handling",
+        "onErrorResume",
+        "retry",
+        "timeout",
+        "circuit-breaker"
+      ]
+    },
+    {
+      "id": "track-04-lesson-07",
+      "sequence": 7,
+      "title": "Hot vs Cold Publishers — Sharing and Multicasting",
+      "slug": "hot-cold-publishers",
+      "path": "content/tracks/track-04-async-reactive/lesson-07-hot-cold-publishers/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "hot-publisher",
+        "cold-publisher",
+        "share",
+        "publish",
+        "multicast"
+      ]
+    },
+    {
+      "id": "track-04-lesson-08",
+      "sequence": 8,
+      "title": "R2DBC — Reactive Database Connectivity",
+      "slug": "r2dbc",
+      "path": "content/tracks/track-04-async-reactive/lesson-08-r2dbc/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "R2DBC",
+        "reactive-database",
+        "connection-pool",
+        "PostgreSQL",
+        "transactions"
+      ]
+    },
+    {
+      "id": "track-04-lesson-09",
+      "sequence": 9,
+      "title": "Context Propagation in Async Systems",
+      "slug": "context-propagation",
+      "path": "content/tracks/track-04-async-reactive/lesson-09-context-propagation/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "context-propagation",
+        "MDC",
+        "tracing",
+        "ThreadLocal",
+        "Reactor-Context"
+      ]
+    },
+    {
+      "id": "track-04-lesson-10",
+      "sequence": 10,
+      "title": "Reactive Security — Authentication in WebFlux",
+      "slug": "reactive-security",
+      "path": "content/tracks/track-04-async-reactive/lesson-10-reactive-security/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "reactive-security",
+        "WebFlux",
+        "JWT",
+        "OAuth2",
+        "SecurityContext"
+      ]
+    },
+    {
+      "id": "track-04-lesson-11",
+      "sequence": 11,
+      "title": "Testing Reactive Code — StepVerifier and TestPublisher",
+      "slug": "testing-reactive",
+      "path": "content/tracks/track-04-async-reactive/lesson-11-testing-reactive/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "StepVerifier",
+        "TestPublisher",
+        "VirtualTime",
+        "reactive-testing"
+      ]
+    },
+    {
+      "id": "track-04-lesson-12",
+      "sequence": 12,
+      "title": "Virtual Threads vs Reactive — Choosing the Right Model",
+      "slug": "virtual-threads-vs-reactive",
+      "path": "content/tracks/track-04-async-reactive/lesson-12-virtual-threads-vs-reactive/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "virtual-threads",
+        "reactive",
+        "java-21",
+        "thread-per-request",
+        "structured-concurrency"
+      ]
+    },
+    {
+      "id": "track-04-lesson-13",
+      "sequence": 13,
+      "title": "Async Patterns — Scatter-Gather, Fan-Out, Pipeline",
+      "slug": "async-patterns",
+      "path": "content/tracks/track-04-async-reactive/lesson-13-async-patterns/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "scatter-gather",
+        "fan-out",
+        "pipeline",
+        "async-patterns",
+        "parallel"
+      ]
+    },
+    {
+      "id": "track-04-lesson-14",
+      "sequence": 14,
+      "title": "Non-Blocking I/O — Netty and NIO Under the Hood",
+      "slug": "non-blocking-io",
+      "path": "content/tracks/track-04-async-reactive/lesson-14-non-blocking-io/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Netty",
+        "NIO",
+        "event-loop",
+        "selector",
+        "non-blocking"
+      ]
+    },
+    {
+      "id": "track-04-lesson-15",
+      "sequence": 15,
+      "title": "Reactor Kafka — Reactive Kafka Consumer and Producer",
+      "slug": "reactor-kafka",
+      "path": "content/tracks/track-04-async-reactive/lesson-15-reactor-kafka/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "reactor-kafka",
+        "reactive-kafka",
+        "Kafka",
+        "consumer",
+        "producer"
+      ]
+    },
+    {
+      "id": "track-04-lesson-16",
+      "sequence": 16,
+      "title": "Reactive Saga — Coordinating Distributed Transactions",
+      "slug": "reactive-saga",
+      "path": "content/tracks/track-04-async-reactive/lesson-16-reactive-saga/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "saga",
+        "reactive",
+        "distributed-transaction",
+        "choreography",
+        "orchestration"
+      ]
+    },
+    {
+      "id": "track-04-lesson-17",
+      "sequence": 17,
+      "title": "Async Idempotency — At-Least-Once in Reactive Systems",
+      "slug": "async-idempotency",
+      "path": "content/tracks/track-04-async-reactive/lesson-17-async-idempotency/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "idempotency",
+        "async",
+        "deduplication",
+        "at-least-once",
+        "reactive"
+      ]
+    },
+    {
+      "id": "track-04-lesson-18",
+      "sequence": 18,
+      "title": "Reactive Rate Limiting — Adaptive Throttling",
+      "slug": "reactive-rate-limiting",
+      "path": "content/tracks/track-04-async-reactive/lesson-18-reactive-rate-limiting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "rate-limiting",
+        "reactive",
+        "token-bucket",
+        "throttle",
+        "adaptive"
+      ]
+    },
+    {
+      "id": "track-04-lesson-19",
+      "sequence": 19,
+      "title": "Performance Benchmarking — Reactive vs Blocking",
+      "slug": "reactive-performance",
+      "path": "content/tracks/track-04-async-reactive/lesson-19-reactive-performance/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "performance",
+        "benchmarking",
+        "JMH",
+        "throughput",
+        "latency"
+      ]
+    },
+    {
+      "id": "track-04-lesson-20",
+      "sequence": 20,
+      "title": "Principal Engineer's Async Architecture Decision Framework",
+      "slug": "async-decision-framework",
+      "path": "content/tracks/track-04-async-reactive/lesson-20-async-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "async",
+        "reactive",
+        "trade-offs",
+        "staff-engineer"
+      ]
+    }
+  ]
+}

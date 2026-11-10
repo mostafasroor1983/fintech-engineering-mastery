@@ -1,0 +1,355 @@
+{
+  "id": "track-11",
+  "sequence": 11,
+  "title": "Messaging, Streaming & Enterprise Integration",
+  "shortTitle": "Messaging & Streaming",
+  "slug": "messaging",
+  "color": "#8b5cf6",
+  "colorMuted": "rgba(139, 92, 246, 0.15)",
+  "description": "Apache Kafka architecture, exactly-once semantics, Outbox pattern, CDC, Event Sourcing, CQRS, Saga pattern, and event-driven financial processing.",
+  "difficulty": "advanced",
+  "estimatedHours": 30,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-11-lesson-01",
+      "sequence": 1,
+      "title": "Kafka Architecture — Topics, Partitions, and Consumer Groups",
+      "slug": "kafka-architecture",
+      "path": "content/tracks/track-11-messaging/lesson-01-kafka-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "topic",
+        "partition",
+        "consumer-group",
+        "broker"
+      ]
+    },
+    {
+      "id": "track-11-lesson-02",
+      "sequence": 2,
+      "title": "Kafka Producer — Acknowledgement, Batching, and Ordering",
+      "slug": "kafka-producer",
+      "path": "content/tracks/track-11-messaging/lesson-02-kafka-producer/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "producer",
+        "acks",
+        "idempotent",
+        "ordering"
+      ]
+    },
+    {
+      "id": "track-11-lesson-03",
+      "sequence": 3,
+      "title": "Kafka Consumer — Offset Management and Rebalancing",
+      "slug": "kafka-consumer",
+      "path": "content/tracks/track-11-messaging/lesson-03-kafka-consumer/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "consumer",
+        "offset",
+        "rebalance",
+        "commit-strategy"
+      ]
+    },
+    {
+      "id": "track-11-lesson-04",
+      "sequence": 4,
+      "title": "Kafka Streams — Stateful Stream Processing",
+      "slug": "kafka-streams",
+      "path": "content/tracks/track-11-messaging/lesson-04-kafka-streams/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "Kafka-Streams",
+        "KStream",
+        "KTable",
+        "state-store",
+        "windowing"
+      ]
+    },
+    {
+      "id": "track-11-lesson-05",
+      "sequence": 5,
+      "title": "Exactly-Once Semantics — Transactions in Kafka",
+      "slug": "kafka-exactly-once",
+      "path": "content/tracks/track-11-messaging/lesson-05-exactly-once/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "exactly-once",
+        "Kafka",
+        "transactions",
+        "idempotent-producer",
+        "EOS"
+      ]
+    },
+    {
+      "id": "track-11-lesson-06",
+      "sequence": 6,
+      "title": "Transactional Outbox Pattern with Debezium CDC",
+      "slug": "outbox-cdc-debezium",
+      "path": "content/tracks/track-11-messaging/lesson-06-outbox-cdc/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "outbox",
+        "CDC",
+        "Debezium",
+        "dual-write",
+        "WAL"
+      ]
+    },
+    {
+      "id": "track-11-lesson-07",
+      "sequence": 7,
+      "title": "Schema Registry — Avro, Protobuf, and Schema Evolution",
+      "slug": "schema-registry",
+      "path": "content/tracks/track-11-messaging/lesson-07-schema-registry/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "schema-registry",
+        "Avro",
+        "Protobuf",
+        "schema-evolution",
+        "compatibility"
+      ]
+    },
+    {
+      "id": "track-11-lesson-08",
+      "sequence": 8,
+      "title": "Kafka Connect — Source and Sink Connector Architecture",
+      "slug": "kafka-connect",
+      "path": "content/tracks/track-11-messaging/lesson-08-kafka-connect/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "Kafka-Connect",
+        "source-connector",
+        "sink-connector",
+        "SMT",
+        "worker"
+      ]
+    },
+    {
+      "id": "track-11-lesson-09",
+      "sequence": 9,
+      "title": "Event Sourcing with Kafka — Event Store Architecture",
+      "slug": "event-sourcing-kafka",
+      "path": "content/tracks/track-11-messaging/lesson-09-event-sourcing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "event-sourcing",
+        "event-store",
+        "append-only",
+        "snapshot",
+        "projection"
+      ]
+    },
+    {
+      "id": "track-11-lesson-10",
+      "sequence": 10,
+      "title": "CQRS with Kafka — Read Model Projection Strategies",
+      "slug": "cqrs-kafka",
+      "path": "content/tracks/track-11-messaging/lesson-10-cqrs/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "CQRS",
+        "read-model",
+        "projection",
+        "eventual-consistency",
+        "Kafka"
+      ]
+    },
+    {
+      "id": "track-11-lesson-11",
+      "sequence": 11,
+      "title": "Dead Letter Queues — Poison Pill Handling and Retry",
+      "slug": "dead-letter-queues",
+      "path": "content/tracks/track-11-messaging/lesson-11-dlq/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "DLQ",
+        "poison-pill",
+        "dead-letter",
+        "retry",
+        "alerting"
+      ]
+    },
+    {
+      "id": "track-11-lesson-12",
+      "sequence": 12,
+      "title": "Kafka Security — TLS, SASL, and ACLs",
+      "slug": "kafka-security",
+      "path": "content/tracks/track-11-messaging/lesson-12-kafka-security/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "TLS",
+        "SASL",
+        "ACL",
+        "mTLS"
+      ]
+    },
+    {
+      "id": "track-11-lesson-13",
+      "sequence": 13,
+      "title": "Kafka Performance Tuning — Throughput vs Latency",
+      "slug": "kafka-performance",
+      "path": "content/tracks/track-11-messaging/lesson-13-kafka-performance/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "performance",
+        "throughput",
+        "latency",
+        "compression"
+      ]
+    },
+    {
+      "id": "track-11-lesson-14",
+      "sequence": 14,
+      "title": "Multi-Region Kafka — MirrorMaker 2 and Replication",
+      "slug": "multi-region-kafka",
+      "path": "content/tracks/track-11-messaging/lesson-14-multi-region-kafka/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "MirrorMaker",
+        "multi-region",
+        "geo-replication",
+        "failover",
+        "Kafka"
+      ]
+    },
+    {
+      "id": "track-11-lesson-15",
+      "sequence": 15,
+      "title": "Saga Pattern — Choreography and Orchestration",
+      "slug": "saga-pattern",
+      "path": "content/tracks/track-11-messaging/lesson-15-saga/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "saga",
+        "choreography",
+        "orchestration",
+        "compensation",
+        "Axon"
+      ]
+    },
+    {
+      "id": "track-11-lesson-16",
+      "sequence": 16,
+      "title": "Event-Driven Microservices — Integration Patterns",
+      "slug": "event-driven-microservices",
+      "path": "content/tracks/track-11-messaging/lesson-16-event-driven-microservices/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "event-driven",
+        "microservices",
+        "event-mesh",
+        "choreography",
+        "decoupling"
+      ]
+    },
+    {
+      "id": "track-11-lesson-17",
+      "sequence": 17,
+      "title": "Kafka Monitoring — Consumer Lag and Broker Metrics",
+      "slug": "kafka-monitoring",
+      "path": "content/tracks/track-11-messaging/lesson-17-kafka-monitoring/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "monitoring",
+        "consumer-lag",
+        "JMX",
+        "Prometheus"
+      ]
+    },
+    {
+      "id": "track-11-lesson-18",
+      "sequence": 18,
+      "title": "Message Ordering — Global vs Partition-Level Guarantees",
+      "slug": "message-ordering",
+      "path": "content/tracks/track-11-messaging/lesson-18-message-ordering/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "message-ordering",
+        "partition-key",
+        "global-order",
+        "sequence-number"
+      ]
+    },
+    {
+      "id": "track-11-lesson-19",
+      "sequence": 19,
+      "title": "RabbitMQ vs Kafka — Choosing the Right Broker",
+      "slug": "rabbitmq-vs-kafka",
+      "path": "content/tracks/track-11-messaging/lesson-19-rabbitmq-vs-kafka/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "RabbitMQ",
+        "Kafka",
+        "comparison",
+        "queue",
+        "log"
+      ]
+    },
+    {
+      "id": "track-11-lesson-20",
+      "sequence": 20,
+      "title": "Principal Engineer's Messaging Decision Framework",
+      "slug": "messaging-decision-framework",
+      "path": "content/tracks/track-11-messaging/lesson-20-messaging-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "messaging",
+        "trade-offs",
+        "staff-engineer",
+        "broker"
+      ]
+    }
+  ]
+}
