@@ -291,19 +291,27 @@ A Principal engineer's impact statement describes capability changes: "12 teams 
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You have just been promoted to Principal Engineer at a mid-size fintech (350 engineers, 4 product teams, 2 platform teams). Your first 90 days.
-
-**Tasks:**
-
-1. **Write your 90-day plan**: structure it as three 30-day phases: Listen (days 1-30), Assess (days 31-60), Act (days 61-90). What specifically do you do in each phase?
-
-2. **Identify your archetype**: given the scenario — 4 product teams building on a shared payment platform that needs significant architectural work — which Larson archetype will you primarily operate as? Justify your choice.
-
-3. **Write your 6-month impact statement** using the format: "Over the next 6 months, I will work on... The impact will be... Success looks like... I will know I've failed if..."
-
-4. **Design a decision-making framework**: there are 7 unresolved architectural decisions in the backlog. Create a prioritisation matrix using: (a) regulatory deadline pressure, (b) number of teams affected, (c) technical risk if not decided, (d) reversibility. Rank hypothetical decisions using this matrix.
-
-5. **Influence without authority**: the security team insists all inter-service calls use mTLS by Q4, but the 4 product teams say the migration effort will delay their feature roadmaps. How do you resolve this as the Principal Engineer without being either the security team's enforcer or the product teams' shield?
+{
+  "title": "The Staff & Principal Engineer Operating Model \u2014 Production Implementation",
+  "difficulty": "principal",
+  "estimatedMinutes": 85,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Write your 90-day plan"
+    },
+    {
+      "id": "2",
+      "description": "Identify your archetype"
+    },
+    {
+      "id": "3",
+      "description": "Write your 6-month impact statement"
+    },
+    {
+      "id": "4",
+      "description": "Design a decision-making framework"
+    }
+  ]
+}
 -->

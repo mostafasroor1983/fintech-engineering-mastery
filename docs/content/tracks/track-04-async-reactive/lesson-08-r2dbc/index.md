@@ -435,17 +435,27 @@ A: For 50-200 rows, the streaming overhead of R2DBC back-pressure is unnecessary
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** Build the settlement processing service for a payment platform processing 2 million transactions nightly.
-
-**Tasks:**
-
-1. Configure R2DBC for PostgreSQL: ConnectionPoolConfiguration with 5 initial / 20 max connections, 30-minute idle timeout, 30-second statement timeout.
-
-2. Implement SettlementRepository extending ReactiveCrudRepository with a @Query method returning Flux<Transaction> for pending settlements by date, and a @Modifying bulk update method.
-
-3. Write a streaming settlement processor using DatabaseClient: stream rows in batches of 1,000, call bankAdapter.confirmBatch(batch) returning Mono<Map<String,SettlementStatus>>, update each transaction status, track throughput with metrics.
-
-4. Write a @DataR2dbcTest: verify findPendingByDate returns correct count, updateStatus modifies correct rows, and @Transactional rolls back when the second operation fails.
+{
+  "title": "R2DBC \u2014 Reactive Database Connectivity \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Configure R2DBC for PostgreSQL: ConnectionPoolConfiguration with 5 initial / 20 max connections, 30-minute idle timeout, 30-second statement timeout"
+    },
+    {
+      "id": "2",
+      "description": "Implement SettlementRepository extending ReactiveCrudRepository with a @Query method returning Flux<Transaction> for pending settlements by date, and a"
+    },
+    {
+      "id": "3",
+      "description": "Write a streaming settlement processor using DatabaseClient: stream rows in batches of 1,000, call bankAdapter.confirmBatch(batch) returning Mono<Map<S"
+    },
+    {
+      "id": "4",
+      "description": "Write a @DataR2dbcTest: verify findPendingByDate returns correct count, updateStatus modifies correct rows, and @Transactional rolls back when the seco"
+    }
+  ]
+}
 -->

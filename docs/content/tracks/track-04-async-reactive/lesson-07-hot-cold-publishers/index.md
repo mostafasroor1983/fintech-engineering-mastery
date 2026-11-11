@@ -336,17 +336,27 @@ A: With `autoConnect(1)`, the upstream connection is **not cancelled** when subs
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** Build the FX rate broadcast infrastructure for a payment platform. Upstream is a WebSocket to an external FX provider. Consumers: payment conversion, hedging engine, audit logger, risk monitoring.
-
-**Tasks:**
-
-1. Implement FxRateFeed as a Spring @Service using Sinks.many().replay(1).autoConnect(1). Populate the sink from a Reactor Netty WebSocketClient. Include @PostConstruct and @PreDestroy.
-
-2. Model the subscription lifecycle for the payment conversion service with correct CompositeDisposable management.
-
-3. Implement a stale-rate guard: timeout(5s) with retryWhen(Retry.fixedDelay(MAX_VALUE, 1s)) for reconnection.
-
-4. Write a test using Sinks.many(): verify (a) late subscriber receives last known rate (replay), (b) all subscribers receive same emission, (c) disposing one does not affect others.
+{
+  "title": "Hot vs Cold Publishers \u2014 Sharing and Multicasting \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Implement FxRateFeed as a Spring @Service using Sinks.many().replay(1).autoConnect(1). Populate the sink from a Reactor Netty WebSocketClient. Include"
+    },
+    {
+      "id": "2",
+      "description": "Model the subscription lifecycle for the payment conversion service with correct CompositeDisposable management"
+    },
+    {
+      "id": "3",
+      "description": "Implement a stale-rate guard: timeout(5s) with retryWhen(Retry.fixedDelay(MAX_VALUE, 1s)) for reconnection"
+    },
+    {
+      "id": "4",
+      "description": "Write a test using Sinks.many(): verify (a) late subscriber receives last known rate (replay), (b) all subscribers receive same emission, (c) disposing"
+    }
+  ]
+}
 -->

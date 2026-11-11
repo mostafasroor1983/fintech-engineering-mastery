@@ -450,19 +450,27 @@ Before deploying a financial service to production Kubernetes:
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are deploying a new microservice `fraud-scoring-api` to a financial services Kubernetes cluster.
-
-**Tasks:**
-
-1. **Write the Deployment manifest**: 4 replicas, rolling update (maxUnavailable=0, maxSurge=1), resource requests (200m CPU, 256Mi memory), limits (500m CPU, 512Mi), non-root security context.
-
-2. **Write the HPA manifest**: minimum 4, maximum 16 replicas, scale up at 70% CPU, stabilise scale-down for 5 minutes.
-
-3. **Write the NetworkPolicy**: fraud-scoring-api can only receive ingress from pods labelled `app: payment-api` and can only egress to the `model-serving` namespace (port 8080) and `database` namespace (port 5432).
-
-4. **Write the ExternalSecret manifest**: sync the database password from Vault path `secret/fraud-prod/database` with a 30-minute refresh interval.
-
-5. **Operational question**: a pod in fraud-scoring-api is stuck in `CrashLoopBackOff`. List three kubectl commands you would run to diagnose the issue, and what each command tells you.
+{
+  "title": "Kubernetes for Financial Services \u2014 Architecture and Workloads \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 90,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Write the Deployment manifest"
+    },
+    {
+      "id": "2",
+      "description": "Write the HPA manifest"
+    },
+    {
+      "id": "3",
+      "description": "Write the NetworkPolicy"
+    },
+    {
+      "id": "4",
+      "description": "Write the ExternalSecret manifest"
+    }
+  ]
+}
 -->

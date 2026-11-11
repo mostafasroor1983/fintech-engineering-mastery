@@ -499,17 +499,27 @@ A: The producer receives `NotEnoughReplicasException`. The partition will not ac
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are the principal engineer for a neo-bank's core banking platform. The PostgreSQL primary processes 4,000 write TPS with three read replicas.
-
-**Tasks:**
-
-1. Write a lag-aware `AbstractRoutingDataSource` that queries `pg_stat_replication` and routes to the synchronous replica when async replica lag exceeds 2 seconds.
-
-2. Add write-your-reads routing using a Caffeine cache keyed by `userId` with 10-second TTL.
-
-3. Write an `OverdraftLimitConflictResolver` for multi-leader conflict resolution that preserves the lower value and logs both.
-
-4. Write a Patroni failover test runbook including kill command, API verification, connection pool reconnect check, and data-loss verification query.
+{
+  "title": "Replication Strategies \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Write a lag-aware `AbstractRoutingDataSource` that queries `pg_stat_replication` and routes to the synchronous replica when async replica lag exceeds 2"
+    },
+    {
+      "id": "2",
+      "description": "Add write-your-reads routing using a Caffeine cache keyed by `userId` with 10-second TTL"
+    },
+    {
+      "id": "3",
+      "description": "Write an `OverdraftLimitConflictResolver` for multi-leader conflict resolution that preserves the lower value and logs both"
+    },
+    {
+      "id": "4",
+      "description": "Write a Patroni failover test runbook including kill command, API verification, connection pool reconnect check, and data-loss verification query"
+    }
+  ]
+}
 -->

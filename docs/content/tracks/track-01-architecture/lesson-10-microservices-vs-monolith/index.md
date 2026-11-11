@@ -323,15 +323,27 @@ A: The saga state is persisted after each step in `sagaStateRepository`. On rest
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are the principal engineer at a neobank with 35 engineers across Payments, Accounts, and Fraud teams. The modular monolith has 14 ArchUnit violations introduced this quarter.
-
-**Task 1 — Boundary Audit:** Write three ArchUnit tests enforcing: (a) fraud module accesses account data only via AccountService API; (b) no cross-module internal package access; (c) domain events only published through DomainEventPublisher interface.
-
-**Task 2 — Extraction Decision:** Using Conway's Law, select the first module to extract as a microservice. Justify based on team ownership, coupling score, data ownership, and team operational maturity.
-
-**Task 3 — Strangler Fig Plan:** Design four migration phases for your chosen module. For each phase: routing mechanism, fitness function, and rollback procedure.
-
-**Task 4 — Saga Design:** Design ProcessPaymentSaga spanning payment and account services. Define steps, compensating transactions, state machine transitions, and idempotency strategy for each step.
+{
+  "title": "Microservices vs Monolith \u2014 The Architecture Decision \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Write three ArchUnit tests enforcing: (a) fraud module accesses account data only via AccountService API; (b) no cross-module internal package access; (c) domain events only published through DomainEv"
+    },
+    {
+      "id": "2",
+      "description": "Using Conway's Law, select the first module to extract as a microservice. Justify based on team ownership, coupling score, data ownership, and team operational maturity"
+    },
+    {
+      "id": "3",
+      "description": "Design four migration phases for your chosen module. For each phase: routing mechanism, fitness function, and rollback procedure"
+    },
+    {
+      "id": "4",
+      "description": "Design ProcessPaymentSaga spanning payment and account services. Define steps, compensating transactions, state machine transitions, and idempotency strategy for each step"
+    }
+  ]
+}
 -->

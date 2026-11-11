@@ -380,19 +380,27 @@ CompletableFuture.supplyAsync(() -> expensiveCall(), dedicatedPaymentPool);
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are building a payment gateway that must call three external services before authorising a payment: a sanctions screening service (must pass — 500ms timeout, no fallback), a fraud scoring service (200ms timeout, default score of 50 on timeout), and a currency conversion service (150ms timeout, no fallback if conversion is required).
-
-**Tasks:**
-
-1. **Write the enrichPayment method** using CompletableFuture.allOf() that calls all three services in parallel with correct timeouts and fallback behaviour.
-
-2. **Handle the error cases:** sanctions timeout should decline the payment, fraud timeout should use a default score, FX timeout should decline if conversion is required but allow if same currency.
-
-3. **Add a Micrometer timer** around the entire enrichment pipeline to measure end-to-end latency.
-
-4. **Write a unit test** that verifies when the fraud service times out after 300ms (simulated with Thread.sleep), the pipeline uses the default score of 50 and completes without throwing an exception.
-
-5. **Explain** why you chose thenCompose vs thenApply at each composition point in your solution.
+{
+  "title": "CompletableFuture \u2014 Asynchronous Pipelines in Java \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 85,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Write the enrichPayment method"
+    },
+    {
+      "id": "2",
+      "description": "Handle the error cases:"
+    },
+    {
+      "id": "3",
+      "description": "Add a Micrometer timer"
+    },
+    {
+      "id": "4",
+      "description": "Write a unit test"
+    }
+  ]
+}
 -->

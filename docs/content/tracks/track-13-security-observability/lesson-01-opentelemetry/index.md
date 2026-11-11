@@ -470,19 +470,27 @@ public class SCAComplianceTracer {
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are adding observability to a payment gateway Spring Boot application.
-
-**Tasks:**
-
-1. **Write the OTEL Java agent JVM arguments** for a production deployment: service name `payment-gateway-prod`, OTLP endpoint at `otel-collector.monitoring.svc.cluster.local:4317`, with traces, metrics, and logs all exported.
-
-2. **Instrument the fraud scoring call**: write a manual span around the `fraudService.evaluate(payment)` call that records: payment ID, amount bucket, evaluation latency, and fraud decision. Ensure the span records the exception if the fraud service throws.
-
-3. **Write the MDC setup and teardown** for the payment authorisation request handler. Include the try-finally pattern ensuring MDC is always cleaned up.
-
-4. **Write the tail sampling configuration** for the OTEL Collector: keep 100% of error traces, keep 100% of traces where `payment.amount_bucket = "large"`, keep 5% of all other traces.
-
-5. **Explain**: a payment fails at P99 (1 in 100 requests) but no one noticed for 3 hours. What observability components were missing that would have detected this earlier?
+{
+  "title": "OpenTelemetry \u2014 Instrumentation for Financial Services \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 85,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Write the OTEL Java agent JVM arguments"
+    },
+    {
+      "id": "2",
+      "description": "Instrument the fraud scoring call"
+    },
+    {
+      "id": "3",
+      "description": "Write the MDC setup and teardown"
+    },
+    {
+      "id": "4",
+      "description": "Write the tail sampling configuration"
+    }
+  ]
+}
 -->

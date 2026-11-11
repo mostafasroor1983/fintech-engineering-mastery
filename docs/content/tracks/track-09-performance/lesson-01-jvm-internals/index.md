@@ -302,19 +302,27 @@ A problematic log shows:
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** A payment processing service starts experiencing P99 latency spikes of 2-4 seconds every 30 minutes in production. GC logs show concurrent G1 pauses of 2.3 seconds. Heap usage grows from 2GB to 7GB over 30 minutes before triggering a Full GC that reclaims back to 1.5GB.
-
-**Tasks:**
-
-1. **Diagnose the root cause**: what GC pattern does this describe? What type of objects are most likely accumulating in Old Generation?
-
-2. **Analyse the GC log**: given the pattern described (heap grows 2GB→7GB over 30 min, Full GC every 30 min), calculate the approximate allocation rate in MB/second. Is this normal for a payment processor?
-
-3. **Write the heap dump command**: what `jcmd` command would you run to capture a heap dump of the running JVM (PID 12345) to identify the accumulating objects?
-
-4. **Propose three JVM flag changes** that might mitigate the problem without changing application code. Explain the expected effect of each.
-
-5. **Write a JMH microbenchmark** that compares the allocation cost of creating a new `PaymentMessage` object per request versus using an object pool of 50 pre-allocated instances. Include both throughput and GC allocation pressure measurements.
+{
+  "title": "JVM Internals \u2014 Memory Model, Class Loading, and JIT \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 90,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Diagnose the root cause"
+    },
+    {
+      "id": "2",
+      "description": "Analyse the GC log"
+    },
+    {
+      "id": "3",
+      "description": "Write the heap dump command"
+    },
+    {
+      "id": "4",
+      "description": "Propose three JVM flag changes"
+    }
+  ]
+}
 -->

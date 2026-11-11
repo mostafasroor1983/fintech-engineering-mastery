@@ -531,15 +531,27 @@ A: Introduce the field as optional in v1 immediately — this is backward compat
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are designing the external-facing API for a new UK Open Banking payment initiation service compliant with PSD2 and OBIE.
-
-**Task 1 — Resource Design:** Define the URL structure, HTTP methods, and status codes for: domestic payment initiation, payment status retrieval, paginated transaction listing, and consent revocation.
-
-**Task 2 — OpenAPI 3.1 Spec:** Write a complete paths block for POST /v2/domestic-payments with Idempotency-Key header, request schema, 201/422 responses, and 429 with rate-limit headers.
-
-**Task 3 — Cursor Pagination:** Implement GET /v2/accounts/{id}/transactions with cursor-based pagination encoding timestamp and UUID. Write a unit test verifying sort order correctness.
-
-**Task 4 — Deprecation Interceptor:** Implement a Spring HandlerInterceptor adding Deprecation, Sunset, and Link headers to v1 endpoints only, verified by unit test.
+{
+  "title": "API Design \u2014 REST, GraphQL, and gRPC in Financial Services \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Define the URL structure, HTTP methods, and status codes for: domestic payment initiation, payment status retrieval, paginated transaction listing, and consent revocation"
+    },
+    {
+      "id": "2",
+      "description": "Write a complete paths block for POST /v2/domestic-payments with Idempotency-Key header, request schema, 201/422 responses, and 429 with rate-limit headers"
+    },
+    {
+      "id": "3",
+      "description": "Implement GET /v2/accounts/{id}/transactions with cursor-based pagination encoding timestamp and UUID. Write a unit test verifying sort order correctness"
+    },
+    {
+      "id": "4",
+      "description": "Implement a Spring HandlerInterceptor adding Deprecation, Sunset, and Link headers to v1 endpoints only, verified by unit test"
+    }
+  ]
+}
 -->

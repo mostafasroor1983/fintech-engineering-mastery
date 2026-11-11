@@ -443,19 +443,27 @@ public RateLimitDecision combinedCheck(String clientId) {
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** An Open Banking platform serves 500 TPPs. Each TPP has a custom rate limit configuration (different tiers: basic 50/min, standard 200/min, premium 1,000/min) and a daily quota. The platform runs 20 API gateway instances.
-
-**Tasks:**
-
-1. Design the Redis key schema for per-TPP, per-resource sliding window limits and daily quotas. Include TTL strategy and key naming conventions.
-
-2. Write the Lua script for a combined sliding-window + daily-quota check that returns: allowed, per-minute remaining, daily remaining, retry-after.
-
-3. Implement the Spring WebFilter that enforces both limits, sets all four rate-limit headers, and records a Micrometer metric for each decision (allowed/rejected/limited-by-quota/limited-by-rate).
-
-4. The Redis cluster fails. What should the gateway do — fail open (allow all requests) or fail closed (reject all)? Justify your answer for a regulated Open Banking environment.
-
-5. Design a test that verifies the sliding window boundary fix: a client sending 100 requests in the last 5 seconds of minute N and 100 in the first 5 seconds of minute N+1 is correctly limited.
+{
+  "title": "Distributed Rate Limiting \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 75,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Design the Redis key schema for per-TPP, per-resource sliding window limits and daily quotas. Include TTL strategy and key naming conventions"
+    },
+    {
+      "id": "2",
+      "description": "Write the Lua script for a combined sliding-window + daily-quota check that returns: allowed, per-minute remaining, daily remaining, retry-after"
+    },
+    {
+      "id": "3",
+      "description": "Implement the Spring WebFilter that enforces both limits, sets all four rate-limit headers, and records a Micrometer metric for each decision (allowed/"
+    },
+    {
+      "id": "4",
+      "description": "The Redis cluster fails. What should the gateway do \u2014 fail open (allow all requests) or fail closed (reject all)? Justify your answer for a regulated O"
+    }
+  ]
+}
 -->

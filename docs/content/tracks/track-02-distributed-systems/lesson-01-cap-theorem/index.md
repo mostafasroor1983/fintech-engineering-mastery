@@ -295,18 +295,27 @@ When selecting a data store or designing a distributed data architecture:
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are the principal engineer for a real-time payment processing platform. Your system spans two data centres (DC-East and DC-West). You must design the CAP behaviour for three components.
-
-**Component 1 — Account Balance Store**
-Design the write and read consistency strategy for account balances. What happens during a DC-to-DC partition? Document your decision as an ADR snippet.
-
-**Component 2 — Idempotency Key Store**
-Your payment API must reject duplicate requests (same idempotency key). What CAP classification does the idempotency key store need? What system would you choose and why?
-
-**Component 3 — Exchange Rate Cache**
-Exchange rates are fetched from an external provider every 30 seconds. Design the CAP behaviour for this cache. What is the maximum acceptable stale window and why?
-
-**Deliverable:** For each component, state the CAP/PACELC classification, the system you would use, and what the partition behaviour is from the client's perspective.
+{
+  "title": "The CAP Theorem \u2014 Consistency, Availability, Partition Tolerance \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 85,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Implement the core the cap theorem \u2014 consistency, availability, partition tolerance mechanism in a Java Spring Boot service with proper error handling"
+    },
+    {
+      "id": "2",
+      "description": "Write integration tests using Testcontainers to validate the the cap theorem \u2014 consistency, availability, partition tolerance behaviour under concurrent load"
+    },
+    {
+      "id": "3",
+      "description": "Add observability: expose Micrometer metrics and structured log entries for key operations"
+    },
+    {
+      "id": "4",
+      "description": "Document architectural decisions: write an ADR and a production runbook covering rollout and rollback"
+    }
+  ]
+}
 -->

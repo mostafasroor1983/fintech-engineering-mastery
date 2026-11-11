@@ -349,19 +349,27 @@ Before approving any significant architectural change to a financial system:
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You join a fintech as the new principal engineer. The payment processing service has accumulated significant technical debt over 3 years. Your task is to introduce evolutionary architecture practices.
-
-**Tasks:**
-
-1. **Write an ArchUnit fitness function** that enforces the rule: no class in `com.bank.payment.domain` may depend on `com.bank.payment.infrastructure` (domain must not know about infrastructure).
-
-2. **Calculate instability** for a module with 12 efferent couplings and 3 afferent couplings. Is this component stable or unstable? What should you do about it?
-
-3. **Write an ADR** for a decision to introduce an anti-corruption layer between your payment service and a legacy SWIFT adapter. Use the four-question format (Context, Decision, Consequences, Status).
-
-4. **Design a fitness function** that verifies your payment API's P95 latency stays under 150ms under load of 1,000 concurrent users. What tool would you use? What does the CI gate look like?
-
-5. **Classify this debt:** "We use String concatenation to build SQL queries in 3 classes — we knew at the time it was wrong but were 2 days from a demo." Which quadrant does this fall into, and what is your prioritisation recommendation?
+{
+  "title": "Evolutionary Architecture \u2014 Fitness Functions and Technical Debt \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 85,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Write an ArchUnit fitness function"
+    },
+    {
+      "id": "2",
+      "description": "Calculate instability"
+    },
+    {
+      "id": "3",
+      "description": "Write an ADR"
+    },
+    {
+      "id": "4",
+      "description": "Design a fitness function"
+    }
+  ]
+}
 -->

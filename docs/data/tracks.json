@@ -11,9 +11,16 @@
     "difficulty": "advanced",
     "estimatedHours": 30,
     "lessonCount": 20,
-    "status": "in-development",
+    "status": "published",
     "priority": "high",
-    "tags": ["architecture", "patterns", "DDD", "ADR", "C4", "hexagonal"]
+    "tags": [
+      "architecture",
+      "patterns",
+      "DDD",
+      "ADR",
+      "C4",
+      "hexagonal"
+    ]
   },
   {
     "id": "track-02",
@@ -27,9 +34,16 @@
     "difficulty": "advanced",
     "estimatedHours": 33,
     "lessonCount": 22,
-    "status": "in-development",
+    "status": "published",
     "priority": "high",
-    "tags": ["distributed", "CAP", "consensus", "consistency", "Paxos", "Raft"]
+    "tags": [
+      "distributed",
+      "CAP",
+      "consensus",
+      "consistency",
+      "Paxos",
+      "Raft"
+    ]
   },
   {
     "id": "track-03",
@@ -42,10 +56,17 @@
     "description": "Java Memory Model, thread safety, synchronization primitives, atomic operations, lock-free algorithms, virtual threads, and concurrent financial data processing.",
     "difficulty": "advanced",
     "estimatedHours": 42,
-    "lessonCount": 28,
-    "status": "in-development",
+    "lessonCount": 29,
+    "status": "published",
     "priority": "critical",
-    "tags": ["concurrency", "JMM", "thread-safety", "virtual-threads", "java-21", "jcstress"]
+    "tags": [
+      "concurrency",
+      "JMM",
+      "thread-safety",
+      "virtual-threads",
+      "java-21",
+      "jcstress"
+    ]
   },
   {
     "id": "track-04",
@@ -59,9 +80,16 @@
     "difficulty": "advanced",
     "estimatedHours": 30,
     "lessonCount": 20,
-    "status": "in-development",
+    "status": "published",
     "priority": "high",
-    "tags": ["async", "reactive", "CompletableFuture", "Reactor", "WebFlux", "backpressure"]
+    "tags": [
+      "async",
+      "reactive",
+      "CompletableFuture",
+      "Reactor",
+      "WebFlux",
+      "backpressure"
+    ]
   },
   {
     "id": "track-05",
@@ -75,9 +103,17 @@
     "difficulty": "advanced",
     "estimatedHours": 33,
     "lessonCount": 22,
-    "status": "in-development",
+    "status": "published",
     "priority": "critical",
-    "tags": ["banking", "payments", "SWIFT", "ISO-20022", "FX", "settlement", "core-banking"]
+    "tags": [
+      "banking",
+      "payments",
+      "SWIFT",
+      "ISO-20022",
+      "FX",
+      "settlement",
+      "core-banking"
+    ]
   },
   {
     "id": "track-06",
@@ -91,9 +127,16 @@
     "difficulty": "principal",
     "estimatedHours": 36,
     "lessonCount": 24,
-    "status": "in-development",
+    "status": "published",
     "priority": "critical",
-    "tags": ["idempotency", "outbox", "ledger", "consistency", "dual-write", "saga"]
+    "tags": [
+      "idempotency",
+      "outbox",
+      "ledger",
+      "consistency",
+      "dual-write",
+      "saga"
+    ]
   },
   {
     "id": "track-07",
@@ -107,9 +150,16 @@
     "difficulty": "advanced",
     "estimatedHours": 27,
     "lessonCount": 18,
-    "status": "in-development",
+    "status": "published",
     "priority": "high",
-    "tags": ["AML", "KYC", "sanctions", "fraud", "compliance", "regulatory"]
+    "tags": [
+      "AML",
+      "KYC",
+      "sanctions",
+      "fraud",
+      "compliance",
+      "regulatory"
+    ]
   },
   {
     "id": "track-08",
@@ -123,9 +173,16 @@
     "difficulty": "advanced",
     "estimatedHours": 27,
     "lessonCount": 18,
-    "status": "in-development",
+    "status": "published",
     "priority": "high",
-    "tags": ["availability", "resilience", "circuit-breaker", "chaos-engineering", "SLO", "DR"]
+    "tags": [
+      "availability",
+      "resilience",
+      "circuit-breaker",
+      "chaos-engineering",
+      "SLO",
+      "DR"
+    ]
   },
   {
     "id": "track-09",
@@ -139,9 +196,16 @@
     "difficulty": "advanced",
     "estimatedHours": 33,
     "lessonCount": 22,
-    "status": "in-development",
+    "status": "published",
     "priority": "high",
-    "tags": ["JVM", "GC", "JMH", "profiling", "tuning", "benchmarking"]
+    "tags": [
+      "JVM",
+      "GC",
+      "JMH",
+      "profiling",
+      "tuning",
+      "benchmarking"
+    ]
   },
   {
     "id": "track-10",
@@ -155,9 +219,17 @@
     "difficulty": "advanced",
     "estimatedHours": 33,
     "lessonCount": 22,
-    "status": "in-development",
+    "status": "published",
     "priority": "high",
-    "tags": ["ACID", "MVCC", "isolation", "locking", "PostgreSQL", "sharding", "replication"]
+    "tags": [
+      "ACID",
+      "MVCC",
+      "isolation",
+      "locking",
+      "PostgreSQL",
+      "sharding",
+      "replication"
+    ]
   },
   {
     "id": "track-11",
@@ -171,9 +243,16 @@
     "difficulty": "advanced",
     "estimatedHours": 30,
     "lessonCount": 20,
-    "status": "in-development",
+    "status": "published",
     "priority": "high",
-    "tags": ["Kafka", "event-sourcing", "CQRS", "saga", "CDC", "exactly-once"]
+    "tags": [
+      "Kafka",
+      "event-sourcing",
+      "CQRS",
+      "saga",
+      "CDC",
+      "exactly-once"
+    ]
   },
   {
     "id": "track-12",
@@ -187,9 +266,16 @@
     "difficulty": "advanced",
     "estimatedHours": 24,
     "lessonCount": 16,
-    "status": "in-development",
+    "status": "published",
     "priority": "medium",
-    "tags": ["Kubernetes", "Docker", "cloud", "GitOps", "service-mesh", "platform"]
+    "tags": [
+      "Kubernetes",
+      "Docker",
+      "cloud",
+      "GitOps",
+      "service-mesh",
+      "platform"
+    ]
   },
   {
     "id": "track-13",
@@ -203,9 +289,15 @@
     "difficulty": "advanced",
     "estimatedHours": 30,
     "lessonCount": 20,
-    "status": "in-development",
+    "status": "published",
     "priority": "high",
-    "tags": ["OpenTelemetry", "observability", "security", "incident-management", "production"]
+    "tags": [
+      "OpenTelemetry",
+      "observability",
+      "security",
+      "incident-management",
+      "production"
+    ]
   },
   {
     "id": "track-14",
@@ -219,8 +311,15 @@
     "difficulty": "principal",
     "estimatedHours": 21,
     "lessonCount": 14,
-    "status": "in-development",
+    "status": "published",
     "priority": "medium",
-    "tags": ["leadership", "technical-strategy", "RFC", "mentoring", "influence", "staff-engineer"]
+    "tags": [
+      "leadership",
+      "technical-strategy",
+      "RFC",
+      "mentoring",
+      "influence",
+      "staff-engineer"
+    ]
   }
 ]

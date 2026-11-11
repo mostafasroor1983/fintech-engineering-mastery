@@ -454,19 +454,27 @@ public class LaunchDarklyAuditWebhook {
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are the principal engineer for a UK payment processor. You need to migrate from a legacy BACS payment submission engine to a new engine that supports both BACS and Faster Payments. This migration affects 2 million direct debit mandates.
-
-**Task 1 — Flag Design**
-Design the feature flag taxonomy for this migration. What flags do you need, what type is each, and what are their targeting rules? Define the rollout phases (percentage milestones) and the criteria for advancing to the next phase.
-
-**Task 2 — Kill Switch Implementation**
-Implement the `BacsSubmissionService` with an ops-type kill switch. The kill switch must revert all in-flight requests within 200ms of being activated. Describe how you test the kill switch without affecting production.
-
-**Task 3 — Dark Launch Comparison**
-The new engine generates BACS file hashes differently. Design the dark launch comparison logic. What fields do you compare, what fields do you exclude as expected differences, and at what divergence rate do you halt the dark launch?
-
-**Task 4 — Compliance Audit Trail**
-Your compliance team requires a full audit trail of all flag changes for PCI DSS. Design the audit log schema and the process for reviewing flag changes in your change management system (e.g., ServiceNow integration).
+{
+  "title": "Feature Flags and Progressive Delivery in Banking \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Design the feature flag taxonomy for this migration. What flags do you need, what type is each, and what are their targeting rules? Define the rollout phases (percentage milestones) and the criteria f"
+    },
+    {
+      "id": "2",
+      "description": "Implement the `BacsSubmissionService` with an ops-type kill switch. The kill switch must revert all in-flight requests within 200ms of being activated. Describe how you test the kill switch without af"
+    },
+    {
+      "id": "3",
+      "description": "The new engine generates BACS file hashes differently. Design the dark launch comparison logic. What fields do you compare, what fields do you exclude as expected differences, and at what divergence r"
+    },
+    {
+      "id": "4",
+      "description": "Your compliance team requires a full audit trail of all flag changes for PCI DSS. Design the audit log schema and the process for reviewing flag changes in your change management system (e.g., Service"
+    }
+  ]
+}
 -->

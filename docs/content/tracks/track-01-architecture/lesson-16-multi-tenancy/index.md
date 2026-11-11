@@ -410,19 +410,27 @@ ORDER BY connections DESC;
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are building a multi-tenant payment processing platform. Your first three tenants are: a Tier-1 bank (requires silo isolation, GDPR data residency in EU), a mid-market lender (schema isolation sufficient), and a fintech startup (cost-sensitive, pool model acceptable).
-
-**Task 1 — Tenancy Model Selection**
-Write an ADR for the tenancy model. How do you support all three tenants from a single platform without maintaining three entirely separate codebases? Define the tiering model that maps tenant requirements to isolation level.
-
-**Task 2 — RLS Implementation**
-Implement the full PostgreSQL RLS setup for the pool-model tenant. Include the policy, the session variable setting mechanism, and a test that proves RLS blocks cross-tenant reads even when the WHERE clause is omitted.
-
-**Task 3 — TenantContext Propagation in Async Code**
-When a payment event triggers an async Kafka consumer, `TenantContext` (a ThreadLocal) is not automatically propagated to the consumer thread. Design and implement a solution that correctly propagates tenant identity into async processing without leaking context between messages.
-
-**Task 4 — Noisy-Neighbour Incident Response**
-Your monitoring shows that the fintech startup tenant is running a nightly batch job consuming 80% of database connections, causing timeouts for other tenants. Design and implement the connection pool enforcement that prevents this, and define the SLA breach thresholds and alerting.
+{
+  "title": "Multi-Tenancy Architecture in FinTech Platforms \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Write an ADR for the tenancy model. How do you support all three tenants from a single platform without maintaining three entirely separate codebases? Define the tiering model that maps tenant require"
+    },
+    {
+      "id": "2",
+      "description": "Implement the full PostgreSQL RLS setup for the pool-model tenant. Include the policy, the session variable setting mechanism, and a test that proves RLS blocks cross-tenant reads even when the WHERE"
+    },
+    {
+      "id": "3",
+      "description": "When a payment event triggers an async Kafka consumer, `TenantContext` (a ThreadLocal) is not automatically propagated to the consumer thread. Design and implement a solution that correctly propagates"
+    },
+    {
+      "id": "4",
+      "description": "Your monitoring shows that the fintech startup tenant is running a nightly batch job consuming 80% of database connections, causing timeouts for other tenants. Design and implement the connection pool"
+    }
+  ]
+}
 -->

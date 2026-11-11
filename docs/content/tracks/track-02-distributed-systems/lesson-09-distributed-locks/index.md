@@ -421,17 +421,27 @@ A: Use PostgreSQL advisory locks. The reasons: (1) you already have a PostgreSQL
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** Settlement job runs nightly on 3 pods, processes 500,000 transactions, takes 8–15 minutes. Must run exactly once.
-
-**Tasks:**
-
-1. Implement `NightlySettlementJob` with Redisson `RLock`, watchdog (`leaseTime = -1`), 5-second wait, and correct `isHeldByCurrentThread()` release guard.
-
-2. Write `SettlementAuditStore.writeSettlementRecord()` with PostgreSQL CAS fencing token check that rejects writes where `fencing_token <= last_accepted_token`.
-
-3. Write `PaymentFileProcessor.processFile(String s3Key)` using `pg_try_advisory_lock` with skip logic, idempotency guard, and explicit `pg_advisory_unlock` in `finally`.
-
-4. Explain why `SELECT FOR UPDATE` as a distributed lock causes connection pool exhaustion at scale and propose the correct optimistic locking alternative.
+{
+  "title": "Distributed Locks \u2014 Redlock and Advisory Locks \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Implement `NightlySettlementJob` with Redisson `RLock`, watchdog (`leaseTime = -1`), 5-second wait, and correct `isHeldByCurrentThread()` release guard"
+    },
+    {
+      "id": "2",
+      "description": "Write `SettlementAuditStore.writeSettlementRecord()` with PostgreSQL CAS fencing token check that rejects writes where `fencing_token <= last_accepted_"
+    },
+    {
+      "id": "3",
+      "description": "Write `PaymentFileProcessor.processFile(String s3Key)` using `pg_try_advisory_lock` with skip logic, idempotency guard, and explicit `pg_advisory_unloc"
+    },
+    {
+      "id": "4",
+      "description": "Explain why `SELECT FOR UPDATE` as a distributed lock causes connection pool exhaustion at scale and propose the correct optimistic locking alternative"
+    }
+  ]
+}
 -->

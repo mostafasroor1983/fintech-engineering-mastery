@@ -364,23 +364,27 @@ producer.send(new ProducerRecord<>(
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are designing the Kafka architecture for a payment processing platform expecting 500k payment events per hour at peak, with these requirements:
-- Payment events must be processed in order per account
-- Multiple downstream consumers: settlement, compliance audit, real-time analytics
-- Duplicate payment processing must be prevented
-- Consumer failures must not cause data loss
-
-**Tasks:**
-
-1. **Calculate partition count**: at 500k events/hour with 10KB average message size, what throughput in MB/second must the topic handle? How many partitions should you create (assume each partition handles 50 MB/s)?
-
-2. **Write the topic creation command** (kafka-topics.sh) for a `payments` topic with the calculated partition count, replication factor 3, and min.insync.replicas=2.
-
-3. **Write the producer configuration** in Java for financial-grade durability: acks=all, idempotent producer, 2-minute delivery timeout.
-
-4. **Design the consumer group strategy**: list the consumer groups needed, their group IDs, and which partitions are assigned to each consumer (assume 3 consumers per group).
-
-5. **Write the idempotency check**: implement a `PaymentIdempotencyService.isAlreadyProcessed(paymentId)` that uses Redis with a 24-hour TTL to prevent duplicate processing. Include the `markProcessed(paymentId)` method.
+{
+  "title": "Kafka Architecture \u2014 Topics, Partitions, and Consumer Groups \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 90,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Calculate partition count"
+    },
+    {
+      "id": "2",
+      "description": "Write the topic creation command"
+    },
+    {
+      "id": "3",
+      "description": "Write the producer configuration"
+    },
+    {
+      "id": "4",
+      "description": "Design the consumer group strategy"
+    }
+  ]
+}
 -->

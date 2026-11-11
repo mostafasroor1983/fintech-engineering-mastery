@@ -529,23 +529,143 @@ EM.Renderer = (function () {
         startOnLoad: false,
         theme:       theme,
         fontFamily:  'Inter, system-ui, sans-serif',
-        fontSize:    14,
-        flowchart:   { htmlLabels: true, curve: 'basis' },
-        sequence:    { actorMargin: 50, messageMargin: 40 },
+        fontSize:    16,
+        flowchart:   { htmlLabels: true, curve: 'basis', nodeSpacing: 50, rankSpacing: 60 },
+        sequence:    { actorMargin: 60, messageMargin: 50, fontSize: 14 },
         themeVariables: theme === 'dark' ? {
           primaryColor:      '#1c2128',
           primaryTextColor:  '#e6edf3',
           primaryBorderColor:'#30363d',
           lineColor:         '#8b949e',
           secondaryColor:    '#21262d',
-          tertiaryColor:     '#161b22'
-        } : {}
+          tertiaryColor:     '#161b22',
+          fontSize:          '16px'
+        } : {
+          fontSize: '16px'
+        }
       });
       _mermaidReady = true;
     }
 
-    mermaid.run({ nodes: Array.from(elements) }).catch(function (err) {
+    mermaid.run({ nodes: Array.from(elements) }).then(function () {
+      _wrapDiagramsWithZoom(body);
+    }).catch(function (err) {
       console.warn('[EM.Renderer] Mermaid render error:', err);
+      _wrapDiagramsWithZoom(body);
+    });
+  }
+
+  function _wrapDiagramsWithZoom(body) {
+    body.querySelectorAll('.mermaid-block').forEach(function (block) {
+      if (block.querySelector('.diagram-zoom-bar')) return; // already wrapped
+
+      var scale  = 1;
+      var minScale = 0.4;
+      var maxScale = 4;
+      var step   = 0.2;
+
+      var svg = block.querySelector('svg');
+      if (!svg) return;
+
+      // Make SVG responsive
+      svg.style.width  = '100%';
+      svg.style.height = 'auto';
+      svg.style.transition = 'transform 0.15s ease';
+      svg.style.transformOrigin = 'top center';
+      svg.style.display = 'block';
+
+      // Zoom bar
+      var bar = document.createElement('div');
+      bar.className = 'diagram-zoom-bar';
+      bar.innerHTML =
+        '<button class="dz-btn dz-out" title="Zoom out">&#8722;</button>' +
+        '<span class="dz-label">100%</span>' +
+        '<button class="dz-btn dz-in" title="Zoom in">&#43;</button>' +
+        '<button class="dz-btn dz-reset" title="Reset zoom">&#8635;</button>' +
+        '<button class="dz-btn dz-full" title="Fullscreen">&#x26F6;</button>';
+
+      var label = bar.querySelector('.dz-label');
+
+      function applyScale() {
+        svg.style.transform = 'scale(' + scale + ')';
+        svg.style.marginBottom = scale > 1 ? ((scale - 1) * svg.getBoundingClientRect().height * 0.5) + 'px' : '0';
+        label.textContent = Math.round(scale * 100) + '%';
+        bar.querySelector('.dz-out').disabled   = scale <= minScale;
+        bar.querySelector('.dz-in').disabled    = scale >= maxScale;
+      }
+
+      bar.querySelector('.dz-in').addEventListener('click', function () {
+        if (scale < maxScale) { scale = Math.min(maxScale, parseFloat((scale + step).toFixed(1))); applyScale(); }
+      });
+      bar.querySelector('.dz-out').addEventListener('click', function () {
+        if (scale > minScale) { scale = Math.max(minScale, parseFloat((scale - step).toFixed(1))); applyScale(); }
+      });
+      bar.querySelector('.dz-reset').addEventListener('click', function () {
+        scale = 1; applyScale();
+      });
+      bar.querySelector('.dz-full').addEventListener('click', function () {
+        _openDiagramModal(svg.cloneNode(true), block);
+      });
+
+      block.insertBefore(bar, block.firstChild);
+    });
+  }
+
+  function _openDiagramModal(svgClone, sourceBlock) {
+    var existing = document.getElementById('em-diagram-modal');
+    if (existing) existing.remove();
+
+    var modal = document.createElement('div');
+    modal.id = 'em-diagram-modal';
+    modal.className = 'em-diagram-modal';
+    modal.innerHTML =
+      '<div class="em-diagram-modal-backdrop"></div>' +
+      '<div class="em-diagram-modal-box">' +
+        '<div class="em-diagram-modal-toolbar">' +
+          '<button class="dz-btn dz-out" title="Zoom out">&#8722;</button>' +
+          '<span class="dz-label">100%</span>' +
+          '<button class="dz-btn dz-in" title="Zoom in">&#43;</button>' +
+          '<button class="dz-btn dz-reset" title="Reset">&#8635;</button>' +
+          '<button class="dz-btn dz-close" title="Close">&#10005;</button>' +
+        '</div>' +
+        '<div class="em-diagram-modal-scroll"></div>' +
+      '</div>';
+
+    var scroll = modal.querySelector('.em-diagram-modal-scroll');
+    svgClone.style.transform = 'none';
+    svgClone.style.width  = 'auto';
+    svgClone.style.maxWidth = 'none';
+    svgClone.style.height = 'auto';
+    svgClone.style.display = 'block';
+    svgClone.style.margin  = '0 auto';
+    svgClone.style.transition = 'transform 0.15s ease';
+    svgClone.style.transformOrigin = 'top center';
+    scroll.appendChild(svgClone);
+    document.body.appendChild(modal);
+
+    var mScale = 1;
+    var mStep  = 0.25;
+    var mMin   = 0.3;
+    var mMax   = 5;
+    var mLabel = modal.querySelector('.dz-label');
+
+    function applyModal() {
+      svgClone.style.transform = 'scale(' + mScale + ')';
+      mLabel.textContent = Math.round(mScale * 100) + '%';
+    }
+
+    modal.querySelector('.dz-in').addEventListener('click', function () {
+      if (mScale < mMax) { mScale = Math.min(mMax, parseFloat((mScale + mStep).toFixed(2))); applyModal(); }
+    });
+    modal.querySelector('.dz-out').addEventListener('click', function () {
+      if (mScale > mMin) { mScale = Math.max(mMin, parseFloat((mScale - mStep).toFixed(2))); applyModal(); }
+    });
+    modal.querySelector('.dz-reset').addEventListener('click', function () { mScale = 1; applyModal(); });
+    modal.querySelector('.dz-close').addEventListener('click', function () { modal.remove(); });
+    modal.querySelector('.em-diagram-modal-backdrop').addEventListener('click', function () { modal.remove(); });
+
+    document.addEventListener('keydown', function escHandler(e) {
+      if (e.key === 'Escape') { modal.remove(); document.removeEventListener('keydown', escHandler); }
     });
   }
 

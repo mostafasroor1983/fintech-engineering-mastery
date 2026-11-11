@@ -414,17 +414,27 @@ A: `timeout` placed before `retryWhen` applies a fresh timeout window to each at
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** A payment gateway service calls three downstream services: FX rate lookup, fraud scoring, and account validation. Each has different reliability characteristics.
-
-**Tasks:**
-
-1. Implement error classification for each service: FX rate (retryable: 503, 429, ConnectTimeoutException; non-retryable: 404); Fraud service (retryable: 503; non-retryable: 400, 422); Account validation (non-retryable: 404 account not found, 403 account frozen).
-
-2. Build a PaymentEnrichmentPipeline that calls all three services, applies retryWhen with Retry.backoff to the FX and fraud services, applies timeout(200ms) to each individual call, and routes any event that exhausts retries to a deadLetterPublisher.
-
-3. Configure a Resilience4j circuit breaker for the fraud service with a 60% failure rate threshold, 15-second open state, and a fallback that returns FraudScore.defaultAllow(). Document why a default-allow fallback may be acceptable or unacceptable depending on your risk posture.
-
-4. Write a test using StepVerifier and WireMock that verifies: (a) the pipeline retries exactly 3 times on a 503 before routing to dead letter, (b) a 400 response does not trigger any retry, and (c) the circuit breaker opens after 10 consecutive 503 responses.
+{
+  "title": "Error Handling and Retry in Reactive Pipelines \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Implement error classification for each service: FX rate (retryable: 503, 429, ConnectTimeoutException; non-retryable: 404); Fraud service (retryable:"
+    },
+    {
+      "id": "2",
+      "description": "Build a PaymentEnrichmentPipeline that calls all three services, applies retryWhen with Retry.backoff to the FX and fraud services, applies timeout(200"
+    },
+    {
+      "id": "3",
+      "description": "Configure a Resilience4j circuit breaker for the fraud service with a 60% failure rate threshold, 15-second open state, and a fallback that returns Fra"
+    },
+    {
+      "id": "4",
+      "description": "Write a test using StepVerifier and WireMock that verifies: (a) the pipeline retries exactly 3 times on a 503 before routing to dead letter, (b) a 400"
+    }
+  ]
+}
 -->

@@ -495,19 +495,27 @@ request.getHeaders().set("Idempotency-Key",
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are building a cross-border payment service. Each payment calls: (1) FX rate lock (100ms timeout), (2) sanctions screening (500ms timeout — no fallback), (3) ledger debit (must be idempotent), (4) SWIFT message dispatch (at-least-once delivery, must not send twice).
-
-**Tasks:**
-
-1. Design the `idempotent_requests` table with appropriate indexes for 10 million records with a 24-hour TTL cleanup job.
-
-2. Implement `IdempotentSWIFTDispatcher` that uses Redis SETNX for the first-pass fast check but falls back to PostgreSQL for durability on the SWIFT dispatch step.
-
-3. Implement child key derivation so that the FX lock, sanctions check, and SWIFT dispatch each have isolated idempotency namespaces derived from the client-provided key.
-
-4. Write a test that simulates a network timeout after the debit succeeds but before the SWIFT dispatch completes, then verifies that the retry does not debit a second time but does successfully dispatch the SWIFT message.
-
-5. What TTL would you set for the SWIFT dispatch deduplication key, and why?
+{
+  "title": "Idempotency in Distributed Financial Systems \u2014 Production Implementation",
+  "difficulty": "principal",
+  "estimatedMinutes": 85,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Design the `idempotent_requests` table with appropriate indexes for 10 million records with a 24-hour TTL cleanup job"
+    },
+    {
+      "id": "2",
+      "description": "Implement `IdempotentSWIFTDispatcher` that uses Redis SETNX for the first-pass fast check but falls back to PostgreSQL for durability on the SWIFT disp"
+    },
+    {
+      "id": "3",
+      "description": "Implement child key derivation so that the FX lock, sanctions check, and SWIFT dispatch each have isolated idempotency namespaces derived from the clie"
+    },
+    {
+      "id": "4",
+      "description": "Write a test that simulates a network timeout after the debit succeeds but before the SWIFT dispatch completes, then verifies that the retry does not d"
+    }
+  ]
+}
 -->

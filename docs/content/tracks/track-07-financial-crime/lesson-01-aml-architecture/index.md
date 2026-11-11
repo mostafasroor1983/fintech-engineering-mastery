@@ -432,19 +432,27 @@ The retention architecture must support:
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are designing an AML transaction monitoring system for a retail bank processing 10 million transactions per day.
-
-**Tasks:**
-
-1. **Design the Kafka Streams topology** for a "rapid movement" scenario: a customer who receives funds and then immediately transfers them out within 24 hours, with the outgoing amount being 90–100% of the incoming amount. Write the KStream windowing logic.
-
-2. **Model the alert severity scoring**: define a scoring function that considers base severity (40 pts for rapid movement), PEP status (+25), high-risk jurisdiction (+20), previous alerts in 30 days (+15), and customer risk rating modifier (-5 to +20). Implement the Java scoring service.
-
-3. **Design the audit schema**: what fields must an `aml_audit_events` table contain to meet FATF requirements? Include the tamper-evident hash chain design.
-
-4. **Write a Testcontainers integration test** that verifies: given a customer with 3 cash deposits of £9,500 each within 7 days, the structuring scenario (AML-001) triggers exactly one alert (testing deduplication).
-
-5. **Operational question**: your AML system generates 2,000 alerts per day but your team can only review 300. What architectural changes would you make to prioritise the right 300 alerts?
+{
+  "title": "AML Architecture \u2014 Anti-Money Laundering Systems Design \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 90,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Design the Kafka Streams topology"
+    },
+    {
+      "id": "2",
+      "description": "Model the alert severity scoring"
+    },
+    {
+      "id": "3",
+      "description": "Design the audit schema"
+    },
+    {
+      "id": "4",
+      "description": "Write a Testcontainers integration test"
+    }
+  ]
+}
 -->

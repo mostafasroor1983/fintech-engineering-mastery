@@ -525,15 +525,27 @@ A: No. With 10 writes and 50 reads per day, there is no workload asymmetry to ad
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are the principal engineer for a payments platform processing 5,000 TPS. Balance query latency is degrading under load because queries and payment writes share the same PostgreSQL primary. Your task is to introduce CQRS for the account domain.
-
-**Task 1 — Command Model:** Implement `WithdrawFundsCommand` and `WithdrawFundsCommandHandler`. The handler must: check sufficient balance via the `Account` aggregate, debit the account, persist the updated aggregate, record idempotency, and publish a `FundsWithdrawnEvent`. Write a unit test that verifies a withdrawal of £200 from an account with £150 balance raises `InsufficientFundsException`.
-
-**Task 2 — Read Model Schema:** Design the SQL schema for a `transaction_history_view` read model that supports efficient queries for "last 30 transactions for account X, sorted by timestamp descending, filtered by type (DEBIT/CREDIT)". Include appropriate indexes and explain your index choices.
-
-**Task 3 — Projection Updater:** Implement `TransactionHistoryProjectionUpdater` that listens to `FundsWithdrawnEvent` and `FundsDepositedEvent` and maintains the `transaction_history_view` table. Handle the case where the event arrives out of order (timestamp-based idempotency check).
-
-**Task 4 — Eventual Consistency Test:** Write an integration test using an in-memory event bus that verifies: after dispatching `WithdrawFundsCommand`, within 100ms the query handler returns a `TransactionHistoryView` that includes the withdrawal transaction. The test should not use `Thread.sleep` — use `Awaitility` with a 200ms timeout.
+{
+  "title": "CQRS \u2014 Separating Commands and Queries in Payment Systems \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Implement `WithdrawFundsCommand` and `WithdrawFundsCommandHandler`. The handler must: check sufficient balance via the `Account` aggregate, debit the account, persist the updated aggregate, record ide"
+    },
+    {
+      "id": "2",
+      "description": "Design the SQL schema for a `transaction_history_view` read model that supports efficient queries for \"last 30 transactions for account X, sorted by timestamp descending, filtered by type (DEBIT/CREDI"
+    },
+    {
+      "id": "3",
+      "description": "Implement `TransactionHistoryProjectionUpdater` that listens to `FundsWithdrawnEvent` and `FundsDepositedEvent` and maintains the `transaction_history_view` table. Handle the case where the event arri"
+    },
+    {
+      "id": "4",
+      "description": "Write an integration test using an in-memory event bus that verifies: after dispatching `WithdrawFundsCommand`, within 100ms the query handler returns a `TransactionHistoryView` that includes the with"
+    }
+  ]
+}
 -->

@@ -383,15 +383,27 @@ A: The fundamental problem is schema-on-read without lineage tracking. Parquet f
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** A UK neobank processes 3M payments/day. The current nightly batch data lake fails to meet real-time fraud feature needs (< 1 minute), FCA lineage requirements, and GDPR residency constraints.
-
-**Task 1 — Pipeline Design:** Write a Flink job consuming payment_events from Kafka, filtering completed payments, computing 5-minute tumbling window aggregates per currency/corridor, and writing facts and aggregates to separate sinks.
-
-**Task 2 — Schema Evolution:** Define Avro schemas for PaymentCompletedEvent v1 and v2 (adds processingRegion field). Configure Schema Registry BACKWARD_TRANSITIVE compatibility. Write a test verifying v1 events deserialise with v2 reader schema using the default value.
-
-**Task 3 — Data Lineage:** Design a data_lineage SQL table schema answering: "For customer X's loan decision on date Y, list every payment event that influenced it, its schema version, and the pipeline version that transformed it."
-
-**Task 4 — GDPR Residency:** Identify personal data fields in PaymentCompletedEvent, propose a tokenisation strategy, and write Kafka topic configuration ensuring PII events are processed only in EU regions.
+{
+  "title": "Data Architecture for Financial Systems \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Write a Flink job consuming payment_events from Kafka, filtering completed payments, computing 5-minute tumbling window aggregates per currency/corridor, and writing facts and aggregates to separate s"
+    },
+    {
+      "id": "2",
+      "description": "Define Avro schemas for PaymentCompletedEvent v1 and v2 (adds processingRegion field). Configure Schema Registry BACKWARD_TRANSITIVE compatibility. Write a test verifying v1 events deserialise with v2"
+    },
+    {
+      "id": "3",
+      "description": "Design a data_lineage SQL table schema answering: \"For customer X's loan decision on date Y, list every payment event that influenced it, its schema version, and the pipeline version that transformed"
+    },
+    {
+      "id": "4",
+      "description": "Identify personal data fields in PaymentCompletedEvent, propose a tokenisation strategy, and write Kafka topic configuration ensuring PII events are processed only in EU regions"
+    }
+  ]
+}
 -->

@@ -390,15 +390,27 @@ A: `outlierDetection` triggers on `consecutiveErrors` (3 consecutive 5xx from a 
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are the platform engineering lead at a bank migrating to Kubernetes with 12 microservices. A PCI DSS audit is in 60 days. You need mTLS across the cluster and canary deployment capability for the payment service.
-
-**Task 1 — mTLS Rollout:** Design a phased rollout (PERMISSIVE → STRICT per namespace). Write PeerAuthentication YAML for each phase and the Prometheus query identifying namespaces still sending non-mTLS traffic.
-
-**Task 2 — Canary Deployment:** Write VirtualService and DestinationRule YAML for payment-service v2 at 5% with header override, circuit breaking on 2 consecutive 5xx, and 60-second ejection. Explain automation for 5% → 25% → 50% → 100% progression.
-
-**Task 3 — Trace Propagation:** The fraud service shows broken Jaeger spans. Diagnose the root cause and provide a Spring configuration fix. Write a test verifying trace header propagation through RestClient calls.
-
-**Task 4 — Latency Budget:** With 5 service hops and 1ms mesh overhead each, calculate the remaining application latency budget within a P99 < 200ms SLO. Propose which hops to collapse or make async if the budget is insufficient.
+{
+  "title": "Service Mesh \u2014 Istio and Envoy in Financial Services \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Design a phased rollout (PERMISSIVE \u2192 STRICT per namespace). Write PeerAuthentication YAML for each phase and the Prometheus query identifying namespaces still sending non-mTLS traffic"
+    },
+    {
+      "id": "2",
+      "description": "Write VirtualService and DestinationRule YAML for payment-service v2 at 5% with header override, circuit breaking on 2 consecutive 5xx, and 60-second ejection. Explain automation for 5% \u2192 25% \u2192 50% \u2192"
+    },
+    {
+      "id": "3",
+      "description": "The fraud service shows broken Jaeger spans. Diagnose the root cause and provide a Spring configuration fix. Write a test verifying trace header propagation through RestClient calls"
+    },
+    {
+      "id": "4",
+      "description": "With 5 service hops and 1ms mesh overhead each, calculate the remaining application latency budget within a P99 < 200ms SLO. Propose which hops to collapse or make async if the budget is insufficient"
+    }
+  ]
+}
 -->

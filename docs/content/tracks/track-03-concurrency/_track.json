@@ -15,7 +15,7 @@
     {
       "id": "track-03-lesson-01",
       "sequence": 1,
-      "title": "The Java Memory Model — Fundamentals",
+      "title": "The Java Memory Model \u2014 Fundamentals",
       "slug": "jmm-fundamentals",
       "path": "content/tracks/track-03-concurrency/lesson-01-jmm-fundamentals/index.md",
       "difficulty": "advanced",
@@ -32,7 +32,7 @@
     {
       "id": "track-03-lesson-02",
       "sequence": 2,
-      "title": "Thread Safety — Design Principles and Immutability",
+      "title": "Thread Safety \u2014 Design Principles and Immutability",
       "slug": "thread-safety-design",
       "path": "content/tracks/track-03-concurrency/lesson-02-thread-safety-design/index.md",
       "difficulty": "advanced",
@@ -49,7 +49,7 @@
     {
       "id": "track-03-lesson-03",
       "sequence": 3,
-      "title": "Synchronization — synchronized, ReentrantLock, StampedLock",
+      "title": "Synchronization \u2014 synchronized, ReentrantLock, StampedLock",
       "slug": "synchronization-primitives",
       "path": "content/tracks/track-03-concurrency/lesson-03-synchronization-primitives/index.md",
       "difficulty": "advanced",
@@ -66,7 +66,7 @@
     {
       "id": "track-03-lesson-04",
       "sequence": 4,
-      "title": "Atomic Operations — AtomicLong, CAS, and Lock-Free Algorithms",
+      "title": "Atomic Operations \u2014 AtomicLong, CAS, and Lock-Free Algorithms",
       "slug": "atomic-operations",
       "path": "content/tracks/track-03-concurrency/lesson-04-atomic-operations/index.md",
       "difficulty": "advanced",
@@ -99,7 +99,7 @@
     {
       "id": "track-03-lesson-06",
       "sequence": 6,
-      "title": "Concurrent Collections — ConcurrentHashMap, BlockingQueue, CopyOnWrite",
+      "title": "Concurrent Collections \u2014 ConcurrentHashMap, BlockingQueue, CopyOnWrite",
       "slug": "concurrent-collections",
       "path": "content/tracks/track-03-concurrency/lesson-06-concurrent-collections/index.md",
       "difficulty": "advanced",
@@ -115,7 +115,7 @@
     {
       "id": "track-03-lesson-07",
       "sequence": 7,
-      "title": "Race Conditions in Financial Systems — Detection and Prevention",
+      "title": "Race Conditions in Financial Systems \u2014 Detection and Prevention",
       "slug": "race-conditions-financial",
       "path": "content/tracks/track-03-concurrency/lesson-07-race-conditions-financial/index.md",
       "difficulty": "advanced",
@@ -165,7 +165,7 @@
     {
       "id": "track-03-lesson-10",
       "sequence": 10,
-      "title": "Thread Pool Design — ThreadPoolExecutor and ForkJoinPool",
+      "title": "Thread Pool Design \u2014 ThreadPoolExecutor and ForkJoinPool",
       "slug": "thread-pool-design",
       "path": "content/tracks/track-03-concurrency/lesson-10-thread-pool-design/index.md",
       "difficulty": "advanced",
@@ -182,7 +182,7 @@
     {
       "id": "track-03-lesson-11",
       "sequence": 11,
-      "title": "CompletableFuture — Asynchronous Pipelines and Composition",
+      "title": "CompletableFuture \u2014 Asynchronous Pipelines and Composition",
       "slug": "completable-future",
       "path": "content/tracks/track-03-concurrency/lesson-11-completable-future/index.md",
       "difficulty": "advanced",
@@ -199,7 +199,7 @@
     {
       "id": "track-03-lesson-12",
       "sequence": 12,
-      "title": "Virtual Threads — Java 21 Fundamentals",
+      "title": "Virtual Threads \u2014 Java 21 Fundamentals",
       "slug": "virtual-threads",
       "path": "content/tracks/track-03-concurrency/lesson-12-virtual-threads/index.md",
       "difficulty": "advanced",
@@ -215,7 +215,7 @@
     {
       "id": "track-03-lesson-13",
       "sequence": 13,
-      "title": "Virtual Thread Pinning — Synchronized Blocks and Carrier Threads",
+      "title": "Virtual Thread Pinning \u2014 Synchronized Blocks and Carrier Threads",
       "slug": "virtual-thread-pinning",
       "path": "content/tracks/track-03-concurrency/lesson-13-virtual-thread-pinning/index.md",
       "difficulty": "advanced",
@@ -232,7 +232,7 @@
     {
       "id": "track-03-lesson-14",
       "sequence": 14,
-      "title": "Structured Concurrency — Java 21",
+      "title": "Structured Concurrency \u2014 Java 21",
       "slug": "structured-concurrency",
       "path": "content/tracks/track-03-concurrency/lesson-14-structured-concurrency/index.md",
       "difficulty": "advanced",
@@ -248,7 +248,7 @@
     {
       "id": "track-03-lesson-15",
       "sequence": 15,
-      "title": "Scoped Values — Java 21",
+      "title": "Scoped Values \u2014 Java 21",
       "slug": "scoped-values",
       "path": "content/tracks/track-03-concurrency/lesson-15-scoped-values/index.md",
       "difficulty": "advanced",
@@ -265,7 +265,7 @@
     {
       "id": "track-03-lesson-16",
       "sequence": 16,
-      "title": "Testing Concurrency — JUnit, jcstress, and Thread Safety Verification",
+      "title": "Testing Concurrency \u2014 JUnit, jcstress, and Thread Safety Verification",
       "slug": "testing-concurrency",
       "path": "content/tracks/track-03-concurrency/lesson-16-testing-concurrency/index.md",
       "difficulty": "advanced",
@@ -430,7 +430,7 @@
     {
       "id": "track-03-lesson-26",
       "sequence": 26,
-      "title": "The Java Memory Model — Advanced: Fences, Final Fields, Unsafe",
+      "title": "The Java Memory Model \u2014 Advanced: Fences, Final Fields, Unsafe",
       "slug": "jmm-advanced",
       "path": "content/tracks/track-03-concurrency/lesson-26-jmm-advanced/index.md",
       "difficulty": "principal",
@@ -476,6 +476,23 @@
         "trade-offs",
         "staff-engineer",
         "principal-engineer"
+      ]
+    },
+    {
+      "id": "track-03-lesson-29",
+      "sequence": 29,
+      "title": "Thread-Safety Audit \u2014 Class, Module and Application Level",
+      "slug": "thread-safety-audit",
+      "path": "content/tracks/track-03-concurrency/lesson-29-thread-safety-audit/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "thread-safety",
+        "audit",
+        "shared-state",
+        "concurrent-design",
+        "review"
       ]
     }
   ]

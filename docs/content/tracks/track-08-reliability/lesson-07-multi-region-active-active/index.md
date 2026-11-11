@@ -1,687 +1,970 @@
 ---
-id: track-08-lesson-07
+id: "track-08-lesson-07"
 title: "Multi-Region Active-Active Architecture"
-slug: multi-region-active-active
-track: track-08
-trackName: "Reliability & Production Engineering"
+track: "track-08"
+track-name: "Reliability Engineering"
 sequence: 7
-difficulty: principal
-estimatedMinutes: 90
-status: published
-tags: [active-active, multi-region, geo-replication, conflict-resolution, latency]
-prerequisites: []
+slug: "multi-region-active-active"
+difficulty: "principal"
+estimated-minutes: 90
+status: "published"
+last-updated: "2026-11-09"
+
+prerequisites:
+  - "track-08-lesson-06"
+
+tags:
+  - "active-active"
+  - "multi-region"
+  - "geo-routing"
+  - "conflict-resolution"
+  - "zero-RTO"
+  - "CockroachDB"
+
+java-versions: [17, 21]
+
+topics:
+  - "Active-Active vs Active-Passive"
+  - "Write Conflict Problem for Financial Balances"
+  - "Home-Region Routing"
+  - "G-Counter CRDT"
+  - "CockroachDB REGIONAL BY ROW"
+  - "GDPR Data Residency Validation"
+  - "Latency Budget"
+  - "Circuit Breaker on Cross-Region gRPC"
+  - "Disaster Recovery with Zero RPO"
+  - "Failover Runbook"
+  - "Production Pitfalls"
+
+components:
+  mermaid: true
+  prism: true
+  katex: false
+  code-tabs: true
+  knowledge-check: true
+  practical-challenge: true
+
+references:
+  - "CockroachDB Documentation — Multi-Region Capabilities — cockroachlabs.com"
+  - "CRDT Papers — Shapiro et al. — Conflict-Free Replicated Data Types (2011)"
+  - "AWS Global Accelerator Documentation"
+  - "Google Cloud Spanner — Truetime and External Consistency"
+  - "Martin Kleppmann — Designing Data-Intensive Applications (2017), Chapter 5"
+  - "GDPR Article 44-49 — Transfers of Personal Data to Third Countries"
 ---
 
-# Multi-Region Active-Active Architecture
+A single-region payment service offers 99.9% availability — about 8.7 hours of downtime per year. For a payment platform processing 10 million transactions daily, that is 36,000 failed transactions per hour of downtime. Moving to multi-region active-active architecture pushes availability toward 99.999% by ensuring that no single region failure takes the service offline. But active-active is deceptively difficult: when every region can accept writes, you face the write conflict problem — the hardest challenge in distributed systems applied to financial data where correctness is non-negotiable.
 
-> [!NOTE]
-> Active-active is not a deployment pattern — it is a data architecture decision. You can deploy services in multiple regions in minutes. Making the data layer globally consistent and conflict-free takes months of careful design.
+## Active-Active vs Active-Passive
 
-## 1. Active-Active vs Active-Passive
+Understanding the trade-offs drives every architectural decision in this lesson.
 
 | Dimension | Active-Passive | Active-Active |
 |---|---|---|
-| Traffic handling | One region handles all traffic | All regions handle traffic |
-| Failover time | 30s–5min (automated) | Near-zero (traffic rerouting) |
-| Data writes | Single primary | Multiple concurrent primaries |
-| Conflict risk | None (single write path) | High (must design for it) |
-| Cost | 1x + warm standby overhead | ~2x (full capacity in each region) |
-| RTO | Minutes | Seconds |
-| RPO | Seconds (async replication) | Near-zero |
-| Use case | Most financial services | High-availability critical paths |
+| RTO (Recovery Time Objective) | Minutes (requires failover) | Zero (no failover needed) |
+| RPO (Recovery Point Objective) | Seconds to minutes (async replication lag) | Near-zero (synchronous or low-lag async) |
+| Write conflicts | None (single write region) | Yes — must be resolved |
+| Read latency | High for non-primary regions | Low (serve from local region) |
+| Write latency | Low for primary, proxied for others | Varies (home-region routing needed) |
+| Cost | Lower (passive region is standby only) | Higher (all regions fully provisioned) |
+| Complexity | Low | Very high |
+| Suitable for | Internal tools, batch, low-criticality | Customer-facing payments, trading, auth |
 
-For most payment services, active-passive with automated failover achieves a satisfactory RTO/RPO. Active-active is warranted for:
-- Payment systems requiring near-zero RTO (global card networks)
-- Read-heavy workloads that can tolerate eventual consistency (transaction history)
-- Latency-sensitive operations requiring geographic routing (FX trading)
+**Active-passive** (also called primary-secondary or leader-follower) has one writable region. All writes go to the primary. The passive region receives replicated data asynchronously. On primary failure, a failover procedure promotes the passive region — taking minutes and potentially losing recently-committed writes (non-zero RPO).
 
-## 2. Global Load Balancing
+**Active-active** (also called multi-master) has every region accepting both reads and writes. Traffic is served locally. No failover required — if EU-WEST-1 fails, traffic routes to US-EAST-1 immediately with zero RTO. But writes to the same record from two regions simultaneously create conflicts.
+
+## The Write Conflict Problem for Financial Balances
+
+Consider a customer with a $1000 balance. At the same millisecond:
+
+```
+EU region receives:    debit  $600  (payment to merchant A)
+US region receives:    debit  $700  (payment to merchant B)
+
+If both regions commit locally without coordination:
+  EU commits: balance = $1000 - $600 = $400  (correct locally)
+  US commits: balance = $1000 - $700 = $300  (correct locally)
+
+After cross-region replication and merge:
+  CONFLICT: which write wins?
+  If EU wins: balance = $400, but the $700 US payment was already approved
+  If US wins: balance = $300, but the $600 EU payment was already approved
+  If last-write-wins: balance = $300 or $400 — either way, $1300 debited from $1000 account
+
+Result: DOUBLE DEBIT — a regulatory compliance failure
+```
+
+This is why naive active-active is dangerous for financial systems. There are three correct approaches:
+
+1. **Home-region routing** — route all writes for a given account to its "home" region. No conflicts because a single region owns each account's writes.
+2. **Serializable distributed transactions** — use a database like CockroachDB or Spanner that provides globally consistent transactions at the cost of cross-region round trips on writes.
+3. **CRDTs** — use conflict-free data structures for specific use cases (transaction counts, aggregate metrics) that commute under merge.
+
+For payment balances, home-region routing is the only practical approach. CRDTs cannot model a balance with debit/credit semantics safely (they cannot express "reject if balance insufficient"). Serializable distributed transactions are too slow (100-200ms cross-region round trips) for real-time payment authorization.
+
+## Home-Region Routing
+
+Every merchant and account is assigned a home region at onboarding. All writes (payment authorizations, balance updates) for that entity are routed to its home region. Cross-region reads are served locally from replicated data.
+
+```
+Account: acc-EUR-001  --> home region: EU-WEST-1
+Account: acc-USD-001  --> home region: US-EAST-1
+Account: acc-SGD-001  --> home region: AP-SOUTHEAST-1
+
+Write request for acc-EUR-001 arrives at US-EAST-1:
+  US-EAST-1 detects: this account's home is EU-WEST-1
+  US-EAST-1 proxies the write to EU-WEST-1 via gRPC
+  EU-WEST-1 commits and returns result
+  US-EAST-1 returns result to caller
+
+Read request for acc-EUR-001 arrives at US-EAST-1:
+  US-EAST-1 serves from local replica (eventual consistency is acceptable for reads)
+  Latency: ~5ms (local)
+```
+
+### RegionAwarePaymentRouter
 
 ```java
+package com.fintech.multiregion.routing;
+
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
- * Geographic routing strategy for multi-region payment processing.
- * Requests are routed to the nearest healthy region.
- * Failover is automatic when health checks fail.
+ * Routes payment writes to the account's home region.
+ * Cross-region calls use gRPC with mTLS; protected by circuit breakers.
  */
-@Configuration
-public class GlobalRoutingConfig {
-
-    /**
-     * AWS Route 53 or Cloudflare-based routing is handled at infrastructure level.
-     * At the application level, we implement region affinity for session continuity.
-     *
-     * Payment sessions should stick to one region to avoid cross-region
-     * read-after-write inconsistency during a payment flow.
-     */
-    @Bean
-    public RegionAffinityFilter regionAffinityFilter() {
-        return new RegionAffinityFilter();
-    }
-}
-
 @Component
-public class RegionAffinityFilter extends OncePerRequestFilter {
+public class RegionAwarePaymentRouter {
 
-    private static final String REGION_HEADER = "X-Processing-Region";
-    private static final String REGION_COOKIE = "pmt-region";
+    private static final String CURRENT_REGION =
+        System.getenv().getOrDefault("AWS_REGION", "eu-west-1");
 
-    @Value("${cloud.aws.region.static}")
-    private String currentRegion;
-
-    @Override
-    protected void doFilterInternal(HttpServletRequest request,
-                                     HttpServletResponse response,
-                                     FilterChain filterChain)
-            throws ServletException, IOException {
-        // Tag response with processing region for client-side affinity
-        response.setHeader(REGION_HEADER, currentRegion);
-        response.addCookie(buildRegionCookie(currentRegion));
-        filterChain.doFilter(request, response);
-    }
-
-    private Cookie buildRegionCookie(String region) {
-        Cookie cookie = new Cookie(REGION_COOKIE, region);
-        cookie.setPath("/");
-        cookie.setMaxAge(3600);  // 1 hour affinity window
-        cookie.setSecure(true);
-        cookie.setHttpOnly(true);
-        return cookie;
-    }
-}
-```
-
-## 3. Data Replication Strategies
-
-The hardest problem in active-active is data: writes in region A must reach region B before region B reads the same data, or region B might serve stale data.
-
-```
-Strategy 1: Global Single-Primary (Semi-Active-Active)
-  - Reads: local region (fast, possibly stale)
-  - Writes: always route to primary region
-  - Latency: reads fast, writes add cross-region round trip
-  - Consistency: strong (single write path)
-  - Use for: account balances, payment final status
-
-Strategy 2: Regional Partitioning
-  - Each account "lives in" one region
-  - That region is primary for that account's writes
-  - Other regions are replicas for reads only
-  - Consistency: strong within partition, eventual across
-  - Use for: account management, payment history
-
-Strategy 3: Multi-Primary with Conflict Resolution
-  - Any region can write any record
-  - Conflicts detected and resolved automatically
-  - Consistency: eventual
-  - Use for: idempotency keys, rate counters, audit logs
-```
-
-```java
-/**
- * Account partition routing — each account has a home region.
- * Writes for that account go to home region; reads can be local.
- */
-@Service
-@RequiredArgsConstructor
-public class AccountRegionRouter {
-
+    // Map of region -> gRPC endpoint for cross-region payment proxy
     private static final Map<String, String> REGION_ENDPOINTS = Map.of(
-        "us-east-1", "https://payments-use1.example.com",
-        "eu-west-1", "https://payments-euw1.example.com",
-        "ap-southeast-1", "https://payments-apse1.example.com"
+        "eu-west-1",       "payment-proxy.eu-west-1.internal:9090",
+        "us-east-1",       "payment-proxy.us-east-1.internal:9090",
+        "ap-southeast-1",  "payment-proxy.ap-southeast-1.internal:9090"
     );
 
-    /**
-     * Route write operations to the account's home region.
-     * Account home region is determined by account ID prefix or
-     * a consistent hash of account ID.
-     */
-    public String getHomeRegion(String accountId) {
-        // Accounts are assigned to regions at creation time
-        // Stored in a globally-replicated accounts metadata table
-        return accountRegionCache.getRegion(accountId);
+    private final AccountRegionRepository accountRegionRepository;
+    private final LocalPaymentService localPaymentService;
+    private final CircuitBreakerRegistry circuitBreakerRegistry;
+    private final Map<String, ManagedChannel> channelCache = new ConcurrentHashMap<>();
+
+    public RegionAwarePaymentRouter(
+            AccountRegionRepository accountRegionRepository,
+            LocalPaymentService localPaymentService,
+            CircuitBreakerRegistry circuitBreakerRegistry) {
+        this.accountRegionRepository = accountRegionRepository;
+        this.localPaymentService = localPaymentService;
+        this.circuitBreakerRegistry = circuitBreakerRegistry;
     }
 
-    public boolean isLocalAccount(String accountId) {
-        return currentRegion.equals(getHomeRegion(accountId));
-    }
-
     /**
-     * For non-local accounts, proxy the write to the home region.
-     * This adds ~10–50ms latency for cross-region writes.
+     * Routes a payment to the correct region.
+     * If the account's home region is local, process directly.
+     * If remote, proxy via gRPC with circuit breaker protection.
      */
-    public PaymentResponse routePaymentWrite(PaymentRequest request) {
-        String homeRegion = getHomeRegion(request.getDebitAccountId());
-        if (isLocalAccount(request.getDebitAccountId())) {
-            return localPaymentService.process(request);
+    public PaymentResponse routePayment(PaymentRequest request) {
+        String homeRegion = accountRegionRepository
+            .getHomeRegion(request.accountId());
+
+        if (CURRENT_REGION.equals(homeRegion)) {
+            // Local write — no network hop, no conflict possible
+            return localPaymentService.processPayment(request);
         }
-        // Forward to home region
-        String homeEndpoint = REGION_ENDPOINTS.get(homeRegion);
-        return crossRegionClient.forwardPayment(homeEndpoint, request);
-    }
-}
-```
 
-## 4. Conflict Resolution — Last-Write-Wins
-
-The simplest conflict resolution strategy is last-write-wins (LWW) using a logical timestamp (Lamport clock or vector clock) rather than wall clock time.
-
-```java
-/**
- * Last-write-wins conflict resolution using vector clocks.
- * Each record carries a vector clock tracking causality across regions.
- */
-@Entity
-@Table(name = "account_preferences")
-public class AccountPreference {
-
-    @Id
-    private UUID accountId;
-
-    private String preferredCurrency;
-    private String defaultPaymentMethod;
-    private String notificationEmail;
-
-    /**
-     * Vector clock: maps region → logical timestamp.
-     * Updated on every write in the writing region.
-     * Used to determine which concurrent update "wins".
-     */
-    @Convert(converter = VectorClockConverter.class)
-    @Column(name = "vector_clock", columnDefinition = "jsonb")
-    private VectorClock vectorClock;
-
-    @Column(name = "last_modified_at")
-    private Instant lastModifiedAt;
-
-    @Column(name = "last_modified_region")
-    private String lastModifiedRegion;
-}
-
-@Service
-@RequiredArgsConstructor
-public class AccountPreferenceService {
-
-    private final AccountPreferenceRepository repository;
-
-    @Value("${cloud.aws.region.static}")
-    private String currentRegion;
-
-    public AccountPreference update(String accountId,
-                                     AccountPreferenceUpdate update) {
-        AccountPreference pref = repository.findById(UUID.fromString(accountId))
-            .orElseGet(() -> new AccountPreference(UUID.fromString(accountId)));
-
-        // Advance local region clock
-        VectorClock newClock = pref.getVectorClock().increment(currentRegion);
-
-        pref.setPreferredCurrency(update.getPreferredCurrency());
-        pref.setVectorClock(newClock);
-        pref.setLastModifiedAt(Instant.now());
-        pref.setLastModifiedRegion(currentRegion);
-
-        return repository.save(pref);
+        // Cross-region write — proxy to home region
+        return routeToRegion(request, homeRegion);
     }
 
-    /**
-     * Resolve conflict when replication brings in a concurrent update.
-     * For account preferences, LWW by wall clock is acceptable
-     * (losing a preference update is not a financial error).
-     * For financial data, use a stricter strategy.
-     */
-    public AccountPreference resolveConflict(AccountPreference local,
-                                              AccountPreference remote) {
-        VectorClock.ComparisonResult comparison =
-            local.getVectorClock().compareTo(remote.getVectorClock());
+    private PaymentResponse routeToRegion(PaymentRequest request, String targetRegion) {
+        String cbName = "cross-region-" + targetRegion;
+        CircuitBreaker circuitBreaker = circuitBreakerRegistry
+            .circuitBreaker(cbName);
 
-        return switch (comparison) {
-            case BEFORE -> remote;    // Remote is strictly newer — use it
-            case AFTER -> local;     // Local is strictly newer — keep it
-            case CONCURRENT -> {
-                // Concurrent updates — use last-modified timestamp as tiebreaker
-                log.warn("Concurrent update conflict for accountId={} " +
-                    "localRegion={} remoteRegion={}",
-                    local.getAccountId(),
-                    local.getLastModifiedRegion(),
-                    remote.getLastModifiedRegion());
-                yield local.getLastModifiedAt().isAfter(remote.getLastModifiedAt())
-                    ? local : remote;
+        return circuitBreaker.executeSupplier(() -> {
+            PaymentServiceGrpc.PaymentServiceBlockingStub stub =
+                getStub(targetRegion);
+
+            com.fintech.proto.PaymentRequest grpcRequest =
+                com.fintech.proto.PaymentRequest.newBuilder()
+                    .setPaymentId(request.paymentId())
+                    .setAccountId(request.accountId())
+                    .setAmount(request.amount().toPlainString())
+                    .setCurrency(request.currency())
+                    .setSourceRegion(CURRENT_REGION)
+                    .build();
+
+            com.fintech.proto.PaymentResponse grpcResponse =
+                stub.withDeadlineAfter(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .processPayment(grpcRequest);
+
+            return new PaymentResponse(
+                grpcResponse.getPaymentId(),
+                PaymentStatus.valueOf(grpcResponse.getStatus()),
+                grpcResponse.getMessage()
+            );
+        });
+    }
+
+    private PaymentServiceGrpc.PaymentServiceBlockingStub getStub(String region) {
+        ManagedChannel channel = channelCache.computeIfAbsent(region, r -> {
+            String endpoint = REGION_ENDPOINTS.get(r);
+            if (endpoint == null) {
+                throw new IllegalArgumentException("Unknown region: " + r);
             }
-            case EQUAL -> local;    // Identical — no conflict
-        };
+            return ManagedChannelBuilder.forTarget(endpoint)
+                .useTransportSecurity()  // mTLS in production
+                .build();
+        });
+        return PaymentServiceGrpc.newBlockingStub(channel);
+    }
+
+    public record PaymentRequest(String paymentId, String accountId,
+                                  java.math.BigDecimal amount, String currency) {}
+    public record PaymentResponse(String paymentId, PaymentStatus status, String message) {}
+    public enum PaymentStatus { APPROVED, DECLINED, PENDING }
+}
+```
+
+### Account Region Repository
+
+```java
+package com.fintech.multiregion.routing;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Repository;
+
+/**
+ * Stores account->home-region mapping in Redis.
+ * Redis is replicated across regions; reads are local and fast.
+ * Writes happen once at account creation.
+ */
+@Repository
+public class AccountRegionRepository {
+
+    private static final String KEY_PREFIX = "account:region:";
+
+    private final StringRedisTemplate redis;
+
+    public AccountRegionRepository(StringRedisTemplate redis) {
+        this.redis = redis;
+    }
+
+    public String getHomeRegion(String accountId) {
+        String region = redis.opsForValue().get(KEY_PREFIX + accountId);
+        if (region == null) {
+            throw new AccountNotFoundException("No home region for account: " + accountId);
+        }
+        return region;
+    }
+
+    public void setHomeRegion(String accountId, String region) {
+        redis.opsForValue().set(KEY_PREFIX + accountId, region);
+    }
+
+    public static class AccountNotFoundException extends RuntimeException {
+        public AccountNotFoundException(String message) { super(message); }
     }
 }
 ```
 
-## 5. CRDTs for Conflict-Free Distributed Counters
+## G-Counter CRDT for Transaction Counts
 
-For financial counters (rate limits, daily limits, attempt counters), Conflict-free Replicated Data Types (CRDTs) allow concurrent increments from multiple regions without conflict.
+For aggregate metrics — total transactions per merchant, total payment volume — CRDTs are the right tool. They allow every region to increment independently and merge without conflicts.
+
+A **G-Counter** (grow-only counter) is the simplest CRDT. Each region maintains its own counter. The global value is the sum of all regional counters. Increments are commutative and idempotent under merge.
+
+```
+EU-WEST-1:      {eu: 150, us: 0,   ap: 0  }
+US-EAST-1:      {eu: 0,   us: 200, ap: 0  }
+AP-SOUTHEAST-1: {eu: 0,   us: 0,   ap: 75 }
+
+After merge (take max of each slot, then sum):
+  Merged: {eu: 150, us: 200, ap: 75}
+  Total:  150 + 200 + 75 = 425 transactions
+```
 
 ```java
+package com.fintech.multiregion.crdt;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
+
 /**
- * G-Counter CRDT: each region maintains its own increment counter.
- * Total value = sum of all regional counters.
- * No conflict possible — each region only writes to its own slot.
+ * G-Counter CRDT for distributed transaction count tracking.
+ *
+ * Properties:
+ *   - Commutativity: merge(a, b) == merge(b, a)
+ *   - Associativity: merge(merge(a,b), c) == merge(a, merge(b,c))
+ *   - Idempotency:   merge(a, a) == a
+ *
+ * These properties guarantee eventual consistency regardless of
+ * message ordering or delivery.
  */
 public class GCounter {
 
-    // Map of region → count incremented by that region
-    private final Map<String, Long> counters;
+    private final String localNodeId;
+    // Per-node counters: nodeId -> count
+    private final Map<String, Long> counters = new ConcurrentHashMap<>();
 
-    public GCounter(Map<String, Long> counters) {
-        this.counters = new HashMap<>(counters);
-    }
-
-    public static GCounter zero() {
-        return new GCounter(Map.of());
+    public GCounter(String localNodeId) {
+        this.localNodeId = localNodeId;
+        this.counters.put(localNodeId, 0L);
     }
 
     /**
-     * Increment counter for the local region.
-     * Only the owning region should call this.
+     * Increment the local node's counter.
+     * Thread-safe via ConcurrentHashMap compute.
      */
-    public GCounter increment(String region, long amount) {
-        Map<String, Long> updated = new HashMap<>(counters);
-        updated.merge(region, amount, Long::sum);
-        return new GCounter(updated);
+    public void increment() {
+        counters.compute(localNodeId,
+            (key, current) -> current == null ? 1L : current + 1L);
+    }
+
+    public void incrementBy(long delta) {
+        if (delta < 0) throw new IllegalArgumentException("G-Counter only grows");
+        counters.compute(localNodeId,
+            (key, current) -> current == null ? delta : current + delta);
     }
 
     /**
-     * Total value = sum across all regions.
+     * Global value: sum of all node counters.
      */
     public long value() {
         return counters.values().stream().mapToLong(Long::longValue).sum();
     }
 
     /**
-     * Merge with another replica.
-     * Take the maximum of each region's counter (since regions only increment).
+     * Merge another G-Counter state into this one.
+     * For each node, take the maximum value seen.
+     * This is the "join" operation in lattice theory.
      */
-    public GCounter merge(GCounter other) {
-        Map<String, Long> merged = new HashMap<>(counters);
-        other.counters.forEach((region, count) ->
-            merged.merge(region, count, Math::max));
-        return new GCounter(merged);
+    public void merge(GCounter other) {
+        other.counters.forEach((nodeId, otherCount) ->
+            counters.merge(nodeId, otherCount, Math::max)
+        );
+    }
+
+    /**
+     * Serialize for cross-region replication.
+     */
+    public Map<String, Long> snapshot() {
+        return Collections.unmodifiableMap(new HashMap<>(counters));
+    }
+
+    /**
+     * Apply a received snapshot from another region.
+     * Idempotent: safe to apply the same snapshot multiple times.
+     */
+    public void applySnapshot(Map<String, Long> remoteSnapshot) {
+        remoteSnapshot.forEach((nodeId, remoteCount) ->
+            counters.merge(nodeId, remoteCount, Math::max)
+        );
+    }
+
+    @Override
+    public String toString() {
+        return "GCounter{local=" + localNodeId +
+               ", counters=" + counters +
+               ", total=" + value() + "}";
     }
 }
+```
 
-/**
- * Daily transaction limit enforced using G-Counter CRDT.
- * Each region tracks its own spend; total = sum across regions.
- * No coordination needed — merge handles eventual consistency.
- */
+### G-Counter Usage in Payment Service
+
+```java
+package com.fintech.multiregion.crdt;
+
+import org.springframework.stereotype.Service;
+
+import java.util.Map;
+
 @Service
-@RequiredArgsConstructor
-public class DailyLimitService {
+public class MerchantTransactionCounter {
 
-    private final DailyLimitRepository repository;
+    private static final String REGION = System.getenv("AWS_REGION");
 
-    @Value("${cloud.aws.region.static}")
-    private String currentRegion;
+    // merchantId -> GCounter
+    private final java.util.concurrent.ConcurrentHashMap<String, GCounter>
+        merchantCounters = new java.util.concurrent.ConcurrentHashMap<>();
 
-    public boolean checkAndIncrement(String accountId,
-                                      long amountCents,
-                                      long dailyLimitCents) {
-        DailyLimitRecord record = repository.findOrCreate(accountId, LocalDate.now());
-        GCounter counter = record.getCounter();
+    /**
+     * Record a successful payment for a merchant.
+     * Called after payment authorization succeeds locally.
+     */
+    public void recordPayment(String merchantId) {
+        merchantCounters
+            .computeIfAbsent(merchantId, id -> new GCounter(REGION))
+            .increment();
+    }
 
-        // Check current total (may be slightly stale for other regions)
-        long currentTotal = counter.value();
-        if (currentTotal + amountCents > dailyLimitCents) {
-            return false;  // Limit would be exceeded
+    /**
+     * Get the globally merged transaction count for a merchant.
+     * Reflects all regions that have replicated their state to this node.
+     */
+    public long getTransactionCount(String merchantId) {
+        GCounter counter = merchantCounters.get(merchantId);
+        return counter == null ? 0L : counter.value();
+    }
+
+    /**
+     * Apply a replication event received from another region.
+     * Called when a cross-region replication message arrives.
+     */
+    public void applyReplicationEvent(String merchantId,
+                                       Map<String, Long> remoteSnapshot) {
+        merchantCounters
+            .computeIfAbsent(merchantId, id -> new GCounter(REGION))
+            .applySnapshot(remoteSnapshot);
+    }
+
+    /**
+     * Export local state for replication to other regions.
+     */
+    public Map<String, Map<String, Long>> exportForReplication() {
+        java.util.HashMap<String, Map<String, Long>> result = new java.util.HashMap<>();
+        merchantCounters.forEach((merchantId, counter) ->
+            result.put(merchantId, counter.snapshot()));
+        return result;
+    }
+}
+```
+
+## CockroachDB REGIONAL BY ROW
+
+For accounts and transactions that need strong consistency within their home region, CockroachDB's `REGIONAL BY ROW` locality allows rows to be pinned to a specific region while remaining in a globally distributed table.
+
+```sql
+-- Create the accounts table with regional affinity
+CREATE TABLE accounts (
+    account_id      UUID          DEFAULT gen_random_uuid() PRIMARY KEY,
+    merchant_id     UUID          NOT NULL,
+    currency        VARCHAR(3)    NOT NULL,
+    balance         DECIMAL(19,4) NOT NULL DEFAULT 0,
+    status          VARCHAR(20)   NOT NULL DEFAULT 'ACTIVE',
+    crdb_region     crdb_internal_region NOT NULL DEFAULT default_to_database_primary_region(gateway_region()),
+    created_at      TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ   NOT NULL DEFAULT now()
+) LOCALITY REGIONAL BY ROW AS crdb_region;
+
+-- Rows where crdb_region = 'eu-west-1' are pinned to EU nodes
+-- Writes to those rows are low-latency from EU
+-- Reads from other regions go to the nearest replica
+
+-- Create regional index for fast lookups within a region
+CREATE INDEX accounts_merchant_region_idx
+    ON accounts (merchant_id, crdb_region, status);
+
+-- Transactions table with same regional affinity
+CREATE TABLE payment_transactions (
+    transaction_id  UUID          DEFAULT gen_random_uuid(),
+    account_id      UUID          NOT NULL REFERENCES accounts(account_id),
+    amount          DECIMAL(19,4) NOT NULL,
+    direction       VARCHAR(6)    NOT NULL CHECK (direction IN ('DEBIT', 'CREDIT')),
+    status          VARCHAR(20)   NOT NULL DEFAULT 'PENDING',
+    crdb_region     crdb_internal_region NOT NULL,
+    created_at      TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    PRIMARY KEY (transaction_id, crdb_region)
+) LOCALITY REGIONAL BY ROW AS crdb_region;
+
+-- A debit with balance check — executes as a serializable transaction
+-- within the home region (low latency for home-region requests)
+BEGIN;
+  SELECT balance FROM accounts
+    WHERE account_id = $1
+    FOR UPDATE;
+
+  -- Application checks balance >= debit amount
+
+  UPDATE accounts
+    SET balance = balance - $2, updated_at = now()
+    WHERE account_id = $1
+      AND balance >= $2;  -- Atomic check-and-debit
+
+  INSERT INTO payment_transactions
+    (transaction_id, account_id, amount, direction, status)
+    VALUES ($3, $1, $2, 'DEBIT', 'COMPLETED');
+COMMIT;
+```
+
+```java
+package com.fintech.multiregion.database;
+
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.util.UUID;
+
+@Repository
+public class AccountRepository {
+
+    private final JdbcTemplate jdbc;
+
+    public AccountRepository(JdbcTemplate jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    /**
+     * Atomic debit with balance check.
+     * Runs as a serializable transaction in CockroachDB.
+     * CockroachDB routes the transaction to the row's home region
+     * when the crdb_region is included in the WHERE clause.
+     */
+    @Transactional
+    public boolean debitAccount(UUID accountId, BigDecimal amount,
+                                 UUID transactionId, String region) {
+        // Lock the row in the home region
+        int updated = jdbc.update("""
+            UPDATE accounts
+               SET balance    = balance - ?,
+                   updated_at = now()
+             WHERE account_id  = ?
+               AND crdb_region = ?
+               AND balance     >= ?
+               AND status      = 'ACTIVE'
+            """, amount, accountId, region, amount);
+
+        if (updated == 0) {
+            return false;  // Insufficient balance or account inactive
         }
 
-        // Increment local region counter
-        GCounter updated = counter.increment(currentRegion, amountCents);
-        record.setCounter(updated);
-        repository.save(record);
+        // Record the transaction in the same region
+        jdbc.update("""
+            INSERT INTO payment_transactions
+                   (transaction_id, account_id, amount, direction, status, crdb_region)
+            VALUES (?, ?, ?, 'DEBIT', 'COMPLETED', ?)
+            """, transactionId, accountId, amount, region);
+
         return true;
     }
 }
 ```
 
-## 6. PostgreSQL Logical Replication for Multi-Region
+## GDPR Data Residency Validation
 
-```sql
--- On primary (us-east-1): create publication for payment tables
-CREATE PUBLICATION payment_tables_pub
-    FOR TABLE payments, accounts, audit_log
-    WITH (publish = 'insert,update,delete');
-
--- On replica (eu-west-1): create subscription to primary
-CREATE SUBSCRIPTION payment_tables_sub
-    CONNECTION 'host=primary.use1.example.com port=5432 dbname=payments user=replicator password=...'
-    PUBLICATION payment_tables_pub
-    WITH (copy_data = true, synchronous_commit = 'remote_write');
-```
+GDPR Article 44 restricts transfers of EU personal data to countries without adequate protection. In a multi-region active-active architecture, writes routed outside the EU for EU customer data are a compliance violation.
 
 ```java
+package com.fintech.multiregion.compliance;
+
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+import java.util.Set;
+
 /**
- * Application-level replication lag monitoring.
- * Replication lag is the gap between primary and replica.
- * For payment systems, alert if lag exceeds 5 seconds.
+ * Validates that payment data is processed in a compliant region
+ * based on the customer's regulatory jurisdiction.
+ *
+ * GDPR Article 44: EU customer data must stay in EU regions.
+ * UK GDPR: UK customer data must stay in UK/EU/adequate regions.
  */
 @Component
-@RequiredArgsConstructor
-@Slf4j
-public class ReplicationLagMonitor {
+public class DataResidencyValidator {
 
-    private final DataSource primaryDataSource;
-    private final DataSource replicaDataSource;
-    private final MeterRegistry meterRegistry;
+    private static final Map<String, Set<String>> ALLOWED_REGIONS = Map.of(
+        "EU",  Set.of("eu-west-1", "eu-west-2", "eu-central-1", "eu-north-1"),
+        "UK",  Set.of("eu-west-2", "eu-west-1"),  // UK GDPR — EU is adequate
+        "US",  Set.of("us-east-1", "us-east-2", "us-west-2"),
+        "APAC", Set.of("ap-southeast-1", "ap-northeast-1", "ap-south-1")
+    );
 
-    @Scheduled(fixedDelay = 10_000)  // Every 10s
-    public void measureReplicationLag() {
-        try {
-            // Write a heartbeat to primary
-            Instant heartbeatTime = Instant.now();
-            writeHeartbeat(primaryDataSource, heartbeatTime);
-
-            // Read from replica and compare
-            Instant replicaHeartbeat = readLatestHeartbeat(replicaDataSource);
-            if (replicaHeartbeat != null) {
-                long lagMs = Duration.between(replicaHeartbeat, heartbeatTime).toMillis();
-                meterRegistry.gauge("postgresql.replication.lag.ms",
-                    Tags.of("replica", "eu-west-1"), lagMs);
-
-                if (lagMs > 5_000) {
-                    log.warn("Replication lag HIGH: {}ms to eu-west-1", lagMs);
-                }
-                if (lagMs > 30_000) {
-                    log.error("Replication lag CRITICAL: {}ms — routing reads to primary",
-                        lagMs);
-                    // Temporarily redirect reads to primary to avoid stale data
-                    routingConfig.disableReplicaReads("eu-west-1");
-                }
-            }
-        } catch (Exception e) {
-            log.error("Failed to measure replication lag", e);
-        }
-    }
+    private static final Map<String, String> CURRENCY_TO_JURISDICTION = Map.of(
+        "EUR", "EU",
+        "GBP", "UK",
+        "USD", "US",
+        "SGD", "APAC",
+        "JPY", "APAC",
+        "INR", "APAC"
+    );
 
     /**
-     * Query PostgreSQL's built-in replication lag view.
+     * Validates that processing the payment in targetRegion is compliant.
+     *
+     * @param currency  The payment currency (used to infer customer jurisdiction)
+     * @param targetRegion  The AWS region where processing will occur
+     * @return ValidationResult with allowed=true if compliant
      */
-    @Query(nativeQuery = true,
-        value = "SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())) * 1000")
-    Double getReplicationLagMs();
+    public ValidationResult validate(String currency, String targetRegion) {
+        String jurisdiction = CURRENCY_TO_JURISDICTION.get(currency.toUpperCase());
+        if (jurisdiction == null) {
+            // Unknown currency — allow but flag for manual review
+            return ValidationResult.allowed("Unknown currency jurisdiction, manual review required");
+        }
+
+        Set<String> allowed = ALLOWED_REGIONS.get(jurisdiction);
+        if (allowed == null || !allowed.contains(targetRegion)) {
+            return ValidationResult.denied(
+                String.format(
+                    "GDPR violation: %s currency (%s jurisdiction) cannot be " +
+                    "processed in region %s. Allowed regions: %s",
+                    currency, jurisdiction, targetRegion, allowed)
+            );
+        }
+
+        return ValidationResult.allowed("Compliant: " + currency + " in " + targetRegion);
+    }
+
+    public record ValidationResult(boolean allowed, String reason) {
+        public static ValidationResult allowed(String reason) {
+            return new ValidationResult(true, reason);
+        }
+        public static ValidationResult denied(String reason) {
+            return new ValidationResult(false, reason);
+        }
+    }
 }
 ```
 
-## 7. Regional Consistency Guarantees
+### Integration with Router
 
 ```java
-/**
- * Read consistency policy based on data criticality.
- *
- * STRONG: Always read from primary.
- *   - Used for: account balance before debit, fraud check state
- *   - Cost: cross-region latency for non-primary regions
- *
- * BOUNDED_STALENESS: Read from local replica if lag < threshold.
- *   - Used for: payment history, account metadata
- *   - Cost: possible stale reads up to threshold
- *
- * EVENTUAL: Always read from local replica.
- *   - Used for: exchange rate caches, notification preferences
- *   - Cost: possible stale reads (bounded by replication lag)
- */
-public enum ConsistencyLevel {
-    STRONG, BOUNDED_STALENESS, EVENTUAL
+// In RegionAwarePaymentRouter.routePayment():
+
+DataResidencyValidator.ValidationResult residency =
+    dataResidencyValidator.validate(request.currency(), homeRegion);
+
+if (!residency.allowed()) {
+    throw new DataResidencyViolationException(residency.reason());
 }
 
-@Service
-@RequiredArgsConstructor
-public class ConsistencyAwareRepository {
+// Then proceed with routing to homeRegion
+```
 
-    private final DataSource primaryDataSource;
-    private final DataSource replicaDataSource;
-    private final ReplicationLagMonitor lagMonitor;
+## Latency Budget
 
-    public Optional<Account> findAccount(String accountId,
-                                          ConsistencyLevel consistency) {
-        DataSource ds = switch (consistency) {
-            case STRONG -> primaryDataSource;
-            case BOUNDED_STALENESS -> {
-                long lagMs = lagMonitor.getCurrentLagMs("eu-west-1");
-                yield lagMs < 2_000 ? replicaDataSource : primaryDataSource;
-            }
-            case EVENTUAL -> replicaDataSource;
-        };
+Understanding latency across regions is essential for SLA design.
 
-        return new JdbcTemplate(ds).queryForObject(
-            "SELECT * FROM accounts WHERE id = ?",
-            accountRowMapper,
-            UUID.fromString(accountId)
+| Connection | Protocol | Typical RTT | P99 RTT |
+|---|---|---|---|
+| Same region (AZ-to-AZ) | gRPC/HTTP2 | 1-3ms | 8ms |
+| EU-WEST-1 to EU-CENTRAL-1 | gRPC | 10-15ms | 25ms |
+| EU-WEST-1 to US-EAST-1 | gRPC | 90-110ms | 140ms |
+| US-EAST-1 to AP-SOUTHEAST-1 | gRPC | 170-200ms | 250ms |
+| EU-WEST-1 to AP-SOUTHEAST-1 | gRPC | 160-180ms | 230ms |
+
+```
+Payment authorization budget (target: <200ms end-to-end):
+
+CASE 1: Request arrives at home region (best case)
+  API gateway:        5ms
+  Auth/JWT validate:  3ms
+  Local DB write:    10ms   (CockroachDB home region)
+  Response:           2ms
+  Total:             20ms   <-- excellent
+
+CASE 2: Request arrives at non-home region (EU customer, request lands in US)
+  US API gateway:         5ms
+  Auth/JWT validate:      3ms
+  Cross-region gRPC:    110ms   (US -> EU RTT)
+  EU DB write:           10ms
+  EU -> US response:    110ms
+  US response:            2ms
+  Total:                240ms   <-- exceeds 200ms SLA
+
+MITIGATION: Use Anycast DNS / GeoDNS to route EU customers to EU endpoints.
+  AWS Global Accelerator with endpoint affinity.
+  Acceptable: 1-5% cross-region requests when GeoDNS propagation lags.
+```
+
+## Circuit Breaker on Cross-Region gRPC
+
+```yaml
+resilience4j:
+  circuit-breaker:
+    instances:
+      cross-region-eu-west-1:
+        register-health-indicator: true
+        sliding-window-size: 20
+        failure-rate-threshold: 30        # Sensitive: 30% failure trips circuit
+        slow-call-duration-threshold: 300ms  # Cross-region should be <300ms
+        slow-call-rate-threshold: 50
+        wait-duration-in-open-state: 30s  # Give the remote region time to recover
+        permitted-number-of-calls-in-half-open-state: 5
+        writable-stack-trace-enabled: false  # Performance: skip stack traces
+
+      cross-region-us-east-1:
+        sliding-window-size: 20
+        failure-rate-threshold: 30
+        slow-call-duration-threshold: 300ms
+        slow-call-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 5
+```
+
+When a cross-region circuit opens, the routing strategy changes:
+
+```java
+private PaymentResponse routeToRegion(PaymentRequest request, String targetRegion) {
+    String cbName = "cross-region-" + targetRegion;
+    CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker(cbName);
+
+    try {
+        return circuitBreaker.executeSupplier(() -> proxyToRegion(request, targetRegion));
+    } catch (io.github.resilience4j.circuitbreaker.CallNotPermittedException e) {
+        // Cross-region circuit is OPEN — remote region is degraded
+        // Options:
+        //   1. Return PENDING and queue for async retry (safest for payments)
+        //   2. If the payment can be processed locally (e.g., balance check can be deferred),
+        //      process locally and reconcile later
+        //   For payment authorization: always PENDING — never approve without balance check
+        return new PaymentResponse(
+            request.paymentId(),
+            PaymentStatus.PENDING,
+            "Home region " + targetRegion + " unreachable, queued for retry"
         );
     }
 }
 ```
 
-## 8. Failover Automation
+## Cross-Region Payment Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant Client as Client (EU Browser)
+    participant GA as AWS Global Accelerator
+    participant US as US-EAST-1<br/>Payment API
+    participant EU as EU-WEST-1<br/>Payment API
+    participant DB as CockroachDB<br/>EU-WEST-1 (home)
+    participant Kafka as Kafka<br/>Cross-Region Replication
+
+    Client->>GA: POST /payments (EUR, acc-EUR-001)
+    Note over GA: GeoDNS should route EU<br/>clients to eu-west-1<br/>but occasionally fails
+    GA->>US: Routes to US (GeoDNS lag)
+    US->>US: Lookup home region for acc-EUR-001
+    US->>US: home = eu-west-1, current = us-east-1
+    US->>US: Validate GDPR: EUR currency must stay in EU
+    US->>EU: gRPC proxy: processPayment() [<300ms budget]
+    EU->>DB: BEGIN; SELECT balance FOR UPDATE; UPDATE balance; INSERT tx; COMMIT
+    DB-->>EU: Transaction committed
+    EU-->>US: PaymentResponse(APPROVED)
+    US-->>GA: 200 OK
+    GA-->>Client: 200 OK APPROVED
+    EU->>Kafka: Publish PaymentCompletedEvent (for replication)
+    Kafka->>US: Replicate event (async, ~100ms lag)
+    US->>US: Update local read replica
+```
+
+## Disaster Recovery: Zero RPO with Active-Active
+
+Active-active achieves zero RPO because every region is always processing live traffic. When EU-WEST-1 fails:
+
+```
+Normal state:
+  EU-WEST-1: processing EUR payments (home region for EU accounts)
+  US-EAST-1: processing USD payments (home region for US accounts)
+
+EU-WEST-1 failure at T=0:
+  AWS Global Accelerator: detects health check failure in <30 seconds
+  GeoDNS: re-routes ALL traffic to US-EAST-1
+
+US-EAST-1 receives EUR payment request:
+  Looks up home region: eu-west-1
+  Tries to proxy: cross-region circuit breaker OPEN (EU is down)
+  Decision: payment = PENDING (queued in Kafka for retry)
+
+When EU-WEST-1 recovers at T=N:
+  AWS Global Accelerator: detects health restored
+  GeoDNS: re-routes EU traffic back to EU-WEST-1
+  Kafka retry consumer: processes queued PENDING payments
+  Zero data loss: all transactions either committed in EU or queued safely
+```
+
+**RPO = 0** because no committed data is lost. EU transactions either committed to CockroachDB (which replicates synchronously to EU availability zones) or are durably queued in Kafka (also replicated). There is no "replication lag to catch up" because the data is already durable.
+
+**RTO approaches zero** (seconds for DNS propagation, not minutes for manual failover).
+
+## Failover Runbook
+
+```
+RUNBOOK: EU-WEST-1 Region Failure Response
+
+DETECTION:
+  1. PagerDuty fires: "eu-west-1 health checks failing > 2 minutes"
+  2. Grafana alert: "cross-region circuit breaker eu-west-1 OPEN"
+  3. CloudWatch: EC2/ECS instances in eu-west-1 not responding
+
+IMMEDIATE ACTIONS (first 5 minutes):
+  1. Confirm failure scope: AWS Service Health Dashboard
+  2. Verify Global Accelerator has removed eu-west-1 from routing
+     - Check: AWS Console > Global Accelerator > Endpoint Groups
+     - Expected: eu-west-1 health = UNHEALTHY, weight = 0
+  3. Verify US/AP regions receiving increased traffic (expected +100% EU traffic)
+  4. Confirm Kafka queuing: check PENDING payments queue depth
+     - Alert if queue > 10,000 (indicates backup accumulating)
+
+DURING OUTAGE:
+  1. EUR payments: queued as PENDING in us-east-1 Kafka
+  2. Communicate to merchants via status page: "EU payments delayed, not lost"
+  3. Monitor queue depth every 5 minutes
+  4. If outage > 30 minutes: consider emergency exception to process EUR
+     payments from US with async reconciliation (requires risk approval)
+
+RECOVERY:
+  1. EU-WEST-1 health checks pass > 3 consecutive checks
+  2. Global Accelerator automatically re-routes EU traffic
+  3. Kafka retry consumer processes PENDING EUR payments
+  4. Reconcile: query CockroachDB for any duplicate payment risks
+  5. Post-incident review within 48 hours
+```
+
+## Production Pitfalls
+
+### Pitfall 1: Assuming Cross-Region Latency Is Acceptable for All Operations
+
+Teams build active-active and then discover that synchronous cross-region gRPC calls add 100-200ms to every mis-routed request. Without GeoDNS or Anycast routing, every EU customer hitting a US edge node pays the cross-region penalty.
 
 ```java
-/**
- * Regional failover controller.
- * Monitors region health and triggers automatic failover.
- */
-@Component
-@RequiredArgsConstructor
-@Slf4j
-public class RegionalFailoverController {
-
-    private final RegionHealthChecker healthChecker;
-    private final TrafficRouter trafficRouter;
-    private final AlertingService alerting;
-
-    private volatile String activeRegion = "us-east-1";
-    private volatile FailoverState state = FailoverState.NORMAL;
-
-    @Scheduled(fixedDelay = 15_000)  // Check every 15s
-    public void checkAndFailover() {
-        RegionHealth health = healthChecker.checkAllRegions();
-
-        if (health.isPrimaryHealthy() && state == FailoverState.NORMAL) {
-            return;  // All good
-        }
-
-        if (!health.isPrimaryHealthy() && state == FailoverState.NORMAL) {
-            initiateFailover(health.getHealthyRegion());
-        }
-
-        if (health.isPrimaryHealthy() && state == FailoverState.FAILED_OVER) {
-            initiateFailback();
-        }
+// WRONG: no routing affinity — every request may hit any region
+// A European customer routed to US-EAST-1 pays 200ms round trip
+// for every payment authorization
+@RestController
+public class PaymentController {
+    @PostMapping("/payments")
+    public PaymentResponse createPayment(@RequestBody PaymentRequest request) {
+        // No region awareness — just process wherever the load balancer sent us
+        return paymentService.process(request);
     }
+}
 
-    private void initiateFailover(String targetRegion) {
-        log.error("PRIMARY REGION UNHEALTHY — initiating failover to {}",
-            targetRegion);
+// CORRECT: check if we are in the home region; proxy if not
+// But more importantly: configure AWS Global Accelerator with endpoint
+// affinity so EU clients reach EU endpoints in the first place
 
-        state = FailoverState.FAILING_OVER;
+// In application.yml, expose the region for health checks:
+// management.endpoint.health.probes.enabled: true
+// Use this health endpoint in Global Accelerator target group health check
 
-        // Alert team immediately
-        alerting.page(PagerDutyAlert.critical(
-            "Regional failover initiated to " + targetRegion));
+// Also: implement latency-based routing in Route53 or Global Accelerator
+// to ensure <1% of requests need cross-region proxying under normal conditions
 
-        try {
-            // 1. Stop writing to unhealthy primary
-            trafficRouter.drainRegion(activeRegion);
+@RestController
+public class PaymentController {
+    private final RegionAwarePaymentRouter router;
 
-            // 2. Wait for in-flight requests to complete (max 30s)
-            trafficRouter.awaitDrain(activeRegion, Duration.ofSeconds(30));
-
-            // 3. Route traffic to target region
-            trafficRouter.activateRegion(targetRegion);
-            activeRegion = targetRegion;
-            state = FailoverState.FAILED_OVER;
-
-            log.info("Failover complete — now serving from {}", targetRegion);
-        } catch (Exception e) {
-            log.error("Failover to {} failed!", targetRegion, e);
-            state = FailoverState.NORMAL;
-            alerting.page(PagerDutyAlert.critical("FAILOVER FAILED: " + e.getMessage()));
-        }
-    }
-
-    private void initiateFailback() {
-        log.info("Primary region healthy — initiating failback to us-east-1");
-        // Failback is manual — requires ops approval to avoid oscillation
-        alerting.notify("Primary region recovered — manual failback available");
+    @PostMapping("/payments")
+    public PaymentResponse createPayment(@RequestBody PaymentRequest request) {
+        // Router checks home region and proxies if necessary
+        // But this code path should be rare — Global Accelerator handles affinity
+        return router.routePayment(request);
     }
 }
 ```
 
-## 9. Latency Implications of Multi-Region
+### Pitfall 2: Using Last-Write-Wins for Financial Balances Causes Double Debits
 
-```
-Inter-region latency (approximate AWS round trips):
-  us-east-1 ↔ us-west-2:         ~65ms
-  us-east-1 ↔ eu-west-1:        ~80ms
-  us-east-1 ↔ ap-southeast-1:   ~230ms
-  eu-west-1 ↔ ap-southeast-1:   ~170ms
-
-Impact on payment processing:
-  Strong consistency read (primary in us-east-1, user in eu-west-1):
-    + 80ms round trip added to every read
-    → Mitigate: regional partitioning (account lives in its nearest region)
-
-  Cross-region write forwarding (home region routing):
-    + 80ms for EU users paying from EU accounts via EU gateway
-    → 0ms if account is home-region in EU
-
-  Replication lag for async replica reads:
-    → p99 replication lag: 50–200ms under normal conditions
-    → p99 replication lag: 500ms–5s during batch settlement windows
-    → Mitigate: bounded staleness routing + replication lag monitoring
-```
+Vector clocks and "last write wins" are acceptable for shopping carts. They are catastrophic for financial balances. The double-debit scenario described at the start of this lesson is a real production incident pattern.
 
 ```java
-/**
- * Latency budget adjustment for multi-region operations.
- * Cross-region calls must account for inter-region round trip.
- */
-@Component
-public class MultiRegionLatencyBudget {
+// WRONG: last-write-wins merge for balance updates
+// This can produce negative balances or double debits
 
-    private static final Map<String, Map<String, Duration>> REGION_LATENCIES = Map.of(
-        "us-east-1", Map.of(
-            "us-west-2", Duration.ofMillis(65),
-            "eu-west-1", Duration.ofMillis(80),
-            "ap-southeast-1", Duration.ofMillis(230)
-        ),
-        "eu-west-1", Map.of(
-            "us-east-1", Duration.ofMillis(80),
-            "ap-southeast-1", Duration.ofMillis(170)
-        )
+// In a Cassandra-style LWW setup (DO NOT DO THIS FOR BALANCES):
+public void updateBalance(String accountId, BigDecimal newBalance) {
+    // Cassandra: last write by timestamp wins
+    // If EU writes balance=400 at T=100ms and US writes balance=300 at T=101ms,
+    // US wins and balance=300. But the EU debit of $600 was already approved.
+    // Customer effectively debited $700 + $600 = $1300 from $1000 balance.
+    cassandraSession.execute(
+        "UPDATE accounts SET balance = ? WHERE account_id = ?",
+        newBalance, accountId
     );
+}
 
-    public Duration estimatedCrossRegionLatency(String sourceRegion,
-                                                  String targetRegion) {
-        return REGION_LATENCIES
-            .getOrDefault(sourceRegion, Map.of())
-            .getOrDefault(targetRegion, Duration.ofMillis(300)); // conservative default
-    }
+// CORRECT: home-region routing ensures only ONE region owns writes for each account
+// The home region performs a serializable balance check before every debit
+// No cross-region balance merge ever happens
+public boolean debitBalance(String accountId, BigDecimal amount) {
+    // This runs in the home region only — no conflict possible
+    // CockroachDB serializable transaction guarantees atomicity
+    return accountRepository.debitAccount(
+        UUID.fromString(accountId), amount,
+        UUID.randomUUID(),
+        currentRegion
+    );
+}
+```
 
-    /**
-     * Adjust operation timeout to account for cross-region routing.
-     */
-    public Duration adjustedTimeout(Duration baseTimeout,
-                                     String sourceRegion,
-                                     String targetRegion) {
-        if (sourceRegion.equals(targetRegion)) {
-            return baseTimeout;
-        }
-        Duration overhead = estimatedCrossRegionLatency(sourceRegion, targetRegion)
-            .multipliedBy(2);  // Round trip
-        return baseTimeout.plus(overhead);
+### Pitfall 3: Not Testing Actual Failover Under Load
+
+Teams test failover in staging with zero traffic and declare success. Production failover with 50,000 req/min looks completely different.
+
+```
+Common failure modes during real failover:
+
+1. DNS TTL not respected by client-side caches:
+   - Some CDN/client caches ignore TTL
+   - Traffic continues to failed region for minutes after removal
+   FIX: Set DNS TTL to 60 seconds for payment endpoints (not 300s default)
+       Implement client-side retry with region-override header
+
+2. Kafka consumer groups not rebalanced:
+   - Consumers in EU that were processing PENDING queue are dead
+   - Consumers in US may not have correct partition assignments
+   FIX: Kafka consumer groups must span regions
+       Use consumer.session.timeout.ms=30000 (not default 45000)
+       Monitor consumer group lag per region separately
+
+3. Cross-region circuit breakers not configured:
+   - US-EAST-1 keeps retrying EU-WEST-1 for every EUR payment
+   - EU-WEST-1 is overloaded with reconnection attempts on recovery
+   FIX: Circuit breaker on every cross-region gRPC channel (shown above)
+       Exponential backoff on HALF_OPEN probes
+
+// Load test your failover — chaos engineering with actual traffic
+// Use AWS Fault Injection Simulator to simulate region failure:
+// (conceptual, not AWS SDK)
+public class FailoverLoadTest {
+    public void simulateRegionFailure() {
+        // 1. Record current error rate baseline
+        // 2. Inject network partition to eu-west-1
+        // 3. Measure: how quickly does traffic shift?
+        // 4. Measure: how many payments go to PENDING vs FAILED?
+        // 5. Measure: queue depth accumulation rate
+        // 6. Remove partition and measure recovery time
+        // Target: <30s for traffic shift, 0 FAILED (only PENDING)
     }
 }
 ```
 
-## 10. Payment Routing Across Regions
+## Checklist
 
-```java
-/**
- * Global payment router: determines which region should process a payment.
- * Considers: account home region, gateway availability, regulatory requirements.
- */
-@Service
-@RequiredArgsConstructor
-public class GlobalPaymentRouter {
-
-    private final AccountRegionRouter accountRouter;
-    private final GatewayAvailabilityRegistry gatewayRegistry;
-    private final RegulatoryRoutingPolicy regulatoryPolicy;
-
-    public PaymentRoute determineRoute(PaymentRequest request) {
-        // 1. Regulatory check: some transactions must stay in specific jurisdictions
-        Optional<String> mandatedRegion = regulatoryPolicy.getMandatedRegion(request);
-        if (mandatedRegion.isPresent()) {
-            return PaymentRoute.of(mandatedRegion.get(),
-                RoutingReason.REGULATORY_MANDATE);
-        }
-
-        // 2. Account home region (minimize cross-region write forwarding)
-        String debitAccountRegion = accountRouter.getHomeRegion(
-            request.getDebitAccountId());
-
-        // 3. Check if home region gateway is available
-        if (gatewayRegistry.isAvailable(debitAccountRegion)) {
-            return PaymentRoute.of(debitAccountRegion,
-                RoutingReason.ACCOUNT_HOME_REGION);
-        }
-
-        // 4. Home region gateway unavailable — find nearest healthy region
-        String fallbackRegion = gatewayRegistry.getNearestHealthyRegion(
-            debitAccountRegion);
-
-        log.warn("Gateway unavailable in home region={}, routing to fallback={}",
-            debitAccountRegion, fallbackRegion);
-
-        return PaymentRoute.of(fallbackRegion, RoutingReason.GATEWAY_FAILOVER);
-    }
-}
-```
-
----
+- [ ] Home-region assignment stored for every account at creation time
+- [ ] GeoDNS / Global Accelerator configured to route clients to their nearest home region
+- [ ] Cross-region gRPC calls protected by circuit breaker per target region
+- [ ] Cross-region circuit breaker failure threshold set lower than intra-region (30% vs 50%)
+- [ ] Payment balance debits use serializable transactions — never last-write-wins
+- [ ] GDPR data residency validation runs before every cross-region proxy
+- [ ] G-Counter CRDTs used for aggregate metrics (not for balance arithmetic)
+- [ ] CockroachDB REGIONAL BY ROW configured for accounts and transactions
+- [ ] Kafka cross-region replication enabled for PENDING payment queue
+- [ ] DNS TTL set to 60 seconds for payment endpoints
+- [ ] Kafka consumer groups span regions with appropriate session timeout
+- [ ] Failover runbook documented and tested quarterly under load
+- [ ] AWS Global Accelerator endpoint health checks configured and verified
+- [ ] Post-failover reconciliation procedure tested (queued PENDING payments retry)
+- [ ] Latency budgets documented per region pair; SLA adjusted for cross-region scenarios
 
 <!-- KNOWLEDGE-CHECK
-{
-  "questions": [
-    {
-      "text": "What is the fundamental challenge that makes active-active architecture difficult compared to active-passive?",
-      "options": ["Higher infrastructure cost", "Concurrent writes to multiple primaries creating potential data conflicts", "More complex load balancing", "Higher network latency between regions"],
-      "correct": 1,
-      "explanation": "Active-passive has a single write path, so there are no concurrent write conflicts. Active-active allows writes in multiple regions simultaneously, requiring conflict detection and resolution strategies. The data architecture is what makes active-active hard, not the infrastructure deployment."
-    },
-    {
-      "text": "Which CRDT type is appropriate for tracking a distributed daily spending limit across multiple regions without requiring coordination?",
-      "options": ["LWW-Register (Last-Write-Wins)", "OR-Set (Observed-Remove Set)", "G-Counter (Grow-only Counter)", "2P-Set (Two-Phase Set)"],
-      "correct": 2,
-      "explanation": "A G-Counter is a grow-only counter where each region maintains its own increment slot and the total is the sum of all regional counters. It has no conflicts because each region only writes to its own slot, making it ideal for distributed spend tracking."
-    },
-    {
-      "text": "When should a payment system use STRONG consistency reads rather than reading from a local replica?",
-      "options": ["For transaction history queries", "For reading exchange rate caches", "For reading account balance before a debit operation", "For notification preference lookups"],
-      "correct": 2,
-      "explanation": "Account balance before a debit must be read with STRONG consistency from the primary to prevent overdrafts. Reading stale balance data from a replica could allow a debit that exceeds the actual balance. Transaction history and preferences tolerate staleness."
-    }
-  ]
-}
+{"questions":[{"text":"A customer in France has a EUR account with 1000 EUR balance. At the same millisecond, EU-WEST-1 receives a 600 EUR debit and US-EAST-1 receives a 700 EUR debit. With home-region routing correctly configured, what happens?","options":["a) Both debits succeed because each region only sees its own write","b) The EU-WEST-1 debit is processed; the US-EAST-1 request is proxied to EU-WEST-1 and serialized, so only one can succeed given the balance constraint","c) Last-write-wins: the debit with the later timestamp wins and the other is silently dropped","d) Both requests fail with a conflict exception and must be retried"],"correct":1,"explanation":"With home-region routing, the EUR account's home region is EU-WEST-1. The EU write processes locally. The US write is proxied to EU-WEST-1 via gRPC. Both writes are serialized in EU-WEST-1 as CockroachDB serializable transactions. The first debit succeeds (1000-600=400 remaining). The second debit (700 EUR) fails the balance check (400 < 700) and returns DECLINED. No double debit is possible."},{"text":"You implement a G-Counter CRDT for transaction counts across three regions. EU has {eu:150, us:0, ap:0}, US has {eu:0, us:200, ap:0}. After merging, what is the global transaction count?","options":["a) 150 (EU's local count only)","b) 200 (US's local count only)","c) 350 (sum after taking max per node)","d) 350 only if the merge happened in a specific order"],"correct":2,"explanation":"G-Counter merge takes the max value per node slot: merged = {eu: max(150,0)=150, us: max(0,200)=200, ap: max(0,0)=0}. Global value = 150+200+0 = 350. Because merge is commutative and associative, the order of merging does not matter. This is the key CRDT property: eventual consistency without coordination."},{"text":"What is the primary reason active-active multi-region achieves zero RTO while active-passive achieves only near-zero RTO?","options":["a) Active-active uses faster database replication technology","b) Active-active requires no failover action because every region is already serving live traffic; active-passive requires a promotion step","c) Active-active stores data in memory while active-passive uses disk","d) Active-passive requires VPN tunnels that add latency during failover"],"correct":1,"explanation":"RTO measures how long the system is unavailable after a failure. In active-passive, the passive region must be promoted to active (DNS changes, connection pool restarts, health checks) which takes minutes. In active-active, all regions are already serving traffic. When EU-WEST-1 fails, AWS Global Accelerator re-routes in seconds (not minutes) to US-EAST-1 which is already processing payments. No promotion step is needed."}]}
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{
-  "title": "Multi-Region Payment Routing with Conflict Resolution",
-  "difficulty": "advanced",
-  "estimatedMinutes": 45,
-  "tasks": [
-    {"id": "1", "description": "Implement an AccountRegionRouter that assigns each account to a home region using consistent hashing, routes writes to the home region (forwarding cross-region writes via HTTP), and allows eventual-consistency reads from local replicas for non-financial data."},
-    {"id": "2", "description": "Build a G-Counter CRDT for distributed daily spending limits: each region increments only its own slot, the total is the sum of all slots, and merge() takes the max of each regional value. Test with concurrent increments from two simulated regions."},
-    {"id": "3", "description": "Implement a ReplicationLagMonitor that writes heartbeat records to the primary, reads them back from the replica, computes lag in milliseconds, publishes the gauge to Prometheus, and disables replica reads when lag exceeds 30 seconds."},
-    {"id": "4", "description": "Build a GlobalPaymentRouter that checks regulatory mandates first, falls back to account home region routing, and falls back again to the nearest healthy region when the home region gateway is unavailable. Write unit tests for all three routing paths."}
-  ]
-}
+{"title":"Build a Multi-Region Active-Active Payment Router with Conflict Prevention","difficulty":"principal","estimatedMinutes":90,"tasks":[{"id":"1","description":"Implement a RegionAwarePaymentRouter that assigns home regions to accounts based on currency (EUR->eu-west-1, USD->us-east-1, SGD->ap-southeast-1). Store the mapping in Redis with a KEY_PREFIX. For payment requests arriving at a non-home region, proxy via gRPC to the home region. Add a DataResidencyValidator that blocks EUR payments from being processed outside EU regions. Write unit tests covering: (a) home region match routes locally, (b) non-home region proxies correctly, (c) GDPR violation throws DataResidencyViolationException."},{"id":"2","description":"Implement a GCounter CRDT with full merge semantics. Write a test that proves commutativity (merge(A,B) equals merge(B,A)), associativity (merge(merge(A,B),C) equals merge(A,merge(B,C))), and idempotency (merge(A,A) equals A). Then implement a MerchantTransactionCounter service that uses GCounter per merchant, exposes recordPayment(), getTransactionCount(), and applyReplicationEvent(). Simulate a cross-region replication scenario where EU and US each record 100 payments for the same merchant, exchange snapshots, and verify the merged count is 200."},{"id":"3","description":"Configure CockroachDB (or simulate with H2 for testing) with a multi-region account schema. Implement AccountRepository.debitAccount() as a serializable transaction that (a) checks balance with FOR UPDATE lock, (b) updates balance only if sufficient, (c) inserts a transaction record. Write a concurrent test using 10 threads that all attempt to debit 100 from an account with 500 balance. Verify exactly 5 succeed and 5 are declined with no negative balance possible. This demonstrates that serializable transactions prevent double-debit."},{"id":"4","description":"Add circuit breakers for cross-region gRPC calls using Resilience4j. Configure: failure rate threshold 30%, slow call threshold 300ms, open state wait 30s. Implement a fallback that returns PaymentStatus.PENDING when the cross-region circuit is open. Write a test using WireMock that simulates EU-WEST-1 becoming unavailable. Verify: (a) circuit opens after 30% failure rate, (b) subsequent EUR payments from US return PENDING (not FAILED), (c) circuit transitions to HALF_OPEN after 30 seconds, (d) a successful probe closes the circuit and payments resume routing correctly."}]}
 -->
-

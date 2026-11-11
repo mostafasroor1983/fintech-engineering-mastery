@@ -1,52 +1,212 @@
 {
   "version": "1.0",
-  "lastUpdated": "2026-11-07",
+  "lastUpdated": "2026-11-11",
   "totalTracks": 14,
-  "totalLessons": 286,
+  "totalLessons": 287,
   "tracks": [
-    { "id": "track-01", "slug": "architecture",          "lessons": [] },
-    { "id": "track-02", "slug": "distributed-systems",   "lessons": [] },
-    { "id": "track-03", "slug": "concurrency",           "lessons": [] },
-    { "id": "track-04", "slug": "async-reactive",        "lessons": [] },
-    { "id": "track-05", "slug": "banking-systems",       "lessons": [] },
-    { "id": "track-06", "slug": "transaction-integrity", "lessons": [] },
-    { "id": "track-07", "slug": "financial-crime",       "lessons": [] },
-    { "id": "track-08", "slug": "reliability",           "lessons": [] },
-    { "id": "track-09", "slug": "performance",           "lessons": [] },
-    { "id": "track-10", "slug": "database",              "lessons": [] },
-    { "id": "track-11", "slug": "messaging",             "lessons": [] },
-    { "id": "track-12", "slug": "cloud-platform",        "lessons": [] },
-    { "id": "track-13", "slug": "security-observability","lessons": [] },
-    { "id": "track-14", "slug": "leadership",            "lessons": [] }
+    {
+      "id": "track-01",
+      "slug": "architecture",
+      "lessons": []
+    },
+    {
+      "id": "track-02",
+      "slug": "distributed-systems",
+      "lessons": []
+    },
+    {
+      "id": "track-03",
+      "slug": "concurrency",
+      "lessons": []
+    },
+    {
+      "id": "track-04",
+      "slug": "async-reactive",
+      "lessons": []
+    },
+    {
+      "id": "track-05",
+      "slug": "banking-systems",
+      "lessons": []
+    },
+    {
+      "id": "track-06",
+      "slug": "transaction-integrity",
+      "lessons": []
+    },
+    {
+      "id": "track-07",
+      "slug": "financial-crime",
+      "lessons": []
+    },
+    {
+      "id": "track-08",
+      "slug": "reliability",
+      "lessons": []
+    },
+    {
+      "id": "track-09",
+      "slug": "performance",
+      "lessons": []
+    },
+    {
+      "id": "track-10",
+      "slug": "database",
+      "lessons": []
+    },
+    {
+      "id": "track-11",
+      "slug": "messaging",
+      "lessons": []
+    },
+    {
+      "id": "track-12",
+      "slug": "cloud-platform",
+      "lessons": []
+    },
+    {
+      "id": "track-13",
+      "slug": "security-observability",
+      "lessons": []
+    },
+    {
+      "id": "track-14",
+      "slug": "leadership",
+      "lessons": []
+    }
   ],
   "decisionLabScenarios": [
-    { "id": "lab-01", "title": "The Overnight Overdraft",          "status": "published" },
-    { "id": "lab-02", "title": "The Double Charge",                "status": "published" },
-    { "id": "lab-03", "title": "The Lost Event",                   "status": "published" },
-    { "id": "lab-04", "title": "The Hot Account",                  "status": "published" },
-    { "id": "lab-05", "title": "The Failed Saga",                  "status": "published" },
-    { "id": "lab-06", "title": "The Cascading Timeout",            "status": "published" },
-    { "id": "lab-07", "title": "The Kafka Rebalance Storm",        "status": "published" },
-    { "id": "lab-08", "title": "The GC Storm",                     "status": "published" },
-    { "id": "lab-09", "title": "The Phantom Trade",                "status": "published" },
-    { "id": "lab-10", "title": "The Duplicate Charge",             "status": "published" },
-    { "id": "lab-11", "title": "The Database Migration Deadline",  "status": "published" },
-    { "id": "lab-12", "title": "The Outbox Failure",               "status": "published" },
-    { "id": "lab-13", "title": "The Memory Leak",                  "status": "published" },
-    { "id": "lab-14", "title": "The Alert Fatigue",                "status": "published" },
-    { "id": "lab-15", "title": "The Config Disaster",              "status": "published" },
-    { "id": "lab-16", "title": "The Slow Query Bomb",              "status": "published" },
-    { "id": "lab-17", "title": "The API Breaking Change",          "status": "published" },
-    { "id": "lab-18", "title": "The Audit Gap",                    "status": "published" },
-    { "id": "lab-19", "title": "The Split Brain",                  "status": "published" },
-    { "id": "lab-20", "title": "The Microservice Maze",            "status": "published" }
+    {
+      "id": "lab-01",
+      "title": "The Overnight Overdraft",
+      "status": "published"
+    },
+    {
+      "id": "lab-02",
+      "title": "The Double Charge",
+      "status": "published"
+    },
+    {
+      "id": "lab-03",
+      "title": "The Lost Event",
+      "status": "published"
+    },
+    {
+      "id": "lab-04",
+      "title": "The Hot Account",
+      "status": "published"
+    },
+    {
+      "id": "lab-05",
+      "title": "The Failed Saga",
+      "status": "published"
+    },
+    {
+      "id": "lab-06",
+      "title": "The Cascading Timeout",
+      "status": "published"
+    },
+    {
+      "id": "lab-07",
+      "title": "The Kafka Rebalance Storm",
+      "status": "published"
+    },
+    {
+      "id": "lab-08",
+      "title": "The GC Storm",
+      "status": "published"
+    },
+    {
+      "id": "lab-09",
+      "title": "The Phantom Trade",
+      "status": "published"
+    },
+    {
+      "id": "lab-10",
+      "title": "The Duplicate Charge",
+      "status": "published"
+    },
+    {
+      "id": "lab-11",
+      "title": "The Database Migration Deadline",
+      "status": "published"
+    },
+    {
+      "id": "lab-12",
+      "title": "The Outbox Failure",
+      "status": "published"
+    },
+    {
+      "id": "lab-13",
+      "title": "The Memory Leak",
+      "status": "published"
+    },
+    {
+      "id": "lab-14",
+      "title": "The Alert Fatigue",
+      "status": "published"
+    },
+    {
+      "id": "lab-15",
+      "title": "The Config Disaster",
+      "status": "published"
+    },
+    {
+      "id": "lab-16",
+      "title": "The Slow Query Bomb",
+      "status": "published"
+    },
+    {
+      "id": "lab-17",
+      "title": "The API Breaking Change",
+      "status": "published"
+    },
+    {
+      "id": "lab-18",
+      "title": "The Audit Gap",
+      "status": "published"
+    },
+    {
+      "id": "lab-19",
+      "title": "The Split Brain",
+      "status": "published"
+    },
+    {
+      "id": "lab-20",
+      "title": "The Microservice Maze",
+      "status": "published"
+    }
   ],
   "capstoneProjects": [
-    { "id": "project-a", "title": "High-Throughput Payment Processing Platform",   "status": "published" },
-    { "id": "project-b", "title": "Concurrent Double-Entry Ledger Engine",          "status": "published" },
-    { "id": "project-c", "title": "Distributed AML & Sanctions Screening Platform", "status": "published" },
-    { "id": "project-d", "title": "Financial Reconciliation Engine",                "status": "published" },
-    { "id": "project-e", "title": "Multi-Region Banking Platform",                  "status": "published" },
-    { "id": "project-f", "title": "Production Observability & Incident Investigation Platform", "status": "published" }
+    {
+      "id": "project-a",
+      "title": "High-Throughput Payment Processing Platform",
+      "status": "published"
+    },
+    {
+      "id": "project-b",
+      "title": "Concurrent Double-Entry Ledger Engine",
+      "status": "published"
+    },
+    {
+      "id": "project-c",
+      "title": "Distributed AML & Sanctions Screening Platform",
+      "status": "published"
+    },
+    {
+      "id": "project-d",
+      "title": "Financial Reconciliation Engine",
+      "status": "published"
+    },
+    {
+      "id": "project-e",
+      "title": "Multi-Region Banking Platform",
+      "status": "published"
+    },
+    {
+      "id": "project-f",
+      "title": "Production Observability & Incident Investigation Platform",
+      "status": "published"
+    }
   ]
 }

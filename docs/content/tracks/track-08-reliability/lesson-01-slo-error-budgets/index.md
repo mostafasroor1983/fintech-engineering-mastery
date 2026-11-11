@@ -344,19 +344,27 @@ Before publishing SLOs for a financial service:
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are the reliability engineer for a payments platform with the following SLA in your customer contract: "99.9% monthly availability for payment submission API."
-
-**Tasks:**
-
-1. **Calculate the error budget**: how many minutes of downtime are allowed per month under 99.9% SLA? What SLO would you set internally (tighter than the SLA)?
-
-2. **Write the SLI Prometheus queries** for: (a) payment success rate excluding business declines (HTTP 402), and (b) P99 payment authorisation latency.
-
-3. **Define the error budget burn rate alert** using the multi-window approach: (a) a critical alert if the budget burns at 14x over 1 hour, (b) a warning alert if it burns at 6x over 6 hours. Write the PromQL expressions.
-
-4. **Design the error budget policy**: document what your team does when the budget is at 75%, 50%, 25%, and 0%.
-
-5. **BACS deadline SLO**: the BACS submission must complete by 15:30 BST every weekday. How do you model this as an SLO? What metric do you track and what alerts do you configure?
+{
+  "title": "SLOs and Error Budgets \u2014 Reliability Engineering for Finance \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 85,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Calculate the error budget"
+    },
+    {
+      "id": "2",
+      "description": "Write the SLI Prometheus queries"
+    },
+    {
+      "id": "3",
+      "description": "Define the error budget burn rate alert"
+    },
+    {
+      "id": "4",
+      "description": "Design the error budget policy"
+    }
+  ]
+}
 -->

@@ -461,17 +461,27 @@ A: The latency increase is caused by lock contention during the Prepare phase: P
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are the principal engineer at a payment processor. The current implementation uses Atomikos JTA to coordinate a PostgreSQL XA datasource and an ActiveMQ XA connection factory for all payment executions. The system processes 3,000 TPS at peak and is about to migrate to AWS (RDS Aurora, Amazon MQ).
-
-**Tasks:**
-
-1. **Identify the migration blocker:** Explain why the existing 2PC/XA approach will not work with Amazon RDS Aurora and Amazon MQ. What specific AWS limitation prevents XA support, and what error would you expect when attempting to use `PGXADataSource` against Aurora?
-
-2. **Design the outbox replacement:** Sketch the table schema for a `payment_outbox` table in PostgreSQL and write a Spring `@Transactional` service method that atomically debits an account and inserts a row into the outbox — all within a single local transaction, no JTA required.
-
-3. **Write a Debezium-compatible relay query:** Write the SQL query a relay process would use to poll unpublished outbox entries, and write the update statement that marks them as published. Explain why the relay must use a row-level lock (`SELECT FOR UPDATE SKIP LOCKED`) rather than a plain `SELECT`.
-
-4. **Handle the heuristic incident runbook:** Write a step-by-step runbook (minimum 5 steps) for responding to a `HeuristicMixedException` alert in the current 2PC system. Include how to query PostgreSQL for transactions in PREPARED state, how to query ActiveMQ for incomplete XA sessions, and what the resolution criteria are.
+{
+  "title": "Two-Phase Commit and XA Transactions \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Identify the migration blocker:"
+    },
+    {
+      "id": "2",
+      "description": "Design the outbox replacement:"
+    },
+    {
+      "id": "3",
+      "description": "Write a Debezium-compatible relay query:"
+    },
+    {
+      "id": "4",
+      "description": "Handle the heuristic incident runbook:"
+    }
+  ]
+}
 -->

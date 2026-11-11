@@ -32,23 +32,28 @@
   </div>
   <script>
     // GitHub Pages 404 → preserve SPA hash routing
-    // Redirect to index.html and restore the path as a hash fragment
+    // Handles both user pages (origin/) and project pages (origin/repo-name/)
     (function () {
-      var path = window.location.pathname;
-      var search = window.location.search;
-      var hash = window.location.hash;
-
-      // If the path is just the root or has no meaningful sub-path, go home
-      if (!path || path === '/' || path === '/index.html') {
-        window.location.replace('/');
-        return;
+      var l = window.location;
+      // The base path is everything up to and including the repo name in the path
+      // e.g. /fintech-engineering-mastery/ or just / for user pages
+      var pathParts = l.pathname.split('/');
+      // Find where index.html would live — the base is origin + first path segment if it's a project repo
+      // We detect this by checking if pathname has more than 1 non-empty segment
+      var segments = pathParts.filter(function(p) { return p !== ''; });
+      var base;
+      if (segments.length > 1) {
+        // Project repo: origin/repo-name/ is the base
+        base = l.origin + '/' + segments[0] + '/';
+      } else {
+        base = l.origin + '/';
       }
-
-      // Convert path segments to a hash route
-      // e.g., /curriculum/track/track-03 → index.html#/curriculum/track/track-03
-      var route = path.replace(/^\//, '');
-      var base  = window.location.origin + '/';
-      window.location.replace(base + '#/' + route + (search || '') + (hash || ''));
+      var route = pathParts.slice(segments.length > 1 ? 2 : 1).filter(Boolean).join('/');
+      if (!route) {
+        window.location.replace(base);
+      } else {
+        window.location.replace(base + '#/' + route + (l.search || '') + (l.hash || ''));
+      }
     }());
   </script>
 </body>

@@ -334,19 +334,27 @@ public void recordAuditEvent(AuditEvent event) {
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are building a multi-currency account balance management service with PostgreSQL.
-
-**Tasks:**
-
-1. **Design the schema**: create `accounts` and `balance_history` tables with appropriate constraints to enforce: (a) non-negative balances, (b) a currency must be a 3-character ISO code, (c) balance history records cannot be updated or deleted.
-
-2. **Demonstrate the race condition**: write a jcstress or multi-threaded JUnit test that demonstrates the double-spend race condition at Read Committed isolation. Two concurrent threads should both read balance = £500 and attempt a £400 debit; show that both succeed without the CHECK constraint violation.
-
-3. **Fix the race condition**: rewrite the debit operation using a conditional atomic UPDATE (`SET balance = balance - ? WHERE balance >= ?`) and verify with a test that only one of the concurrent debits succeeds.
-
-4. **Isolation level selection**: for each of these operations, state the correct isolation level and explain why: (a) payment authorisation, (b) end-of-day account statement generation, (c) regulatory capital adequacy calculation, (d) exchange rate update.
-
-5. **Durability configuration**: write the `postgresql.conf` settings for a production primary with one synchronous standby that must survive simultaneous primary failure without data loss.
+{
+  "title": "ACID Properties \u2014 Atomicity, Consistency, Isolation, Durability \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 85,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Design the schema"
+    },
+    {
+      "id": "2",
+      "description": "Demonstrate the race condition"
+    },
+    {
+      "id": "3",
+      "description": "Fix the race condition"
+    },
+    {
+      "id": "4",
+      "description": "Isolation level selection"
+    }
+  ]
+}
 -->

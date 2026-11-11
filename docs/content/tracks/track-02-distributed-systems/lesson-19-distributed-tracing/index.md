@@ -432,19 +432,27 @@ span.setAttribute("payment.outcome",  "AUTHORISED");               // 4 values
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** A payment platform processes 2,000 payments/second across 8 microservices. P99 latency is 800ms but SLA requires 500ms. The team suspects the fraud service or the FX rate service is the bottleneck, but logs show timestamps, not call trees.
-
-**Tasks:**
-
-1. Configure OpenTelemetry + Jaeger for the payment-service and fraud-service. Include: OTLP exporter config, sampling strategy (tail-based: keep all >500ms and all errors; 0.5% otherwise), and span attributes for payment operations.
-
-2. Implement `@WithSpan` instrumentation for the payment orchestration pipeline with meaningful span names and attributes. Add timing events for: validation complete, fraud check complete, FX lookup complete, debit complete.
-
-3. Implement Kafka trace propagation so that the notification service spans appear as children of the payment service span in the same trace.
-
-4. Set up a Jaeger query to find the top 10 slowest payment authorisations in the last hour. What span attributes would you index to make this query efficient?
-
-5. Calculate the storage cost for 90-day trace retention at 2,000 payments/second, 8 spans/payment, 1.5KB/span with tail-based sampling retaining 2% of traces. Would you change the sampling strategy?
+{
+  "title": "Distributed Tracing \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 75,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Configure OpenTelemetry + Jaeger for the payment-service and fraud-service. Include: OTLP exporter config, sampling strategy (tail-based: keep all >500"
+    },
+    {
+      "id": "2",
+      "description": "Implement `@WithSpan` instrumentation for the payment orchestration pipeline with meaningful span names and attributes. Add timing events for: validati"
+    },
+    {
+      "id": "3",
+      "description": "Implement Kafka trace propagation so that the notification service spans appear as children of the payment service span in the same trace"
+    },
+    {
+      "id": "4",
+      "description": "Set up a Jaeger query to find the top 10 slowest payment authorisations in the last hour. What span attributes would you index to make this query effic"
+    }
+  ]
+}
 -->

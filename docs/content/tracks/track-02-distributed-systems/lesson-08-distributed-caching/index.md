@@ -551,17 +551,27 @@ A: This is a cache stampede for a hot key. Prevention strategies: (1) probabilis
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** Payment service with 12,000 TPS, top 10,000 accounts = 60% of reads, 6-node Redis Cluster.
-
-**Tasks:**
-
-1. Write the full `RedisClusterConfig` with Lettuce, read-from-replica, topology refresh, and per-cache TTL for `account-balances` (30s), `credit-limits` (10m), and `fx-rates` (60s).
-
-2. Implement `AccountBalanceCacheService.getBalance()` and `updateBalance()` with correct delete-not-update invalidation and rollback commentary.
-
-3. Implement `StampedeResistantCacheService` using a Redis distributed lock (SET NX EX) so only one pod refills the cache; others wait 100ms then fall back to DB.
-
-4. Implement `TwoTierFxRateCache` with Caffeine L1 (5s TTL) backed by Redis L2 (60s TTL). Calculate max Redis reads per minute for 20 pods and explain TTL scatter.
+{
+  "title": "Distributed Caching \u2014 Redis Cluster Architecture \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Write the full `RedisClusterConfig` with Lettuce, read-from-replica, topology refresh, and per-cache TTL for `account-balances` (30s), `credit-limits`"
+    },
+    {
+      "id": "2",
+      "description": "Implement `AccountBalanceCacheService.getBalance()` and `updateBalance()` with correct delete-not-update invalidation and rollback commentary"
+    },
+    {
+      "id": "3",
+      "description": "Implement `StampedeResistantCacheService` using a Redis distributed lock (SET NX EX) so only one pod refills the cache; others wait 100ms then fall bac"
+    },
+    {
+      "id": "4",
+      "description": "Implement `TwoTierFxRateCache` with Caffeine L1 (5s TTL) backed by Redis L2 (60s TTL). Calculate max Redis reads per minute for 20 pods and explain TTL"
+    }
+  ]
+}
 -->

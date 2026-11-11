@@ -340,19 +340,27 @@ For internal BFFs where the client team and BFF team are the same, BFF is typica
 -->
 
 <!-- PRACTICAL-CHALLENGE
-## Practical Challenge
-
-**Scenario:** You are the principal engineer for a fintech platform that serves three client types: a consumer mobile app, a web dashboard, and a partner API used by enterprise clients. Each has different payload, latency, and versioning requirements.
-
-**Task 1 — Gateway Route Design**
-Design the full Spring Cloud Gateway route configuration for all three client types. Include authentication filter (JWT validation), per-client rate limiting, circuit breakers per downstream service, and correlation ID injection. Specify the rate limit thresholds for each client type and justify them.
-
-**Task 2 — Mobile BFF Implementation**
-Implement the `MobileHomeScreenBff` with reactive fan-out to at least four downstream services. Include timeout handling with a degraded response, mobile-specific payload transformation (mask sensitive fields, format currency for locale), and unit tests that mock downstream clients.
-
-**Task 3 — Circuit Breaker Calibration**
-Your payment service has an SLA of 200ms p99. Design the circuit breaker configuration: what failure rate threshold, sliding window size, and open-state duration is appropriate? Justify each value. What monitoring do you add to alert when the circuit breaker transitions to open state?
-
-**Task 4 — API Version Sunset**
-You need to sunset the v0 payment API in 90 days. Design and implement the full lifecycle: add deprecation headers, build a migration guide endpoint that returns the v1 equivalent for any v0 request, track which partners are still calling v0 using gateway metrics, and define the process for forcing migration before the sunset date.
+{
+  "title": "API Gateway and Backend-for-Frontend Patterns \u2014 Production Implementation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {
+      "id": "1",
+      "description": "Design the full Spring Cloud Gateway route configuration for all three client types. Include authentication filter (JWT validation), per-client rate limiting, circuit breakers per downstream service,"
+    },
+    {
+      "id": "2",
+      "description": "Implement the `MobileHomeScreenBff` with reactive fan-out to at least four downstream services. Include timeout handling with a degraded response, mobile-specific payload transformation (mask sensitiv"
+    },
+    {
+      "id": "3",
+      "description": "Your payment service has an SLA of 200ms p99. Design the circuit breaker configuration: what failure rate threshold, sliding window size, and open-state duration is appropriate? Justify each value. Wh"
+    },
+    {
+      "id": "4",
+      "description": "You need to sunset the v0 payment API in 90 days. Design and implement the full lifecycle: add deprecation headers, build a migration guide endpoint that returns the v1 equivalent for any v0 request,"
+    }
+  ]
+}
 -->
