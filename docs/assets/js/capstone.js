@@ -253,8 +253,8 @@ EM.Capstone = (function () {
           '</div>' +
           '<h1 class="lesson-title">' + EM.esc(project.title) + '</h1>' +
           '<p class="lesson-subtitle">' + EM.esc(project.description) + '</p>' +
-          '<div class="lesson-meta">' +
-            '<span>' + EM.Icons.clock + ' ' + project.estimatedHours + ' hours</span>' +
+          '<div class="lesson-meta-row">' +
+            '<span class="lesson-meta-item">' + EM.Icons.clock + ' ' + project.estimatedHours + ' hours</span>' +
           '</div>' +
           '<div class="cs-tech-pills" style="margin-top:0.75rem">' + techPills + '</div>' +
         '</header>' +

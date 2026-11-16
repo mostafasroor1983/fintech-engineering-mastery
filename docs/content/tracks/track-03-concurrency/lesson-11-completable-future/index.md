@@ -53,6 +53,20 @@ references:
 
 `CompletableFuture<T>` is Java's composable asynchronous computation model. It represents a value that will be available in the future and provides a rich API to chain, combine, and handle failures across asynchronous stages — without blocking threads between stages.
 
+Consider a synchronous payment enrichment pipeline that calls three independent services sequentially. If each call takes 50 ms, total latency is 150 ms:
+
+```
+Request → FX Rate Service (50 ms) → Fraud Score (50 ms) → Account Lookup (50 ms) → Response
+```
+
+These three calls share no data dependency — none needs the result of another. With `CompletableFuture`, they run in parallel and the pipeline completes in ~50 ms (the slowest single call):
+
+```
+                   ┌→ FX Rate Service (50 ms) ─┐
+Request ──────────→├→ Fraud Score     (50 ms) ─┤──→ Combine → Response (~50 ms)
+                   └→ Account Lookup  (50 ms) ─┘
+```
+
 In a payment processing pipeline, `CompletableFuture` enables fraud check, balance validation, and routing to run as concurrent stages, with the final settlement step triggered only when all prerequisites succeed. The result: a pipeline that runs in max(stage_times) rather than sum(stage_times), dramatically improving throughput and latency.
 
 This lesson covers the full `CompletableFuture` API in the context of real payment processing pipelines.

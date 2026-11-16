@@ -1,0 +1,166 @@
+{
+  "id": "track-13",
+  "sequence": 13,
+  "title": "Spring Boot 4 for Senior Fintech Engineers",
+  "shortTitle": "Spring Boot 4",
+  "slug": "spring-boot-4",
+  "color": "#22c55e",
+  "colorMuted": "rgba(34, 197, 94, 0.15)",
+  "description": "Spring Boot 4, Spring Framework 7, virtual thread integration, Spring Data 4, Spring Security 7, Spring Kafka 4, and migrating production fintech services from Spring Boot 3.x.",
+  "difficulty": "advanced",
+  "estimatedHours": 10,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-13-lesson-01",
+      "sequence": 1,
+      "title": "Spring Boot 4 — What Changed from 3.x",
+      "slug": "spring-boot-4-changes",
+      "path": "content/tracks/track-13-spring-boot-4/lesson-01-sb4-changes/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "spring-boot-4",
+        "spring-framework-7",
+        "migration",
+        "graalvm",
+        "aot",
+        "baseline"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-13-lesson-02",
+      "sequence": 2,
+      "title": "Spring Framework 7 — New Baseline Features",
+      "slug": "spring-framework-7",
+      "path": "content/tracks/track-13-spring-boot-4/lesson-02-spring-framework-7/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "spring-framework-7",
+        "http-interfaces",
+        "rfc9110",
+        "jakarta-ee11",
+        "observability"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-13-lesson-03",
+      "sequence": 3,
+      "title": "Virtual Thread Integration in Spring Boot 4",
+      "slug": "virtual-threads-spring-boot-4",
+      "path": "content/tracks/track-13-spring-boot-4/lesson-03-virtual-threads-sb4/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "virtual-threads",
+        "java-21",
+        "spring-boot-4",
+        "loom",
+        "tomcat",
+        "undertow",
+        "pinning"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-13-lesson-04",
+      "sequence": 4,
+      "title": "Spring Data 4 — JDBC, JPA, and Redis",
+      "slug": "spring-data-4",
+      "path": "content/tracks/track-13-spring-boot-4/lesson-04-spring-data-4/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "spring-data-4",
+        "spring-data-jpa",
+        "spring-data-jdbc",
+        "spring-data-redis",
+        "repositories"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-13-lesson-05",
+      "sequence": 5,
+      "title": "Spring Security 7 — OAuth2 and JWT",
+      "slug": "spring-security-7",
+      "path": "content/tracks/track-13-spring-boot-4/lesson-05-spring-security-7/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "spring-security-7",
+        "oauth2",
+        "jwt",
+        "resource-server",
+        "security-filter-chain"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-13-lesson-06",
+      "sequence": 6,
+      "title": "Spring Kafka 4 — Configuration and Exactly-Once",
+      "slug": "spring-kafka-4",
+      "path": "content/tracks/track-13-spring-boot-4/lesson-06-spring-kafka-4/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "spring-kafka-4",
+        "kafka-4",
+        "kraft",
+        "exactly-once",
+        "eos",
+        "kafka-listener"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-13-lesson-07",
+      "sequence": 7,
+      "title": "Migrating from Spring Boot 3.x to 4.x",
+      "slug": "migration-3-to-4",
+      "path": "content/tracks/track-13-spring-boot-4/lesson-07-migration-3-to-4/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "migration",
+        "spring-boot-4",
+        "breaking-changes",
+        "aot",
+        "graalvm"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-13-lesson-08",
+      "sequence": 8,
+      "title": "Spring Boot 4 Testing — Slices and Testcontainers",
+      "slug": "testing-sb4",
+      "path": "content/tracks/track-13-spring-boot-4/lesson-08-testing-sb4/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "testing",
+        "testcontainers",
+        "spring-boot-test",
+        "data-jpa-test",
+        "service-connection"
+      ],
+      "tier": "core"
+    }
+  ],
+  "mainPathMinutes": 580,
+  "optionalLessonCount": 0
+}

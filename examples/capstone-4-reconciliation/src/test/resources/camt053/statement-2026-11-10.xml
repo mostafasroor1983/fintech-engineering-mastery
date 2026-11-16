@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Illustrative camt.053.001.08 statement for a fictional account. Subset of the ISO 20022 message. -->
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.08">
+  <BkToCstmrStmt>
+    <GrpHdr>
+      <MsgId>MSG-20261110-0001</MsgId>
+      <CreDtTm>2026-11-10T18:00:00+00:00</CreDtTm>
+    </GrpHdr>
+    <Stmt>
+      <Id>STMT-20261110-GB29</Id>
+      <CreDtTm>2026-11-10T18:00:00+00:00</CreDtTm>
+      <Acct>
+        <Id><IBAN>GB29NWBK60161331926819</IBAN></Id>
+        <Ccy>GBP</Ccy>
+      </Acct>
+      <Bal>
+        <Tp><CdOrPrtry><Cd>OPBD</Cd></CdOrPrtry></Tp>
+        <Amt Ccy="GBP">1000.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Dt><Dt>2026-11-10</Dt></Dt>
+      </Bal>
+      <Bal>
+        <Tp><CdOrPrtry><Cd>CLBD</Cd></CdOrPrtry></Tp>
+        <Amt Ccy="GBP">1223.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Dt><Dt>2026-11-10</Dt></Dt>
+      </Bal>
+      <!-- 1. Exact match on EndToEndId -->
+      <Ntry>
+        <Amt Ccy="GBP">250.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Sts><Cd>BOOK</Cd></Sts>
+        <BookgDt><Dt>2026-11-10</Dt></BookgDt>
+        <ValDt><Dt>2026-11-10</Dt></ValDt>
+        <AcctSvcrRef>BANKREF-0001</AcctSvcrRef>
+        <NtryDtls><TxDtls>
+          <Refs><EndToEndId>E2E-001</EndToEndId></Refs>
+          <RmtInf><Ustrd>Invoice 1001</Ustrd></RmtInf>
+        </TxDtls></NtryDtls>
+      </Ntry>
+      <!-- 2. Same EndToEndId, different amount: AMOUNT_MISMATCH -->
+      <Ntry>
+        <Amt Ccy="GBP">100.00</Amt>
+        <CdtDbtInd>DBIT</CdtDbtInd>
+        <Sts><Cd>BOOK</Cd></Sts>
+        <BookgDt><Dt>2026-11-10</Dt></BookgDt>
+        <ValDt><Dt>2026-11-10</Dt></ValDt>
+        <AcctSvcrRef>BANKREF-0002</AcctSvcrRef>
+        <NtryDtls><TxDtls>
+          <Refs><EndToEndId>E2E-002</EndToEndId></Refs>
+        </TxDtls></NtryDtls>
+      </Ntry>
+      <!-- 3. No EndToEndId: fuzzy match on amount + direction + date window -->
+      <Ntry>
+        <Amt Ccy="GBP">75.50</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Sts><Cd>BOOK</Cd></Sts>
+        <BookgDt><Dt>2026-11-10</Dt></BookgDt>
+        <ValDt><Dt>2026-11-10</Dt></ValDt>
+        <AcctSvcrRef>BANKREF-0003</AcctSvcrRef>
+        <NtryDtls><TxDtls>
+          <Refs><EndToEndId>NOTPROVIDED</EndToEndId></Refs>
+        </TxDtls></NtryDtls>
+      </Ntry>
+      <!-- 4. Bank fee we did not book: MISSING_IN_LEDGER -->
+      <Ntry>
+        <Amt Ccy="GBP">2.50</Amt>
+        <CdtDbtInd>DBIT</CdtDbtInd>
+        <Sts><Cd>BOOK</Cd></Sts>
+        <BookgDt><Dt>2026-11-10</Dt></BookgDt>
+        <ValDt><Dt>2026-11-10</Dt></ValDt>
+        <AcctSvcrRef>BANKREF-0004</AcctSvcrRef>
+        <NtryDtls><TxDtls>
+          <RmtInf><Ustrd>Account fee</Ustrd></RmtInf>
+        </TxDtls></NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>

@@ -1,0 +1,196 @@
+{
+  "id": "track-14",
+  "sequence": 14,
+  "title": "System Design for Fintech Interviews",
+  "shortTitle": "System Design",
+  "slug": "system-design",
+  "color": "#f59e0b",
+  "colorMuted": "rgba(245, 158, 11, 0.15)",
+  "description": "Eight senior-level design lessons on the RESHADED plan: payment service (2 parts), fraud detection, ledger at scale, rate limiter, six compact problems, and reference sheets.",
+  "difficulty": "senior",
+  "estimatedHours": 10,
+  "status": "published",
+  "priority": "critical",
+  "lessons": [
+    {
+      "id": "track-14-lesson-01",
+      "sequence": 1,
+      "title": "System Design Framework for Fintech Interviews (RESHADED)",
+      "slug": "system-design-framework",
+      "path": "content/tracks/track-14-system-design/lesson-01-framework/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tags": [
+        "system-design",
+        "interviews",
+        "framework",
+        "reshaded",
+        "trade-offs",
+        "fintech"
+      ],
+      "tier": "core",
+      "prerequisites": []
+    },
+    {
+      "id": "track-14-lesson-02",
+      "sequence": 2,
+      "title": "Design a Payment Processing Service, Part 1: Requirements to API",
+      "slug": "payment-service-part1",
+      "path": "content/tracks/track-14-system-design/lesson-02-payment-service-part1/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "system-design",
+        "payments",
+        "idempotency",
+        "api-design",
+        "estimation",
+        "schema"
+      ],
+      "tier": "core",
+      "prerequisites": [
+        "track-14-lesson-01"
+      ]
+    },
+    {
+      "id": "track-14-lesson-03",
+      "sequence": 3,
+      "title": "Design a Payment Processing Service, Part 2: Deep Dives, Failures and SLOs",
+      "slug": "payment-service-part2",
+      "path": "content/tracks/track-14-system-design/lesson-03-payment-service-part2/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "system-design",
+        "payments",
+        "outbox",
+        "idempotency",
+        "failure-modes",
+        "slo"
+      ],
+      "tier": "core",
+      "prerequisites": [
+        "track-14-lesson-02"
+      ]
+    },
+    {
+      "id": "track-14-lesson-04",
+      "sequence": 4,
+      "title": "Design a Real-Time Fraud Detection Pipeline",
+      "slug": "fraud-detection-pipeline",
+      "path": "content/tracks/track-14-system-design/lesson-04-fraud-detection/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "system-design",
+        "fraud",
+        "streaming",
+        "latency-budget",
+        "feature-store",
+        "fallback"
+      ],
+      "tier": "core",
+      "prerequisites": [
+        "track-14-lesson-01"
+      ]
+    },
+    {
+      "id": "track-14-lesson-05",
+      "sequence": 5,
+      "title": "Design a Financial Ledger at Scale",
+      "slug": "financial-ledger-at-scale",
+      "path": "content/tracks/track-14-system-design/lesson-05-financial-ledger/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "system-design",
+        "ledger",
+        "double-entry",
+        "sharding",
+        "event-sourcing",
+        "hot-accounts"
+      ],
+      "tier": "core",
+      "prerequisites": [
+        "track-14-lesson-01",
+        "track-05-lesson-01"
+      ]
+    },
+    {
+      "id": "track-14-lesson-06",
+      "sequence": 6,
+      "title": "Design a Distributed Rate Limiter for a Payment API",
+      "slug": "rate-limiter-payment-api",
+      "path": "content/tracks/track-14-system-design/lesson-06-rate-limiter/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "system-design",
+        "rate-limiting",
+        "token-bucket",
+        "redis",
+        "multi-tenant",
+        "429"
+      ],
+      "tier": "core",
+      "prerequisites": [
+        "track-14-lesson-01"
+      ]
+    },
+    {
+      "id": "track-14-lesson-07",
+      "sequence": 7,
+      "title": "Six More Fintech Design Problems, Compact (Wallet, Settlement, Webhooks, FX, Locking, Cards + P2P)",
+      "slug": "common-fintech-system-design-problems",
+      "path": "content/tracks/track-14-system-design/lesson-07-common-problems/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "system-design",
+        "wallet",
+        "reconciliation",
+        "webhooks",
+        "fx",
+        "distributed-lock",
+        "cards",
+        "p2p"
+      ],
+      "tier": "core",
+      "prerequisites": [
+        "track-14-lesson-01",
+        "track-14-lesson-03"
+      ]
+    },
+    {
+      "id": "track-14-lesson-08",
+      "sequence": 8,
+      "title": "Reference: Patterns Catalogue, Estimation Cheat Sheet and Database Choice Guide",
+      "slug": "system-design-reference",
+      "path": "content/tracks/track-14-system-design/lesson-08-mock-interview-guide/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 45,
+      "status": "published",
+      "tags": [
+        "system-design",
+        "reference",
+        "patterns",
+        "estimation",
+        "database-choice",
+        "cheat-sheet"
+      ],
+      "tier": "core",
+      "prerequisites": [
+        "track-14-lesson-01"
+      ]
+    }
+  ],
+  "mainPathMinutes": 545,
+  "optionalLessonCount": 0
+}

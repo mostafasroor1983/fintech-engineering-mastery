@@ -1,0 +1,57 @@
+spring:
+  application:
+    name: instant-p2p
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/p2p}
+    username: ${DB_USER:p2p}
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: 20
+      connection-timeout: 2000
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: 6379
+      timeout: 200ms          # a slow Redis must not stall every request
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${JWT_ISSUER_URI:http://localhost:9000}   # your identity provider; keys fetched from its JWKS
+          audiences: p2p-api
+  mvc:
+    apiversion:
+      use:
+        path-segment: 0
+      supported: "1"
+    problemdetails:
+      enabled: true
+
+p2p:
+  rate-limit:
+    default-tier: standard
+    tiers:
+      standard: { capacity: 20, refill-per-second: 10 }
+      premium: { capacity: 200, refill-per-second: 100 }
+    tenant-tiers: {}
+    fail-open: true           # if Redis is down, allow traffic and alert (availability over precision)
+  webhooks:
+    max-attempts: 8
+    base-backoff: 2s
+    max-backoff: 1h
+    lease: 30s
+    batch-size: 50
+    allow-insecure-localhost: false   # true only in local dev / tests
+    dispatch-enabled: true
+    dispatch-interval: 1s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+server:
+  shutdown: graceful

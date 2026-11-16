@@ -1,0 +1,59 @@
+spring:
+  application:
+    name: payment-service
+  threads:
+    virtual:
+      enabled: true          # request threads are virtual; the Hikari pool is now the real concurrency limit
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/payments}
+    username: ${DB_USER:payments}
+    password: ${DB_PASSWORD:}   # never commit secrets; inject via env / secret store
+    hikari:
+      maximum-pool-size: 20
+      connection-timeout: 2000   # fail fast (ms) instead of queueing forever when the pool is exhausted
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate       # Flyway owns the schema
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
+    consumer:
+      group-id: settlement
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+  mvc:
+    apiversion:
+      use:
+        path-segment: 0        # /v1/payments -> version "1"
+      supported: "1"
+    problemdetails:
+      enabled: true
+
+payments:
+  topic: payments.events
+  outbox:
+    relay-enabled: true
+    batch-size: 100
+    poll-interval: 500ms
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+server:
+  shutdown: graceful

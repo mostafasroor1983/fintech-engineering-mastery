@@ -1,78 +1,104 @@
 {
   "version": "1.0",
-  "lastUpdated": "2026-11-11",
-  "totalTracks": 14,
-  "totalLessons": 287,
+  "lastUpdated": "2026-11-13",
+  "totalTracks": 16,
+  "totalLessons": 272,
   "tracks": [
     {
       "id": "track-01",
       "slug": "architecture",
-      "lessons": []
+      "lessons": [],
+      "lessonCount": 20
     },
     {
       "id": "track-02",
       "slug": "distributed-systems",
-      "lessons": []
+      "lessons": [],
+      "lessonCount": 22
     },
     {
       "id": "track-03",
       "slug": "concurrency",
-      "lessons": []
+      "lessons": [],
+      "lessonCount": 29
     },
     {
       "id": "track-04",
-      "slug": "async-reactive",
-      "lessons": []
+      "slug": "banking-systems",
+      "lessons": [],
+      "lessonCount": 22
     },
     {
       "id": "track-05",
-      "slug": "banking-systems",
-      "lessons": []
+      "slug": "transaction-integrity",
+      "lessons": [],
+      "lessonCount": 24
     },
     {
       "id": "track-06",
-      "slug": "transaction-integrity",
-      "lessons": []
+      "slug": "reliability",
+      "lessons": [],
+      "lessonCount": 18
     },
     {
       "id": "track-07",
-      "slug": "financial-crime",
-      "lessons": []
+      "slug": "performance",
+      "lessons": [],
+      "lessonCount": 22
     },
     {
       "id": "track-08",
-      "slug": "reliability",
-      "lessons": []
+      "slug": "database",
+      "lessons": [],
+      "lessonCount": 22
     },
     {
       "id": "track-09",
-      "slug": "performance",
-      "lessons": []
+      "slug": "messaging",
+      "lessons": [],
+      "lessonCount": 20
     },
     {
       "id": "track-10",
-      "slug": "database",
-      "lessons": []
+      "slug": "cloud-platform",
+      "lessons": [],
+      "lessonCount": 16
     },
     {
       "id": "track-11",
-      "slug": "messaging",
-      "lessons": []
+      "slug": "security-observability",
+      "lessons": [],
+      "lessonCount": 20
     },
     {
       "id": "track-12",
-      "slug": "cloud-platform",
-      "lessons": []
+      "slug": "leadership",
+      "lessons": [],
+      "lessonCount": 14
     },
     {
       "id": "track-13",
-      "slug": "security-observability",
-      "lessons": []
+      "slug": "spring-boot-4",
+      "lessons": [],
+      "lessonCount": 8
     },
     {
       "id": "track-14",
-      "slug": "leadership",
-      "lessons": []
+      "slug": "system-design",
+      "lessons": [],
+      "lessonCount": 8
+    },
+    {
+      "id": "track-15",
+      "slug": "interview-playbook",
+      "lessons": [],
+      "lessonCount": 5
+    },
+    {
+      "id": "track-16",
+      "slug": "first-90-days",
+      "lessons": [],
+      "lessonCount": 2
     }
   ],
   "decisionLabScenarios": [
@@ -180,32 +206,27 @@
   "capstoneProjects": [
     {
       "id": "project-a",
-      "title": "High-Throughput Payment Processing Platform",
+      "title": "Payment Service with Idempotency, Transactional Outbox and Kafka",
       "status": "published"
     },
     {
       "id": "project-b",
-      "title": "Concurrent Double-Entry Ledger Engine",
+      "title": "Multi-Currency Wallet on a Double-Entry Ledger, with FX Transfers",
       "status": "published"
     },
     {
       "id": "project-c",
-      "title": "Distributed AML & Sanctions Screening Platform",
+      "title": "Card Authorisation and Clearing with a Fraud Hook and Resilience",
       "status": "published"
     },
     {
       "id": "project-d",
-      "title": "Financial Reconciliation Engine",
+      "title": "Settlement and Reconciliation Pipeline (CAMT.053 ingest, matching, breaks)",
       "status": "published"
     },
     {
       "id": "project-e",
-      "title": "Multi-Region Banking Platform",
-      "status": "published"
-    },
-    {
-      "id": "project-f",
-      "title": "Production Observability & Incident Investigation Platform",
+      "title": "Instant P2P Transfer API with OAuth2, Per-Tenant Rate Limiting and Webhooks",
       "status": "published"
     }
   ]

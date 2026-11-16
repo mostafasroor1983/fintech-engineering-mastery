@@ -1,0 +1,36 @@
+spring:
+  application:
+    name: reconciliation
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/recon}
+    username: ${DB_USER:recon}
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: 10
+  mvc:
+    apiversion:
+      use:
+        path-segment: 0
+      supported: "1"
+    problemdetails:
+      enabled: true
+  servlet:
+    multipart:
+      enabled: false
+
+recon:
+  # Ledger entries newer than this are "in transit", not breaks (bank posts a day or two later).
+  timing-tolerance: 2d
+  # Fuzzy matching window between ledger value date and bank value date.
+  fuzzy-date-window: 2d
+  # Write-offs above this need a second person (maker-checker). Illustrative threshold.
+  four-eyes-threshold: "100.00"
+  max-file-bytes: 5242880
+
+server:
+  shutdown: graceful
+  tomcat:
+    max-swallow-size: 6MB

@@ -1,0 +1,40 @@
+spring:
+  application:
+    name: wallet-ledger
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/wallet}
+    username: ${DB_USER:wallet}
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: 20
+      connection-timeout: 2000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  mvc:
+    apiversion:
+      use:
+        path-segment: 0
+      supported: "1"
+    problemdetails:
+      enabled: true
+
+wallet:
+  fx:
+    quote-ttl: 30s
+    # Illustrative mid rates and spread for the demo provider. Real systems pull rates from a market-data feed.
+    spread-bps: 50
+    mid-rates:
+      GBP-EUR: "1.15000000"
+      EUR-GBP: "0.86956522"
+      GBP-USD: "1.27000000"
+      USD-GBP: "0.78740157"
+      EUR-USD: "1.10434783"
+      USD-EUR: "0.90551181"
+
+server:
+  shutdown: graceful

@@ -1,0 +1,1348 @@
+{
+  "version": "1.0",
+  "experiments": [
+    {
+      "id": "fin-07",
+      "category": "financial",
+      "title": "Kafka Consumer Offset Commit Race",
+      "subtitle": "Rebalance mid-batch causes uncommitted offsets to be reprocessed",
+      "difficulty": "advanced",
+      "tags": ["Kafka", "offset-commit", "rebalance", "at-least-once", "duplicate-processing"],
+      "estimatedMinutes": 25,
+      "relatedLessons": ["track-09-lesson-03", "track-09-lesson-05"],
+      "scenario": "A payment processing service uses manual offset commits (enable.auto.commit=false) to guarantee delivery. When the service is slow, a group rebalance reassigns the partition before commitSync() is called — causing the new consumer to reprocess the same payment records.",
+      "impact": "Duplicate payment debits reach end-users; reconciliation gaps inflate daily settlement totals and trigger fraud alerts.",
+      "incorrectCode": [
+        "import org.apache.kafka.clients.consumer.ConsumerRecords;",
+        "import org.apache.kafka.clients.consumer.KafkaConsumer;",
+        "import java.time.Duration;",
+        "",
+        "public class PaymentBatchConsumer {",
+        "    private final KafkaConsumer<String, String> consumer;",
+        "",
+        "    public void run() {",
+        "        while (true) {",
+        "            ConsumerRecords<String, String> records =",
+        "                consumer.poll(Duration.ofMillis(500));",
+        "            for (var record : records) {",
+        "                paymentService.process(record.value());",
+        "            }",
+        "            // BUG: single commit after entire batch",
+        "            // Rebalance between processing and commit",
+        "            // means every record in the batch replays",
+        "            consumer.commitSync();",
+        "        }",
+        "    }",
+        "}"
+      ],
+      "incorrectAnnotations": [
+        {"line": 17, "note": "UNSAFE: commitSync() after full batch — a rebalance between line 13 and here leaves all processed records uncommitted and eligible for redelivery"},
+        {"line": 11, "note": "UNSAFE: batch poll without per-record commit means slow processing widens the rebalance vulnerability window"}
+      ],
+      "failureExplanation": "Kafka's group coordinator triggers a rebalance when a consumer exceeds max.poll.interval.ms without polling. If the batch takes longer than that interval to process, the coordinator revokes the partition and assigns it to another consumer before commitSync() executes. Because no offsets were committed, the new consumer starts from the last committed offset and reprocesses every record the original consumer already handled.",
+      "simulation": {
+        "type": "sequence",
+        "title": "Uncommitted Offsets Reprocessed After Rebalance",
+        "participants": [
+          {"id": 0, "name": "Consumer-1"},
+          {"id": 1, "name": "Kafka Broker"},
+          {"id": 2, "name": "Group Coordinator"}
+        ],
+        "buggySteps": [
+          {"seq": 1, "from": 0, "to": 1, "message": "poll() — receives offsets 100-109", "note": "Batch of 10 payment records", "highlight": false},
+          {"seq": 2, "from": 0, "to": 0, "message": "process(offsets 100-109) — 6 seconds", "note": "Slow downstream API call", "highlight": false},
+          {"seq": 3, "from": 2, "to": 1, "message": "Rebalance triggered (max.poll.interval exceeded)", "note": "Consumer-1 partition revoked", "highlight": true},
+          {"seq": 4, "from": 1, "to": 2, "message": "Assign partition to Consumer-2", "note": "New owner starts at last committed offset=100", "highlight": false},
+          {"seq": 5, "from": 0, "to": 1, "message": "commitSync() — FAILS", "note": "⚠ Partition no longer owned by Consumer-1", "highlight": true},
+          {"seq": 6, "from": 2, "to": 1, "message": "Consumer-2 polls offsets 100-109 again", "note": "⚠ DUPLICATE: same payments reprocessed", "highlight": true}
+        ],
+        "bugAnnotation": "A single end-of-batch commitSync() leaves all processed records uncommitted during a rebalance, guaranteeing duplicate delivery.",
+        "safeSteps": [
+          {"seq": 1, "from": 0, "to": 1, "message": "poll() — receives offsets 100-109", "note": "Batch of 10 payment records", "highlight": false},
+          {"seq": 2, "from": 0, "to": 1, "message": "process(offset 100) → commitSync(offset 101)", "note": "Per-record commit immediately after processing", "highlight": false},
+          {"seq": 3, "from": 0, "to": 1, "message": "process(offset 101) → commitSync(offset 102)", "note": "Committed offset advances with each record", "highlight": false},
+          {"seq": 4, "from": 2, "to": 1, "message": "Rebalance triggered", "note": "Consumer-1 revoked; last committed=102", "highlight": false},
+          {"seq": 5, "from": 2, "to": 1, "message": "Consumer-2 polls from offset 102", "note": "Only uncommitted records replayed ✓", "highlight": false}
+        ],
+        "safeAnnotation": "Per-record commitSync() minimises the redelivery window to at most one record, making duplicate payments operationally negligible."
+      },
+      "correctCode": [
+        "import org.apache.kafka.clients.consumer.*;",
+        "import org.apache.kafka.common.TopicPartition;",
+        "import java.time.Duration;",
+        "import java.util.*;",
+        "",
+        "public class PaymentSafeConsumer implements ConsumerRebalanceListener {",
+        "    private final KafkaConsumer<String, String> consumer;",
+        "    private final Map<TopicPartition, OffsetAndMetadata> pendingOffsets = new HashMap<>();",
+        "",
+        "    public void run() {",
+        "        consumer.subscribe(List.of(\"payments\"), this);",
+        "        while (true) {",
+        "            ConsumerRecords<String, String> records =",
+        "                consumer.poll(Duration.ofMillis(500));",
+        "            for (var record : records) {",
+        "                paymentService.process(record.value());",
+        "                pendingOffsets.put(",
+        "                    new TopicPartition(record.topic(), record.partition()),",
+        "                    new OffsetAndMetadata(record.offset() + 1));",
+        "                consumer.commitSync(pendingOffsets);",
+        "                pendingOffsets.clear();",
+        "            }",
+        "        }",
+        "    }",
+        "",
+        "    @Override",
+        "    public void onPartitionsRevoked(Collection<TopicPartition> partitions) {",
+        "        // Commit any pending offsets before rebalance completes",
+        "        if (!pendingOffsets.isEmpty()) {",
+        "            consumer.commitSync(pendingOffsets);",
+        "        }",
+        "    }",
+        "",
+        "    @Override",
+        "    public void onPartitionsAssigned(Collection<TopicPartition> partitions) {}",
+        "}"
+      ],
+      "correctExplanation": "Per-record commitSync() advances the committed offset immediately after each successful process() call, bounding redelivery to at most one record. The ConsumerRebalanceListener.onPartitionsRevoked() hook flushes any in-flight offsets before the coordinator finalises the rebalance.",
+      "alternatives": [
+        {
+          "name": "Kafka Exactly-Once Semantics (EOS)",
+          "code": [
+            "// Producer config",
+            "props.put(\"enable.idempotence\", \"true\");",
+            "props.put(\"transactional.id\", \"payment-processor-1\");",
+            "// Consumer config",
+            "props.put(\"isolation.level\", \"read_committed\");",
+            "",
+            "producer.initTransactions();",
+            "producer.beginTransaction();",
+            "try {",
+            "    paymentService.process(record.value());",
+            "    producer.sendOffsetsToTransaction(offsets, groupMetadata);",
+            "    producer.commitTransaction();",
+            "} catch (Exception e) {",
+            "    producer.abortTransaction();",
+            "}"
+          ],
+          "pros": ["True exactly-once delivery — no duplicates even on failure", "Atomic offset commit + produce in one transaction"],
+          "cons": ["~20% throughput reduction", "Requires Kafka 2.5+ and careful transactional.id management", "Zombie fencing adds operational complexity"],
+          "whenToUse": "When payment idempotency cannot be guaranteed at the application layer and duplicate processing is strictly prohibited."
+        }
+      ],
+      "performanceNotes": "Per-record commitSync() adds one round-trip per message; for high-throughput topics (>10 k msg/s), use commitAsync() with a fallback commitSync() on partition revocation. Kafka EOS reduces throughput by ~20% but eliminates application-level deduplication overhead.",
+      "performanceTable": [
+        {"approach": "End-of-batch commitSync()", "throughput": "~50 k msg/s", "notes": "Highest throughput; duplicates on rebalance"},
+        {"approach": "Per-record commitSync()", "throughput": "~8 k msg/s", "notes": "One network RTT per record; safest for low-volume payment topics"},
+        {"approach": "Per-record commitAsync()", "throughput": "~40 k msg/s", "notes": "Non-blocking; flush synchronously in onPartitionsRevoked"},
+        {"approach": "Kafka EOS transactions", "throughput": "~35 k msg/s", "notes": "True exactly-once; ~20% overhead vs. at-least-once"}
+      ],
+      "tests": [
+        {
+          "framework": "testcontainers",
+          "code": [
+            "import org.testcontainers.containers.KafkaContainer;",
+            "import org.testcontainers.utility.DockerImageName;",
+            "import org.junit.jupiter.api.*;",
+            "import java.util.concurrent.atomic.AtomicInteger;",
+            "",
+            "@Testcontainers",
+            "class PaymentConsumerRebalanceTest {",
+            "    @Container",
+            "    static KafkaContainer kafka =",
+            "        new KafkaContainer(DockerImageName.parse(\"confluentinc/cp-kafka:7.5.0\"));",
+            "",
+            "    @Test",
+            "    void perRecordCommit_preventsDoubleProcessing_afterRebalance() throws Exception {",
+            "        var idempotencyStore = new ConcurrentHashSet<String>();",
+            "        var processedCount = new AtomicInteger(0);",
+            "        producePayments(kafka, \"payments\", 10);",
+            "        var consumer1 = startConsumer(kafka, record -> {",
+            "            if (idempotencyStore.add(record.key())) {",
+            "                processedCount.incrementAndGet();",
+            "            }",
+            "        });",
+            "        Thread.sleep(2000); // process first few records",
+            "        triggerRebalance(kafka); // add consumer2 to group",
+            "        Thread.sleep(5000); // allow rebalance + redelivery",
+            "        Assertions.assertEquals(10, processedCount.get(),",
+            "            \"Each payment must be processed exactly once\");",
+            "    }",
+            "}"
+          ],
+          "explanation": "Testcontainers spins up a real Kafka broker. The test produces 10 payment records, starts a consumer with per-record commits, triggers a rebalance mid-consumption, and asserts the idempotency store prevents double-counting despite at-least-once redelivery.",
+          "limitations": "Rebalance timing is non-deterministic; use awaitility with a generous timeout rather than fixed sleeps in production test suites."
+        }
+      ],
+      "monitoringSymptoms": [
+        "kafka_consumer_records_lag_max rising without throughput drop — consumers stalling before commit",
+        "Duplicate payment IDs appearing in settlement reports within the same processing window",
+        "kafka.consumer.fetch-manager-metrics: records-consumed-rate spike followed by offset regression",
+        "CommitFailedException in consumer logs correlated with GroupCoordinator rebalance events",
+        "Idempotency key collision rate > 0% in payment processing metrics"
+      ],
+      "debugTips": [
+        "Run kafka-consumer-groups.sh --describe to inspect current-offset vs log-end-offset per partition",
+        "Enable DEBUG logging on org.apache.kafka.clients.consumer.internals.ConsumerCoordinator to trace rebalance lifecycle",
+        "Compare consumer group committed offsets before and after a rebalance event using kafka-consumer-groups.sh --reset-offsets --dry-run",
+        "Search logs for CommitFailedException — always indicates an offset commit attempted after partition revocation",
+        "Correlate payment-service logs with group coordinator logs using the memberId field present in both"
+      ],
+      "productionRecommendations": [
+        "Set max.poll.interval.ms to 2× the 99th-percentile processing time for a full batch",
+        "Always implement ConsumerRebalanceListener.onPartitionsRevoked() to flush pending commits",
+        "Use idempotency keys (payment-id) in the downstream system as defence-in-depth against at-least-once delivery",
+        "Alert on CommitFailedException rate > 0 in production consumers",
+        "Prefer commitAsync() with a synchronous fallback in onPartitionsRevoked() for high-throughput topics"
+      ],
+      "assessment": [
+        {
+          "text": "Why does placing commitSync() at the end of a batch create a duplicate-processing risk in Kafka?",
+          "options": [
+            "A) Kafka automatically commits offsets every 5 seconds regardless of manual commits",
+            "B) A rebalance between the last process() call and commitSync() leaves all batch offsets uncommitted, so the new owner replays them",
+            "C) commitSync() blocks the event loop, causing the broker to drop the partition",
+            "D) Kafka only allows one commitSync() per consumer session"
+          ],
+          "correct": 1,
+          "explanation": "Kafka's at-least-once guarantee means uncommitted offsets are redelivered after a rebalance. If commitSync() has not been called when the partition is revoked, the new consumer starts from the last committed offset and reprocesses all records the original consumer already handled."
+        },
+        {
+          "text": "Which configuration parameter controls how long a Kafka consumer can be absent from poll() before the coordinator considers it dead and triggers a rebalance?",
+          "options": [
+            "A) session.timeout.ms",
+            "B) heartbeat.interval.ms",
+            "C) max.poll.interval.ms",
+            "D) fetch.max.wait.ms"
+          ],
+          "correct": 2,
+          "explanation": "max.poll.interval.ms defines the maximum delay between successive poll() calls. If the consumer exceeds this interval — typically because processing is too slow — the coordinator triggers a rebalance and revokes its partitions, even if the heartbeat thread is still running."
+        },
+        {
+          "text": "What is the primary trade-off of Kafka Exactly-Once Semantics (EOS) compared to per-record commitSync()?",
+          "options": [
+            "A) EOS requires Zookeeper; per-record commit works with KRaft mode only",
+            "B) EOS delivers ~20% lower throughput but eliminates application-level deduplication logic entirely",
+            "C) EOS only works with Avro serialisation; JSON is unsupported",
+            "D) EOS commits offsets synchronously on every record just like commitSync()"
+          ],
+          "correct": 1,
+          "explanation": "Kafka EOS uses producer transactions to atomically commit offsets and produced messages, providing true exactly-once guarantees. The overhead of two-phase commit and zombie fencing reduces throughput by roughly 20% compared to at-least-once delivery, but it removes the need for idempotency keys at the application layer."
+        }
+      ]
+    },
+    {
+      "id": "fin-08",
+      "category": "financial",
+      "title": "Zombie Consumer After Group Rebalance",
+      "subtitle": "Network partition keeps a stale consumer alive — two pods process the same payments",
+      "difficulty": "advanced",
+      "tags": ["Kafka", "zombie-consumer", "group-fencing", "session-timeout", "duplicate-processing"],
+      "estimatedMinutes": 25,
+      "relatedLessons": ["track-09-lesson-03"],
+      "scenario": "A Kafka payment consumer crashes internally but its TCP connection to the broker stays open due to a network partition. The coordinator's session timer expires and it reassigns the partition to a healthy consumer. The zombie then resumes polling and both consumers process the same payment records simultaneously.",
+      "impact": "Duplicate payment debits are issued; account balances go negative; fraud detection triggers false positives that freeze merchant accounts.",
+      "incorrectCode": [
+        "import java.util.Properties;",
+        "import org.apache.kafka.clients.consumer.KafkaConsumer;",
+        "",
+        "public class PaymentConsumerConfig {",
+        "    public static Properties buildConfig() {",
+        "        var props = new Properties();",
+        "        props.put(\"bootstrap.servers\", \"kafka:9092\");",
+        "        props.put(\"group.id\", \"payment-processors\");",
+        "        props.put(\"enable.auto.commit\", \"false\");",
+        "        // BUG: session.timeout too long — zombie lives for up to 30s",
+        "        props.put(\"session.timeout.ms\", \"30000\");",
+        "        // BUG: poll interval far longer than actual processing time",
+        "        // creates a 5-minute zombie window before eviction",
+        "        props.put(\"max.poll.interval.ms\", \"300000\");",
+        "        props.put(\"key.deserializer\",",
+        "            \"org.apache.kafka.common.serialization.StringDeserializer\");",
+        "        props.put(\"value.deserializer\",",
+        "            \"org.apache.kafka.common.serialization.StringDeserializer\");",
+        "        return props;",
+        "    }",
+        "}"
+      ],
+      "incorrectAnnotations": [
+        {"line": 11, "note": "UNSAFE: session.timeout.ms=30000 — zombie consumer retains partition ownership for up to 30 seconds after a crash"},
+        {"line": 14, "note": "UNSAFE: max.poll.interval.ms=300000 creates a 5-minute window in which a GC-paused or slow consumer still appears alive to the coordinator"}
+      ],
+      "failureExplanation": "When a network partition isolates a consumer, its TCP connection remains open so the heartbeat thread continues sending heartbeats — the coordinator never sees a session timeout. If the application thread stops calling poll() due to an internal crash, the coordinator waits for max.poll.interval.ms (5 minutes by default) before declaring the consumer dead and triggering a rebalance. During this window both the zombie and the newly assigned consumer may poll the same partition.",
+      "simulation": {
+        "type": "sequence",
+        "title": "Zombie Consumer Causes Dual Payment Processing",
+        "participants": [
+          {"id": 0, "name": "Zombie Consumer"},
+          {"id": 1, "name": "New Consumer"},
+          {"id": 2, "name": "Group Coordinator"}
+        ],
+        "buggySteps": [
+          {"seq": 1, "from": 0, "to": 2, "message": "Heartbeat (TCP alive, app thread crashed)", "note": "Coordinator still sees consumer as healthy", "highlight": false},
+          {"seq": 2, "from": 1, "to": 2, "message": "JoinGroup request", "note": "New consumer added to group", "highlight": false},
+          {"seq": 3, "from": 2, "to": 1, "message": "Partition assigned (offset 500)", "note": "Coordinator assigns based on timeout expiry", "highlight": false},
+          {"seq": 4, "from": 1, "to": 1, "message": "process(offsets 500-510)", "note": "New consumer begins processing", "highlight": false},
+          {"seq": 5, "from": 0, "to": 0, "message": "App thread resumes — poll() offsets 500-510", "note": "⚠ Zombie resumes from same position", "highlight": true},
+          {"seq": 6, "from": 0, "to": 0, "message": "process(offsets 500-510)", "note": "⚠ DUPLICATE: same payments processed twice", "highlight": true}
+        ],
+        "bugAnnotation": "A zombie consumer with an alive TCP connection but a crashed app thread can resume polling after the coordinator assigns the partition to a new consumer, causing simultaneous dual processing.",
+        "safeSteps": [
+          {"seq": 1, "from": 0, "to": 2, "message": "Heartbeat stops (session.timeout.ms=6000)", "note": "Coordinator detects failure within 6 seconds", "highlight": false},
+          {"seq": 2, "from": 2, "to": 1, "message": "Rebalance — partition assigned to New Consumer", "note": "Fast eviction limits zombie window", "highlight": false},
+          {"seq": 3, "from": 1, "to": 1, "message": "process(offset 500) — idempotency check passes", "note": "Payment ID not in processed set", "highlight": false},
+          {"seq": 4, "from": 0, "to": 1, "message": "Zombie attempts poll() — fenced by epoch check", "note": "⚠ Broker rejects stale consumer epoch ✓", "highlight": false}
+        ],
+        "safeAnnotation": "Tuning session.timeout.ms to 6000ms combined with generation-id fencing ensures the zombie is evicted quickly and rejected if it attempts to poll after reassignment."
+      },
+      "correctCode": [
+        "import java.util.Properties;",
+        "",
+        "public class PaymentConsumerConfig {",
+        "    public static Properties buildSafeConfig() {",
+        "        var props = new Properties();",
+        "        props.put(\"bootstrap.servers\", \"kafka:9092\");",
+        "        props.put(\"group.id\", \"payment-processors\");",
+        "        props.put(\"enable.auto.commit\", \"false\");",
+        "        // Detect dead consumers within 6 seconds",
+        "        props.put(\"session.timeout.ms\", \"6000\");",
+        "        props.put(\"heartbeat.interval.ms\", \"2000\");",
+        "        // Align with realistic processing SLA (e.g. 30s max per batch)",
+        "        props.put(\"max.poll.interval.ms\", \"30000\");",
+        "        // Idempotent consumer defence-in-depth",
+        "        props.put(\"group.instance.id\", \"payment-pod-\" + podId());",
+        "        props.put(\"key.deserializer\",",
+        "            \"org.apache.kafka.common.serialization.StringDeserializer\");",
+        "        props.put(\"value.deserializer\",",
+        "            \"org.apache.kafka.common.serialization.StringDeserializer\");",
+        "        return props;",
+        "    }",
+        "",
+        "    // Idempotency guard in the consumer loop",
+        "    private boolean alreadyProcessed(String paymentId) {",
+        "        return idempotencyRepo.existsByPaymentId(paymentId);",
+        "    }",
+        "}"
+      ],
+      "correctExplanation": "Setting session.timeout.ms=6000 causes the coordinator to evict a zombie within 6 seconds, drastically shrinking the dual-processing window. The group.instance.id enables static membership and generation-id fencing, so the broker rejects any poll() from the old consumer generation after reassignment.",
+      "alternatives": [
+        {
+          "name": "Idempotent Consumer with Database Guard",
+          "code": [
+            "// In the consumer processing loop:",
+            "String paymentId = record.key();",
+            "int updated = jdbcTemplate.update(",
+            "    \"INSERT INTO processed_payments (payment_id, processed_at)\" +",
+            "    \" VALUES (?, NOW()) ON CONFLICT (payment_id) DO NOTHING\",",
+            "    paymentId);",
+            "if (updated == 0) {",
+            "    log.warn(\"Duplicate skipped: {}\", paymentId);",
+            "    return; // already processed",
+            "}",
+            "paymentService.debit(record.value());"
+          ],
+          "pros": ["Prevents duplicate debits even if Kafka fencing fails", "Works across multiple consumer groups"],
+          "cons": ["Adds a DB round-trip per record", "Requires a unique index on payment_id in the processed_payments table"],
+          "whenToUse": "As a defence-in-depth layer alongside session timeout tuning; never as the sole protection against zombie consumers."
+        }
+      ],
+      "performanceNotes": "Lowering session.timeout.ms increases sensitivity to transient network jitter — set it to at least 3× the 99th-percentile heartbeat round-trip time. heartbeat.interval.ms should be session.timeout.ms / 3. Static membership (group.instance.id) avoids unnecessary rebalances on planned pod restarts.",
+      "performanceTable": [
+        {"approach": "session.timeout.ms=30000 (default)", "throughput": "Baseline", "notes": "30-second zombie window; high duplicate risk"},
+        {"approach": "session.timeout.ms=6000", "throughput": "Baseline", "notes": "6-second window; network jitter may cause false evictions"},
+        {"approach": "Static membership + tuned timeout", "throughput": "Baseline +5%", "notes": "Avoids unnecessary rebalances on restarts; best balance"},
+        {"approach": "Kafka EOS fencing", "throughput": "−20%", "notes": "Epoch-based fencing; complete zombie protection"}
+      ],
+      "tests": [
+        {
+          "framework": "testcontainers",
+          "code": [
+            "import org.testcontainers.containers.KafkaContainer;",
+            "import org.junit.jupiter.api.*;",
+            "import java.util.concurrent.atomic.AtomicInteger;",
+            "",
+            "@Testcontainers",
+            "class ZombieConsumerTest {",
+            "    @Container",
+            "    static KafkaContainer kafka =",
+            "        new KafkaContainer(DockerImageName.parse(\"confluentinc/cp-kafka:7.5.0\"));",
+            "",
+            "    @Test",
+            "    void idempotencyGuard_preventsDoubleProcessing_afterZombieResumes() throws Exception {",
+            "        var processedIds = ConcurrentHashMap.newKeySet();",
+            "        var duplicateCount = new AtomicInteger(0);",
+            "        producePayments(kafka, 10);",
+            "        var zombie = startConsumerPaused(kafka); // pauses after 5 records",
+            "        Thread.sleep(8000); // exceed max.poll.interval.ms=6000",
+            "        var newConsumer = startConsumer(kafka, id -> {",
+            "            if (!processedIds.add(id)) duplicateCount.incrementAndGet();",
+            "        });",
+            "        zombie.resume(); // zombie tries to process again",
+            "        Thread.sleep(5000);",
+            "        Assertions.assertEquals(0, duplicateCount.get(),",
+            "            \"Idempotency guard must block zombie duplicates\");",
+            "    }",
+            "}"
+          ],
+          "explanation": "The test pauses a consumer longer than max.poll.interval.ms, causing the coordinator to trigger a rebalance and assign partitions to a new consumer. When the zombie resumes, the idempotency guard in the consumer loop detects the duplicate payment IDs and skips reprocessing.",
+          "limitations": "Docker networking does not perfectly simulate a real TCP-alive / app-dead scenario; in practice use Toxiproxy to introduce network partitions for more realistic zombie simulation."
+        }
+      ],
+      "monitoringSymptoms": [
+        "kafka_consumer_group_lag increasing on a partition while two members show non-zero fetch rates",
+        "Payment idempotency collision rate > 0 in application metrics",
+        "GroupCoordinator logs showing repeated JoinGroup / SyncGroup cycles without member changes",
+        "Duplicate payment_id entries in the settlements table within a single processing window",
+        "Alert: two consumer members with identical assigned partitions in kafka-consumer-groups.sh output"
+      ],
+      "debugTips": [
+        "Run kafka-consumer-groups.sh --describe to check if two members own the same partition simultaneously",
+        "Grep coordinator logs for 'Preparing to rebalance group' correlated with the payment duplicate timestamp",
+        "Use kafka-log-dirs.sh to compare the log end offset with both consumers' current offset — a zombie shows stale current-offset",
+        "Enable TRACE on org.apache.kafka.clients.consumer.internals.AbstractCoordinator to log every heartbeat and generation change",
+        "Check JVM GC logs — a long GC pause can mimic a zombie by halting poll() while the heartbeat thread continues"
+      ],
+      "productionRecommendations": [
+        "Set session.timeout.ms=6000 and heartbeat.interval.ms=2000 for financial consumer groups",
+        "Set max.poll.interval.ms to 2× the 99th-percentile end-to-end processing time per poll batch",
+        "Use group.instance.id (static membership) on Kubernetes pods to prevent rebalances on planned restarts",
+        "Implement an idempotency guard (database unique constraint) as defence-in-depth against zombie duplicates",
+        "Alert when any consumer group member's lag stops decreasing for more than 2× the poll interval"
+      ],
+      "assessment": [
+        {
+          "text": "What condition allows a zombie Kafka consumer to continue sending heartbeats even after its application thread has crashed?",
+          "options": [
+            "A) The consumer automatically spawns a backup heartbeat process on crash",
+            "B) Kafka brokers ignore heartbeat failures for the first 60 seconds",
+            "C) The heartbeat runs on a separate background thread; a crashed application thread does not kill it, so the TCP connection and heartbeats persist",
+            "D) The consumer commits offsets automatically, keeping the session alive"
+          ],
+          "correct": 2,
+          "explanation": "Kafka's consumer client separates the heartbeat thread from the application polling thread. If the application thread crashes or stalls without killing the JVM process, the heartbeat thread continues sending heartbeats independently, so the coordinator never sees a session timeout and the zombie retains partition ownership."
+        },
+        {
+          "text": "Which configuration change most directly shrinks the zombie consumer window in a Kafka consumer group?",
+          "options": [
+            "A) Increase max.poll.records to process fewer batches",
+            "B) Decrease session.timeout.ms so the coordinator detects the dead consumer faster",
+            "C) Increase fetch.min.bytes to reduce polling frequency",
+            "D) Set auto.offset.reset=earliest to replay from the beginning"
+          ],
+          "correct": 1,
+          "explanation": "session.timeout.ms controls how long the coordinator waits after the last successful heartbeat before declaring a consumer dead and triggering a rebalance. Lowering it from 30s to 6s reduces the zombie window by 80%, limiting the period during which two consumers can own the same partition."
+        },
+        {
+          "text": "Why is an idempotency guard (database unique constraint on payment_id) described as 'defence-in-depth' rather than a primary fix for the zombie consumer problem?",
+          "options": [
+            "A) Database constraints cannot prevent duplicate Kafka consumption",
+            "B) The guard adds latency that makes Kafka consumers slower than the zombie timeout",
+            "C) It prevents the symptom (duplicate debit) but not the root cause (dual partition ownership); proper timeout tuning and fencing must eliminate the zombie first",
+            "D) Unique constraints only work with relational databases, not NoSQL stores"
+          ],
+          "correct": 2,
+          "explanation": "An idempotency guard prevents the harmful outcome of zombie consumption (a duplicate financial transaction) but does not stop the zombie from consuming records, holding partition ownership, or skewing consumer lag metrics. Proper session timeout tuning and generation-id fencing address the root cause by evicting the zombie and rejecting its subsequent poll attempts."
+        }
+      ]
+    },
+    {
+      "id": "fin-09",
+      "category": "financial",
+      "title": "Redis Cache Stampede on Balance Read",
+      "subtitle": "Simultaneous cache expiry floods PostgreSQL and returns stale balances",
+      "difficulty": "advanced",
+      "tags": ["Redis", "cache-stampede", "thundering-herd", "TTL", "Redisson"],
+      "estimatedMinutes": 20,
+      "relatedLessons": ["track-03-lesson-27"],
+      "scenario": "Account balances are cached in Redis with a 60-second TTL. At the moment of expiry, 1,000 concurrent API requests all miss the cache simultaneously, all query PostgreSQL, and all attempt to repopulate Redis — the database is overwhelmed and some requests return stale or inconsistent balances.",
+      "impact": "PostgreSQL connection pool exhaustion causes payment authorization timeouts; some accounts temporarily show incorrect available balances, leading to declined transactions or overdrafts.",
+      "incorrectCode": [
+        "import redis.clients.jedis.Jedis;",
+        "import java.math.BigDecimal;",
+        "",
+        "public class BalanceCacheService {",
+        "    private final Jedis redis;",
+        "    private final AccountRepository accountRepo;",
+        "",
+        "    public BigDecimal getBalance(String accountId) {",
+        "        String key = \"balance:\" + accountId;",
+        "        // BUG: no coordination — all threads miss and query DB simultaneously",
+        "        String cached = redis.get(key);",
+        "        if (cached == null) {",
+        "            // All 1000 threads reach here at expiry",
+        "            BigDecimal balance = accountRepo.findBalance(accountId);",
+        "            // All 1000 threads write the same value",
+        "            redis.setex(key, 60, balance.toPlainString());",
+        "            return balance;",
+        "        }",
+        "        return new BigDecimal(cached);",
+        "    }",
+        "}"
+      ],
+      "incorrectAnnotations": [
+        {"line": 11, "note": "UNSAFE: uncoordinated cache-miss check — all concurrent threads see null simultaneously and proceed to query the database"},
+        {"line": 14, "note": "UNSAFE: 1000 threads call findBalance() concurrently, exhausting the DB connection pool and causing cascading timeouts"},
+        {"line": 16, "note": "UNSAFE: redundant writes — all threads overwrite the same key with the same value, wasting network bandwidth and causing write amplification"}
+      ],
+      "failureExplanation": "When a cache entry expires, every waiting request evaluates `redis.get(key)` before any single request has had time to repopulate it. All threads see null, all issue a database query in parallel, and all write back to Redis — a classic thundering herd. Because the PostgreSQL connection pool has a fixed size, the simultaneous queries exhaust available connections, forcing later requests to queue or timeout.",
+      "simulation": {
+        "type": "thread-timeline",
+        "title": "Cache Stampede — 5 Threads All Miss and Query DB",
+        "threads": ["T1 (request)", "T2 (request)", "T3 (request)", "T4 (request)", "T5 (request)"],
+        "shared": [{"name": "balance:acc-1", "value": "null (expired)"}],
+        "buggySteps": [
+          {"seq": 1, "thread": 0, "op": "READ", "var": "balance:acc-1", "value": null, "note": "T1 cache MISS", "highlight": false},
+          {"seq": 2, "thread": 1, "op": "READ", "var": "balance:acc-1", "value": null, "note": "⚠ T2 cache MISS — same stale state", "highlight": true},
+          {"seq": 3, "thread": 2, "op": "READ", "var": "balance:acc-1", "value": null, "note": "⚠ T3 cache MISS", "highlight": true},
+          {"seq": 4, "thread": 3, "op": "READ", "var": "balance:acc-1", "value": null, "note": "⚠ T4 cache MISS", "highlight": true},
+          {"seq": 5, "thread": 4, "op": "READ", "var": "balance:acc-1", "value": null, "note": "⚠ T5 cache MISS", "highlight": true},
+          {"seq": 6, "thread": 0, "op": "CALL", "var": "accountRepo.findBalance", "value": "1000.00", "note": "T1 queries DB", "highlight": false},
+          {"seq": 7, "thread": 1, "op": "CALL", "var": "accountRepo.findBalance", "value": "1000.00", "note": "⚠ T2 queries DB (redundant)", "highlight": true},
+          {"seq": 8, "thread": 2, "op": "CALL", "var": "accountRepo.findBalance", "value": "1000.00", "note": "⚠ T3 queries DB (redundant)", "highlight": true},
+          {"seq": 9, "thread": 3, "op": "CALL", "var": "accountRepo.findBalance", "value": "1000.00", "note": "⚠ T4 queries DB (redundant)", "highlight": true},
+          {"seq": 10, "thread": 4, "op": "CALL", "var": "accountRepo.findBalance", "value": "1000.00", "note": "⚠ T5 queries DB (redundant)", "highlight": true},
+          {"seq": 11, "thread": 0, "op": "WRITE", "var": "balance:acc-1", "value": "1000.00", "note": "T1 writes cache", "highlight": false},
+          {"seq": 12, "thread": 1, "op": "WRITE", "var": "balance:acc-1", "value": "1000.00", "note": "⚠ T2–T5 redundant writes", "highlight": true}
+        ],
+        "bugAnnotation": "All five threads miss the expired cache entry simultaneously, issuing five redundant DB queries and writes.",
+        "safeSteps": [
+          {"seq": 1, "thread": 0, "op": "ACQUIRE", "var": "lock:balance:acc-1", "value": "acquired", "note": "T1 wins the Redisson lock", "highlight": false},
+          {"seq": 2, "thread": 1, "op": "WAIT", "var": "lock:balance:acc-1", "value": "waiting", "note": "T2–T5 wait on lock", "highlight": false},
+          {"seq": 3, "thread": 0, "op": "CALL", "var": "accountRepo.findBalance", "value": "1000.00", "note": "Only T1 queries DB", "highlight": false},
+          {"seq": 4, "thread": 0, "op": "WRITE", "var": "balance:acc-1", "value": "1000.00", "note": "T1 populates cache", "highlight": false},
+          {"seq": 5, "thread": 0, "op": "RELEASE", "var": "lock:balance:acc-1", "value": "released", "note": "T1 unlocks", "highlight": false},
+          {"seq": 6, "thread": 1, "op": "READ", "var": "balance:acc-1", "value": "1000.00", "note": "T2–T5 read from cache ✓", "highlight": false}
+        ],
+        "safeAnnotation": "A Redisson distributed lock ensures only one thread populates the cache; all others wait and read the populated value."
+      },
+      "correctCode": [
+        "import org.redisson.api.RLock;",
+        "import org.redisson.api.RedissonClient;",
+        "import java.math.BigDecimal;",
+        "import java.util.concurrent.TimeUnit;",
+        "",
+        "public class BalanceCacheService {",
+        "    private final RedissonClient redisson;",
+        "    private final AccountRepository accountRepo;",
+        "",
+        "    public BigDecimal getBalance(String accountId) throws InterruptedException {",
+        "        String key = \"balance:\" + accountId;",
+        "        String cached = redisson.getBucket(key).get();",
+        "        if (cached != null) return new BigDecimal((String) cached);",
+        "",
+        "        // Single-flight: only one thread populates; others wait",
+        "        RLock lock = redisson.getLock(\"lock:\" + key);",
+        "        lock.lock(5, TimeUnit.SECONDS);",
+        "        try {",
+        "            // Double-check after acquiring lock",
+        "            cached = (String) redisson.getBucket(key).get();",
+        "            if (cached != null) return new BigDecimal(cached);",
+        "            BigDecimal balance = accountRepo.findBalance(accountId);",
+        "            // Probabilistic early expiration: jitter ±10s prevents synchronized expiry",
+        "            int ttl = 55 + (int)(Math.random() * 10);",
+        "            redisson.getBucket(key).set(balance.toPlainString(), ttl, TimeUnit.SECONDS);",
+        "            return balance;",
+        "        } finally {",
+        "            lock.unlock();",
+        "        }",
+        "    }",
+        "}"
+      ],
+      "correctExplanation": "A Redisson distributed lock combined with a double-checked read ensures only one thread issues the database query and populates the cache. TTL jitter (55–65 seconds) staggers expiry across the fleet, preventing all instances from experiencing a cache miss simultaneously.",
+      "alternatives": [
+        {
+          "name": "Caffeine L1 + Redis L2 Layered Cache",
+          "code": [
+            "import com.github.benmanes.caffeine.cache.Caffeine;",
+            "import com.github.benmanes.caffeine.cache.Cache;",
+            "import java.util.concurrent.TimeUnit;",
+            "",
+            "public class LayeredBalanceCache {",
+            "    private final Cache<String, BigDecimal> l1 = Caffeine.newBuilder()",
+            "        .maximumSize(10_000)",
+            "        .expireAfterWrite(5, TimeUnit.SECONDS)",
+            "        .build();",
+            "",
+            "    public BigDecimal getBalance(String accountId) {",
+            "        return l1.get(accountId, id ->",
+            "            redisCache.getOrLoad(id, () -> accountRepo.findBalance(id)));",
+            "    }",
+            "}"
+          ],
+          "pros": ["Sub-millisecond L1 hit; absorbs intra-pod stampede entirely", "Caffeine's built-in single-flight (CacheLoader) prevents duplicate L1 misses"],
+          "cons": ["L1 serves slightly stale data (up to 5s); inconsistent across pods during the stale window", "Memory overhead per JVM"],
+          "whenToUse": "When sub-millisecond p99 latency is required and a 5-second staleness window is acceptable for balance reads."
+        }
+      ],
+      "performanceNotes": "Adding TTL jitter alone (without a lock) reduces stampede probability proportionally to the jitter range but does not eliminate it under high concurrency. The Redisson lock adds one round-trip on cache miss but completely serialises repopulation. For accounts with millions of QPS, prefer the Caffeine L1 layer to avoid the lock becoming a bottleneck.",
+      "performanceTable": [
+        {"approach": "Uncoordinated GET + SETEX (buggy)", "throughput": "~50 k RPS cache-hit; DB collapses on miss", "notes": "Thundering herd on every TTL expiry"},
+        {"approach": "Redisson lock + double-check", "throughput": "~48 k RPS cache-hit; 1 DB query on miss", "notes": "Lock adds ~1ms on miss; eliminates stampede"},
+        {"approach": "TTL jitter only", "throughput": "~50 k RPS; reduced stampede probability", "notes": "Does not fully eliminate stampede under very high concurrency"},
+        {"approach": "Caffeine L1 + Redis L2", "throughput": "~200 k RPS (L1 hit); 1 DB query per pod on miss", "notes": "Best throughput; accepts 5s staleness per pod"}
+      ],
+      "tests": [
+        {
+          "framework": "testcontainers",
+          "code": [
+            "import org.testcontainers.containers.GenericContainer;",
+            "import org.junit.jupiter.api.*;",
+            "import java.util.concurrent.*;",
+            "import java.util.concurrent.atomic.AtomicInteger;",
+            "",
+            "@Testcontainers",
+            "class CacheStampedeTest {",
+            "    @Container",
+            "    static GenericContainer<?> redis =",
+            "        new GenericContainer<>(\"redis:7-alpine\").withExposedPorts(6379);",
+            "",
+            "    @Test",
+            "    void withLock_dbCalledOnce_under100ConcurrentMisses() throws Exception {",
+            "        var dbCallCount = new AtomicInteger(0);",
+            "        var service = buildService(redis, () -> {",
+            "            dbCallCount.incrementAndGet();",
+            "            return new BigDecimal(\"1000.00\");",
+            "        });",
+            "        // Expire cache entry",
+            "        service.evict(\"acc-1\");",
+            "        var latch = new CountDownLatch(1);",
+            "        var executor = Executors.newFixedThreadPool(100);",
+            "        for (int i = 0; i < 100; i++) {",
+            "            executor.submit(() -> { latch.await(); service.getBalance(\"acc-1\"); return null; });",
+            "        }",
+            "        latch.countDown();",
+            "        executor.shutdown();",
+            "        executor.awaitTermination(10, TimeUnit.SECONDS);",
+            "        Assertions.assertEquals(1, dbCallCount.get(),",
+            "            \"DB must be queried exactly once despite 100 concurrent cache misses\");",
+            "    }",
+            "}"
+          ],
+          "explanation": "One hundred threads are released simultaneously against an expired cache entry. The test asserts the database mock is called exactly once, verifying that the Redisson lock serialises cache population under stampede conditions.",
+          "limitations": "A local Testcontainers Redis does not replicate real network latency between application pods and the cache; in production the lock acquisition time is higher, so test with realistic latency profiles."
+        }
+      ],
+      "monitoringSymptoms": [
+        "Redis cache miss rate spikes to 100% every 60 seconds (aligned with TTL)",
+        "PostgreSQL active_connections hitting pool maximum simultaneously with the miss spike",
+        "p99 balance API latency jumps from 5ms (cache hit) to 300ms+ every TTL cycle",
+        "Redis keyspace notifications showing mass expiry events at regular intervals",
+        "DB slow query log flooded with identical SELECT balance FROM accounts WHERE id=? statements"
+      ],
+      "debugTips": [
+        "Run redis-cli --stat and watch hit_rate drop to 0% every 60 seconds to confirm stampede timing",
+        "Use pg_stat_activity to observe hundreds of identical queries executing simultaneously at the stampede moment",
+        "Enable Redis MONITOR (briefly in production) to observe burst of SET commands after the GET miss wave",
+        "Graph cache miss rate against DB query rate on the same timeline — perfect correlation confirms stampede",
+        "Add TTL jitter and observe whether the miss spike broadens into a smooth ramp — if not, concurrent threads per key is too high"
+      ],
+      "productionRecommendations": [
+        "Always add TTL jitter (±10% of base TTL) to prevent synchronised expiry across a large key space",
+        "Use a distributed lock (Redisson) with a double-checked read for any cache key with high concurrent read demand",
+        "Set a PostgreSQL connection pool size that explicitly accounts for stampede scenarios, or use PgBouncer with transaction-mode pooling",
+        "Consider probabilistic early expiration: re-fetch a key before it expires with probability proportional to remaining TTL",
+        "Alert on cache miss rate > 10% sustained for more than 5 seconds — this indicates a stampede or cache node failure"
+      ],
+      "assessment": [
+        {
+          "text": "What causes a cache stampede in a Redis-backed balance service?",
+          "options": [
+            "A) Redis running out of memory and evicting keys under LRU policy",
+            "B) Multiple threads simultaneously reading a key that just expired, all missing the cache and issuing redundant database queries",
+            "C) The database returning different values to different threads due to read isolation",
+            "D) Redis replication lag causing primary and replica to return different values"
+          ],
+          "correct": 1,
+          "explanation": "A cache stampede occurs when a TTL expiry causes every concurrent thread to see a cache miss at the same instant. Without coordination, all threads independently query the database and attempt to repopulate the cache, overwhelming the database and defeating the caching strategy."
+        },
+        {
+          "text": "What is the purpose of the double-checked read (re-reading the cache inside the lock) in the Redisson single-flight pattern?",
+          "options": [
+            "A) To verify that the Redisson lock was acquired correctly",
+            "B) To ensure the balance returned is always the most recent value from the database",
+            "C) To avoid a database query if another thread already populated the cache while the current thread was waiting for the lock",
+            "D) To prevent Redis from accepting stale writes from other pods"
+          ],
+          "correct": 2,
+          "explanation": "Threads that were queued waiting for the lock check the cache again after acquiring it. The first thread to acquire the lock will find the cache empty and query the database. All subsequent threads will find the cache already populated by the first thread and return immediately without hitting the database."
+        },
+        {
+          "text": "How does adding TTL jitter (e.g., 55–65 seconds instead of a fixed 60 seconds) reduce cache stampede risk?",
+          "options": [
+            "A) It increases the total time data stays in cache, reducing miss frequency",
+            "B) It staggers expiry times across different cache keys and pod write times, so not all keys expire simultaneously",
+            "C) It instructs Redis to automatically refresh keys before they expire",
+            "D) It prevents any two threads from writing to the same Redis key within the jitter window"
+          ],
+          "correct": 1,
+          "explanation": "TTL jitter spreads expiry events across a time window rather than concentrating them at a single point. When millions of keys all have TTL=60s exactly, they expire together and cause a simultaneous stampede. With jitter, different keys expire at slightly different times, distributing the resulting DB load evenly across the jitter window."
+        }
+      ]
+    },
+    {
+      "id": "fin-10",
+      "category": "financial",
+      "title": "Distributed Lock Expiry During Financial Operation",
+      "subtitle": "Redisson TTL shorter than processing time allows a second pod to acquire the lock — duplicate payment",
+      "difficulty": "advanced",
+      "tags": ["distributed-lock", "Redisson", "TTL", "watchdog", "duplicate-payment"],
+      "estimatedMinutes": 20,
+      "relatedLessons": ["track-02-lesson-09"],
+      "scenario": "Payment deduplication relies on a Redisson distributed lock with a 5-second TTL. When a slow downstream payment gateway causes processing to take 6 seconds, the lock expires before unlock() is called. A second pod then acquires the lock and processes the same payment, issuing a duplicate transaction.",
+      "impact": "Customers are charged twice for the same transaction; chargeback rates increase; card network fines are triggered when duplicate-transaction rates exceed thresholds.",
+      "incorrectCode": [
+        "import org.redisson.api.RLock;",
+        "import org.redisson.api.RedissonClient;",
+        "import java.util.concurrent.TimeUnit;",
+        "",
+        "public class PaymentDeduplicationService {",
+        "    private final RedissonClient redisson;",
+        "    private final PaymentGateway gateway;",
+        "",
+        "    public void processPayment(String paymentId, PaymentRequest req) {",
+        "        RLock lock = redisson.getLock(\"payment:\" + paymentId);",
+        "        // BUG: fixed 5-second TTL, but gateway call may take 6+ seconds",
+        "        lock.lock(5, TimeUnit.SECONDS);",
+        "        try {",
+        "            // Slow gateway call: average 4s, spikes to 7s under load",
+        "            gateway.submit(req);  // may take > 5s",
+        "        } finally {",
+        "            // By the time we reach here, TTL may have expired",
+        "            // A second pod already acquired the lock and re-submitted",
+        "            lock.unlock();",
+        "        }",
+        "    }",
+        "}"
+      ],
+      "incorrectAnnotations": [
+        {"line": 12, "note": "UNSAFE: explicit 5-second leaseTime causes lock to auto-expire if the lock holder is still alive — another node acquires it immediately"},
+        {"line": 15, "note": "UNSAFE: gateway.submit() can exceed the leaseTime under slow network conditions, leaving the critical section unprotected"},
+        {"line": 19, "note": "UNSAFE: unlock() after TTL expiry throws IllegalMonitorStateException and does not re-lock — the duplicate has already been issued"}
+      ],
+      "failureExplanation": "When lock.lock() is called with an explicit leaseTime, Redisson sets the Redis key TTL to exactly that value. If the holder's operation outlasts the TTL, Redis automatically deletes the key and any other node can acquire the lock immediately — even though the original holder is still inside the critical section. The result is two simultaneous holders of the same \"exclusive\" lock, breaking the mutual-exclusion guarantee.",
+      "simulation": {
+        "type": "thread-timeline",
+        "title": "Lock TTL Expiry Allows Duplicate Payment",
+        "threads": ["Pod-1 (original)", "Pod-2 (competitor)"],
+        "shared": [{"name": "payment:pay-001", "value": "UNLOCKED"}],
+        "buggySteps": [
+          {"seq": 1, "thread": 0, "op": "ACQUIRE", "var": "payment:pay-001", "value": "LOCKED TTL=5s", "note": "Pod-1 acquires lock with 5s TTL", "highlight": false},
+          {"seq": 2, "thread": 0, "op": "CALL", "var": "gateway.submit(pay-001)", "value": "PENDING", "note": "Gateway call starts — expected 4s, actual 6s", "highlight": false},
+          {"seq": 3, "thread": 0, "op": "WAIT", "var": "TTL=0", "value": "EXPIRED", "note": "⚠ 5 seconds elapsed — Redis deletes the lock key", "highlight": true},
+          {"seq": 4, "thread": 1, "op": "ACQUIRE", "var": "payment:pay-001", "value": "LOCKED", "note": "⚠ Pod-2 acquires the now-free lock", "highlight": true},
+          {"seq": 5, "thread": 1, "op": "CALL", "var": "gateway.submit(pay-001)", "value": "SUBMITTED", "note": "⚠ DUPLICATE: Pod-2 submits same payment", "highlight": true},
+          {"seq": 6, "thread": 0, "op": "RETURN", "var": "gateway.submit", "value": "SUCCESS", "note": "Pod-1 returns — unaware of duplicate", "highlight": false},
+          {"seq": 7, "thread": 0, "op": "RELEASE", "var": "payment:pay-001", "value": "ERROR", "note": "⚠ unlock() throws — lock owned by Pod-2", "highlight": true}
+        ],
+        "bugAnnotation": "An explicit leaseTime shorter than the actual operation duration allows the lock to auto-expire while Pod-1 is still inside the critical section.",
+        "safeSteps": [
+          {"seq": 1, "thread": 0, "op": "ACQUIRE", "var": "payment:pay-001", "value": "LOCKED (watchdog)", "note": "Pod-1 acquires lock — no TTL, watchdog active", "highlight": false},
+          {"seq": 2, "thread": 0, "op": "CALL", "var": "gateway.submit(pay-001)", "value": "PENDING", "note": "Gateway call starts", "highlight": false},
+          {"seq": 3, "thread": 0, "op": "COMPUTE", "var": "watchdog", "value": "RENEW TTL", "note": "Watchdog renews lock every TTL/3 seconds", "highlight": false},
+          {"seq": 4, "thread": 1, "op": "WAIT", "var": "payment:pay-001", "value": "BLOCKED", "note": "Pod-2 blocked — lock still held", "highlight": false},
+          {"seq": 5, "thread": 0, "op": "RETURN", "var": "gateway.submit", "value": "SUCCESS", "note": "Operation completes successfully", "highlight": false},
+          {"seq": 6, "thread": 0, "op": "RELEASE", "var": "payment:pay-001", "value": "UNLOCKED", "note": "Pod-1 releases lock ✓", "highlight": false},
+          {"seq": 7, "thread": 1, "op": "ACQUIRE", "var": "payment:pay-001", "value": "LOCKED", "note": "Pod-2 now acquires — but idempotency check prevents re-submission ✓", "highlight": false}
+        ],
+        "safeAnnotation": "lock.lock() without leaseTime activates Redisson's watchdog, which automatically renews the lock TTL every TTL/3 seconds for as long as the holder JVM is alive."
+      },
+      "correctCode": [
+        "import org.redisson.api.RLock;",
+        "import org.redisson.api.RedissonClient;",
+        "import org.springframework.jdbc.core.JdbcTemplate;",
+        "",
+        "public class PaymentDeduplicationService {",
+        "    private final RedissonClient redisson;",
+        "    private final PaymentGateway gateway;",
+        "    private final JdbcTemplate jdbc;",
+        "",
+        "    public void processPayment(String paymentId, PaymentRequest req) {",
+        "        RLock lock = redisson.getLock(\"payment:\" + paymentId);",
+        "        // No leaseTime = watchdog mode: auto-renews until unlock() or JVM crash",
+        "        lock.lock();",
+        "        try {",
+        "            // Defence-in-depth: idempotency guard even inside the lock",
+        "            int inserted = jdbc.update(",
+        "                \"INSERT INTO payments (id, status) VALUES (?, 'PENDING')\" +",
+        "                \" ON CONFLICT (id) DO NOTHING\",",
+        "                paymentId);",
+        "            if (inserted == 0) {",
+        "                return; // already processed — skip gateway call",
+        "            }",
+        "            gateway.submit(req);",
+        "            jdbc.update(\"UPDATE payments SET status='DONE' WHERE id=?\",",
+        "                paymentId);",
+        "        } finally {",
+        "            lock.unlock();",
+        "        }",
+        "    }",
+        "}"
+      ],
+      "correctExplanation": "Calling lock.lock() without a leaseTime enables Redisson's watchdog daemon, which renews the lock's TTL every lockWatchdogTimeout/3 milliseconds (default every 10 seconds) for as long as the JVM process is alive. The database idempotency constraint provides defence-in-depth: even if the lock fails, a duplicate payment cannot be inserted.",
+      "alternatives": [
+        {
+          "name": "Long TTL + Database Idempotency",
+          "code": [
+            "// Set TTL to 3× expected processing time",
+            "lock.lock(30, TimeUnit.SECONDS); // 3× the 10s SLA",
+            "try {",
+            "    // Atomic idempotency: returns 0 if already processed",
+            "    int rows = jdbc.update(",
+            "        \"UPDATE payments SET status='PROCESSING'\" +",
+            "        \" WHERE id=? AND status='PENDING'\",",
+            "        paymentId);",
+            "    if (rows == 0) return; // already claimed",
+            "    gateway.submit(req);",
+            "    jdbc.update(\"UPDATE payments SET status='DONE' WHERE id=?\",",
+            "        paymentId);",
+            "} finally {",
+            "    lock.unlock();",
+            "}",
+            ""
+          ],
+          "pros": ["Avoids watchdog thread overhead", "Explicit TTL makes lock behaviour predictable in runbooks"],
+          "cons": ["Must accurately estimate max processing time; underestimation recreates the original bug", "Leaves lock held for full TTL if JVM crashes, blocking retries for up to 30 seconds"],
+          "whenToUse": "When processing time is tightly bounded by an SLA with a known worst-case ceiling and watchdog threads are disallowed by policy."
+        }
+      ],
+      "performanceNotes": "Redisson's watchdog uses a single Netty scheduled thread per RedissonClient instance and adds negligible CPU overhead. The watchdog timer fires every lockWatchdogTimeout/3 ms (default 10s), making one Redis PEXPIRE call per active lock. Under thousands of concurrent payment locks, the watchdog call volume is proportional to the number of active locks, not to request throughput.",
+      "performanceTable": [
+        {"approach": "lock(5, SECONDS) — fixed TTL (buggy)", "throughput": "High until TTL race; then duplicates", "notes": "Lock expires under slow operations"},
+        {"approach": "lock() — watchdog mode", "throughput": "Same as fixed TTL for sub-10s ops", "notes": "Auto-renews; no expiry race; +1 Redis call per 10s per active lock"},
+        {"approach": "lock(30, SECONDS) — conservative TTL", "throughput": "Same; 30s orphan window on crash", "notes": "Predictable but blocks retries for 30s after JVM crash"},
+        {"approach": "DB idempotency only (no lock)", "throughput": "Highest", "notes": "Relies entirely on DB unique constraint; no network lock overhead; acceptable if idempotency is 100% reliable"}
+      ],
+      "tests": [
+        {
+          "framework": "testcontainers",
+          "code": [
+            "import org.testcontainers.containers.GenericContainer;",
+            "import org.redisson.Redisson;",
+            "import org.junit.jupiter.api.*;",
+            "import java.util.concurrent.atomic.AtomicInteger;",
+            "",
+            "@Testcontainers",
+            "class RedissonWatchdogTest {",
+            "    @Container",
+            "    static GenericContainer<?> redis =",
+            "        new GenericContainer<>(\"redis:7-alpine\").withExposedPorts(6379);",
+            "",
+            "    @Test",
+            "    void watchdogLock_preventsSecondPod_duringSlowGateway() throws Exception {",
+            "        var submitCount = new AtomicInteger(0);",
+            "        var gateway = (PaymentRequest r) -> {",
+            "            Thread.sleep(7000); // simulate slow gateway",
+            "            submitCount.incrementAndGet();",
+            "        };",
+            "        var svc = buildService(redis, gateway);",
+            "        var t1 = new Thread(() -> svc.processPayment(\"pay-001\", req()));",
+            "        var t2 = new Thread(() -> svc.processPayment(\"pay-001\", req()));",
+            "        t1.start(); Thread.sleep(100); t2.start();",
+            "        t1.join(); t2.join();",
+            "        Assertions.assertEquals(1, submitCount.get(),",
+            "            \"Gateway must be called exactly once despite 7s processing\");",
+            "    }",
+            "}"
+          ],
+          "explanation": "Two threads attempt to process the same payment simultaneously. The gateway mock sleeps for 7 seconds, exceeding the old 5-second TTL. The test asserts the gateway is called exactly once, verifying that the watchdog lock or idempotency guard prevents the second thread from submitting a duplicate.",
+          "limitations": "Testcontainers Redis does not simulate Redis sentinel or cluster failover; in a cluster, Redisson's RedLock algorithm is required to maintain mutual exclusion across replicas."
+        }
+      ],
+      "monitoringSymptoms": [
+        "Duplicate payment_id entries in the transactions table with the same amount within seconds of each other",
+        "IllegalMonitorStateException in application logs — lock.unlock() called after TTL expiry",
+        "Payment gateway reporting duplicate transaction IDs with idempotency-key conflicts",
+        "Redis keyspace notification showing lock key deletion before the application calls DEL",
+        "Chargeback rate spike correlated with gateway p99 latency exceeding the configured lock TTL"
+      ],
+      "debugTips": [
+        "Query SELECT id, COUNT(*) FROM payments GROUP BY id HAVING COUNT(*) > 1 to identify duplicate payments immediately",
+        "Check Redis TTL on the lock key during processing: redis-cli TTL payment:pay-001 — a rapidly decrementing TTL confirms the watchdog is not running",
+        "Search logs for IllegalMonitorStateException from Redisson — always indicates lock expired before unlock",
+        "Correlate gateway p99 latency with lock TTL in dashboards — when gateway p99 > lock TTL, duplicate probability rises sharply",
+        "Enable Redisson DEBUG logging to trace watchdog renewal events: org.redisson.RedissonLock"
+      ],
+      "productionRecommendations": [
+        "Always use lock.lock() without leaseTime for operations with variable duration — let the watchdog manage renewal",
+        "Set lockWatchdogTimeout to 3× the typical lock holding time (default 30s is appropriate for most payment flows)",
+        "Add a database idempotency constraint (unique index on payment_id) as mandatory defence-in-depth",
+        "Alert on lock acquisition failures and queue depth — a lock that cannot be acquired within 2× expected TTL indicates a runaway holder",
+        "Test lock behaviour under slow gateway conditions in staging by artificially sleeping inside the locked block"
+      ],
+      "assessment": [
+        {
+          "text": "What is Redisson's watchdog, and what problem does it solve?",
+          "options": [
+            "A) A monitoring thread that alerts on Redis connection failures",
+            "B) A background daemon that periodically renews a lock's TTL while the holder JVM is alive, preventing auto-expiry during long operations",
+            "C) A circuit breaker that prevents new lock acquisitions when Redis is overloaded",
+            "D) A fallback that acquires a local JVM lock when Redis is unavailable"
+          ],
+          "correct": 1,
+          "explanation": "Redisson's watchdog is an internal scheduled task that calls PEXPIRE on a lock key every lockWatchdogTimeout/3 milliseconds, resetting the TTL and preventing auto-expiry. It activates only when lock.lock() is called without an explicit leaseTime, and it stops when lock.unlock() is called or the JVM process terminates."
+        },
+        {
+          "text": "Why does specifying an explicit leaseTime in lock.lock(5, TimeUnit.SECONDS) disable the Redisson watchdog?",
+          "options": [
+            "A) Redisson cannot run the watchdog and a TTL simultaneously due to a Redis limitation",
+            "B) An explicit leaseTime signals that the caller has intentionally set a maximum lock duration, so Redisson respects that boundary and disables automatic renewal",
+            "C) The watchdog requires a Redisson cluster configuration; it does not work with single-node Redis",
+            "D) Explicit TTL locks are stored in a separate Redis keyspace where the watchdog has no access"
+          ],
+          "correct": 1,
+          "explanation": "Redisson interprets an explicit leaseTime as a deliberate upper bound set by the application. If the caller specifies leaseTime, Redisson assumes they want the lock to expire at that time regardless of operation status and disables watchdog renewal. Omitting leaseTime (-1 internally) enables watchdog mode."
+        },
+        {
+          "text": "If a JVM hosting a Redisson watchdog lock crashes mid-operation, how does the lock eventually become available?",
+          "options": [
+            "A) The lock is permanently orphaned and must be manually deleted from Redis",
+            "B) Redisson on another pod detects the crash and releases the lock within 1 second",
+            "C) The watchdog stops renewing the TTL when the JVM dies, so Redis auto-expires the key after the last-renewed TTL (default up to 30 seconds)",
+            "D) The lock is released immediately because Redis monitors JVM process health"
+          ],
+          "correct": 2,
+          "explanation": "The watchdog runs inside the holder's JVM. When the JVM crashes, the watchdog thread stops and can no longer renew the lock TTL. Redis then auto-expires the key after the last renewed TTL elapses (up to lockWatchdogTimeout, default 30 seconds), after which another node can acquire the lock. This is safer than a permanent orphan but means retries must wait up to 30 seconds after a crash."
+        }
+      ]
+    },
+    {
+      "id": "fin-11",
+      "category": "financial",
+      "title": "CDC Reconciliation Gap (Duplicate Event Redelivery)",
+      "subtitle": "Debezium connector restart causes at-least-once redelivery — reconciliation totals are double-counted",
+      "difficulty": "advanced",
+      "tags": ["Debezium", "CDC", "reconciliation", "idempotency", "at-least-once"],
+      "estimatedMinutes": 25,
+      "relatedLessons": ["track-09-lesson-06", "track-05-lesson-10"],
+      "scenario": "A Debezium CDC connector captures transaction events from PostgreSQL and publishes them to Kafka. During a network blip, the connector restarts and redelivers events between the last committed Kafka offset and the restart point. A reconciliation job consuming these events double-counts redelivered event pairs, producing incorrect daily closing balances.",
+      "impact": "Daily settlement reports show inflated transaction totals, triggering regulatory reconciliation failures and requiring manual correction that delays end-of-day processing by hours.",
+      "incorrectCode": [
+        "import org.springframework.kafka.annotation.KafkaListener;",
+        "import org.springframework.stereotype.Service;",
+        "import java.math.BigDecimal;",
+        "",
+        "@Service",
+        "public class ReconciliationConsumer {",
+        "    private final ReconciliationRepository repo;",
+        "",
+        "    @KafkaListener(topics = \"cdc.public.transactions\")",
+        "    public void onEvent(TransactionEvent event) {",
+        "        // BUG: no duplicate check — redelivered events are saved twice",
+        "        repo.save(new ReconciliationEvent(",
+        "            event.getTxId(),",
+        "            event.getEventType(),",
+        "            event.getAmount()",
+        "        ));",
+        "        // BUG: running total updated without idempotency guard",
+        "        repo.incrementDailyTotal(event.getAmount());",
+        "    }",
+        "}"
+      ],
+      "incorrectAnnotations": [
+        {"line": 12, "note": "UNSAFE: repo.save() with no uniqueness check — Debezium at-least-once redelivery inserts the same (tx_id, event_type) pair twice"},
+        {"line": 17, "note": "UNSAFE: incrementDailyTotal() on redelivered events adds the same amount twice to the closing balance — reconciliation total is wrong"}
+      ],
+      "failureExplanation": "Debezium guarantees at-least-once delivery: after a connector restart, it replays all events from the last committed Kafka offset, which may be behind the last event the connector had already captured and sent. The reconciliation consumer has no mechanism to detect that an incoming event has already been processed, so every redelivered event is inserted as a new row and counted again in the daily total.",
+      "simulation": {
+        "type": "sequence",
+        "title": "CDC Restart Causes Duplicate Reconciliation Count",
+        "participants": [
+          {"id": 0, "name": "CDC Connector"},
+          {"id": 1, "name": "Kafka Broker"},
+          {"id": 2, "name": "Reconciliation Consumer"}
+        ],
+        "buggySteps": [
+          {"seq": 1, "from": 0, "to": 1, "message": "Publish tx-101 DEBIT $500 (offset 200)", "note": "Normal CDC event", "highlight": false},
+          {"seq": 2, "from": 1, "to": 2, "message": "Deliver tx-101 (offset 200)", "note": "Consumer processes and saves", "highlight": false},
+          {"seq": 3, "from": 2, "to": 2, "message": "dailyTotal += $500 → $500", "note": "Total correct so far", "highlight": false},
+          {"seq": 4, "from": 0, "to": 0, "message": "Network blip — connector restarts", "note": "Last committed Kafka offset = 199", "highlight": true},
+          {"seq": 5, "from": 0, "to": 1, "message": "Redeliver tx-101 DEBIT $500 (offset 200)", "note": "⚠ At-least-once redelivery", "highlight": true},
+          {"seq": 6, "from": 1, "to": 2, "message": "Deliver tx-101 again", "note": "Consumer has no duplicate check", "highlight": false},
+          {"seq": 7, "from": 2, "to": 2, "message": "dailyTotal += $500 → $1000", "note": "⚠ WRONG: $500 counted twice", "highlight": true}
+        ],
+        "bugAnnotation": "The reconciliation consumer blindly inserts every event and updates the daily total — a redelivered event doubles the count without any error.",
+        "safeSteps": [
+          {"seq": 1, "from": 0, "to": 1, "message": "Publish tx-101 DEBIT $500 (offset 200)", "note": "Normal CDC event", "highlight": false},
+          {"seq": 2, "from": 1, "to": 2, "message": "Deliver tx-101 (offset 200)", "note": "Consumer processes", "highlight": false},
+          {"seq": 3, "from": 2, "to": 2, "message": "INSERT ... ON CONFLICT DO NOTHING → 1 row", "note": "Inserted; dailyTotal += $500", "highlight": false},
+          {"seq": 4, "from": 0, "to": 1, "message": "Redeliver tx-101 (after restart)", "note": "At-least-once redelivery", "highlight": false},
+          {"seq": 5, "from": 1, "to": 2, "message": "Deliver tx-101 again", "note": "Consumer receives duplicate", "highlight": false},
+          {"seq": 6, "from": 2, "to": 2, "message": "INSERT ... ON CONFLICT DO NOTHING → 0 rows", "note": "Conflict detected — total NOT incremented ✓", "highlight": false}
+        ],
+        "safeAnnotation": "An ON CONFLICT DO NOTHING constraint on (tx_id, event_type) makes the INSERT idempotent — redelivered events are silently discarded with no effect on the daily total."
+      },
+      "correctCode": [
+        "import org.springframework.kafka.annotation.KafkaListener;",
+        "import org.springframework.jdbc.core.JdbcTemplate;",
+        "import org.springframework.stereotype.Service;",
+        "",
+        "@Service",
+        "public class ReconciliationConsumer {",
+        "    private final JdbcTemplate jdbc;",
+        "",
+        "    @KafkaListener(topics = \"cdc.public.transactions\")",
+        "    public void onEvent(TransactionEvent event) {",
+        "        // Idempotent upsert: unique constraint on (tx_id, event_type)",
+        "        // ON CONFLICT DO NOTHING ensures redelivered events are no-ops",
+        "        int inserted = jdbc.update(",
+        "            \"INSERT INTO reconciliation_events\" +",
+        "            \"  (tx_id, event_type, amount, created_at)\" +",
+        "            \" VALUES (?, ?, ?, NOW())\" +",
+        "            \" ON CONFLICT (tx_id, event_type) DO NOTHING\",",
+        "            event.getTxId(),",
+        "            event.getEventType(),",
+        "            event.getAmount());",
+        "        if (inserted == 1) {",
+        "            // Only update daily total when a new event was actually inserted",
+        "            jdbc.update(",
+        "                \"UPDATE daily_totals SET amount = amount + ?\" +",
+        "                \" WHERE date = CURRENT_DATE\",",
+        "                event.getAmount());",
+        "        }",
+        "    }",
+        "}"
+      ],
+      "correctExplanation": "The unique constraint on (tx_id, event_type) makes the INSERT operation idempotent: redelivered events produce a conflict and are silently discarded. The daily total is only updated when inserted == 1, ensuring each unique event is counted exactly once regardless of how many times Debezium delivers it.",
+      "alternatives": [
+        {
+          "name": "Outbox Pattern with Exactly-Once Semantics",
+          "code": [
+            "// Application writes to outbox table atomically with the business tx",
+            "@Transactional",
+            "public void recordTransaction(Transaction tx) {",
+            "    transactionRepo.save(tx);",
+            "    outboxRepo.save(new OutboxEvent(",
+            "        tx.getId(), \"DEBIT\", tx.getAmount()));",
+            "}",
+            "// Separate relay picks up outbox events and marks them sent",
+            "// Debezium captures the outbox table — each row has a unique event_id",
+            "// Consumer uses event_id as idempotency key"
+          ],
+          "pros": ["Exactly-one event per business transaction — no spurious duplicates", "Outbox table provides a natural audit log"],
+          "cons": ["Requires schema changes to add outbox table", "Relay process adds operational complexity"],
+          "whenToUse": "When the source transaction and the event publication must be atomic and duplicate-free; preferred for high-value payment event sourcing."
+        }
+      ],
+      "performanceNotes": "ON CONFLICT DO NOTHING with a unique index on (tx_id, event_type) has near-zero overhead for non-conflicting rows — PostgreSQL evaluates the unique index as part of the normal INSERT path. For high-throughput reconciliation topics (>50 k events/s), batch the INSERTs using COPY or multi-row INSERT ... ON CONFLICT DO NOTHING to reduce round-trips.",
+      "performanceTable": [
+        {"approach": "repo.save() — no duplicate check (buggy)", "throughput": "~20 k events/s", "notes": "Fast but produces wrong totals on redelivery"},
+        {"approach": "INSERT ON CONFLICT DO NOTHING", "throughput": "~18 k events/s", "notes": "Negligible index overhead; correct under at-least-once"},
+        {"approach": "SELECT then INSERT (check-then-act)", "throughput": "~10 k events/s", "notes": "Two round-trips; race condition between check and insert"},
+        {"approach": "Batch INSERT ON CONFLICT DO NOTHING", "throughput": "~80 k events/s", "notes": "Best throughput; batches 500 rows per statement"}
+      ],
+      "tests": [
+        {
+          "framework": "testcontainers",
+          "code": [
+            "import org.testcontainers.containers.PostgreSQLContainer;",
+            "import org.testcontainers.containers.KafkaContainer;",
+            "import org.junit.jupiter.api.*;",
+            "",
+            "@Testcontainers",
+            "class ReconciliationIdempotencyTest {",
+            "    @Container",
+            "    static PostgreSQLContainer<?> pg = new PostgreSQLContainer<>(\"postgres:15\");",
+            "    @Container",
+            "    static KafkaContainer kafka =",
+            "        new KafkaContainer(DockerImageName.parse(\"confluentinc/cp-kafka:7.5.0\"));",
+            "",
+            "    @Test",
+            "    void duplicateCdcEvents_doNotDoubleCounts_dailyTotal() throws Exception {",
+            "        var consumer = buildConsumer(pg, kafka);",
+            "        var event = new TransactionEvent(\"tx-101\", \"DEBIT\", new BigDecimal(\"500.00\"));",
+            "        consumer.onEvent(event); // first delivery",
+            "        consumer.onEvent(event); // simulated CDC redelivery",
+            "        consumer.onEvent(event); // simulate third delivery after crash",
+            "        var total = queryDailyTotal(pg);",
+            "        Assertions.assertEquals(new BigDecimal(\"500.00\"), total,",
+            "            \"Daily total must reflect each unique event exactly once\");",
+            "    }",
+            "}"
+          ],
+          "explanation": "The test delivers the same CDC event three times (simulating Debezium at-least-once redelivery after multiple restarts) and asserts the daily total equals the amount of a single event. The ON CONFLICT DO NOTHING constraint ensures only the first delivery inserts a row and updates the total.",
+          "limitations": "This test does not simulate the actual Debezium connector restart; use the Debezium embedded engine or a full Testcontainers Debezium container for end-to-end CDC restart testing."
+        }
+      ],
+      "monitoringSymptoms": [
+        "Daily closing balance drifts from expected value by an amount equal to recent transaction totals — classic double-count signature",
+        "reconciliation_events table row count exceeds expected transaction count — indicates duplicate rows despite ON CONFLICT",
+        "Debezium connector logs showing 'Resuming from offset X' at an offset earlier than the last produced offset",
+        "Kafka consumer group committed offset for the reconciliation consumer lags behind log-end-offset after a connector restart",
+        "Alert: daily_totals.amount > SUM(transactions.amount) for CURRENT_DATE — reconciliation invariant violated"
+      ],
+      "debugTips": [
+        "Query SELECT tx_id, event_type, COUNT(*) FROM reconciliation_events GROUP BY 1,2 HAVING COUNT(*) > 1 to identify rows that escaped the unique constraint",
+        "Compare Debezium connector's last committed binlog/LSN position with the last Kafka offset to measure redelivery extent",
+        "Use Kafka's kafka-consumer-groups.sh to find the consumer group offset before and after a connector restart — the gap equals the redelivery window",
+        "Enable Debezium's snapshot.mode=schema_only_recovery to avoid full table snapshots on restart when only WAL redelivery is needed",
+        "Check pg_stat_user_tables for n_dead_tup spikes on reconciliation_events — high conflict rates increase dead tuple bloat, requiring more frequent VACUUM"
+      ],
+      "productionRecommendations": [
+        "Always put a unique constraint on (tx_id, event_type) in reconciliation tables and use ON CONFLICT DO NOTHING for all CDC-driven inserts",
+        "Use Debezium's signal-based incremental snapshots and committed offset tracking to minimise the redelivery window on restart",
+        "Run a nightly reconciliation invariant check: daily_totals.amount must equal SUM(transactions.amount) — alert on any discrepancy",
+        "Set Kafka consumer enable.auto.commit=false for reconciliation consumers and commit only after successful INSERT",
+        "Use the outbox pattern for high-value events where even one duplicate is unacceptable — treat CDC as an at-least-once transport"
+      ],
+      "assessment": [
+        {
+          "text": "Why does Debezium deliver the same CDC event more than once after a connector restart?",
+          "options": [
+            "A) Debezium uses exactly-once delivery by default; duplicates indicate a misconfiguration",
+            "B) Debezium provides at-least-once delivery — it replays from the last committed Kafka offset on restart, which may be before events already captured and sent before the restart",
+            "C) The PostgreSQL WAL deletes events after delivery, so Debezium must re-read from the beginning of the log",
+            "D) Debezium deduplicates events using the transaction ID, so duplicates are impossible"
+          ],
+          "correct": 1,
+          "explanation": "Debezium is an at-least-once delivery system. It periodically commits its Kafka consumer offsets, but the gap between the last committed offset and the actual position at restart causes all events in that gap to be redelivered. Consumers must be idempotent to handle this correctly."
+        },
+        {
+          "text": "What SQL pattern makes a reconciliation INSERT idempotent against CDC event redelivery?",
+          "options": [
+            "A) INSERT IGNORE INTO reconciliation_events ...",
+            "B) INSERT INTO reconciliation_events ... ON CONFLICT (tx_id, event_type) DO NOTHING",
+            "C) MERGE INTO reconciliation_events WHEN MATCHED THEN UPDATE SET amount=amount",
+            "D) INSERT INTO reconciliation_events ... IF NOT EXISTS (SELECT 1 FROM reconciliation_events WHERE tx_id=?)"
+          ],
+          "correct": 1,
+          "explanation": "PostgreSQL's ON CONFLICT DO NOTHING clause combined with a unique index on (tx_id, event_type) makes the INSERT atomic and idempotent: if a row with the same key already exists, the statement completes successfully with zero rows inserted rather than raising a duplicate-key error. The rowcount return value lets the application decide whether to update dependent aggregates."
+        },
+        {
+          "text": "What is the key advantage of the Outbox Pattern over relying solely on CDC idempotency for financial reconciliation?",
+          "options": [
+            "A) The outbox pattern eliminates the need for a Kafka broker entirely",
+            "B) Events are written atomically with the business transaction, guaranteeing each business event produces exactly one outbox row — there are no spurious CDC events to deduplicate",
+            "C) The outbox pattern uses batch inserts, which are faster than individual CDC events",
+            "D) The outbox pattern automatically retries failed events without consumer intervention"
+          ],
+          "correct": 1,
+          "explanation": "With the Outbox Pattern, the outbox row is inserted in the same database transaction as the business operation. This guarantees that each business event produces exactly one outbox row; Debezium then captures and delivers each row at least once, but the unique event_id on the outbox row makes consumer deduplication trivial. The result is a strongly ordered, deduplicated event stream that reflects exactly the business transactions that committed."
+        }
+      ]
+    },
+    {
+      "id": "fin-12",
+      "category": "financial",
+      "title": "Rate Limiter Race Under Concurrent Pressure",
+      "subtitle": "Redis INCR + EXPIRE race allows excess requests to bypass merchant rate limits",
+      "difficulty": "advanced",
+      "tags": ["rate-limiting", "Redis", "Lua-script", "INCR", "EXPIRE", "race-condition"],
+      "estimatedMinutes": 20,
+      "relatedLessons": ["track-06-lesson-13"],
+      "scenario": "A merchant API enforces a rate limit of 100 requests per minute using Redis INCR + EXPIRE. Under a burst of 200 concurrent requests, 10 threads all increment the counter before any EXPIRE is set. The counter reaches 110 before EXPIRE fires, allowing 10 extra requests to slip through the limit and triggering downstream fraud scoring at an unsupported rate.",
+      "impact": "Merchants can inadvertently bypass rate-limit controls designed to prevent fraud pattern detection; downstream payment processors throttle the platform and issue penalty fees for excessive call rates.",
+      "incorrectCode": [
+        "import redis.clients.jedis.Jedis;",
+        "",
+        "public class MerchantRateLimiter {",
+        "    private final Jedis redis;",
+        "    private static final int LIMIT = 100;",
+        "    private static final int WINDOW_SECS = 60;",
+        "",
+        "    public boolean isAllowed(String merchantId) {",
+        "        String key = \"rl:\" + merchantId;",
+        "        // BUG: INCR and EXPIRE are two separate commands — not atomic",
+        "        long count = redis.incr(key);",
+        "        // BUG: 10 threads all reach count==1 check before any sets EXPIRE",
+        "        // because INCR returns 1 only for the FIRST call; others return 2..10",
+        "        // but all calls happen before EXPIRE executes, so key has no TTL",
+        "        if (count == 1) {",
+        "            redis.expire(key, WINDOW_SECS); // EXPIRE set by first thread only",
+        "        }",
+        "        // Count may reach 110 before TTL is applied; all 110 are allowed",
+        "        return count <= LIMIT;",
+        "    }",
+        "}"
+      ],
+      "incorrectAnnotations": [
+        {"line": 11, "note": "UNSAFE: redis.incr() and redis.expire() are separate round-trips — another thread can call incr() after the count becomes 1 but before expire() sets the TTL"},
+        {"line": 14, "note": "UNSAFE: count==1 check only sets EXPIRE from the first thread; threads 2–10 all see count > 1 and skip the expire, leaving the key with no TTL if the first thread has not yet executed expire"},
+        {"line": 18, "note": "UNSAFE: count can exceed LIMIT between INCR and EXPIRE because the counter window does not close — 10 extra requests slip through before the key gets a TTL"}
+      ],
+      "failureExplanation": "Redis commands are individually atomic but INCR and EXPIRE are separate operations with no guarantee of sequential execution between threads. When 10 threads call INCR simultaneously, they all receive a return value of 1–10 before any EXPIRE is set. Only the thread that received exactly 1 will call EXPIRE; threads receiving 2–10 do not. In the window between all those INCRs and the eventual EXPIRE call, more threads continue to INCR — pushing the counter to 110 — and all are allowed through because the counter has not yet been windowed.",
+      "simulation": {
+        "type": "thread-timeline",
+        "title": "10 Threads INCR Before EXPIRE — 10 Extra Requests Allowed",
+        "threads": ["T1", "T2", "T3", "T4", "T5-T10 (batch)"],
+        "shared": [{"name": "rl:merchant-A", "value": 0}],
+        "buggySteps": [
+          {"seq": 1, "thread": 0, "op": "COMPUTE", "var": "rl:merchant-A", "value": 1, "note": "T1 INCR → 1 (key created, no TTL yet)", "highlight": false},
+          {"seq": 2, "thread": 1, "op": "COMPUTE", "var": "rl:merchant-A", "value": 2, "note": "⚠ T2 INCR → 2 before T1 calls EXPIRE", "highlight": true},
+          {"seq": 3, "thread": 2, "op": "COMPUTE", "var": "rl:merchant-A", "value": 3, "note": "⚠ T3 INCR → 3 (still no TTL)", "highlight": true},
+          {"seq": 4, "thread": 3, "op": "COMPUTE", "var": "rl:merchant-A", "value": 4, "note": "⚠ T4 INCR → 4", "highlight": true},
+          {"seq": 5, "thread": 4, "op": "COMPUTE", "var": "rl:merchant-A", "value": 10, "note": "⚠ T5-T10 all INCR → reaches 10 before any EXPIRE", "highlight": true},
+          {"seq": 6, "thread": 0, "op": "CALL", "var": "redis.expire", "value": "TTL=60s", "note": "T1 finally sets EXPIRE — but 10 INCRs already happened with no window", "highlight": false},
+          {"seq": 7, "thread": 4, "op": "COMPUTE", "var": "rl:merchant-A", "value": 110, "note": "⚠ 100 more requests increment to 110 — all allowed (count<=100 is false only after 101st)", "highlight": true}
+        ],
+        "bugAnnotation": "INCR and EXPIRE are non-atomic; multiple threads increment the counter before the window is set, allowing burst requests to slip through the limit.",
+        "safeSteps": [
+          {"seq": 1, "thread": 0, "op": "CALL", "var": "evalLua(INCR+EXPIRE)", "value": 1, "note": "T1 executes Lua script atomically — INCR + conditional EXPIRE in one step", "highlight": false},
+          {"seq": 2, "thread": 1, "op": "WAIT", "var": "Redis single-threaded exec", "value": "queued", "note": "T2 waits — Redis executes Lua scripts serially", "highlight": false},
+          {"seq": 3, "thread": 1, "op": "CALL", "var": "evalLua(INCR+EXPIRE)", "value": 2, "note": "T2 gets count=2; EXPIRE already set; no race", "highlight": false},
+          {"seq": 4, "thread": 2, "op": "CALL", "var": "evalLua(INCR+EXPIRE)", "value": 3, "note": "All subsequent threads increment within the window", "highlight": false},
+          {"seq": 5, "thread": 4, "op": "CALL", "var": "evalLua(INCR+EXPIRE)", "value": 101, "note": "101st request — count > 100, rejected ✓", "highlight": false}
+        ],
+        "safeAnnotation": "Redis executes Lua scripts atomically in a single thread — INCR and conditional EXPIRE are indivisible, eliminating the race window entirely."
+      },
+      "correctCode": [
+        "import redis.clients.jedis.Jedis;",
+        "import java.util.List;",
+        "",
+        "public class MerchantRateLimiter {",
+        "    private final Jedis redis;",
+        "    private static final int LIMIT = 100;",
+        "    private static final String LUA_SCRIPT =",
+        "        \"local c = redis.call('INCR', KEYS[1])\\n\" +",
+        "        \"if c == 1 then\\n\" +",
+        "        \"  redis.call('EXPIRE', KEYS[1], ARGV[1])\\n\" +",
+        "        \"end\\n\" +",
+        "        \"return c\";",
+        "",
+        "    public boolean isAllowed(String merchantId) {",
+        "        String key = \"rl:\" + merchantId;",
+        "        // Lua script executes atomically in Redis single-threaded engine",
+        "        // INCR and conditional EXPIRE happen in one indivisible step",
+        "        Object result = redis.eval(",
+        "            LUA_SCRIPT,",
+        "            List.of(key),",
+        "            List.of(\"60\"));",
+        "        long count = (Long) result;",
+        "        return count <= LIMIT;",
+        "    }",
+        "}"
+      ],
+      "correctExplanation": "Redis executes Lua scripts atomically in its single-threaded event loop — no other command can execute between the INCR and the conditional EXPIRE within the script. This ensures the counter window is always set on the very first increment, making it impossible for concurrent threads to increment a windowless key.",
+      "alternatives": [
+        {
+          "name": "Bucket4j Token Bucket with Redis ProxyManager",
+          "code": [
+            "import io.github.bucket4j.distributed.proxy.ProxyManager;",
+            "import io.github.bucket4j.grid.jcache.JCacheProxyManager;",
+            "import io.github.bucket4j.*;",
+            "import java.time.Duration;",
+            "",
+            "public class TokenBucketRateLimiter {",
+            "    private final ProxyManager<String> proxyManager;",
+            "",
+            "    public boolean isAllowed(String merchantId) {",
+            "        var config = BucketConfiguration.builder()",
+            "            .addLimit(Bandwidth.simple(100, Duration.ofMinutes(1)))",
+            "            .build();",
+            "        Bucket bucket = proxyManager.builder()",
+            "            .build(merchantId, () -> config);",
+            "        return bucket.tryConsume(1);",
+            "    }",
+            "}"
+          ],
+          "pros": ["Token bucket allows controlled bursting above the per-minute limit", "Fully atomic via CAS operations in Redis; no Lua scripting required", "Bucket4j handles distributed state automatically"],
+          "cons": ["Adds the Bucket4j dependency and JCache layer", "Token bucket semantics differ from fixed-window — merchants may still burst to 2× the limit across window boundaries"],
+          "whenToUse": "When merchants need smooth burst allowance (e.g., 100 req/min average with brief spikes to 150) rather than a hard fixed-window cutoff."
+        }
+      ],
+      "performanceNotes": "A Lua script evaluation adds ~0.1ms over a single INCR command and eliminates one network round-trip compared to separate INCR + EXPIRE calls. At 100 k concurrent rate-limit checks per second, the Lua approach adds negligible latency while removing the race condition. For Redis Cluster, the key must hash to the same slot — use hash tags: {rl:merchant-A}:window.",
+      "performanceTable": [
+        {"approach": "INCR + EXPIRE (buggy)", "throughput": "~500 k ops/s", "notes": "Race condition; 2 round-trips; incorrect under burst"},
+        {"approach": "Lua INCR + EXPIRE", "throughput": "~480 k ops/s", "notes": "Atomic; 1 eval round-trip; correct under any concurrency"},
+        {"approach": "Bucket4j token bucket (Redis)", "throughput": "~300 k ops/s", "notes": "CAS-based; slightly slower; better burst semantics"},
+        {"approach": "Redis SETNX + GETSET (sliding window)", "throughput": "~400 k ops/s", "notes": "More complex; true sliding window; avoids fixed-window edge cases"}
+      ],
+      "tests": [
+        {
+          "framework": "testcontainers",
+          "code": [
+            "import org.testcontainers.containers.GenericContainer;",
+            "import org.junit.jupiter.api.*;",
+            "import java.util.concurrent.*;",
+            "import java.util.concurrent.atomic.AtomicInteger;",
+            "",
+            "@Testcontainers",
+            "class RateLimiterRaceTest {",
+            "    @Container",
+            "    static GenericContainer<?> redis =",
+            "        new GenericContainer<>(\"redis:7-alpine\").withExposedPorts(6379);",
+            "",
+            "    @Test",
+            "    void luaRateLimiter_allowsAtMost101Requests_under200ConcurrentBurst()",
+            "            throws Exception {",
+            "        var limiter = buildLuaLimiter(redis);",
+            "        var allowed = new AtomicInteger(0);",
+            "        var executor = Executors.newFixedThreadPool(200);",
+            "        var latch = new CountDownLatch(1);",
+            "        for (int i = 0; i < 200; i++) {",
+            "            executor.submit(() -> {",
+            "                latch.await();",
+            "                if (limiter.isAllowed(\"merchant-A\")) allowed.incrementAndGet();",
+            "                return null;",
+            "            });",
+            "        }",
+            "        latch.countDown();",
+            "        executor.shutdown();",
+            "        executor.awaitTermination(10, TimeUnit.SECONDS);",
+            "        Assertions.assertTrue(allowed.get() <= 101,",
+            "            \"Lua limiter must allow at most 101 requests (100 limit + 1 boundary)\");",
+            "    }",
+            "}"
+          ],
+          "explanation": "Two hundred threads are released simultaneously against a fresh rate-limit key. The test asserts that at most 101 requests are allowed (the 100th is the last allowed; the 101st may land on the boundary). With the buggy INCR+EXPIRE implementation, the allowed count typically reaches 110+.",
+          "limitations": "Docker networking serialises Redis calls more than production deployments; run with -Djunit.jupiter.execution.parallel.enabled=true to maximise concurrency in the test harness."
+        }
+      ],
+      "monitoringSymptoms": [
+        "Merchant request count in APM exceeds configured LIMIT by 5–15% during traffic bursts",
+        "Redis keyspace notifications showing keys with no TTL set (key created but EXPIRE never called)",
+        "Downstream payment processor returning HTTP 429 (rate-limit exceeded) despite the platform believing it is within limits",
+        "redis-cli TTL rl:merchant-A returns -1 (no expiry) transiently during burst periods",
+        "Alert: allowed_requests_per_minute > LIMIT for any merchant_id — rate limit bypass detected"
+      ],
+      "debugTips": [
+        "Run redis-cli DEBUG SLEEP 0.1 immediately after INCR and check if TTL is -1 — a -1 TTL confirms the EXPIRE never executed",
+        "Use Redis MONITOR to observe the sequence of INCR and EXPIRE commands in real time — interleaving confirms the race",
+        "Add a counter in the application for requests where count > LIMIT but isAllowed() returns true — these are race victims",
+        "Reproduce with redis-cli in two terminals: T1 runs INCR rl:test-race; T2 immediately runs INCR rl:test-race before T1 runs EXPIRE",
+        "Check downstream processor rate-limit error rate against your platform rate-limit metric — a discrepancy > 5% suggests bypass"
+      ],
+      "productionRecommendations": [
+        "Always use a Lua script or Redis pipeline for INCR + EXPIRE to guarantee atomicity in rate limiters",
+        "Use Redis hash tags ({rl:merchant-A}) to ensure all rate-limit keys for the same merchant land on the same cluster slot",
+        "Consider a sliding window log algorithm using ZADD + ZREMRANGEBYSCORE in Lua for more accurate rate limiting without fixed-window edge cases",
+        "Alert on any rate-limit key with TTL=-1 (no expiry) — these keys grow indefinitely and bypass the window mechanism",
+        "Load-test rate limiters with concurrent burst scenarios before production deployment; a simple INCR+EXPIRE implementation always fails under burst"
+      ],
+      "assessment": [
+        {
+          "text": "Why does the INCR + EXPIRE pattern fail under concurrent burst traffic in Redis?",
+          "options": [
+            "A) Redis cannot handle more than one INCR command per second per key",
+            "B) INCR and EXPIRE are separate commands; between the INCR returning 1 and the EXPIRE call, other threads can INCR the key to values > 1 without a TTL being set, allowing a burst to exceed the limit",
+            "C) Redis automatically expires keys after INCR if no EXPIRE is set within 1 second",
+            "D) EXPIRE resets the counter to 0, causing the limit to be re-evaluated incorrectly"
+          ],
+          "correct": 1,
+          "explanation": "Redis commands are individually atomic but not composed atomically. After the first INCR returns 1, there is a gap before EXPIRE is called. During this gap, all other concurrent threads can INCR the key beyond 1 without any TTL being set. These threads see count > 1 and skip the EXPIRE call, leaving the key windowless until the first thread's EXPIRE executes — by which time the counter may already exceed the limit."
+        },
+        {
+          "text": "How does executing INCR and EXPIRE inside a Redis Lua script guarantee atomicity?",
+          "options": [
+            "A) Lua scripts run in a separate Redis thread with higher priority than regular commands",
+            "B) Redis executes Lua scripts in its single-threaded event loop without preemption — no other command can run between any two operations within the script",
+            "C) Lua scripts lock the entire Redis instance for 100ms, preventing concurrent access",
+            "D) Redis replicates Lua scripts before execution, making them durable and atomic"
+          ],
+          "correct": 1,
+          "explanation": "Redis's execution model is single-threaded for command processing. When a Lua script is submitted via EVAL, Redis runs the entire script to completion before processing any other command. This means the INCR and conditional EXPIRE inside the script execute as a single indivisible unit from the perspective of all other clients."
+        },
+        {
+          "text": "What is a key operational difference between a fixed-window rate limiter (INCR + EXPIRE) and a token bucket (Bucket4j)?",
+          "options": [
+            "A) Token buckets support higher throughput because they do not use Redis",
+            "B) Fixed-window limiters reset the count at exact window boundaries, allowing a burst of 2× the limit across the boundary; token buckets smooth traffic with continuous refill, limiting true burst capacity",
+            "C) Token buckets count requests in reverse, decrementing from the limit to zero",
+            "D) Fixed-window limiters use Lua scripts while token buckets use transactions"
+          ],
+          "correct": 1,
+          "explanation": "A fixed-window limiter with a 1-minute window allows up to 100 requests in the last second of minute N and 100 more in the first second of minute N+1 — a 200-request burst in 2 seconds. A token bucket refills at a steady rate (e.g., 100/60 tokens per second) and limits instantaneous burst capacity, making it more suitable for protecting downstream services from sudden spikes."
+        }
+      ]
+    }
+  ]
+}

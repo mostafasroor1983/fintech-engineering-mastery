@@ -108,7 +108,7 @@ graph TD
     Scope --> |fork| ST1[Subtask: Fraud Check]
     Scope --> |fork| ST2[Subtask: Sanctions Screen]
     Scope --> |fork| ST3[Subtask: Limit Check]
-    ST1 --> |completes| Join[scope.join()]
+    ST1 --> |completes| Join["scope.join()"]
     ST2 --> |completes| Join
     ST3 --> |fails → ShutdownOnFailure cancels others| Join
     Join --> |scope closed| Parent

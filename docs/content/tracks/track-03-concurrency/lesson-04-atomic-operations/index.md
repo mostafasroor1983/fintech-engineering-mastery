@@ -287,7 +287,7 @@ graph TD
     T3[Thread 3] --> C3[Cell 2]
     T4[Thread 4] --> C1
 
-    C1 --> Sum[sum()]
+    C1 --> Sum["sum()"]
     C2 --> Sum
     C3 --> Sum
     

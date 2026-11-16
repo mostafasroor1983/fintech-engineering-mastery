@@ -1,0 +1,162 @@
+{
+  "id": "track-16",
+  "sequence": 14,
+  "title": "System Design for Fintech Interviews",
+  "shortTitle": "System Design",
+  "slug": "system-design",
+  "color": "#f59e0b",
+  "colorMuted": "rgba(245, 158, 11, 0.15)",
+  "description": "End-to-end system design walkthroughs for the most common fintech interview questions: payment processing, fraud detection, financial ledger, rate limiting, and distributed systems trade-offs.",
+  "difficulty": "principal",
+  "estimatedHours": 10,
+  "status": "published",
+  "priority": "critical",
+  "lessons": [
+    {
+      "id": "track-16-lesson-01",
+      "sequence": 1,
+      "title": "System Design Framework for Fintech Interviews",
+      "slug": "system-design-framework",
+      "path": "content/tracks/track-16-system-design/lesson-01-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "system-design",
+        "framework",
+        "interviews",
+        "RADE",
+        "fintech"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-16-lesson-02",
+      "sequence": 2,
+      "title": "Design a Payment Processing Service — Part 1",
+      "slug": "payment-service-part1",
+      "path": "content/tracks/track-16-system-design/lesson-02-payment-service-part1/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "payment-processing",
+        "api-design",
+        "data-model",
+        "idempotency",
+        "postgres"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-16-lesson-03",
+      "sequence": 3,
+      "title": "Design a Payment Processing Service — Part 2",
+      "slug": "payment-service-part2",
+      "path": "content/tracks/track-16-system-design/lesson-03-payment-service-part2/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "payment-processing",
+        "saga",
+        "outbox",
+        "kafka",
+        "sharding",
+        "circuit-breaker"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-16-lesson-04",
+      "sequence": 4,
+      "title": "Design a Fraud Detection Pipeline",
+      "slug": "fraud-detection-pipeline",
+      "path": "content/tracks/track-16-system-design/lesson-04-fraud-detection/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "fraud-detection",
+        "kafka-streams",
+        "feature-store",
+        "real-time",
+        "latency"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-16-lesson-05",
+      "sequence": 5,
+      "title": "Design a Financial Ledger at Scale",
+      "slug": "financial-ledger-at-scale",
+      "path": "content/tracks/track-16-system-design/lesson-05-financial-ledger/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "ledger",
+        "event-sourcing",
+        "cqrs",
+        "sharding",
+        "double-entry"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-16-lesson-06",
+      "sequence": 6,
+      "title": "Design a Rate Limiter for a Payment API",
+      "slug": "rate-limiter-payment-api",
+      "path": "content/tracks/track-16-system-design/lesson-06-rate-limiter/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "rate-limiting",
+        "token-bucket",
+        "redis",
+        "lua",
+        "sliding-window"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-16-lesson-07",
+      "sequence": 7,
+      "title": "10 Common Fintech System Design Problems",
+      "slug": "common-fintech-system-design-problems",
+      "path": "content/tracks/track-16-system-design/lesson-07-common-problems/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "system-design",
+        "interview-prep",
+        "payment-processing",
+        "kafka",
+        "idempotency"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-16-lesson-08",
+      "sequence": 8,
+      "title": "System Design Mock Interview Guide",
+      "slug": "system-design-mock-interview-guide",
+      "path": "content/tracks/track-16-system-design/lesson-08-mock-interview-guide/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tags": [
+        "mock-interview",
+        "self-assessment",
+        "rubric",
+        "preparation"
+      ],
+      "tier": "core"
+    }
+  ],
+  "mainPathMinutes": 585,
+  "optionalLessonCount": 0
+}

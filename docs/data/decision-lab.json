@@ -12,10 +12,10 @@
       "estimatedMinutes": 20,
       "status": "published",
       "relatedLessons": [
-        "track-06-lesson-02"
+        "track-05-lesson-02"
       ],
       "relatedTracks": [
-        "track-06",
+        "track-05",
         "track-03"
       ],
       "tags": [
@@ -158,8 +158,8 @@
           "Principal Engineers distinguish root cause (lost update) from symptom (overdraft) and from mechanism (missing lock)"
         ],
         "furtherReading": [
-          "Track 06, Lesson 02 — Scenario A: Concurrent Withdrawals and Lost Updates",
-          "Track 06, Lesson 05 — Scenario D: Concurrent Ledger Posting",
+          "Track 05, Lesson 02 — Scenario A: Concurrent Withdrawals and Lost Updates",
+          "Track 05, Lesson 05 — Scenario D: Concurrent Ledger Posting",
           "Track 03, Lesson 04 — Atomic Operations and CAS"
         ]
       }
@@ -174,10 +174,10 @@
       "estimatedMinutes": 20,
       "status": "published",
       "relatedLessons": [
-        "track-06-lesson-03"
+        "track-05-lesson-03"
       ],
       "relatedTracks": [
-        "track-06"
+        "track-05"
       ],
       "tags": [
         "idempotency",
@@ -319,9 +319,9 @@
           "Client-generated idempotency keys are the industry standard — do not replace them with server-generated keys"
         ],
         "furtherReading": [
-          "Track 06, Lesson 03 — Scenario B: Duplicate Payment Detection and Idempotency",
-          "Track 06, Lesson 12 — Idempotency Design Patterns and Implementation",
-          "Track 06, Lesson 08 — Scenario G: Duplicate Kafka Delivery and Consumer Idempotency"
+          "Track 05, Lesson 03 — Scenario B: Duplicate Payment Detection and Idempotency",
+          "Track 05, Lesson 12 — Idempotency Design Patterns and Implementation",
+          "Track 05, Lesson 08 — Scenario G: Duplicate Kafka Delivery and Consumer Idempotency"
         ]
       }
     },
@@ -336,8 +336,8 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-06",
-        "track-11"
+        "track-05",
+        "track-09"
       ],
       "tags": [
         "dual-write",
@@ -479,9 +479,9 @@
           "Kafka producer idempotence prevents duplicate delivery but not events never created in the first place"
         ],
         "furtherReading": [
-          "Track 06, Lesson 07 — Scenario F: Database and Kafka Dual-Write",
-          "Track 06, Lesson 13 — The Transactional Outbox Pattern",
-          "Track 11 — Messaging and Event Streaming (coming soon)"
+          "Track 05, Lesson 07 — Scenario F: Database and Kafka Dual-Write",
+          "Track 05, Lesson 13 — The Transactional Outbox Pattern",
+          "Track 09 — Messaging and Event Streaming (coming soon)"
         ]
       }
     },
@@ -496,7 +496,7 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-06",
+        "track-05",
         "track-03"
       ],
       "tags": [
@@ -639,9 +639,9 @@
           "Name the trade-offs explicitly: 'batching sacrifices real-time balance visibility up to 100ms'"
         ],
         "furtherReading": [
-          "Track 06, Lesson 11 — Scenario J: Concurrent Balance Updates at Scale",
+          "Track 05, Lesson 11 — Scenario J: Concurrent Balance Updates at Scale",
           "Track 03, Lesson 21 — Concurrent Balance Management Patterns",
-          "Track 11 — Messaging and Event Streaming (coming soon)"
+          "Track 09 — Messaging and Event Streaming (coming soon)"
         ]
       }
     },
@@ -656,7 +656,7 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-06"
+        "track-05"
       ],
       "tags": [
         "saga",
@@ -798,9 +798,9 @@
           "Monitor the Saga state table directly with a Micrometer gauge — not Kafka lag or log parsing"
         ],
         "furtherReading": [
-          "Track 06, Lesson 06 — Scenario E: Partial Payment Failure and Compensation",
-          "Track 06, Lesson 14 — Saga Pattern: Distributed Transaction Management",
-          "Track 06, Lesson 15 — Two-Phase Commit vs Saga: When to Use Each"
+          "Track 05, Lesson 06 — Scenario E: Partial Payment Failure and Compensation",
+          "Track 05, Lesson 14 — Saga Pattern: Distributed Transaction Management",
+          "Track 05, Lesson 15 — Two-Phase Commit vs Saga: When to Use Each"
         ]
       }
     },
@@ -816,8 +816,8 @@
       "relatedLessons": [],
       "relatedTracks": [
         "track-02",
-        "track-08",
-        "track-04"
+        "track-06",
+        "track-01"
       ],
       "tags": [
         "circuit-breaker",
@@ -961,9 +961,9 @@
           "Monitor bulkhead utilisation as a leading indicator, not overall P99 as a trailing one"
         ],
         "furtherReading": [
-          "Track 08, Lesson 03 — Circuit Breakers and Bulkheads",
+          "Track 06, Lesson 03 — Circuit Breakers and Bulkheads",
           "Track 02, Lesson 09 — Failure Isolation Patterns",
-          "Track 04, Lesson 08 — Reactive Streams and Backpressure"
+          "Track 01, Lesson 14 — Rate Limiting, Throttling, and Back Pressure"
         ]
       }
     },
@@ -978,9 +978,9 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-11",
-        "track-07",
-        "track-08"
+        "track-09",
+        "track-04",
+        "track-06"
       ],
       "tags": [
         "kafka",
@@ -1126,9 +1126,9 @@
           "Monitor poll-batch-to-interval ratio as a leading indicator, not lag as a trailing one"
         ],
         "furtherReading": [
-          "Track 11, Lesson 01 — Kafka Architecture: Topics, Partitions, Consumer Groups",
-          "Track 11, Lesson 06 — Exactly-Once Semantics and Idempotent Consumers",
-          "Track 07, Lesson 03 — AML Transaction Monitoring with Kafka Streams"
+          "Track 09, Lesson 01 — Kafka Architecture: Topics, Partitions, Consumer Groups",
+          "Track 09, Lesson 06 — Exactly-Once Semantics and Idempotent Consumers",
+          "Track 04, Lesson 13 — AML — Anti-Money Laundering Systems Architecture"
         ]
       }
     },
@@ -1143,9 +1143,9 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-09",
-        "track-08",
-        "track-12"
+        "track-07",
+        "track-06",
+        "track-10"
       ],
       "tags": [
         "JVM",
@@ -1294,9 +1294,9 @@
           "Streaming serialisation (write to OutputStream) eliminates intermediate byte[] accumulation"
         ],
         "furtherReading": [
-          "Track 09, Lesson 01 — JVM Internals: Heap Regions, GC Algorithms",
-          "Track 09, Lesson 05 — Profiling with JFR and Async-Profiler",
-          "Track 08, Lesson 02 — SLO Definition and Latency Percentiles"
+          "Track 07, Lesson 01 — JVM Internals: Heap Regions, GC Algorithms",
+          "Track 07, Lesson 05 — Profiling with JFR and Async-Profiler",
+          "Track 06, Lesson 02 — SLO Definition and Latency Percentiles"
         ]
       }
     },
@@ -1311,9 +1311,9 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-10",
+        "track-08",
         "track-03",
-        "track-06"
+        "track-05"
       ],
       "tags": [
         "isolation-levels",
@@ -1457,8 +1457,8 @@
           "Retried transactions always see full committed state — correctness is preserved"
         ],
         "furtherReading": [
-          "Track 10, Lesson 01 — ACID Properties and Transaction Isolation",
-          "Track 10, Lesson 04 — Isolation Levels: Anomalies and Trade-offs",
+          "Track 08, Lesson 01 — ACID Properties and Transaction Isolation",
+          "Track 08, Lesson 04 — Isolation Levels: Anomalies and Trade-offs",
           "Track 03, Lesson 06 — Spring Transactions and Database Locking"
         ]
       }
@@ -1475,7 +1475,7 @@
       "relatedLessons": [],
       "relatedTracks": [
         "track-03",
-        "track-06",
+        "track-05",
         "track-02"
       ],
       "tags": [
@@ -1638,8 +1638,8 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
+        "track-08",
         "track-10",
-        "track-12",
         "track-01"
       ],
       "tags": [
@@ -1786,9 +1786,9 @@
           "Flyway/Liquibase migrations in CI must include the expand-contract sequence, not raw ALTER TABLE"
         ],
         "furtherReading": [
-          "Track 10, Lesson 09 — Online Schema Migrations",
-          "Track 10, Lesson 05 — PostgreSQL Locking and MVCC",
-          "Track 12, Lesson 06 — Kubernetes Rolling Deployments and Database Compatibility"
+          "Track 08, Lesson 09 — Online Schema Migrations",
+          "Track 08, Lesson 05 — PostgreSQL Locking and MVCC",
+          "Track 10, Lesson 06 — Kubernetes Rolling Deployments and Database Compatibility"
         ]
       }
     },
@@ -1803,9 +1803,9 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-11",
+        "track-09",
         "track-03",
-        "track-06"
+        "track-05"
       ],
       "tags": [
         "transactional-outbox",
@@ -1952,8 +1952,8 @@
           "Monitor outbox age (unpublished rows > 60s), not Kafka consumer lag, for relay health"
         ],
         "furtherReading": [
-          "Track 11, Lesson 09 — Transactional Outbox Pattern",
-          "Track 10, Lesson 11 — Debezium CDC: Reading PostgreSQL WAL",
+          "Track 09, Lesson 09 — Transactional Outbox Pattern",
+          "Track 08, Lesson 11 — Debezium CDC: Reading PostgreSQL WAL",
           "Capstone Project A — High-Throughput Payment Platform: Transactional Outbox"
         ]
       }
@@ -1969,9 +1969,9 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-09",
-        "track-08",
-        "track-12"
+        "track-07",
+        "track-06",
+        "track-10"
       ],
       "tags": [
         "OOM",
@@ -2119,9 +2119,9 @@
           "Increasing heap without fixing the cache is a time-delay, not a solution"
         ],
         "furtherReading": [
-          "Track 09, Lesson 01 — JVM Internals: Heap Regions and Garbage Collection",
-          "Track 09, Lesson 05 — Profiling with JFR and Heap Dump Analysis",
-          "Track 09, Lesson 07 — Memory Leak Detection and Prevention Patterns"
+          "Track 07, Lesson 01 — JVM Internals: Heap Regions and Garbage Collection",
+          "Track 07, Lesson 05 — Profiling with JFR and Heap Dump Analysis",
+          "Track 07, Lesson 07 — Memory Leak Detection and Prevention Patterns"
         ]
       }
     },
@@ -2136,8 +2136,8 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-08",
-        "track-13",
+        "track-06",
+        "track-11",
         "track-01"
       ],
       "tags": [
@@ -2285,9 +2285,9 @@
           "Alert fatigue → engineers mute alerts → real outages missed: a predictable, preventable failure mode"
         ],
         "furtherReading": [
-          "Track 08, Lesson 01 — SLOs, SLIs, Error Budgets",
-          "Track 08, Lesson 06 — Multi-Window Burn Rate Alerting",
-          "Track 13, Lesson 03 — Prometheus Alerting Rules for Financial Services"
+          "Track 06, Lesson 01 — SLOs, SLIs, Error Budgets",
+          "Track 06, Lesson 06 — Multi-Window Burn Rate Alerting",
+          "Track 11, Lesson 03 — Prometheus Alerting Rules for Financial Services"
         ]
       }
     },
@@ -2302,9 +2302,9 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-12",
+        "track-10",
         "track-01",
-        "track-08"
+        "track-06"
       ],
       "tags": [
         "configuration",
@@ -2450,9 +2450,9 @@
           "Never bundle config changes with code changes in the same PR — config changes deserve separate scrutiny"
         ],
         "furtherReading": [
-          "Track 12, Lesson 08 — Kubernetes Canary Deployments with Istio",
+          "Track 10, Lesson 08 — Kubernetes Canary Deployments with Istio",
           "Track 01, Lesson 07 — Configuration Management and Deployment Safety",
-          "Track 08, Lesson 09 — Deployment Verification and Automated Rollback"
+          "Track 06, Lesson 09 — Deployment Verification and Automated Rollback"
         ]
       }
     },
@@ -2467,9 +2467,9 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-10",
-        "track-09",
-        "track-08"
+        "track-08",
+        "track-07",
+        "track-06"
       ],
       "tags": [
         "query-performance",
@@ -2617,9 +2617,9 @@
           "Automated EXPLAIN regression testing against production-scale data prevents recurrence"
         ],
         "furtherReading": [
-          "Track 10, Lesson 06 — Index Design: B-Tree, Composite, Partial Indexes",
-          "Track 10, Lesson 07 — Query Plan Analysis with EXPLAIN ANALYZE",
-          "Track 10, Lesson 09 — Online Schema Migrations and Index Management"
+          "Track 08, Lesson 06 — Index Design: B-Tree, Composite, Partial Indexes",
+          "Track 08, Lesson 07 — Query Plan Analysis with EXPLAIN ANALYZE",
+          "Track 08, Lesson 09 — Online Schema Migrations and Index Management"
         ]
       }
     },
@@ -2636,7 +2636,7 @@
       "relatedTracks": [
         "track-01",
         "track-02",
-        "track-12"
+        "track-10"
       ],
       "tags": [
         "API-versioning",
@@ -2783,7 +2783,7 @@
         "furtherReading": [
           "Track 01, Lesson 10 — API Design and Evolution Patterns",
           "Track 02, Lesson 12 — Distributed System Contracts and Compatibility",
-          "Track 12, Lesson 09 — Deployment Pipelines and Consumer-Driven Testing"
+          "Track 10, Lesson 09 — Deployment Pipelines and Consumer-Driven Testing"
         ]
       }
     },
@@ -2798,9 +2798,8 @@
       "status": "published",
       "relatedLessons": [],
       "relatedTracks": [
-        "track-07",
-        "track-10",
-        "track-13"
+        "track-08",
+        "track-11"
       ],
       "tags": [
         "audit-trail",
@@ -2947,8 +2946,8 @@
           "FATF Recommendation 11: 5-year retention — design for this from day one, not as an afterthought"
         ],
         "furtherReading": [
-          "Track 07, Lesson 08 — Compliance Data Architecture: Hot, Warm, Cold",
-          "Track 10, Lesson 12 — Tamper-Evident Data Patterns",
+          "Track 08, Lesson 18 — Data Archival — Cold Storage and Tiered Data Management",
+          "Track 08, Lesson 12 — Tamper-Evident Data Patterns",
           "Capstone Project C — AML Screening Platform: Compliance Audit Trail"
         ]
       }
@@ -2965,8 +2964,8 @@
       "relatedLessons": [],
       "relatedTracks": [
         "track-02",
-        "track-10",
-        "track-05"
+        "track-08",
+        "track-04"
       ],
       "tags": [
         "split-brain",
@@ -3132,7 +3131,7 @@
       "relatedTracks": [
         "track-01",
         "track-02",
-        "track-12"
+        "track-10"
       ],
       "tags": [
         "microservices",

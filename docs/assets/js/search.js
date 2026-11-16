@@ -346,6 +346,11 @@ EM.Search = (function () {
         typeLabel = 'Capstone';
         typeCls   = 'result-type-capstone';
         break;
+      case 'experiment':
+        typeIcon  = EM.Icons.threads || EM.Icons.lab;
+        typeLabel = 'Experiment';
+        typeCls   = 'result-type-scenario';
+        break;
       default:
         typeIcon  = EM.Icons.build;
         typeLabel = doc.type;

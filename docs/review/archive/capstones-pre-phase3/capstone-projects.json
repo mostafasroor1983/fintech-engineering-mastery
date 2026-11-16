@@ -1,0 +1,148 @@
+{
+  "projects": [
+    {
+      "id": "project-a",
+      "sequence": 1,
+      "title": "High-Throughput Payment Processing Platform",
+      "shortTitle": "Payment Platform",
+      "slug": "payment-platform",
+      "path": "content/capstone/project-a-payment-platform/index.md",
+      "difficulty": "principal",
+      "estimatedHours": 20,
+      "status": "published",
+      "color": "#6366f1",
+      "colorMuted": "rgba(99, 102, 241, 0.15)",
+      "description": "Design and implement a production-grade payment gateway capable of 50,000 TPS with idempotency, exactly-once semantics, and sub-100ms P99 authorisation latency.",
+      "objectives": [
+        "Design a horizontally scalable payment authorisation pipeline",
+        "Implement idempotency with distributed deduplication",
+        "Apply CompletableFuture-based parallel enrichment (fraud, FX, balance)",
+        "Handle exactly-once Kafka event publishing via Outbox pattern",
+        "Achieve P99 < 100ms under 50k TPS sustained load"
+      ],
+      "techStack": ["Java 21", "Spring Boot 4", "PostgreSQL", "Kafka", "Redis", "Kubernetes"],
+      "tracks": ["track-01", "track-02", "track-03", "track-04", "track-06", "track-08"],
+      "tags": ["payments", "idempotency", "CompletableFuture", "Kafka", "Outbox", "high-throughput"]
+    },
+    {
+      "id": "project-b",
+      "sequence": 2,
+      "title": "Concurrent Double-Entry Ledger Engine",
+      "shortTitle": "Ledger Engine",
+      "slug": "ledger-engine",
+      "path": "content/capstone/project-b-ledger-engine/index.md",
+      "difficulty": "principal",
+      "estimatedHours": 18,
+      "status": "published",
+      "color": "#ef4444",
+      "colorMuted": "rgba(239, 68, 68, 0.15)",
+      "description": "Build a concurrent, ACID-compliant double-entry ledger that handles 10,000 concurrent balance updates with no race conditions, guaranteed accounting invariants, and full audit trail.",
+      "objectives": [
+        "Implement double-entry accounting with database-enforced invariants",
+        "Prevent race conditions using optimistic and pessimistic locking strategies",
+        "Design a tamper-evident hash-chained audit log",
+        "Handle the concurrent overdraft problem correctly",
+        "Achieve linearisable balance updates at 10k concurrent writers"
+      ],
+      "techStack": ["Java 21", "Spring Boot 4", "PostgreSQL", "jcstress", "JMH", "Testcontainers"],
+      "tracks": ["track-03", "track-06", "track-10"],
+      "tags": ["ledger", "double-entry", "ACID", "concurrency", "jcstress", "optimistic-locking"]
+    },
+    {
+      "id": "project-c",
+      "sequence": 3,
+      "title": "Distributed AML & Sanctions Screening Platform",
+      "shortTitle": "AML Screening",
+      "slug": "aml-screening",
+      "path": "content/capstone/project-c-aml-screening/index.md",
+      "difficulty": "principal",
+      "estimatedHours": 16,
+      "status": "published",
+      "color": "#f59e0b",
+      "colorMuted": "rgba(245, 158, 11, 0.15)",
+      "description": "Build a real-time AML transaction monitoring system with Kafka Streams windowed aggregation, sanctions screening, alert generation, and regulatory audit trail.",
+      "objectives": [
+        "Implement Kafka Streams windowed aggregation for structuring detection",
+        "Design a rule engine with pluggable AML scenarios",
+        "Build a sanctions screening service with fuzzy name matching",
+        "Create a tamper-evident compliance audit trail",
+        "Handle regulatory latency requirements (sub-500ms screening)"
+      ],
+      "techStack": ["Java 21", "Spring Boot 4", "Kafka Streams", "Redis", "PostgreSQL", "Elasticsearch"],
+      "tracks": ["track-02", "track-07", "track-11"],
+      "tags": ["AML", "sanctions", "Kafka-Streams", "rule-engine", "compliance", "audit"]
+    },
+    {
+      "id": "project-d",
+      "sequence": 4,
+      "title": "Financial Reconciliation Engine",
+      "shortTitle": "Reconciliation Engine",
+      "slug": "reconciliation-engine",
+      "path": "content/capstone/project-d-reconciliation-engine/index.md",
+      "difficulty": "principal",
+      "estimatedHours": 16,
+      "status": "published",
+      "color": "#10b981",
+      "colorMuted": "rgba(16, 185, 129, 0.15)",
+      "description": "Design a financial reconciliation system that detects discrepancies between internal ledger records and external settlement reports, with automated break investigation and resolution workflows.",
+      "objectives": [
+        "Design a multi-source reconciliation pipeline with CDC (Debezium)",
+        "Implement break detection with configurable tolerance rules",
+        "Build an event-sourced break investigation workflow",
+        "Handle settlement file formats (BACS, SWIFT MT940)",
+        "Provide real-time reconciliation dashboards via CQRS projections"
+      ],
+      "techStack": ["Java 21", "Spring Boot 4", "PostgreSQL", "Kafka", "Debezium", "Redis"],
+      "tracks": ["track-05", "track-06", "track-10", "track-11"],
+      "tags": ["reconciliation", "CDC", "Debezium", "CQRS", "event-sourcing", "BACS", "SWIFT"]
+    },
+    {
+      "id": "project-e",
+      "sequence": 5,
+      "title": "Multi-Region Banking Platform",
+      "shortTitle": "Multi-Region Banking",
+      "slug": "multi-region-banking",
+      "path": "content/capstone/project-e-multi-region-banking/index.md",
+      "difficulty": "principal",
+      "estimatedHours": 20,
+      "status": "published",
+      "color": "#0ea5e9",
+      "colorMuted": "rgba(14, 165, 233, 0.15)",
+      "description": "Architect a multi-region active-active banking platform with conflict-free data replication, region-local reads, global consistency for critical operations, and sub-50ms RTO.",
+      "objectives": [
+        "Design active-active multi-region topology with conflict resolution",
+        "Implement CRDTs for balance accumulators across regions",
+        "Apply global CP for critical operations, regional AP for reads",
+        "Design the cross-region Saga for international transfers",
+        "Achieve RTO < 50ms and RPO = 0 for account balance data"
+      ],
+      "techStack": ["Java 21", "Spring Boot 4", "CockroachDB", "Kafka MirrorMaker 2", "Kubernetes", "Istio"],
+      "tracks": ["track-02", "track-08", "track-12"],
+      "tags": ["multi-region", "active-active", "CRDT", "conflict-resolution", "CockroachDB", "geo-replication"]
+    },
+    {
+      "id": "project-f",
+      "sequence": 6,
+      "title": "Production Observability & Incident Investigation Platform",
+      "shortTitle": "Observability Platform",
+      "slug": "observability-platform",
+      "path": "content/capstone/project-f-observability-platform/index.md",
+      "difficulty": "principal",
+      "estimatedHours": 14,
+      "status": "published",
+      "color": "#ec4899",
+      "colorMuted": "rgba(236, 72, 153, 0.15)",
+      "description": "Build a production-grade observability stack for a payment platform: OpenTelemetry instrumentation, SLO-based alerting, distributed trace correlation, JVM diagnostics, and a runbook-driven incident response framework.",
+      "objectives": [
+        "Instrument a payment service with OpenTelemetry traces, metrics, and logs",
+        "Define SLIs, SLOs, and configure multi-window burn-rate alerts",
+        "Build a trace-to-log correlation dashboard in Grafana",
+        "Design the on-call runbook for a P1 payment processing incident",
+        "Implement JVM flight recorder profiling for production use"
+      ],
+      "techStack": ["Java 21", "OpenTelemetry", "Prometheus", "Grafana", "Jaeger", "Loki", "Kubernetes"],
+      "tracks": ["track-08", "track-09", "track-13"],
+      "tags": ["observability", "OpenTelemetry", "SLO", "Prometheus", "Grafana", "incident-management"]
+    }
+  ]
+}

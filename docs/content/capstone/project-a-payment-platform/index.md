@@ -1,617 +1,232 @@
 ---
 id: project-a
-title: "High-Throughput Payment Processing Platform"
-slug: payment-platform
-difficulty: principal
-estimatedHours: 20
+title: "Payment Service with Idempotency, Transactional Outbox and Kafka"
+slug: payment-service
+difficulty: advanced
+estimatedHours: 12
 status: published
-techStack: [Java 21, Spring Boot 4, PostgreSQL, Kafka, Redis, Kubernetes]
-tracks: [track-01, track-02, track-03, track-04, track-06, track-08]
-tags: [payments, idempotency, CompletableFuture, Kafka, Outbox, high-throughput]
+techStack: [Java 21, Spring Boot 4.0, PostgreSQL 17, Kafka 4.1, Testcontainers 2]
+tracks: [track-05, track-09, track-13, track-14]
+tags: [payments, idempotency, outbox, kafka, dead-letter-topic]
+module: examples/capstone-1-payment-service
 ---
+<!-- GENERATED from examples/capstone-1-payment-service/README.md by tools/build_capstone_pages.py. Edit the README, then re-run the script. -->
 
-# High-Throughput Payment Processing Platform
+**Source code:** [`examples/capstone-1-payment-service`](https://github.com/mostafasroor1983/fintech-engineering-mastery/tree/v1/examples/capstone-1-payment-service) · run `mvn test -pl capstone-1-payment-service -am` from `examples/`
 
-## Project Overview
+> A small payment-acceptance service that never takes a payment twice and never loses the event
+> that tells settlement about it. Spring Boot 4.0.9, Java 21, PostgreSQL 17, Kafka 4.1 (client 4.1.2).
 
-Build a production-grade payment gateway capable of processing **50,000 transactions per second** with sub-100ms P99 authorisation latency, exactly-once delivery semantics, and financial-grade idempotency guarantees.
+## The problem
 
-This project integrates: distributed systems, concurrency, async processing, transaction integrity, and reliability engineering.
+A merchant's server calls `POST /v1/payments`. The network times out. Did the payment happen? The
+merchant retries. Without care, the customer pays twice. After accepting a payment, the
+service must also tell settlement (over Kafka). If it writes to the database and *then* publishes to
+Kafka, a crash between the two leaves a payment that settlement never hears about. This is the
+**dual-write problem**.
 
-**What you will build:**
-- Payment authorisation API with parallel enrichment pipeline
-- Idempotency engine with distributed deduplication
-- Transactional Outbox for exactly-once Kafka event publishing
-- Settlement worker with Kafka consumer exactly-once semantics
-- SLO dashboards and alerting
+This service solves both:
 
----
-
-## System Requirements
-
-### Functional Requirements
-
-| Requirement | Specification |
-|---|---|
-| Payment submission | Synchronous authorisation response |
-| Idempotency | Same request replayed ≤ 24h returns identical result |
-| Currencies | GBP, EUR, USD — real-time FX conversion |
-| Fraud screening | Third-party call, 200ms timeout, default allow |
-| Settlement | Asynchronous, at-least-once with idempotent consumer |
-| Audit | Every decision logged with actor, timestamp, decision |
-
-### Non-Functional Requirements
-
-| SLO | Target |
-|---|---|
-| P50 authorisation latency | < 30ms |
-| P99 authorisation latency | < 100ms |
-| Availability | 99.95% (20-min/month error budget) |
-| Throughput | 50,000 TPS sustained |
-| Idempotency window | 24 hours |
-| Data durability | Zero loss (acks=all, min.insync.replicas=2) |
-
----
+| Risk | Fix in this project | Canonical lesson |
+|---|---|---|
+| Client retries create duplicate payments | `Idempotency-Key` header + primary key on `(merchant_id, idempotency_key)` | [Idempotency patterns](#/tracks/track-05/lessons/track-05-lesson-12) |
+| Two identical requests arrive at the same instant | `INSERT ... ON CONFLICT DO NOTHING`: PostgreSQL makes the second one wait for the first | [Scenario B: duplicate payment](#/tracks/track-05/lessons/track-05-lesson-03) |
+| DB commit succeeds, Kafka publish lost | Transactional outbox: event row in the same transaction, relay publishes later | [Transactional outbox](#/tracks/track-05/lessons/track-05-lesson-13), [Scenario F: dual write](#/tracks/track-05/lessons/track-05-lesson-07) |
+| Kafka/outbox deliver the same event twice | Idempotent consumer: `processed_event` primary key in the same transaction as the side effect | [Scenario G: duplicate Kafka delivery](#/tracks/track-05/lessons/track-05-lesson-08) |
+| One bad message blocks a partition forever | Retry 3×, then dead-letter topic `payments.events-dlt` | [Dead letter queues](#/tracks/track-09/lessons/track-09-lesson-11) |
 
 ## Architecture
 
 ```mermaid
-graph TB
-    Client[Client API\nREST / gRPC] --> GW[API Gateway\nRate Limiting]
-    GW --> PA[Payment API\nSpring Boot\n6 replicas]
-
-    PA --> IDM[Idempotency\nCheck\nRedis + DB]
-    
-    PA --> ENRICH[Parallel Enrichment\nCompletableFuture.allOf]
-    
-    subgraph Enrichment [Parallel Enrichment 50ms budget]
-        FRAUD[Fraud Service\n200ms timeout\ndefault-allow]
-        FX[FX Rate Service\n150ms timeout]
-        ACCT[Account Service\n100ms timeout]
+flowchart LR
+    M[Merchant] -- "POST /v1/payments<br/>Idempotency-Key" --> API[PaymentController]
+    API --> S[PaymentService]
+    subgraph TX["One PostgreSQL transaction"]
+        S --> IK[(idempotency_key)]
+        S --> P[(payment)]
+        S --> O[(outbox_event)]
     end
-    
-    ENRICH --> FRAUD
-    ENRICH --> FX
-    ENRICH --> ACCT
-    
-    PA --> DB[(PostgreSQL\nPayments + Outbox\nHA primary)]
-    PA --> KAFKA[Kafka\npayments topic\n24 partitions]
-    
-    subgraph Outbox [Transactional Outbox]
-        DB --> DEBZ[Debezium CDC\nWAL reader]
-        DEBZ --> KAFKA
-    end
-    
-    KAFKA --> SW[Settlement Worker\nKafka consumer\nexactly-once]
-    SW --> LEDGER[Ledger Service\nDouble-Entry]
+    R[OutboxRelay<br/>SKIP LOCKED poll] --> O
+    R -- "acks=all, key=paymentId" --> K[[Kafka: payments.events]]
+    K --> L[SettlementListener]
+    L --> PE[(processed_event)]
+    L --> SI[(settlement_instruction)]
+    K -. "after 3 failures" .-> DLT[[payments.events-dlt]]
 ```
 
----
-
-## Domain Model
+Failure path: Kafka is down when the relay runs.
 
 ```mermaid
-erDiagram
-    PAYMENT {
-        uuid id PK
-        uuid account_id FK
-        varchar idempotency_key UK
-        numeric amount
-        char3 currency
-        numeric amount_gbp
-        varchar status
-        varchar decline_reason
-        timestamp authorised_at
-        timestamp created_at
-    }
-    
-    IDEMPOTENCY_RECORD {
-        uuid id PK
-        varchar idempotency_key UK
-        varchar response_status
-        jsonb response_body
-        timestamp expires_at
-        timestamp created_at
-    }
-    
-    OUTBOX_EVENT {
-        uuid id PK
-        varchar aggregate_type
-        uuid aggregate_id
-        varchar event_type
-        jsonb payload
-        varchar status
-        int retry_count
-        timestamp created_at
-        timestamp published_at
-    }
-    
-    ACCOUNT {
-        uuid id PK
-        numeric balance
-        char3 currency
-        bigint version
-        timestamp updated_at
-    }
-    
-    PAYMENT ||--o| IDEMPOTENCY_RECORD : "keyed by"
-    PAYMENT ||--|{ OUTBOX_EVENT : "publishes"
-    ACCOUNT ||--|{ PAYMENT : "owns"
+sequenceDiagram
+    participant Relay as OutboxRelay
+    participant DB as PostgreSQL
+    participant K as Kafka
+    Relay->>DB: BEGIN, then SELECT ... FOR UPDATE SKIP LOCKED
+    Relay->>K: send(paymentId, event)
+    K--xRelay: timeout / not leader
+    Relay->>DB: ROLLBACK (rows stay unpublished)
+    Note over Relay,DB: next poll (500 ms later)
+    Relay->>DB: BEGIN, then SELECT ... FOR UPDATE SKIP LOCKED
+    Relay->>K: send(paymentId, event)
+    K-->>Relay: ack (acks=all)
+    Relay->>DB: UPDATE published_at = now(), then COMMIT
 ```
 
----
+## Key decisions and trade-offs
 
-## Database Schema
-
-```sql
-CREATE TABLE payments (
-    id               UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    account_id       UUID NOT NULL,
-    idempotency_key  VARCHAR(255) NOT NULL,
-    amount           NUMERIC(20,4) NOT NULL CHECK (amount > 0),
-    currency         CHAR(3) NOT NULL,
-    amount_gbp       NUMERIC(20,4) NOT NULL,
-    fx_rate          NUMERIC(16,8) NOT NULL DEFAULT 1,
-    status           VARCHAR(20) NOT NULL DEFAULT 'PENDING',
-    decline_reason   VARCHAR(100),
-    fraud_score      INTEGER,
-    authorised_at    TIMESTAMPTZ,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    
-    CONSTRAINT payments_status_check CHECK (
-        status IN ('PENDING', 'AUTHORISED', 'DECLINED', 'REVERSED', 'SETTLED')
-    ),
-    CONSTRAINT payments_idempotency_key_uk UNIQUE (idempotency_key)
-);
-
-CREATE TABLE outbox_events (
-    id              UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    aggregate_type  VARCHAR(100) NOT NULL,
-    aggregate_id    UUID NOT NULL,
-    event_type      VARCHAR(100) NOT NULL,
-    payload         JSONB NOT NULL,
-    status          VARCHAR(20) NOT NULL DEFAULT 'PENDING',
-    retry_count     INTEGER NOT NULL DEFAULT 0,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    published_at    TIMESTAMPTZ,
-    
-    CONSTRAINT outbox_status_check CHECK (status IN ('PENDING', 'PUBLISHED', 'FAILED'))
-);
-
--- Partial index: only unpublished events are queried for dispatch
-CREATE INDEX idx_outbox_pending ON outbox_events (created_at) WHERE status = 'PENDING';
-CREATE INDEX idx_payments_account ON payments (account_id, created_at DESC);
-```
-
----
-
-## API Design
-
-### POST /v1/payments — Authorise Payment
-
-**Request:**
-```json
-{
-  "idempotencyKey": "client-ref-abc123",
-  "accountId": "acc-00000001",
-  "amount": "250.00",
-  "currency": "EUR",
-  "description": "Invoice payment INV-2024-0042"
-}
-```
-
-**Response (202 Accepted — first call):**
-```json
-{
-  "paymentId": "pay-xxxxxxxx",
-  "status": "AUTHORISED",
-  "amountGBP": "214.73",
-  "fxRate": "1.1642",
-  "authorisedAt": "2024-11-07T14:23:01.123Z"
-}
-```
-
-**Response (200 OK — duplicate call, same idempotency key):**
-```json
-{
-  "paymentId": "pay-xxxxxxxx",
-  "status": "AUTHORISED",
-  "amountGBP": "214.73",
-  "fxRate": "1.1642",
-  "authorisedAt": "2024-11-07T14:23:01.123Z",
-  "idempotent": true
-}
-```
-
----
-
-## Implementation
-
-### Idempotency Engine
-
-```java
-@Service
-public class IdempotencyService {
-
-    private final IdempotencyRepository repository;
-    private final RedisTemplate<String, String> redis;
-    
-    private static final Duration WINDOW = Duration.ofHours(24);
-    private static final String REDIS_PREFIX = "idem:";
-
-    // Check-then-store with database UNIQUE constraint as the final arbiter
-    // Redis provides fast-path cache; DB provides correctness under concurrent load
-    public Optional<IdempotencyRecord> check(String key) {
-        // Fast path: check Redis cache
-        String cached = redis.opsForValue().get(REDIS_PREFIX + key);
-        if (cached != null) {
-            return Optional.of(IdempotencyRecord.fromJson(cached));
-        }
-        // Slow path: check database
-        return repository.findByKeyAndNotExpired(key, Instant.now());
-    }
-
-    @Transactional
-    public IdempotencyRecord store(String key, PaymentResult result) {
-        IdempotencyRecord record = IdempotencyRecord.builder()
-            .idempotencyKey(key)
-            .responseStatus(result.getStatus().name())
-            .responseBody(result.toJson())
-            .expiresAt(Instant.now().plus(WINDOW))
-            .build();
-        
-        try {
-            repository.insert(record);  // throws DataIntegrityViolationException on duplicate key
-        } catch (DataIntegrityViolationException e) {
-            // Race condition: another request stored the result concurrently
-            // Return the winning result — caller gets idempotent response
-            return repository.findByKeyAndNotExpired(key, Instant.now())
-                .orElseThrow(() -> new IllegalStateException("Idempotency store inconsistency"));
-        }
-        
-        // Write through to Redis cache
-        redis.opsForValue().set(REDIS_PREFIX + key, record.toJson(), WINDOW);
-        return record;
-    }
-}
-```
-
-### Parallel Enrichment Pipeline (Java 21 — Virtual Threads)
-
-```java
-@Service
-public class PaymentEnrichmentService {
-
-    private final FraudService fraudService;
-    private final FxService fxService;
-    private final AccountService accountService;
-    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-
-    public EnrichedPayment enrich(PaymentRequest request) {
-        // All three calls are I/O-bound → virtual threads make them cheap
-        var fraudFuture = CompletableFuture
-            .supplyAsync(() -> fraudService.score(request), executor)
-            .completeOnTimeout(FraudScore.defaultAllow(), 200, TimeUnit.MILLISECONDS);
-
-        var fxFuture = request.getCurrency().equals("GBP")
-            ? CompletableFuture.completedFuture(FxRate.one())
-            : CompletableFuture
-                .supplyAsync(() -> fxService.getRate(request.getCurrency(), "GBP"), executor)
-                .orTimeout(150, TimeUnit.MILLISECONDS);
-
-        var accountFuture = CompletableFuture
-            .supplyAsync(() -> accountService.getWithBalance(request.getAccountId()), executor)
-            .orTimeout(100, TimeUnit.MILLISECONDS);
-
-        return CompletableFuture.allOf(fraudFuture, fxFuture, accountFuture)
-            .thenApply(ignored -> EnrichedPayment.builder()
-                .request(request)
-                .fraudScore(fraudFuture.join())
-                .fxRate(fxFuture.join())
-                .account(accountFuture.join())
-                .enrichedAt(Instant.now())
-                .build())
-            .join();
-    }
-}
-```
-
-### Transactional Outbox — Exactly-Once Kafka Publishing
-
-```java
-@Service
-@Transactional
-public class PaymentService {
-
-    private final PaymentRepository paymentRepository;
-    private final OutboxRepository outboxRepository;
-    private final IdempotencyService idempotencyService;
-    private final PaymentEnrichmentService enrichmentService;
-
-    public PaymentResult authorise(PaymentRequest request) {
-        // 1. Check idempotency
-        var existing = idempotencyService.check(request.getIdempotencyKey());
-        if (existing.isPresent()) {
-            return PaymentResult.idempotent(existing.get());
-        }
-
-        // 2. Enrich (outside transaction — network calls should not hold DB connections)
-        // Note: enrichment is called before @Transactional opens a connection
-        var enriched = enrichmentService.enrich(request);
-
-        // 3. Make authorisation decision
-        var decision = makeDecision(enriched);
-
-        // 4. Persist payment + outbox event in ONE TRANSACTION
-        var payment = Payment.from(request, decision, enriched);
-        paymentRepository.insert(payment);
-
-        outboxRepository.insert(OutboxEvent.builder()
-            .aggregateType("Payment")
-            .aggregateId(payment.getId())
-            .eventType("PaymentAuthorised")
-            .payload(PaymentAuthorisedEvent.from(payment))
-            .build());
-
-        // 5. Store idempotency record (also in same transaction)
-        var result = PaymentResult.from(payment);
-        idempotencyService.store(request.getIdempotencyKey(), result);
-
-        return result;
-        // Outbox event will be picked up by Debezium CDC → Kafka
-        // No dual-write problem: DB write and "Kafka publish" are atomic
-    }
-}
-```
-
-### Settlement Worker — Exactly-Once Consumer
-
-```java
-@Service
-public class SettlementWorker {
-
-    private final KafkaConsumer<String, PaymentEvent> consumer;
-    private final KafkaProducer<String, SettlementEvent> producer;
-    private final LedgerService ledgerService;
-
-    public void run() {
-        consumer.subscribe(List.of("payments.authorised"));
-
-        while (true) {
-            var records = consumer.poll(Duration.ofMillis(100));
-            
-            producer.beginTransaction();
-            try {
-                for (var record : records) {
-                    var settlement = ledgerService.settle(record.value());
-                    producer.send(new ProducerRecord<>("settlements.completed",
-                        record.key(), settlement));
-                }
-                // Commit offsets AND output messages atomically
-                producer.sendOffsetsToTransaction(
-                    getOffsets(records), consumer.groupMetadata());
-                producer.commitTransaction();
-                
-            } catch (Exception e) {
-                producer.abortTransaction();
-                log.error("Settlement transaction aborted, will retry", e);
-            }
-        }
-    }
-}
-```
-
----
-
-## Concurrency Strategy
-
-| Operation | Strategy | Rationale |
+| Decision | Why | Cost / when not to |
 |---|---|---|
-| Balance debit | Conditional atomic UPDATE (`WHERE balance >= amount`) | Prevents overdraft without locking |
-| Idempotency store | DB UNIQUE constraint | Correct under concurrent insertions |
-| Outbox dispatch | Single Debezium reader per partition | No concurrent dispatch races |
-| FX rate reads | Stale-tolerant (Redis cache, 30s TTL) | AP — eventual consistency acceptable |
+| Idempotency key, payment and outbox row in **one** transaction | All-or-nothing; no "key stored but payment missing" state | Works because nothing slow happens inside the transaction. If you call a PSP synchronously, split it: claim key (`IN_PROGRESS`), call outside the transaction, then store the result. |
+| Store the **original response body** for replays | A retry gets byte-for-byte the same answer, even if the payment changed later | Storage grows: purge keys after the retention window you promise clients (Stripe documents 24 h; pick and document yours). |
+| Key scoped per merchant | Two merchants may pick the same key | Requires a trusted merchant identity (here a header stands in for the OAuth2 principal; capstone 5 does it properly). |
+| Polling relay (not CDC) | No extra infrastructure; easy to test | Adds up to one poll interval of latency and some DB load. At high volume use Debezium CDC ([Outbox + CDC](#/tracks/track-09/lessons/track-09-lesson-06)). |
+| At-least-once + idempotent consumer, not Kafka transactions | Kafka EOS covers Kafka-to-Kafka. Our side effect is a DB write, which Kafka transactions cannot include | The consumer must de-duplicate. The `processed_event` table needs a retention job. |
+| Kafka key = payment id | Ordering per payment (one partition) | Hot payments do not exist, so no hot-partition risk here; a per-merchant key would be. |
+| Virtual threads + Hikari pool of 20 | Cheap request threads | The pool is now the real concurrency limit; `connection-timeout: 2000` fails fast instead of queueing forever. |
 
-```java
-// Atomic conditional debit — prevents double-spend race condition
-int updated = jdbcTemplate.update(
-    "UPDATE accounts SET balance = balance - ?, version = version + 1 " +
-    "WHERE id = ? AND balance >= ? AND version = ?",
-    amount, accountId, amount, expectedVersion
-);
-if (updated == 0) {
-    throw new InsufficientFundsException(accountId);
-}
+## How to run
+
+Prerequisites: Java 21, Maven 3.9+, Docker running.
+
+```bash
+cd examples
+mvn test -pl capstone-1-payment-service -am          # 13 tests, real PostgreSQL + Kafka via Testcontainers
 ```
 
----
+Docker Desktop on macOS: if Testcontainers reports "Could not find a valid Docker environment", export
+`DOCKER_HOST=unix://$HOME/.docker/run/docker.sock` first.
 
-## Failure Handling
+Run the app against your own PostgreSQL and Kafka:
 
-```mermaid
-graph LR
-    A[Request] --> B{Fraud Service\nTimeout?}
-    B -->|Yes 200ms| C[Use FraudScore.defaultAllow\ncontinue pipeline]
-    B -->|No| D{FX Service\nTimeout?}
-    D -->|Yes 150ms| E[Decline: FX unavailable\nif conversion required]
-    D -->|No| F{Account Service\nTimeout?}
-    F -->|Yes 100ms| G[Decline: balance unavailable]
-    F -->|No| H[Authorise / Decline\nbased on data]
-    
-    H --> I{Outbox write\nfails?}
-    I -->|DB down| J[503 to client\nretry with same idem key]
-    I -->|Success| K[202 response]
+```bash
+export DB_URL=jdbc:postgresql://localhost:5432/payments DB_USER=payments DB_PASSWORD=...   # never commit secrets
+export KAFKA_BOOTSTRAP=localhost:9092
+mvn spring-boot:run -pl capstone-1-payment-service
+
+curl -i -X POST localhost:8080/v1/payments \
+  -H 'Content-Type: application/json' -H 'X-Merchant-Id: acme' -H 'Idempotency-Key: order-1001-attempt' \
+  -d '{"debtorAccount":"GB33BUKB20201555555555","creditorAccount":"DE89370400440532013000","amount":10.50,"currency":"GBP","reference":"Invoice 42"}'
+# Run it again: same body, same id, header Idempotent-Replayed: true
 ```
 
----
+## API
 
-## Architecture Decision Records
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v1/payments` | Headers `Idempotency-Key` (8–64 chars) and `X-Merchant-Id`. 201 + `Location`. Replay returns the stored 201 with `Idempotent-Replayed: true`. Same key, different body: **422** problem+json. |
+| `GET` | `/v1/payments/{id}` | Only the owning merchant sees it; anyone else gets 404 (not 403), so ids cannot be probed (OWASP API1). |
 
-### ADR-001: Transactional Outbox over Direct Kafka Write
+Versioning uses Spring Framework 7 built-in API versioning (`spring.mvc.apiversion.use.path-segment=0`).
+`/v2/...` is rejected with 400. Errors are RFC 9457 `application/problem+json`.
 
-**Status:** Accepted
+## Tests (what each one proves)
 
-**Context:** Payment service must publish a Kafka event and persist the payment record atomically. Direct producer.send() after DB commit risks: DB committed, process crashes before Kafka write → event lost.
+| Test | Proves |
+|---|---|
+| `createsPaymentAndOutboxEventInOneTransaction` | Payment and outbox row are written together |
+| `retryWithSameKeyReplaysTheOriginalResponse` | Same id, `Idempotent-Replayed: true`, still 1 payment and 1 event |
+| `concurrentDuplicatesCreateExactlyOnePayment` | 20 simultaneous requests with one key → exactly 1 payment |
+| `sameKeyWithDifferentBodyIsRejected` | Key reuse with another body → 422, no new payment |
+| `tooManyDecimalsForTheCurrencyIsRejectedNotRounded` | `10.005 GBP` → 400 and the whole transaction rolls back (no orphan key) |
+| `anotherMerchantCannotReadMyPayment` | Object-level authorisation |
+| `unsupportedApiVersionIsRejected` | `/v2` → 400 |
+| `brokerDownKeepsEventsInTheOutboxUntilItRecovers` | **Failure then fix**: send fails → row stays pending → next run publishes |
+| `duplicateDeliveryIsAppliedOnce` | Same event sent twice → 1 settlement instruction |
+| `poisonMessageGoesToDeadLetterTopicAndDoesNotBlockTheNextOne` | Unknown payment → DLT after retries; the next good message is processed |
 
-**Decision:** Use the Transactional Outbox pattern. Write to `outbox_events` table in the same DB transaction as the payment record. Debezium reads the WAL and publishes to Kafka, ensuring exactly-once publishing.
+Real output (2026-11-12, `mvn test -pl capstone-1-payment-service -am`):
 
-**Consequences:** Requires Debezium CDC deployment. Introduces ~100-500ms publishing delay. Eliminates dual-write failure mode entirely.
-
-### ADR-002: Redis + DB for Idempotency (Not Redis Alone)
-
-**Status:** Accepted
-
-**Context:** Redis provides fast idempotency checks but can lose data on eviction or failure. A pure Redis solution violates durability requirements for 24-hour idempotency windows.
-
-**Decision:** Redis as a performance cache layer; PostgreSQL UNIQUE constraint as the correctness guarantee. `UNIQUE (idempotency_key)` prevents duplicates even when Redis is down or returns a cache miss on concurrent requests.
-
-**Consequences:** Idempotency checks hit DB on cache miss (~1-2% of requests). `DataIntegrityViolationException` handling required for race conditions (handled gracefully in `IdempotencyService.store()`).
-
-### ADR-003: Virtual Threads for Enrichment Pipeline
-
-**Status:** Accepted (Java 21 target)
-
-**Context:** Payment enrichment calls 3 external services in parallel. Original implementation used a fixed thread pool of 100 threads. Under 50k TPS, each enrichment call holds a thread for up to 200ms → pool exhaustion.
-
-**Decision:** Use `Executors.newVirtualThreadPerTaskExecutor()` for the enrichment executor. Virtual threads are cheap (~1KB stack vs 512KB for platform threads), making 50k concurrent enrichment calls feasible.
-
-**Consequences:** Requires Java 21. Libraries pinning carrier threads (synchronized blocks in JDBC drivers) may cause performance degradation; monitor with `-Djdk.tracePinnedThreads=full`.
-
----
-
-## Testing Strategy
-
-### Unit Tests — Idempotency Race Condition
-
-```java
-@Test
-void concurrentRequests_sameIdempotencyKey_onlyOneProcessed() throws Exception {
-    int threads = 50;
-    var latch = new CountDownLatch(1);
-    var successCount = new AtomicInteger(0);
-    var idempotentCount = new AtomicInteger(0);
-    
-    var futures = IntStream.range(0, threads).mapToObj(i ->
-        CompletableFuture.runAsync(() -> {
-            try {
-                latch.await();
-                var result = paymentService.authorise(
-                    PaymentRequest.builder()
-                        .idempotencyKey("test-key-concurrent-001")
-                        .accountId(testAccountId)
-                        .amount(new BigDecimal("100.00"))
-                        .currency("GBP")
-                        .build()
-                );
-                if (result.isIdempotent()) idempotentCount.incrementAndGet();
-                else successCount.incrementAndGet();
-            } catch (Exception e) { /* expected */ }
-        })
-    ).toArray(CompletableFuture[]::new);
-    
-    latch.countDown();  // Release all 50 threads simultaneously
-    CompletableFuture.allOf(futures).get(10, TimeUnit.SECONDS);
-    
-    assertThat(successCount.get()).isEqualTo(1);       // exactly 1 original
-    assertThat(idempotentCount.get()).isEqualTo(49);   // 49 idempotent replays
-}
+```text
+Tests run: 9, Failures: 0, Errors: 0, Skipped: 0 -- in com.fintechmastery.payments.PaymentApiTest
+Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in com.fintechmastery.payments.OutboxFlowTest
+BUILD SUCCESS
 ```
 
-### Integration Tests — Outbox Delivery
+## Load test
 
-```java
-@Test
-@Testcontainers
-void outboxEvent_publishedToKafka_afterDbCommit() {
-    // Execute a payment
-    var result = paymentService.authorise(testRequest);
-    
-    // Verify: event appears in Kafka within 5 seconds
-    var consumer = kafkaConsumerForTopic("payments.authorised");
-    var records = consumer.poll(Duration.ofSeconds(5));
-    
-    assertThat(records.count()).isEqualTo(1);
-    assertThat(records.iterator().next().value().getPaymentId())
-        .isEqualTo(result.getPaymentId());
-}
+```bash
+mvn test -pl capstone-1-payment-service -am -Dgroups=load
 ```
 
----
+200 concurrent clients send 4,000 requests; every 10th request retries an earlier key. The test asserts
+zero errors and exactly 3,600 payments and 3,600 outbox rows.
 
-## Performance Targets & Analysis
+Measured once on an Apple M1 Pro laptop (8 cores, 16 GB) with PostgreSQL and Kafka in Docker on the
+same machine. **Illustrative only, not a capacity claim:**
 
-```
-Target: 50,000 TPS, P99 < 100ms
-
-Latency budget breakdown:
-  Network ingress:         3ms
-  Idempotency check:       2ms  (Redis hit)
-  Parallel enrichment:    50ms  (bounded by slowest: fraud at 200ms timeout,
-                                 but p50 is ~40ms)
-  DB write (payment):      5ms  (NVMe SSD, single insert)
-  Outbox write:            2ms  (same transaction)
-  Response serialisation:  1ms
-  Network egress:          3ms
-  Total p50:              ~66ms ✓
-
-For P99:
-  Fraud service p99:      180ms → exceeds 100ms budget alone
-  
-Mitigation: completeOnTimeout(200ms) with defaultAllow
-  → p99 enrichment bounded at ~100ms (account service timeout)
-  → Total p99: ~115ms — requires further optimisation
-
-Optimisation options:
-  1. Move fraud scoring async post-auth (risk-based accept/challenge)
-  2. Pre-fetch fraud features from Redis (reduces to 10ms lookup)  
-  3. Use gRPC instead of HTTP for internal calls (saves ~15ms on serialisation)
+```text
+LOAD capstone-1: 4000 requests in 3.0 s = 1353 req/s; p50 116.0 ms, p99 590.8 ms, errors 0
 ```
 
----
+Where the time goes: 200 clients share a pool of 20 connections, so most of the latency is waiting for a
+connection. That is the point to discuss: raise the pool only if PostgreSQL has headroom. Otherwise keep
+it small and scale out the relay and consumers instead.
 
-## Deployment
+## Known limits
 
-```yaml
-# Kubernetes HPA — scale for payment peak days
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: payment-api
-  namespace: payments-prod
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: payment-api
-  minReplicas: 6
-  maxReplicas: 24
-  metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 60
-  - type: Pods
-    pods:
-      metric:
-        name: payment_queue_depth
-      target:
-        type: AverageValue
-        averageValue: "500"
-```
+- Merchant identity is a header. Production takes it from the OAuth2 token (see capstone 5).
+- No idempotency-key expiry job (a `DELETE ... WHERE created_at < now() - interval '24 hours'` batch).
+- `processed_event` grows forever; partition by day and drop old partitions.
+- Polling relay latency is up to `poll-interval`. Use CDC for high volume.
+- No settlement provider: the consumer writes a `settlement_instruction` row as its side effect.
+- Single region. See [Multi-region active-active](#/tracks/track-06/lessons/track-06-lesson-07).
 
----
+## Build it yourself in about 12 hours
 
-## Principal Engineer Review Criteria
+| Step | Hours | Done when |
+|---|---|---|
+| 1. Schema, `Payment` entity, `POST` without idempotency | 1.5 | Happy-path test green |
+| 2. Write the concurrent-duplicate test **first**, watch it fail with a naive "select then insert" | 1.5 | Test red, you can explain why |
+| 3. Idempotency key in the same transaction, replay, 422 on body mismatch | 2 | Tests green, including the 20-thread one |
+| 4. Outbox table + relay with `SKIP LOCKED`, broker-down test | 2.5 | Failure → recovery test green |
+| 5. Idempotent consumer + DLT | 2 | Duplicate and poison tests green |
+| 6. Load test, README numbers, practise the pitch aloud | 2.5 | You can draw the diagram from memory in 2 minutes |
 
-Your implementation will be evaluated against:
+## How I would explain this in an interview
 
-- [ ] **Idempotency is correct under concurrent load** — 50 concurrent requests, same key → 1 success, 49 idempotent
-- [ ] **No dual-write failures** — payment record and Kafka event published atomically
-- [ ] **No race conditions** in balance debit — atomic conditional UPDATE used
-- [ ] **Timeouts configured** on all external calls with appropriate fallback strategy
-- [ ] **P99 latency measured** under realistic load with JMH or Gatling
-- [ ] **SLO defined** — SLI, 28-day window, error budget policy documented
-- [ ] **ADRs written** for the top 3 architectural decisions
-- [ ] **Testcontainers integration test** for the full payment-to-Kafka flow
+"It is a payment API that guarantees two things: a payment is taken at most once per idempotency key,
+and every accepted payment reaches settlement at least once. For the first, the key, the payment and the
+outbox event are written in one PostgreSQL transaction. The key is a primary key, so two concurrent
+retries serialise on the insert: the second waits, sees the committed row, and replays the stored
+response. For the second, I don't publish to Kafka inside the request. A relay reads unpublished outbox
+rows with `FOR UPDATE SKIP LOCKED`, sends with `acks=all`, and only then marks them published. That gives
+at-least-once delivery, so the consumer de-duplicates by event id in the same transaction as its side
+effect. I proved each guarantee with a failing test first: concurrent duplicates, broker down, duplicate
+delivery, poison message."
+
+## The 5 hardest follow-up questions
+
+1. **"Why not just check if the key exists, then insert?"**
+   Two requests can both see "not there" and both insert a payment (check-then-act race). The
+   database's unique constraint is the only arbiter that sees both. `ON CONFLICT DO NOTHING` turns the race
+   into a wait. *Common wrong answer:* "use `synchronized`". It fails as soon as you run two instances.
+
+2. **"Why not Kafka transactions / exactly-once instead of the outbox?"**
+   Kafka transactions make *Kafka writes* atomic with *Kafka offset commits*. My state change is in
+   PostgreSQL, and no Kafka transaction can include a PostgreSQL commit. The outbox makes the DB the single
+   commit point. Exactly-once *effects* then come from at-least-once delivery plus an idempotent consumer.
+
+3. **"What happens if the relay crashes after Kafka acked but before marking the row?"**
+   The transaction rolls back, the row is still unpublished, and it is sent again. The consumer sees the
+   same `eventId` and skips it. That is why the event id is generated once, when the outbox row is written,
+   not by the relay.
+
+4. **"Two relay instances: do they send the same row twice?"**
+   Not concurrently: `SKIP LOCKED` hands each row to one instance at a time. Sequential duplicates are still
+   possible (crash case above). Ordering per payment holds because rows are read in id order and keyed
+   by payment id. Across a crash and retry, a later event could overtake an earlier one, so consumers that
+   care check a version or state (see [Scenario H: out-of-order events](#/tracks/track-05/lessons/track-05-lesson-09)).
+
+5. **"Your p99 is 590 ms locally. How do you find and fix the bottleneck?"**
+   Measure first: Hikari's `hikaricp.connections.pending` and acquire-time metrics show if requests wait for
+   connections. With 200 clients and 20 connections, they do. Options, in order: shorten the transaction
+   (it already has no remote calls), check slow SQL with `EXPLAIN ANALYZE`, then scale instances while
+   watching PostgreSQL CPU and `max_connections`. Do not just raise the pool: a bigger pool on a saturated
+   database makes latency worse.
+
+## See also
+
+- [Track 05: Idempotency patterns](#/tracks/track-05/lessons/track-05-lesson-12)
+- [Track 05: Transactional outbox](#/tracks/track-05/lessons/track-05-lesson-13)
+- [Track 13: Spring Kafka 4](#/tracks/track-13/lessons/track-13-lesson-06)
+- [Track 14: Design a payment service (part 2)](#/tracks/track-14/lessons/track-14-lesson-03)

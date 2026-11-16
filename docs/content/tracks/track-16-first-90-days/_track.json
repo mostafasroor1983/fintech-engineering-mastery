@@ -1,0 +1,49 @@
+{
+  "id": "track-16",
+  "sequence": 16,
+  "title": "First 90 Days",
+  "shortTitle": "First 90 Days",
+  "slug": "first-90-days",
+  "color": "#0ea5e9",
+  "colorMuted": "rgba(14, 165, 233, 0.15)",
+  "description": "A senior engineer's 30/60/90 plan: reading an unfamiliar Spring codebase with Actuator, first PR, on-call readiness and safe database migrations.",
+  "difficulty": "senior",
+  "estimatedHours": 1.6,
+  "status": "published",
+  "priority": "medium",
+  "lessons": [
+    {
+      "id": "track-16-lesson-01",
+      "sequence": 1,
+      "title": "Your First 90 Days and Reading an Unfamiliar Spring Codebase",
+      "slug": "first-90-days",
+      "path": "content/new-job/01-first-90-days/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 50,
+      "status": "published",
+      "tier": "supporting",
+      "tags": [
+        "onboarding",
+        "actuator"
+      ]
+    },
+    {
+      "id": "track-16-lesson-02",
+      "sequence": 2,
+      "title": "Production Safety: First PR, On-Call Readiness and Safe Migrations",
+      "slug": "production-safety",
+      "path": "content/new-job/02-production-safety/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 45,
+      "status": "published",
+      "tier": "supporting",
+      "tags": [
+        "on-call",
+        "flyway",
+        "migrations"
+      ]
+    }
+  ],
+  "mainPathMinutes": 95,
+  "optionalLessonCount": 0
+}

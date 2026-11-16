@@ -27,7 +27,8 @@
         "availability",
         "partition-tolerance",
         "PACELC"
-      ]
+      ],
+      "tier": "core"
     },
     {
       "id": "track-02-lesson-02",
@@ -43,7 +44,8 @@
         "linearisability",
         "eventual-consistency",
         "causal-consistency"
-      ]
+      ],
+      "tier": "core"
     },
     {
       "id": "track-02-lesson-03",
@@ -60,7 +62,8 @@
         "TrueTime",
         "clock-sync",
         "NTP"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-04",
@@ -77,7 +80,8 @@
         "ZooKeeper",
         "leader-election",
         "consensus"
-      ]
+      ],
+      "tier": "supporting"
     },
     {
       "id": "track-02-lesson-05",
@@ -93,7 +97,8 @@
         "financial-systems",
         "etcd",
         "distributed-commit"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-06",
@@ -110,7 +115,8 @@
         "distributed-transaction",
         "coordinator",
         "blocking"
-      ]
+      ],
+      "tier": "core"
     },
     {
       "id": "track-02-lesson-07",
@@ -127,7 +133,8 @@
         "multi-leader",
         "leaderless",
         "quorum"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-08",
@@ -144,7 +151,8 @@
         "cache-coherence",
         "cluster",
         "consistent-hashing"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-09",
@@ -160,7 +168,8 @@
         "Redlock",
         "advisory-lock",
         "fencing-token"
-      ]
+      ],
+      "tier": "core"
     },
     {
       "id": "track-02-lesson-10",
@@ -176,7 +185,8 @@
         "network-partition",
         "fencing",
         "STONITH"
-      ]
+      ],
+      "tier": "core"
     },
     {
       "id": "track-02-lesson-11",
@@ -193,7 +203,8 @@
         "Eureka",
         "health-check",
         "DNS"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-12",
@@ -209,7 +220,8 @@
         "epidemic-algorithm",
         "Cassandra",
         "membership"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-13",
@@ -226,7 +238,8 @@
         "write-quorum",
         "ROWA",
         "replication"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-14",
@@ -242,7 +255,8 @@
         "distributed",
         "at-least-once",
         "exactly-once"
-      ]
+      ],
+      "tier": "core"
     },
     {
       "id": "track-02-lesson-15",
@@ -258,7 +272,8 @@
         "append-only",
         "event-store",
         "snapshot"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-16",
@@ -274,7 +289,8 @@
         "idempotency",
         "deduplication",
         "transactional-outbox"
-      ]
+      ],
+      "tier": "core"
     },
     {
       "id": "track-02-lesson-17",
@@ -291,7 +307,8 @@
         "sliding-window",
         "Redis",
         "distributed"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-18",
@@ -307,7 +324,8 @@
         "multi-region",
         "geo-replication",
         "conflict-resolution"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-19",
@@ -323,7 +341,8 @@
         "OpenTelemetry",
         "Jaeger",
         "correlation-id"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-20",
@@ -339,7 +358,8 @@
         "fault-injection",
         "resilience-testing",
         "GameDay"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-21",
@@ -355,7 +375,8 @@
         "BFT",
         "fault-tolerance",
         "trust"
-      ]
+      ],
+      "tier": "optional"
     },
     {
       "id": "track-02-lesson-22",
@@ -371,7 +392,10 @@
         "distributed-systems",
         "trade-offs",
         "staff-engineer"
-      ]
+      ],
+      "tier": "optional"
     }
-  ]
+  ],
+  "mainPathMinutes": 675,
+  "optionalLessonCount": 14
 }

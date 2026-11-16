@@ -701,6 +701,9 @@ EM.Renderer = (function () {
       var raw = node.nodeValue.replace(/^\s*KNOWLEDGE-CHECK\s*/, '').trim();
       var questions;
       try { questions = JSON.parse(raw); } catch (e) { return; }
+      // Lessons use either a bare array or {"questions": [...]}.
+      if (questions && !Array.isArray(questions)) questions = questions.questions;
+      if (!Array.isArray(questions) || !questions.length) return;
       var el = _renderKnowledgeCheck(questions);
       node.parentNode.replaceChild(el, node);
     });
@@ -734,7 +737,7 @@ EM.Renderer = (function () {
 
       var text = document.createElement('div');
       text.className = 'kc-question-text';
-      text.textContent = q.q || q.text || '';
+      text.textContent = q.q || q.text || q.question || '';
 
       var opts = document.createElement('div');
       opts.className = 'kc-options';
@@ -999,10 +1002,21 @@ EM.Renderer = (function () {
     return marked.parse(md || '');
   }
 
+  /* Post-process rendered markdown outside a lesson page (used by capstone.js). */
+  function postProcess(el) {
+    if (!el) return;
+    _transformCallouts(el);
+    _buildCodeTabs(el);
+    _addCopyButtons(el);
+    _initMermaid(el);
+    _initPrism(el);
+  }
+
   return {
     renderLesson:    renderLesson,
     initComponents:  initComponents,
     toggleComplete:  toggleComplete,
-    convertMd:       convertMd
+    convertMd:       convertMd,
+    postProcess:     postProcess
   };
 }());

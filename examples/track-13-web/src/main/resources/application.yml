@@ -1,0 +1,5 @@
+payments:
+  limits:
+    max-single-payment: "25000.00"
+    currency: GBP
+    quote-ttl: 30s

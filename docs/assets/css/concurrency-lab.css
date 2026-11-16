@@ -1,0 +1,877 @@
+/* ============================================================
+   ENGINEERING MASTERY — Concurrency & Failure Lab Styles
+   ============================================================ */
+
+/* ----------------------------------------------------------
+   Shared Helpers
+---------------------------------------------------------- */
+.clab-muted   { color: var(--text-muted); font-style: italic; }
+.clab-error   { color: var(--red); padding: var(--sp-4); }
+.hidden       { display: none !important; }
+
+/* ----------------------------------------------------------
+   Lab Index Page
+---------------------------------------------------------- */
+.clab-index {
+  padding: var(--sp-6) 0;
+}
+
+.clab-index-header {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-8);
+}
+
+.clab-index-icon-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 46px;
+  background: rgba(249, 115, 22, 0.14);
+  border-radius: var(--r-lg);
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.clab-index-icon-wrap svg { width: 24px; height: 24px; }
+
+.clab-index-subtitle {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  margin-top: var(--sp-1);
+}
+
+/* ----------------------------------------------------------
+   Filter Tabs
+---------------------------------------------------------- */
+.clab-filter-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-6);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: var(--sp-3);
+}
+
+.clab-filter-tab {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--r-full);
+  padding: 6px 16px;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color var(--ease), background var(--ease), border-color var(--ease);
+}
+.clab-filter-tab:hover {
+  color: var(--text-primary);
+  border-color: var(--border);
+}
+.clab-filter-tab.active {
+  background: var(--accent-muted);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+/* ----------------------------------------------------------
+   Experiment Cards Grid
+---------------------------------------------------------- */
+.clab-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--sp-5);
+}
+@media (max-width: 1100px) {
+  .clab-cards-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 680px) {
+  .clab-cards-grid { grid-template-columns: 1fr; }
+}
+
+/* ----------------------------------------------------------
+   Experiment Card
+---------------------------------------------------------- */
+.clab-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  padding: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  transition: border-color 0.15s, transform 0.12s, box-shadow 0.15s;
+  position: relative;
+  overflow: hidden;
+  cursor: default;
+}
+.clab-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+/* Category-specific top stripe colour */
+.clab-card:has(.clab-cat-indigo)::before { background: #818cf8; }
+.clab-card:has(.clab-cat-purple)::before { background: var(--purple); }
+.clab-card:has(.clab-cat-green)::before  { background: var(--green); }
+
+.clab-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow);
+}
+.clab-card:hover::before { opacity: 1; }
+
+.clab-card-header { display: flex; align-items: center; }
+
+/* Category badge */
+.clab-card-category {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: var(--r-full);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.clab-cat-indigo  { background: rgba(99, 102, 241, 0.15); color: #818cf8; }
+.clab-cat-purple  { background: rgba(168, 85, 247, 0.15); color: var(--purple); }
+.clab-cat-green   { background: var(--green-muted);        color: var(--green); }
+
+[data-theme="light"] .clab-cat-indigo { background: rgba(99,102,241,0.1); color: #4f46e5; }
+[data-theme="light"] .clab-cat-purple { background: rgba(130,80,223,0.1); color: #7c3aed; }
+[data-theme="light"] .clab-cat-green  { background: var(--green-muted);   color: var(--green); }
+
+.clab-card-body { flex: 1; display: flex; flex-direction: column; gap: var(--sp-2); }
+
+.clab-card-title {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+.clab-card-subtitle {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.clab-card-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: var(--sp-1); }
+
+.clab-tag {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: var(--r-full);
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  border: 1px solid var(--border-muted);
+}
+
+.clab-card-footer { margin-top: auto; padding-top: var(--sp-2); }
+
+.clab-card-btn {
+  display: inline-block;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-muted);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--r);
+  padding: 7px 16px;
+  cursor: pointer;
+  transition: background var(--ease), color var(--ease);
+  text-decoration: none;
+}
+.clab-card-btn:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ----------------------------------------------------------
+   Experiment Detail Page
+---------------------------------------------------------- */
+.clab-experiment { padding: var(--sp-4) 0; }
+
+/* Breadcrumb */
+.clab-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  margin-bottom: var(--sp-5);
+  flex-wrap: wrap;
+}
+.clab-breadcrumb a { color: var(--text-link); text-decoration: none; }
+.clab-breadcrumb a:hover { text-decoration: underline; }
+.clab-bc-sep    { opacity: 0.5; }
+.clab-bc-current { color: var(--text-primary); font-weight: 500; }
+
+/* Experiment header */
+.clab-exp-header {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  padding: var(--sp-6);
+  margin-bottom: var(--sp-6);
+  border-left: 4px solid var(--accent);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.clab-accent-indigo  { border-left-color: #818cf8; }
+.clab-accent-purple  { border-left-color: var(--purple); }
+.clab-accent-green   { border-left-color: var(--green); }
+
+.clab-exp-meta-top { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+.clab-exp-title    { font-size: var(--text-xl); font-weight: 700; color: var(--text-primary); }
+.clab-exp-subtitle { font-size: var(--text-sm); color: var(--text-muted); }
+
+.clab-time-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  padding: 3px 10px;
+}
+.clab-time-badge svg { width: 13px; height: 13px; }
+
+/* ----------------------------------------------------------
+   Tab Bar
+---------------------------------------------------------- */
+.clab-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  border-bottom: 2px solid var(--border);
+  margin-bottom: var(--sp-6);
+  overflow-x: auto;
+}
+
+.clab-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  padding: 10px 16px;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--ease), border-color var(--ease);
+}
+.clab-tab:hover { color: var(--text-primary); }
+.clab-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+/* ----------------------------------------------------------
+   Tab Panels
+---------------------------------------------------------- */
+.clab-panel {
+  display: block;
+  animation: clab-fadein 0.18s ease;
+}
+.clab-panel.hidden { display: none !important; }
+
+@keyframes clab-fadein {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ----------------------------------------------------------
+   Code Blocks
+---------------------------------------------------------- */
+.clab-code-wrap {
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  margin: var(--sp-4) 0;
+}
+.clab-code-wrap pre {
+  margin: 0;
+  padding: var(--sp-4) var(--sp-5);
+  overflow-x: auto;
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  background: var(--bg-inset);
+  line-height: 1.6;
+}
+
+/* ----------------------------------------------------------
+   Callouts
+---------------------------------------------------------- */
+.clab-callout {
+  display: flex;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  border-radius: var(--r-lg);
+  margin: var(--sp-4) 0;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  border: 1px solid transparent;
+}
+.clab-callout-warn   { background: var(--yellow-muted); border-color: rgba(210,153,34,0.3); color: var(--yellow); }
+.clab-callout-info   { background: var(--blue-muted);   border-color: rgba(88,166,255,0.3); color: var(--blue); }
+.clab-callout-danger { background: var(--red-muted);    border-color: rgba(248,81,73,0.3);  color: var(--red); }
+
+[data-theme="light"] .clab-callout-warn   { color: var(--yellow); }
+[data-theme="light"] .clab-callout-info   { color: var(--blue);   }
+[data-theme="light"] .clab-callout-danger { color: var(--red);    }
+
+/* ----------------------------------------------------------
+   Annotations
+---------------------------------------------------------- */
+.clab-annotations { margin: var(--sp-4) 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+
+.clab-annotation {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--text-xs);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-elevated);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--r) var(--r) 0;
+  color: var(--text-secondary);
+}
+.clab-ann-line {
+  font-weight: 700;
+  color: var(--accent);
+  min-width: 56px;
+}
+
+/* ----------------------------------------------------------
+   Simulation Container
+---------------------------------------------------------- */
+.clab-sim-container {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.clab-sim-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.clab-sim-btn {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 6px 14px;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background var(--ease), border-color var(--ease);
+  font-family: var(--font-sans);
+}
+.clab-sim-btn:hover { background: var(--bg-hover); border-color: var(--accent); }
+.clab-sim-play-btn  { background: var(--accent-muted); border-color: var(--accent-border); color: var(--accent); }
+.clab-sim-play-btn:hover { background: var(--accent); color: #fff; }
+
+.clab-sim-step-info {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  margin-left: var(--sp-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.clab-sim-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+/* ----------------------------------------------------------
+   Thread Timeline Grid
+---------------------------------------------------------- */
+.clab-timeline-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: var(--r-lg);
+}
+
+.clab-timeline-grid {
+  display: grid;
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  font-size: var(--text-xs);
+  min-width: fit-content;
+}
+
+.clab-tl-header {
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-weight: 600;
+  padding: 6px 8px;
+  text-align: center;
+  font-size: 11px;
+  transition: background 0.2s, color 0.2s;
+}
+.clab-tl-header-active {
+  background: var(--accent-muted);
+  color: var(--accent);
+  font-weight: 700;
+}
+.clab-tl-corner { background: var(--bg-inset); }
+
+.clab-tl-thread {
+  background: var(--bg-inset);
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--text-secondary);
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+}
+
+.clab-tl-cell {
+  background: var(--bg-surface);
+  padding: 7px 4px;
+  font-size: 10px;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  min-height: 36px;
+  min-width: 56px;
+  transition: background 0.2s, opacity 0.2s;
+  line-height: 1.3;
+  word-break: break-word;
+  overflow: hidden;
+}
+.clab-tl-cell-active {
+  background: rgba(249, 115, 22, 0.08);
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  color: var(--text-primary);
+  font-weight: 600;
+  z-index: 1;
+  position: relative;
+}
+.clab-tl-cell-bug {
+  background: rgba(248, 81, 73, 0.1);
+  color: var(--red);
+  border: 1px solid rgba(248,81,73,0.3);
+}
+.clab-tl-cell-bug::before { content: '⚠ '; }
+.clab-tl-cell-safe {
+  background: var(--green-muted);
+  color: var(--green);
+}
+.clab-tl-cell-empty {
+  background: var(--bg-inset);
+  color: transparent;
+}
+
+/* ----------------------------------------------------------
+   Shared State Display
+---------------------------------------------------------- */
+.clab-sim-state {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  min-height: 36px;
+}
+
+.clab-state-var {
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: var(--r);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  transition: background 0.3s, border-color 0.3s;
+}
+.clab-state-name { color: var(--text-muted); }
+.clab-state-val  { color: var(--text-primary); font-weight: 600; }
+.clab-state-change {
+  background: var(--accent-muted) !important;
+  border-color: var(--accent-border) !important;
+}
+
+.clab-sim-annotation {
+  min-height: 24px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  font-style: italic;
+  padding: var(--sp-2) 0;
+}
+.clab-sim-disclaimer { font-size: var(--text-xs); }
+
+/* ----------------------------------------------------------
+   Lock Graph
+---------------------------------------------------------- */
+.clab-lock-graph {
+  display: block;
+  max-width: 100%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+}
+.clab-lg-thread {
+  fill: var(--blue-muted);
+  stroke: var(--blue);
+  stroke-width: 1.5;
+}
+.clab-lg-lock {
+  fill: var(--yellow-muted);
+  stroke: var(--yellow);
+  stroke-width: 1.5;
+}
+.clab-lg-label {
+  font-size: 11px;
+  fill: var(--text-primary);
+  font-family: var(--font-mono);
+}
+.clab-lg-holds {
+  stroke: var(--green);
+  stroke-width: 2;
+  fill: none;
+}
+.clab-lg-waits {
+  stroke: var(--red);
+  stroke-width: 2;
+  fill: none;
+}
+
+/* ----------------------------------------------------------
+   Sequence Diagram
+---------------------------------------------------------- */
+.clab-seq-diagram {
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  background: var(--bg-surface);
+}
+
+.clab-seq-participants {
+  display: flex;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+.clab-seq-participant {
+  flex: 1;
+  text-align: center;
+  padding: var(--sp-3);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+  border-right: 1px solid var(--border);
+}
+.clab-seq-participant:last-child { border-right: none; }
+
+.clab-seq-steps {
+  padding: var(--sp-3);
+  overflow-x: auto;
+}
+
+.clab-seq-step {
+  font-size: var(--text-xs);
+  padding: 7px var(--sp-3);
+  border-left: 2px solid var(--border);
+  margin: 4px 0;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  transition: opacity 0.2s;
+  line-height: 1.5;
+  flex-wrap: wrap;
+}
+.clab-seq-step-num {
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--accent);
+  min-width: 28px;
+}
+.clab-seq-bug {
+  border-left-color: var(--red);
+  color: var(--red);
+  background: var(--red-muted);
+}
+
+/* ----------------------------------------------------------
+   Performance Table
+---------------------------------------------------------- */
+.clab-perf-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+  margin: var(--sp-4) 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+.clab-perf-table th {
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-weight: 600;
+  padding: 10px 14px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.clab-perf-table td {
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border-muted);
+  color: var(--text-primary);
+}
+.clab-perf-table tr:last-child td { border-bottom: none; }
+.clab-perf-table tr:nth-child(even) td { background: var(--bg-inset); }
+
+/* ----------------------------------------------------------
+   Alternative Solutions
+---------------------------------------------------------- */
+.clab-alt-block {
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  padding: var(--sp-5);
+  margin: var(--sp-4) 0;
+  background: var(--bg-surface);
+}
+.clab-alt-title {
+  font-size: var(--text-sm);
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: var(--sp-3);
+}
+.clab-pros-cons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-4);
+  margin: var(--sp-3) 0;
+}
+@media (max-width: 600px) { .clab-pros-cons { grid-template-columns: 1fr; } }
+
+.clab-pros, .clab-cons {
+  list-style: none;
+  font-size: var(--text-xs);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.clab-pros li { color: var(--green); }
+.clab-pros li::before { content: ''; }
+.clab-cons li { color: var(--red); }
+.clab-when-to-use { font-size: var(--text-xs); color: var(--text-muted); font-style: italic; }
+
+/* ----------------------------------------------------------
+   Test Blocks
+---------------------------------------------------------- */
+.clab-test-block {
+  margin: var(--sp-5) 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  overflow: hidden;
+  background: var(--bg-surface);
+}
+.clab-test-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+.clab-framework-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 3px 10px;
+  border-radius: var(--r-full);
+}
+.clab-fw-jcstress      { background: rgba(249,115,22,0.15); color: var(--accent); }
+.clab-fw-junit         { background: var(--green-muted);    color: var(--green);  }
+.clab-fw-testcontainers { background: var(--blue-muted);    color: var(--blue);   }
+
+.clab-test-block .clab-code-wrap { margin: 0; border: none; border-radius: 0; }
+.clab-test-name { font-size: var(--text-xs); font-weight: 600; color: var(--text-secondary); }
+.clab-test-explanation { padding: var(--sp-3) var(--sp-4); font-size: var(--text-xs); color: var(--text-muted); }
+.clab-test-disclaimer  { font-size: var(--text-xs); margin-bottom: var(--sp-4); }
+
+/* ----------------------------------------------------------
+   Production Checklist
+---------------------------------------------------------- */
+.clab-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0;
+}
+.clab-checklist-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r);
+  transition: background var(--ease);
+}
+.clab-checklist-item:hover { background: var(--bg-hover); }
+.clab-checklist-item input[type=checkbox] {
+  margin-top: 3px;
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+.clab-checklist-item input:checked + span {
+  text-decoration: line-through;
+  color: var(--text-muted);
+}
+
+/* ----------------------------------------------------------
+   Related Lessons & Supporting Elements
+---------------------------------------------------------- */
+.clab-related-lessons {
+  margin-top: var(--sp-5);
+  padding: var(--sp-4);
+  background: var(--bg-elevated);
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+}
+.clab-related-lessons h4 { font-size: var(--text-xs); color: var(--text-muted); font-weight: 600; margin-bottom: var(--sp-2); }
+.clab-related-lessons ul { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.clab-related-lessons a { font-size: var(--text-xs); color: var(--text-link); text-decoration: none; }
+.clab-related-lessons a:hover { text-decoration: underline; }
+
+.clab-key-changes { margin-top: var(--sp-4); }
+.clab-key-changes h4 { font-size: var(--text-xs); font-weight: 700; color: var(--text-secondary); margin-bottom: var(--sp-2); }
+.clab-key-changes ul { list-style: disc; padding-left: var(--sp-5); font-size: var(--text-xs); color: var(--text-secondary); display: flex; flex-direction: column; gap: 4px; }
+
+.clab-scenario-text, .clab-why-text, .clab-fix-explanation {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  line-height: 1.7;
+}
+
+.clab-symptom-list {
+  list-style: disc;
+  padding-left: var(--sp-5);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: var(--sp-2) 0 var(--sp-4);
+}
+
+.clab-debug-tip {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  padding: 4px 0;
+}
+.clab-debug-cmd {
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: var(--sp-3) var(--sp-4);
+  margin: var(--sp-2) 0;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.clab-perf-notes {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  margin: var(--sp-3) 0;
+  font-style: italic;
+}
+
+/* ----------------------------------------------------------
+   Assessment / Quiz
+---------------------------------------------------------- */
+.clab-quiz { display: flex; flex-direction: column; gap: var(--sp-6); }
+
+.clab-quiz-question {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  padding: var(--sp-5);
+}
+
+.clab-quiz-q-text {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  line-height: 1.6;
+  margin-bottom: var(--sp-4);
+}
+
+.clab-quiz-options { display: flex; flex-direction: column; gap: var(--sp-2); }
+
+.clab-quiz-option {
+  text-align: left;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 10px 16px;
+  font-size: var(--text-xs);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background var(--ease), border-color var(--ease);
+  font-family: var(--font-sans);
+  line-height: 1.5;
+}
+.clab-quiz-option:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--accent); }
+.clab-quiz-option:disabled { cursor: default; }
+.clab-quiz-option.correct   { background: var(--green-muted); border-color: var(--green); color: var(--green); }
+.clab-quiz-option.incorrect { background: var(--red-muted);   border-color: var(--red);   color: var(--red);   }
+
+.clab-quiz-explanation {
+  margin-top: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--blue-muted);
+  border-left: 3px solid var(--blue);
+  border-radius: 0 var(--r) var(--r) 0;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.clab-quiz-score {
+  padding: var(--sp-4) var(--sp-5);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--accent);
+  text-align: center;
+}

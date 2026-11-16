@@ -1,8 +1,21 @@
-# Engineering Mastery — Principal Engineer Program
+# Fintech Engineering Mastery: a 30-week Java/Spring curriculum for senior fintech interviews
 
-A complete, production-grade self-study program for Staff and Principal Software Engineers in banking and FinTech. 287 lessons across 14 tracks, covering everything from JVM internals and distributed consensus to PCI DSS architecture and cross-team influence.
+A focused self-study program for **Senior Software Engineer** roles at large fintechs and banks:
+payments, ledgers, wallets, FX, cards, reconciliation and resilience, in **Java 21 and Spring Boot 4**.
+It is sized to **30 weeks × 10 hours**: a 228.5-hour main path (lessons + five capstone projects), plus
+reserved time for mock interviews, review and slack.
 
-**Live site:** deploy to GitHub Pages using the instructions below, or run locally in 10 seconds.
+**Start here:**
+
+| | |
+|---|---|
+| 30-week study plan | [`docs/content/study-plan.md`](docs/content/study-plan.md) (generated and checked: every week ≤ 10 h) |
+| Capstone projects (runnable, tested) | [`examples/`](examples/README.md): five Spring Boot 4.0.9 services, 67 tests on real PostgreSQL/Kafka/Redis |
+| Interview playbook | Track 15 (`docs/content/interview/`): STAR stories, the 45-minute design round, top 60 questions, 10 mock interviews |
+| First 90 days in a new job | Track 16 (`docs/content/new-job/`) |
+| Review notes and decisions | [`docs/review/`](docs/review/) |
+
+**Live site:** deploy to GitHub Pages using the instructions below, or run it locally in 10 seconds.
 
 ---
 
@@ -48,27 +61,31 @@ Open `http://localhost:8080` in your browser.
 
 ## Course Structure
 
-| # | Track | Lessons | Hours |
-|---|-------|---------|-------|
-| 01 | Advanced Software Architecture | 20 | 30h |
-| 02 | Distributed Systems Engineering | 22 | 33h |
-| 03 | Concurrency & Thread Safety Engineering | 29 | 42h |
-| 04 | Asynchronous & Reactive Systems Engineering | 20 | 30h |
-| 05 | Banking & Financial Systems Architecture | 22 | 33h |
-| 06 | Financial Transaction Integrity & Ledger Engineering | 24 | 36h |
-| 07 | Financial Crime, Compliance & Risk Engineering | 18 | 27h |
-| 08 | High Availability, Reliability & Resilience | 18 | 27h |
-| 09 | Performance Engineering & JVM Internals | 22 | 33h |
-| 10 | Database & Data Architecture | 22 | 33h |
-| 11 | Messaging, Streaming & Enterprise Integration | 20 | 30h |
-| 12 | Cloud, Infrastructure & Platform Engineering | 16 | 24h |
-| 13 | Security, Observability & Production Engineering | 20 | 30h |
-| 14 | Staff & Principal Engineering Leadership | 14 | 21h |
-| | **Total** | **287 lessons** | **429 hours** |
+Each lesson is tiered **Core**, **Supporting** (together: the main path, inside the time budget) or
+**Optional** (kept for depth, outside the budget; shown under "Optional" on each track page).
+Track 05 (transaction integrity) is entirely Core and is studied early (weeks 3–6).
 
-Plus:
-- **20 Decision Lab scenarios** — real-world fintech incidents (The Double Charge, The Split Brain, The Kafka Rebalance Storm, …)
-- **6 Capstone Projects** — end-to-end system design and implementation
+| # | Id | Track | Lessons | Main path | All lessons |
+|---|----|-------|---------|-----------|-------------|
+| 01 | `track-01` | Advanced Software Architecture | 20 | 9.9 h | 26.2 h |
+| 02 | `track-02` | Distributed Systems Engineering | 22 | 11.2 h | 29.2 h |
+| 03 | `track-03` | Concurrency & Thread Safety Engineering | 29 | 26.4 h | 38.1 h |
+| 04 | `track-04` | Banking & Financial Systems Architecture | 22 | 8.6 h | 30.4 h |
+| 05 | `track-05` | Financial Transaction Integrity & Ledger Engineering | 24 | 34.4 h | 34.4 h |
+| 06 | `track-06` | High Availability, Reliability & Resilience | 18 | 6.5 h | 23.2 h |
+| 07 | `track-07` | Performance Engineering & JVM Internals | 22 | 10.9 h | 29.0 h |
+| 08 | `track-08` | Database & Data Architecture | 22 | 11.2 h | 28.9 h |
+| 09 | `track-09` | Messaging, Streaming & Enterprise Integration | 20 | 8.4 h | 26.6 h |
+| 10 | `track-10` | Cloud, Infrastructure & Platform Engineering | 16 | 4.2 h | 21.2 h |
+| 11 | `track-11` | Security, Observability & Production Engineering | 20 | 5.4 h | 25.8 h |
+| 12 | `track-12` | Staff & Principal Engineering Leadership | 14 | 6.2 h | 17.4 h |
+| 13 | `track-13` | Spring Boot 4 for Senior Fintech Engineers | 8 | 9.7 h | 9.7 h |
+| 14 | `track-14` | System Design for Fintech Interviews | 8 | 9.8 h | 9.8 h |
+| 15 | `track-15` | Interview Playbook | 5 | 4.2 h | 4.2 h |
+| 16 | `track-16` | First 90 Days | 2 | 1.6 h | 1.6 h |
+| | | **Total** | **272** | **168.6 h** | **355.7 h** |
+
+Plus **five capstone projects** (12 h each, 60 h, in the main path) and **20 Decision Lab scenarios**.
 
 ---
 
@@ -103,44 +120,41 @@ Plus:
 
 ```
 fintech-engineering-mastery/
-├── .github/
-│   └── workflows/
-│       └── deploy.yml          # GitHub Actions: deploy docs/ to GitHub Pages
-├── docs/                        # Everything served as the static site
-│   ├── .nojekyll               # Disables Jekyll (required for _track.json serving)
-│   ├── index.html              # Single-page application shell
-│   ├── 404.html                # GitHub Pages SPA redirect fallback
-│   ├── assets/
-│   │   ├── css/
-│   │   │   ├── main.css        # Layout, sidebar, top bar, theme variables
-│   │   │   ├── lesson.css      # Lesson page, code blocks, diagram zoom, KC/PC widgets
-│   │   │   └── lab.css         # Decision Lab and Capstone styles
-│   │   └── js/
-│   │       ├── router.js       # Hash router (register/navigate/handle)
-│   │       ├── app.js          # Bootstrap, sidebar, top bar, page renderers
-│   │       ├── renderer.js     # Lesson fetch → frontmatter → markdown → DOM
-│   │       ├── progress.js     # localStorage-backed lesson progress
-│   │       ├── search.js       # lunr.js search index + results page
-│   │       ├── lab.js          # Decision Lab scenario engine
-│   │       └── capstone.js     # Capstone project viewer
+├── docs/                              # The static site (GitHub Pages serves this folder)
+│   ├── index.html, assets/            # SPA shell, CSS, JS (router, renderer, search, capstones)
 │   ├── content/
-│   │   └── tracks/
-│   │       ├── track-01-architecture/
-│   │       │   ├── _track.json         # Track metadata + ordered lesson list
-│   │       │   ├── lesson-01-*/index.md
-│   │       │   └── ...
-│   │       └── track-14-leadership/    # (14 tracks total, 287 lesson files)
-│   └── data/
-│       ├── tracks.json                 # Top-level track metadata for sidebar + dashboard
-│       ├── search-index.json           # Pre-built lunr document set (327 docs)
-│       ├── curriculum-index.json       # Curriculum metadata summary
-│       ├── decision-lab.json           # 20 lab scenario definitions
-│       └── capstone-projects.json      # 6 capstone project definitions
-├── scripts/
-│   └── build-search-index.js           # Node script to rebuild search-index.json
-├── rebuild_search_index.py             # Python script to rebuild search-index.json
+│   │   ├── tracks/track-NN-*/         # _track.json (ordered lessons, tiers) + lesson-*/index.md
+│   │   ├── interview/                 # Track 15 lessons (interview playbook)
+│   │   ├── new-job/                   # Track 16 lessons (first 90 days)
+│   │   ├── capstone/project-*/        # GENERATED from examples/*/README.md
+│   │   ├── study-plan.md              # GENERATED 30-week plan
+│   │   └── glossary.md                # Terms defined in the lessons
+│   ├── data/                          # tracks.json, search-index.json, curriculum-index.json, capstone-projects.json
+│   └── review/                        # Phase reports, corrections log, decisions, archive of replaced content
+├── examples/                          # Maven multi-module project: capstones + lesson code, all tested
+├── tools/
+│   ├── validate_content.py            # The validator (run before every commit)
+│   ├── build_capstone_pages.py        # examples/*/README.md -> capstone pages + manifests
+│   ├── sync_manifest_tiers.py         # tiers -> _track.json and tracks.json totals
+│   └── build_study_plan.py            # schedule -> docs/content/study-plan.md (with checks)
+├── rebuild_search_index.py            # Rebuild docs/data/search-index.json
 └── README.md
 ```
+
+## Maintenance
+
+```bash
+python3 tools/sync_manifest_tiers.py     # after changing tiers (CORE_IDS / SUPPORTING_IDS in the validator)
+python3 tools/build_capstone_pages.py    # after editing a capstone README in examples/
+python3 tools/build_study_plan.py        # after changing the schedule or lesson minutes
+python3 rebuild_search_index.py          # after adding or editing lessons
+python3 tools/validate_content.py --verbose   # must print "All checks passed"
+
+cd examples && mvn test                  # all modules; needs Docker (Testcontainers)
+```
+
+The validator fails if the generated files are out of date, if any week of the plan exceeds 10 hours,
+if the main path exceeds 260 hours, or if any Track 05 lesson is missing.
 
 ---
 

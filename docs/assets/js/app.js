@@ -20,7 +20,8 @@ EM.Icons = {
   clock:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
   check:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
   arrow:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>',
-  build:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6"/><path d="M9 12h6"/><path d="M9 15h4"/></svg>'
+  build:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6"/><path d="M9 12h6"/><path d="M9 15h4"/></svg>',
+  threads:    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="15" y2="12"/><line x1="3" y1="18" x2="18" y2="18"/><circle cx="18" cy="6" r="2"/><circle cx="18" cy="12" r="2"/><circle cx="21" cy="18" r="2"/></svg>'
 };
 
 /* ------------------------------------------------------------
@@ -173,7 +174,8 @@ EM.App = {
     var nav = [
       { route: '/',             icon: EM.Icons.dashboard,  label: 'Dashboard'       },
       { route: '/curriculum',   icon: EM.Icons.curriculum, label: 'Curriculum'      },
-      { route: '/decision-lab', icon: EM.Icons.lab,        label: 'Decision Lab'    },
+      { route: '/decision-lab',      icon: EM.Icons.lab,        label: 'Decision Lab'       },
+      { route: '/concurrency-lab',   icon: EM.Icons.threads,    label: 'Concurrency Lab'    },
       { route: '/capstone',     icon: EM.Icons.capstone,   label: 'Capstone Projects' },
       { route: '/search',       icon: EM.Icons.search,     label: 'Search'          },
       { route: '/about',        icon: EM.Icons.about,      label: 'About'           }
@@ -281,6 +283,8 @@ EM.App = {
     EM.Router.register('/curriculum/track/:trackId',    function (p)        { return EM.Pages.trackDetail(p.trackId); });
     EM.Router.register('/decision-lab',                 function ()         { return EM.Lab.renderIndex(); });
     EM.Router.register('/decision-lab/:scenarioId',     function (p)        { return EM.Lab.renderScenario(p.scenarioId); });
+    EM.Router.register('/concurrency-lab',              function ()         { return EM.ConcurrencyLab.renderIndex(); });
+    EM.Router.register('/concurrency-lab/:expId',       function (p)        { return EM.ConcurrencyLab.renderExperiment(p.expId); });
     EM.Router.register('/capstone',                     function ()         { return EM.Capstone.renderIndex(); });
     EM.Router.register('/capstone/:projectId',          function (p)        { return EM.Capstone.renderProject(p.projectId); });
     EM.Router.register('/tracks/:trackId/lessons/:lessonId', function (p)   { return EM.Renderer.renderLesson(p.trackId, p.lessonId); });
@@ -543,7 +547,15 @@ EM.Pages.trackDetail = async function (trackId) {
 };
 
 function _renderLessonList(lessons, appTrack) {
-  var items = lessons.map(function (lesson, idx) {
+  // Main path (core/supporting) first; lessons with tier "optional" are grouped below.
+  var mainLessons     = lessons.filter(function (l) { return l.tier !== 'optional'; });
+  var optionalLessons = lessons.filter(function (l) { return l.tier === 'optional'; });
+  var heading = function (text) {
+    return '<div style="font-size:var(--text-xs);font-weight:600;color:var(--text-muted);text-transform:uppercase;' +
+      'letter-spacing:0.06em;margin:var(--sp-6) 0 var(--sp-4)">' + text + '</div>';
+  };
+  var rows = function (list) { return list.map(_lessonRow).join(''); };
+  function _lessonRow(lesson, idx) {
     var status = EM.Progress.getLessonStatus(lesson.id);
     var num    = String(lesson.sequence || idx + 1).padStart(2, '0');
     var mins   = lesson.estimatedMinutes ? lesson.estimatedMinutes + ' min' : '';
@@ -570,19 +582,23 @@ function _renderLessonList(lessons, appTrack) {
         statusDot +
       '</div>' +
     '</button>';
-  }).join('');
+  }
 
   return '<div>' +
     '<div style="font-size:var(--text-xs);font-weight:600;color:var(--text-muted);text-transform:uppercase;' +
-      'letter-spacing:0.06em;margin-bottom:var(--sp-4)">Lessons (' + lessons.length + ')</div>' +
-    '<div class="curriculum-grid">' + items + '</div>' +
+      'letter-spacing:0.06em;margin-bottom:var(--sp-4)">Lessons (' + mainLessons.length + ')</div>' +
+    '<div class="curriculum-grid">' + rows(mainLessons) + '</div>' +
+    (optionalLessons.length
+      ? heading('Optional: read if time allows (' + optionalLessons.length + ')') +
+        '<div class="curriculum-grid">' + rows(optionalLessons) + '</div>'
+      : '') +
   '</div>';
 }
 
 function _comingSoonSection(track) {
   var messages = {
     'in-development': 'This track is being developed. Lessons will appear here as they are published.',
-    'planned':        'This track is on the roadmap. Priority tracks (Track 03, 05, 06) are developed first.'
+    'planned':        'This track is on the roadmap. Priority tracks (Track 03, 04, 05) are developed first.'
   };
   var msg = messages[track.status] || messages['planned'];
 
@@ -613,9 +629,9 @@ EM.Pages.comingSoon = function (title, iconKey) {
     'lab':      ['20 scenarios live — covering concurrency, Kafka, GC, isolation levels, Sagas, AML, and more',
                  'Multi-stage decision engine with Principal Engineer rubric scoring',
                  'Scenarios span all 14 tracks: distributed systems, database, messaging, reliability, security'],
-    'capstone': ['Project A: High-Throughput Payment Platform',
-                 'Project B: Concurrent Double-Entry Ledger Engine',
-                 'Project C: Distributed AML & Sanctions Platform'],
+    'capstone': ['Project A: Payment Service with Idempotency, Outbox and Kafka',
+                 'Project B: Multi-Currency Wallet on a Double-Entry Ledger',
+                 'Project C: Card Authorisation and Clearing with Resilience'],
     'search':   ['Full-text search across all lesson content',
                  'Filter by track, difficulty, and tags',
                  'Instant results powered by lunr.js']
@@ -731,7 +747,7 @@ EM.Pages.about = function () {
 
     '<div class="about-section">' +
       '<h2>Curriculum Structure</h2>' +
-      '<p>The program contains <strong>14 learning tracks</strong>, <strong>6 capstone projects</strong>, ' +
+      '<p>The program contains <strong>14 learning tracks</strong>, <strong>5 capstone projects</strong>, ' +
         'and an interactive <strong>Principal Engineer Decision Lab</strong> with 20+ architecture scenarios.</p>' +
       '<p>Every lesson follows a structured 27-section format covering: Overview, Learning Objectives, ' +
         'Prerequisites, Business Context, Deep Technical Explanation, Java 17 &amp; 21 implementations, ' +

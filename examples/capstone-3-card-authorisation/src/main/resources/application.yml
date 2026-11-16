@@ -1,0 +1,49 @@
+spring:
+  application:
+    name: card-authorisation
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/cards}
+    username: ${DB_USER:cards}
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: 20
+      connection-timeout: 2000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  # HTTP Service Client group "fraud" (Spring Boot 4). Timeouts are mandatory on every remote call.
+  http:
+    serviceclient:
+      fraud:
+        base-url: ${FRAUD_URL:http://localhost:8090}
+        connect-timeout: 200ms
+        read-timeout: 300ms
+  mvc:
+    apiversion:
+      use:
+        path-segment: 0
+      supported: "1"
+    problemdetails:
+      enabled: true
+
+cards:
+  # Above this score the fraud engine says "decline".
+  decline-score: 80
+  # Fallback when the fraud check is unavailable: approve only small amounts (fail-open under a limit).
+  # Illustrative number; a real limit comes from the risk team and differs per merchant category.
+  stand-in-limit: "50.00"
+  auth-validity: 7d
+  fraud:
+    max-concurrent-calls: 20
+    circuit-breaker:
+      failure-rate-threshold: 50
+      sliding-window-size: 10
+      minimum-number-of-calls: 5
+      wait-in-open-state: 10s
+
+server:
+  shutdown: graceful

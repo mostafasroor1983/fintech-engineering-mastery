@@ -9,7 +9,7 @@
     "colorMuted": "rgba(99, 102, 241, 0.15)",
     "description": "Evolutionary architecture, architectural decision records, design patterns, C4 model, domain-driven design, and system design for large-scale financial platforms.",
     "difficulty": "advanced",
-    "estimatedHours": 30,
+    "estimatedHours": 26.2,
     "lessonCount": 20,
     "status": "published",
     "priority": "high",
@@ -20,7 +20,8 @@
       "ADR",
       "C4",
       "hexagonal"
-    ]
+    ],
+    "mainPathHours": 9.9
   },
   {
     "id": "track-02",
@@ -32,7 +33,7 @@
     "colorMuted": "rgba(14, 165, 233, 0.15)",
     "description": "CAP theorem, distributed consensus, consistency models, clock synchronization, partition tolerance, and designing fault-tolerant distributed financial systems.",
     "difficulty": "advanced",
-    "estimatedHours": 33,
+    "estimatedHours": 29.2,
     "lessonCount": 22,
     "status": "published",
     "priority": "high",
@@ -43,7 +44,8 @@
       "consistency",
       "Paxos",
       "Raft"
-    ]
+    ],
+    "mainPathHours": 11.2
   },
   {
     "id": "track-03",
@@ -55,7 +57,7 @@
     "colorMuted": "rgba(249, 115, 22, 0.15)",
     "description": "Java Memory Model, thread safety, synchronization primitives, atomic operations, lock-free algorithms, virtual threads, and concurrent financial data processing.",
     "difficulty": "advanced",
-    "estimatedHours": 42,
+    "estimatedHours": 38.1,
     "lessonCount": 29,
     "status": "published",
     "priority": "critical",
@@ -66,34 +68,12 @@
       "virtual-threads",
       "java-21",
       "jcstress"
-    ]
+    ],
+    "mainPathHours": 26.4
   },
   {
     "id": "track-04",
     "sequence": 4,
-    "title": "Asynchronous & Reactive Systems Engineering",
-    "shortTitle": "Async & Reactive",
-    "slug": "async-reactive",
-    "color": "#a855f7",
-    "colorMuted": "rgba(168, 85, 247, 0.15)",
-    "description": "CompletableFuture, Project Reactor, Spring WebFlux, context propagation, backpressure, and designing asynchronous payment processing pipelines.",
-    "difficulty": "advanced",
-    "estimatedHours": 30,
-    "lessonCount": 20,
-    "status": "published",
-    "priority": "high",
-    "tags": [
-      "async",
-      "reactive",
-      "CompletableFuture",
-      "Reactor",
-      "WebFlux",
-      "backpressure"
-    ]
-  },
-  {
-    "id": "track-05",
-    "sequence": 5,
     "title": "Banking & Financial Systems Architecture",
     "shortTitle": "Banking Systems",
     "slug": "banking-systems",
@@ -101,7 +81,7 @@
     "colorMuted": "rgba(16, 185, 129, 0.15)",
     "description": "Core banking architecture, payment processing, SWIFT MT/MX, ISO 20022, real-time payments, FX, settlement, and cross-border payment systems.",
     "difficulty": "advanced",
-    "estimatedHours": 33,
+    "estimatedHours": 30.4,
     "lessonCount": 22,
     "status": "published",
     "priority": "critical",
@@ -113,11 +93,12 @@
       "FX",
       "settlement",
       "core-banking"
-    ]
+    ],
+    "mainPathHours": 8.6
   },
   {
-    "id": "track-06",
-    "sequence": 6,
+    "id": "track-05",
+    "sequence": 5,
     "title": "Financial Transaction Integrity & Ledger Engineering",
     "shortTitle": "Transaction Integrity",
     "slug": "transaction-integrity",
@@ -125,7 +106,7 @@
     "colorMuted": "rgba(239, 68, 68, 0.15)",
     "description": "Idempotency, dual-write problems, Outbox pattern, double-entry ledger engineering, concurrent balance management, and preventing financial data corruption.",
     "difficulty": "principal",
-    "estimatedHours": 36,
+    "estimatedHours": 34.4,
     "lessonCount": 24,
     "status": "published",
     "priority": "critical",
@@ -136,34 +117,12 @@
       "consistency",
       "dual-write",
       "saga"
-    ]
+    ],
+    "mainPathHours": 34.4
   },
   {
-    "id": "track-07",
-    "sequence": 7,
-    "title": "Financial Crime, Compliance & Risk Engineering",
-    "shortTitle": "Financial Crime & Compliance",
-    "slug": "financial-crime",
-    "color": "#f59e0b",
-    "colorMuted": "rgba(245, 158, 11, 0.15)",
-    "description": "AML screening, KYC workflows, sanctions list processing, fraud detection systems, regulatory reporting, and compliance-driven architecture at scale.",
-    "difficulty": "advanced",
-    "estimatedHours": 27,
-    "lessonCount": 18,
-    "status": "published",
-    "priority": "high",
-    "tags": [
-      "AML",
-      "KYC",
-      "sanctions",
-      "fraud",
-      "compliance",
-      "regulatory"
-    ]
-  },
-  {
-    "id": "track-08",
-    "sequence": 8,
+    "id": "track-06",
+    "sequence": 6,
     "title": "High Availability, Reliability & Resilience",
     "shortTitle": "Reliability Engineering",
     "slug": "reliability",
@@ -171,7 +130,7 @@
     "colorMuted": "rgba(20, 184, 166, 0.15)",
     "description": "Circuit breakers, bulkheads, chaos engineering, multi-region architecture, disaster recovery, SLO/SLA design, and error budget management.",
     "difficulty": "advanced",
-    "estimatedHours": 27,
+    "estimatedHours": 23.2,
     "lessonCount": 18,
     "status": "published",
     "priority": "high",
@@ -182,11 +141,12 @@
       "chaos-engineering",
       "SLO",
       "DR"
-    ]
+    ],
+    "mainPathHours": 6.5
   },
   {
-    "id": "track-09",
-    "sequence": 9,
+    "id": "track-07",
+    "sequence": 7,
     "title": "Performance Engineering & JVM Internals",
     "shortTitle": "Performance Engineering",
     "slug": "performance",
@@ -194,7 +154,7 @@
     "colorMuted": "rgba(132, 204, 22, 0.15)",
     "description": "JVM internals, garbage collection analysis, JMH benchmarking, memory profiling, database query optimization, and tuning high-throughput financial services.",
     "difficulty": "advanced",
-    "estimatedHours": 33,
+    "estimatedHours": 29.0,
     "lessonCount": 22,
     "status": "published",
     "priority": "high",
@@ -205,11 +165,12 @@
       "profiling",
       "tuning",
       "benchmarking"
-    ]
+    ],
+    "mainPathHours": 10.9
   },
   {
-    "id": "track-10",
-    "sequence": 10,
+    "id": "track-08",
+    "sequence": 8,
     "title": "Database & Data Architecture",
     "shortTitle": "Database Architecture",
     "slug": "database",
@@ -217,7 +178,7 @@
     "colorMuted": "rgba(6, 182, 212, 0.15)",
     "description": "ACID properties, MVCC, transaction isolation levels, row-level locking, optimistic/pessimistic locking, PostgreSQL internals, and financial database design.",
     "difficulty": "advanced",
-    "estimatedHours": 33,
+    "estimatedHours": 28.9,
     "lessonCount": 22,
     "status": "published",
     "priority": "high",
@@ -229,11 +190,12 @@
       "PostgreSQL",
       "sharding",
       "replication"
-    ]
+    ],
+    "mainPathHours": 11.2
   },
   {
-    "id": "track-11",
-    "sequence": 11,
+    "id": "track-09",
+    "sequence": 9,
     "title": "Messaging, Streaming & Enterprise Integration",
     "shortTitle": "Messaging & Streaming",
     "slug": "messaging",
@@ -241,7 +203,7 @@
     "colorMuted": "rgba(139, 92, 246, 0.15)",
     "description": "Apache Kafka architecture, exactly-once semantics, Outbox pattern, CDC, Event Sourcing, CQRS, Saga pattern, and event-driven financial processing.",
     "difficulty": "advanced",
-    "estimatedHours": 30,
+    "estimatedHours": 26.6,
     "lessonCount": 20,
     "status": "published",
     "priority": "high",
@@ -252,11 +214,12 @@
       "saga",
       "CDC",
       "exactly-once"
-    ]
+    ],
+    "mainPathHours": 8.4
   },
   {
-    "id": "track-12",
-    "sequence": 12,
+    "id": "track-10",
+    "sequence": 10,
     "title": "Cloud, Infrastructure & Platform Engineering",
     "shortTitle": "Cloud & Platform",
     "slug": "cloud-platform",
@@ -264,7 +227,7 @@
     "colorMuted": "rgba(59, 130, 246, 0.15)",
     "description": "Kubernetes orchestration, Docker containerization, cloud architecture patterns, GitOps, service mesh, and platform engineering for financial services.",
     "difficulty": "advanced",
-    "estimatedHours": 24,
+    "estimatedHours": 21.2,
     "lessonCount": 16,
     "status": "published",
     "priority": "medium",
@@ -275,11 +238,12 @@
       "GitOps",
       "service-mesh",
       "platform"
-    ]
+    ],
+    "mainPathHours": 4.2
   },
   {
-    "id": "track-13",
-    "sequence": 13,
+    "id": "track-11",
+    "sequence": 11,
     "title": "Security, Observability & Production Engineering",
     "shortTitle": "Security & Observability",
     "slug": "security-observability",
@@ -287,7 +251,7 @@
     "colorMuted": "rgba(236, 72, 153, 0.15)",
     "description": "OpenTelemetry, distributed tracing, Prometheus/Grafana, JVM diagnostics, security engineering, incident management, and production readiness for financial systems.",
     "difficulty": "advanced",
-    "estimatedHours": 30,
+    "estimatedHours": 25.8,
     "lessonCount": 20,
     "status": "published",
     "priority": "high",
@@ -297,11 +261,12 @@
       "security",
       "incident-management",
       "production"
-    ]
+    ],
+    "mainPathHours": 5.4
   },
   {
-    "id": "track-14",
-    "sequence": 14,
+    "id": "track-12",
+    "sequence": 12,
     "title": "Staff & Principal Engineering Leadership",
     "shortTitle": "Engineering Leadership",
     "slug": "leadership",
@@ -309,7 +274,7 @@
     "colorMuted": "rgba(100, 116, 139, 0.15)",
     "description": "Technical strategy, RFC process, architectural decision-making, mentoring senior engineers, cross-team influence, and the Staff/Principal engineer operating model.",
     "difficulty": "principal",
-    "estimatedHours": 21,
+    "estimatedHours": 17.4,
     "lessonCount": 14,
     "status": "published",
     "priority": "medium",
@@ -320,6 +285,93 @@
       "mentoring",
       "influence",
       "staff-engineer"
-    ]
+    ],
+    "mainPathHours": 6.2
+  },
+  {
+    "id": "track-13",
+    "sequence": 13,
+    "title": "Spring Boot 4 for Senior Fintech Engineers",
+    "shortTitle": "Spring Boot 4",
+    "slug": "spring-boot-4",
+    "color": "#22c55e",
+    "colorMuted": "rgba(34, 197, 94, 0.15)",
+    "description": "Spring Boot 4, Spring Framework 7, virtual thread integration, Spring Data 4, Spring Security 7, Spring Kafka 4, and migrating production fintech services from Spring Boot 3.x.",
+    "difficulty": "advanced",
+    "estimatedHours": 9.7,
+    "lessonCount": 8,
+    "status": "published",
+    "priority": "high",
+    "tags": [
+      "spring-boot-4",
+      "spring-framework-7",
+      "virtual-threads",
+      "java-21",
+      "migration"
+    ],
+    "mainPathHours": 9.7
+  },
+  {
+    "id": "track-14",
+    "sequence": 14,
+    "title": "System Design for Fintech Interviews",
+    "shortTitle": "System Design",
+    "slug": "system-design",
+    "color": "#f59e0b",
+    "colorMuted": "rgba(245, 158, 11, 0.15)",
+    "description": "End-to-end system design walkthroughs: payment processing, fraud detection, financial ledger, rate limiting, and distributed systems trade-offs.",
+    "difficulty": "principal",
+    "estimatedHours": 9.1,
+    "lessonCount": 8,
+    "status": "published",
+    "priority": "critical",
+    "tags": [
+      "system-design",
+      "interviews",
+      "payment-processing",
+      "fintech",
+      "trade-offs"
+    ],
+    "mainPathHours": 9.1
+  },
+  {
+    "id": "track-15",
+    "sequence": 15,
+    "title": "Interview Playbook",
+    "shortTitle": "Interview Playbook",
+    "slug": "interview-playbook",
+    "color": "#e11d48",
+    "colorMuted": "rgba(225, 29, 72, 0.15)",
+    "description": "STAR stories, running the 45-minute design round, the top 60 Java/Spring/fintech questions, and ten timed mock interviews with rubrics.",
+    "difficulty": "senior",
+    "estimatedHours": 4.2,
+    "lessonCount": 5,
+    "status": "published",
+    "priority": "high",
+    "tags": [
+      "interview",
+      "senior"
+    ],
+    "mainPathHours": 4.2
+  },
+  {
+    "id": "track-16",
+    "sequence": 16,
+    "title": "First 90 Days",
+    "shortTitle": "First 90 Days",
+    "slug": "first-90-days",
+    "color": "#0ea5e9",
+    "colorMuted": "rgba(14, 165, 233, 0.15)",
+    "description": "A senior engineer's 30/60/90 plan: reading an unfamiliar Spring codebase with Actuator, first PR, on-call readiness and safe database migrations.",
+    "difficulty": "senior",
+    "estimatedHours": 1.6,
+    "lessonCount": 2,
+    "status": "published",
+    "priority": "medium",
+    "tags": [
+      "onboarding",
+      "senior"
+    ],
+    "mainPathHours": 1.6
   }
 ]

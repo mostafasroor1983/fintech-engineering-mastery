@@ -1,0 +1,95 @@
+{
+  "id": "track-15",
+  "sequence": 15,
+  "title": "Interview Playbook",
+  "shortTitle": "Interview Playbook",
+  "slug": "interview-playbook",
+  "color": "#e11d48",
+  "colorMuted": "rgba(225, 29, 72, 0.15)",
+  "description": "STAR stories, running the 45-minute design round, the top 60 Java/Spring/fintech questions, and ten timed mock interviews with rubrics.",
+  "difficulty": "senior",
+  "estimatedHours": 4.2,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-15-lesson-01",
+      "sequence": 1,
+      "title": "STAR Stories for Senior Backend Interviews",
+      "slug": "star-stories",
+      "path": "content/interview/01-star-stories/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 50,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "behavioural",
+        "star"
+      ]
+    },
+    {
+      "id": "track-15-lesson-02",
+      "sequence": 2,
+      "title": "Running the 45-Minute System Design Round",
+      "slug": "design-round",
+      "path": "content/interview/02-design-round/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 45,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "system-design",
+        "reshaded"
+      ]
+    },
+    {
+      "id": "track-15-lesson-03",
+      "sequence": 3,
+      "title": "Top 60 Questions, Part 1: Java and Spring (30)",
+      "slug": "top-questions-java-spring",
+      "path": "content/interview/03-top-questions-java-spring/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "java",
+        "spring",
+        "questions"
+      ]
+    },
+    {
+      "id": "track-15-lesson-04",
+      "sequence": 4,
+      "title": "Top 60 Questions, Part 2: Data, Distributed Systems and Fintech (30)",
+      "slug": "top-questions-fintech-systems",
+      "path": "content/interview/04-top-questions-fintech-systems/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "kafka",
+        "payments",
+        "questions"
+      ]
+    },
+    {
+      "id": "track-15-lesson-05",
+      "sequence": 5,
+      "title": "Ten Timed Mock Interviews with Rubrics",
+      "slug": "mock-interviews",
+      "path": "content/interview/05-mock-interviews/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 35,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "mock-interview",
+        "rubric"
+      ]
+    }
+  ],
+  "mainPathMinutes": 250,
+  "optionalLessonCount": 0
+}
