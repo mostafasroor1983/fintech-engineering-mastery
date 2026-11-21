@@ -98,7 +98,8 @@ graph TD
 - Empty bucket insertion: **CAS** — no lock
 - Non-empty bucket (chain/tree): **synchronized on the bucket head** — only that bucket is locked
 - Multiple threads writing to different buckets proceed **in parallel**
-- Global resize: `size()` aggregates striped counters — approximate under concurrent modification
+- Size: `size()` adds up striped counters — approximate under concurrent modification
+- Resizing is cooperative: threads that write during a resize help move buckets
 
 ### Basic Operations
 
@@ -199,9 +200,9 @@ public class PaymentAggregator {
 
 > [!WARNING]
 > **`compute`, `merge`, and `computeIfAbsent` lock the bucket while the function runs.** The function must be:
-> - **Fast** — no I/O, no blocking calls
-> - **Side-effect free** — the function may be retried
-> - **Non-recursive** — calling `compute` on the same key inside the function deadlocks immediately
+> - **Fast** — no I/O, no blocking calls: other writers to that bucket wait for it
+> - **Free of side effects on the map** — it runs once per call while holding the lock (unlike `AtomicLong.updateAndGet`, it is not retried), but it must not modify the map itself
+> - **Non-recursive** — updating the same map (even another key) inside the function is forbidden: it throws `IllegalStateException("Recursive update")` or can hang
 >
 > Never call a database or external service inside a `ConcurrentHashMap` compute function.
 
@@ -281,22 +282,29 @@ public class PaymentProcessingPipeline {
 
     private final BlockingQueue<Payment> queue = new ArrayBlockingQueue<>(10_000);
 
+    // Long-lived executor: NOT try-with-resources here — close() waits for
+    // all tasks to finish, and these consumers never finish on their own,
+    // so startConsumers() would block forever
+    private final ExecutorService consumers = Executors.newVirtualThreadPerTaskExecutor();
+
     // Start N virtual thread consumers
     public void startConsumers(int count) {
-        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-            for (int i = 0; i < count; i++) {
-                executor.submit(() -> {
-                    try {
-                        while (!Thread.currentThread().isInterrupted()) {
-                            Payment p = queue.take(); // Parks virtual thread — no carrier pinning
-                            process(p);
-                        }
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
+        for (int i = 0; i < count; i++) {
+            consumers.submit(() -> {
+                try {
+                    while (!Thread.currentThread().isInterrupted()) {
+                        Payment p = queue.take(); // Parks virtual thread — no carrier pinning
+                        process(p);
                     }
-                });
-            }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
         }
+    }
+
+    public void stop() {
+        consumers.shutdownNow();   // interrupts the consumers blocked in take()
     }
 
     public void submit(Payment payment) throws InterruptedException {
@@ -316,7 +324,9 @@ public class PaymentProcessingPipeline {
 
 ```java17
 // SynchronousQueue: used for direct handoff to thread pool workers
-// No buffering — if no worker is available, put() blocks
+// No buffering. ThreadPoolExecutor uses offer(), not put(): if no idle worker
+// takes the task, a new thread is started (up to max), and beyond max the
+// task is REJECTED (here: AbortPolicy throws RejectedExecutionException)
 BlockingQueue<Runnable> workQueue = new SynchronousQueue<>();
 ThreadPoolExecutor pool = new ThreadPoolExecutor(
     0, 200,                        // 0 core threads, 200 max
@@ -410,16 +420,26 @@ import java.util.concurrent.ConcurrentSkipListMap;
 // Supports efficient range queries: "all transactions between T1 and T2"
 public class TransactionLedger {
 
-    private final ConcurrentSkipListMap<Instant, Transaction> ledger
+    // Key = (timestamp, transaction ID). A timestamp ALONE would let two
+    // transactions in the same instant overwrite each other — a lost entry
+    record TxKey(Instant at, String txId) implements Comparable<TxKey> {
+        public int compareTo(TxKey o) {
+            int c = at.compareTo(o.at);
+            return c != 0 ? c : txId.compareTo(o.txId);
+        }
+    }
+
+    private final ConcurrentSkipListMap<TxKey, Transaction> ledger
         = new ConcurrentSkipListMap<>();
 
     public void record(Transaction tx) {
-        ledger.put(tx.getTimestamp(), tx);
+        ledger.put(new TxKey(tx.getTimestamp(), tx.getId()), tx);
     }
 
     // Efficient range query — O(log n) + O(k) for k results
-    public NavigableMap<Instant, Transaction> getRange(Instant from, Instant to) {
-        return ledger.subMap(from, true, to, true);
+    public Collection<Transaction> getRange(Instant from, Instant to) {
+        return ledger.subMap(new TxKey(from, ""), true,
+                             new TxKey(to, "\uffff"), true).values();
     }
 
     // Latest transaction
@@ -428,8 +448,8 @@ public class TransactionLedger {
     }
 
     // All transactions since a given time — for reconciliation
-    public SortedMap<Instant, Transaction> getSince(Instant since) {
-        return ledger.tailMap(since);
+    public Collection<Transaction> getSince(Instant since) {
+        return ledger.tailMap(new TxKey(since, ""), true).values();
     }
 }
 ```
@@ -520,12 +540,12 @@ flowchart TD
     "question": "Inside a `ConcurrentHashMap.compute()` call, can you call `compute()` again on the same key?",
     "options": [
       "Yes — ConcurrentHashMap is reentrant for compute operations",
-      "No — it deadlocks, because compute() holds a lock on the bucket",
+      "No — it is forbidden: the bucket is already locked, so it throws IllegalStateException (\"Recursive update\") or can hang",
       "Yes — but only if the second compute() uses a different function",
       "No — ConcurrentModificationException is thrown"
     ],
     "correct": 1,
-    "explanation": "compute(), computeIfAbsent(), and merge() synchronize on the bucket containing the key while the function executes. Calling compute() on the same key inside the function attempts to acquire the same bucket lock — which is already held by the outer compute(). This causes an immediate deadlock. The function must complete without touching the same ConcurrentHashMap key."
+    "explanation": "compute(), computeIfAbsent(), and merge() lock the bucket containing the key while the function executes. Calling compute() on the same key (or otherwise updating the same map) inside the function is not allowed: depending on the case it throws IllegalStateException(\"Recursive update\") or the thread hangs. The function must finish without touching the same ConcurrentHashMap."
   }
 ] -->
 
@@ -550,7 +570,7 @@ flowchart TD
     },
     {
       "id": "pc-cc-04",
-      "description": "Implement `TransactionRangeQuery` using `ConcurrentSkipListMap<Instant, Transaction>`. Implement `record(Transaction)`, `getRange(Instant from, Instant to)`, and `getSince(Instant)`. Explain why ConcurrentSkipListMap is chosen over ConcurrentHashMap for this use case."
+      "description": "Implement `TransactionRangeQuery` using `ConcurrentSkipListMap` keyed by (timestamp, transaction ID). Implement `record(Transaction)`, `getRange(Instant from, Instant to)`, and `getSince(Instant)`. Explain why ConcurrentSkipListMap is chosen over ConcurrentHashMap here, and why the key must include the transaction ID."
     }
   ]
 } -->

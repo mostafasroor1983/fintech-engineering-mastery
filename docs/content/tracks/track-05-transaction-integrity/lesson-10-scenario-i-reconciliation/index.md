@@ -11,6 +11,8 @@ tags: [reconciliation, mismatch, external-reconciliation, audit, shadow-ledger]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 End-of-day reconciliation at a payment processor found 150 accounts where the internal ledger balance differed from the settlement file — discrepancies ranging from $0.01 to $500. The on-call engineer had no tooling to answer the most critical question in those first minutes: is any real customer money at risk right now, or is this a data artefact? This lesson builds the full reconciliation stack — internal balance checks, external settlement matching, shadow ledgers, and threshold-driven alerting — so the answer to that question is always a single query away.
 
 ## Learning Objectives
@@ -19,14 +21,14 @@ End-of-day reconciliation at a payment processor found 150 accounts where the in
 - Write a PostgreSQL query using `SUM` and `HAVING` to detect accounts where the stored balance has drifted from the sum of their ledger entries.
 - Implement a Spring Batch `InternalReconciliationJob` that runs nightly and writes mismatches to a `reconciliation_items` table.
 - Load a CSV settlement file from a payment processor and perform a full outer join against internal transaction records, classifying results as `MATCHED`, `MISSING_INTERNAL`, `MISSING_EXTERNAL`, or `AMOUNT_MISMATCH`.
-- Design a shadow ledger pattern using a `shadow_balance` column updated by an independent code path, and explain what failure modes it detects that internal reconciliation misses.
-- Apply threshold-based alert routing: auto-close rounding artefacts below $0.01, page operations above $1, escalate to finance above $1,000, and trigger emergency payment suspension above $10,000.
+- Design a shadow ledger maintained by an independent code path (an event consumer writing to its own table), and explain what failure modes it detects that internal reconciliation misses.
+- Apply threshold-based alert routing: auto-classify only known, explained patterns, alert operations above $1, escalate to finance above $1,000, and trigger emergency payment suspension above $10,000.
 
 ## Business Context
 
-Meridian Payments, a US-based payment facilitator processing $4.2 billion annually for 23,000 merchant accounts, runs a nightly batch job that compares internal ledger balances against the Visa settlement file for the previous business day. On the evening of a Tuesday in Q3, the reconciliation job surfaced 150 mismatches affecting 150 distinct accounts. Discrepancies ranged from $0.01 (consistent with floating-point rounding in a currency conversion added 6 weeks earlier) to $487.33 (unexplained).
+*Composite example:* "Meridian Payments", a fictional US-based payment facilitator processing $4.2 billion annually for 23,000 merchant accounts, runs a nightly batch job that compares internal ledger balances against the Visa settlement file for the previous business day. On the evening of a Tuesday in Q3, the reconciliation job surfaced 150 mismatches affecting 150 distinct accounts. Discrepancies ranged from $0.01 (traced to a currency conversion added 6 weeks earlier that rounded with `double` arithmetic) to $487.33 (unexplained).
 
-The on-call engineer had no classification tooling. Every mismatch looked identical in the alert — a UUID and two dollar amounts. Working through 150 rows manually at 11 PM took 3 hours. Of the 150 discrepancies: 142 were confirmed rounding artefacts below $0.02 and auto-resolvable; 6 were timing differences where a refund had settled on day D but was posted internally on day D+1 (a known edge case with no open ticket); and 2 were genuine unexplained discrepancies totalling $912.11, requiring finance team review. No customer money was ultimately at risk, but the 3-hour investigation delay violated Meridian's internal SLA of 45 minutes to triage any reconciliation alert. The postmortem produced three action items: automated mismatch classification, threshold-driven paging, and a shadow ledger to detect drift before EOD.
+The on-call engineer had no classification tooling. Every mismatch looked identical in the alert — a UUID and two dollar amounts. Working through 150 rows manually at 11 PM took 3 hours. Of the 150 discrepancies: 142 were 1–2 cent errors from that conversion bug — small, but a real, systematic defect that had to be fixed, not ignored; 6 were timing differences where a refund had settled on day D but was posted internally on day D+1 (a known edge case with no open ticket); and 2 were genuine unexplained discrepancies totalling $912.11, requiring finance team review. No customer money was ultimately at risk, but the 3-hour investigation delay violated Meridian's internal SLA of 45 minutes to triage any reconciliation alert. The postmortem produced four action items: fix the conversion (integer minor units, with an explicit rounding rule and any rounding difference booked to a rounding account), automated mismatch classification, threshold-driven paging, and a shadow ledger to detect drift before EOD.
 
 ## Types of Reconciliation
 
@@ -64,7 +66,9 @@ flowchart TD
 
 ```sql
 -- Detect accounts where stored balance differs from sum of ledger entries.
--- Run after all same-day postings are complete (e.g., 02:00 UTC in a batch window).
+-- Run in ONE consistent snapshot (REPEATABLE READ, or against a replica at a
+-- known point) — otherwise postings that land mid-query look like drift.
+-- (Signed convention here: credits positive, debits negative.)
 SELECT
     a.id                                                 AS account_id,
     a.balance_cents                                      AS stored_balance,
@@ -83,30 +87,31 @@ The `HAVING` clause filters to only drifted accounts. For a database with 2 mill
 ### InternalReconciliationJob
 
 ```java
+// Spring Batch 5: JobBuilderFactory / StepBuilderFactory were removed —
+// use JobBuilder / StepBuilder with the JobRepository and transaction manager
 @Configuration
 @RequiredArgsConstructor
 public class InternalReconciliationJobConfig {
 
-    private final JobBuilderFactory      jobs;
-    private final StepBuilderFactory     steps;
-    private final DataSource             dataSource;
-    private final ReconciliationWriter   reconciliationWriter;
+    private final JobRepository              jobRepository;
+    private final PlatformTransactionManager txManager;
+    private final DataSource                 dataSource;
+    private final ReconciliationWriter       reconciliationWriter;
 
     @Bean
     public Job internalReconciliationJob() {
-        return jobs.get("internalReconciliationJob")
+        return new JobBuilder("internalReconciliationJob", jobRepository)
                 .start(detectDriftStep())
                 .build();
     }
 
     @Bean
     public Step detectDriftStep() {
-        return steps.get("detectDriftStep")
-                .<InternalMismatch, InternalMismatch>chunk(500)
+        // No skip policy: any exception fails the job (zero tolerance)
+        return new StepBuilder("detectDriftStep", jobRepository)
+                .<InternalMismatch, InternalMismatch>chunk(500, txManager)
                 .reader(driftReader())
                 .writer(reconciliationWriter)
-                .faultTolerant()
-                .skipLimit(0)           // zero tolerance: any exception fails the job
                 .build();
     }
 
@@ -156,8 +161,11 @@ public class ReconciliationWriter implements ItemWriter<InternalMismatch> {
     private final AlertThresholdService        alertService;
 
     @Override
-    public void write(List<? extends InternalMismatch> mismatches) {
+    public void write(Chunk<? extends InternalMismatch> chunk) {   // Spring Batch 5 signature
+        List<? extends InternalMismatch> mismatches = chunk.getItems();
         UUID runId = runRepository.currentRunId();  // set at job start
+        // (Alerts below fire even if this chunk's transaction later rolls back;
+        //  for strict behaviour, send alerts from a step listener after commit.)
         List<ReconciliationItem> items = mismatches.stream()
                 .map(m -> ReconciliationItem.fromInternal(runId, m))
                 .toList();
@@ -210,16 +218,22 @@ public class ExternalReconciliationJob {
 
     public ReconciliationRunSummary run(UUID runId, Path settlementFile,
                                         LocalDate settlementDate) throws IOException {
-        // Step 1: load settlement file into a ref → amount map
-        Map<String, Long> settledAmounts = loadSettlementFile(settlementFile);
+        List<ReconciliationItem> items = new ArrayList<>();
 
-        // Step 2: load today's internal transactions
-        Map<String, Long> internalAmounts = transactionRepository
-                .findBySettlementDate(settlementDate)
-                .stream()
-                .collect(Collectors.toMap(
-                        Transaction::processorReference,
-                        Transaction::amountCents));
+        // Step 1: load settlement file into a ref → amount map
+        Map<String, Long> settledAmounts = loadSettlementFile(settlementFile, runId, items);
+
+        // Step 2: load today's internal transactions.
+        // A reference that appears TWICE on either side is itself a finding
+        // (a double posting or a double settlement) — toMap without a merge
+        // function would just crash, and a silent merge would hide it.
+        Map<String, Long> internalAmounts = new HashMap<>();
+        for (Transaction t : transactionRepository.findBySettlementDate(settlementDate)) {
+            if (internalAmounts.putIfAbsent(t.processorReference(), t.amountCents()) != null) {
+                items.add(ReconciliationItem.fromExternal(runId, t.processorReference(),
+                        MismatchCategory.DUPLICATE_INTERNAL, t.amountCents()));
+            }
+        }
 
         // Step 3: full outer join in memory — classify every reference
         Set<String> allRefs = new HashSet<>();
@@ -227,7 +241,6 @@ public class ExternalReconciliationJob {
         allRefs.addAll(internalAmounts.keySet());
 
         int matched = 0, missingInternal = 0, missingExternal = 0, amountMismatch = 0;
-        List<ReconciliationItem> items = new ArrayList<>();
 
         for (String ref : allRefs) {
             Long external = settledAmounts.get(ref);
@@ -268,16 +281,24 @@ public class ExternalReconciliationJob {
                 missingExternal, amountMismatch);
     }
 
-    private Map<String, Long> loadSettlementFile(Path file) throws IOException {
+    private Map<String, Long> loadSettlementFile(Path file, UUID runId,
+                                                 List<ReconciliationItem> items) throws IOException {
         Map<String, Long> result = new HashMap<>();
-        try (BufferedReader reader = Files.newBufferedReader(file)) {
-            String line;
-            boolean header = true;
-            while ((line = reader.readLine()) != null) {
-                if (header) { header = false; continue; }   // skip CSV header row
-                String[] cols = line.split(",");
+        // Use a real CSV parser (quoted fields, embedded commas) — never String.split(",")
+        try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8);
+             CSVParser csv = CSVFormat.DEFAULT.builder()
+                     .setHeader().setSkipHeaderRecord(true).build().parse(reader)) {
+            for (CSVRecord row : csv) {
                 // columns: processor_ref, merchant_account_id, settled_amount_cents, currency
-                result.put(cols[0].trim(), Long.parseLong(cols[2].trim()));
+                String ref = row.get("processor_ref").trim();
+                if (!"USD".equals(row.get("currency"))) {
+                    throw new SettlementFileException("Unexpected currency in row " + row.getRecordNumber());
+                }
+                long amount = Long.parseLong(row.get("settled_amount_cents").trim());
+                if (result.putIfAbsent(ref, amount) != null) {
+                    items.add(ReconciliationItem.fromExternal(runId, ref,
+                            MismatchCategory.DUPLICATE_EXTERNAL, amount));
+                }
             }
         }
         return result;
@@ -285,7 +306,8 @@ public class ExternalReconciliationJob {
 }
 
 public enum MismatchCategory {
-    MATCHED, MISSING_INTERNAL, MISSING_EXTERNAL, AMOUNT_MISMATCH
+    MATCHED, MISSING_INTERNAL, MISSING_EXTERNAL, AMOUNT_MISMATCH,
+    DUPLICATE_INTERNAL, DUPLICATE_EXTERNAL
 }
 ```
 
@@ -294,11 +316,17 @@ public enum MismatchCategory {
 
 ## Shadow Ledger
 
-A shadow ledger maintains a second, independently computed balance that runs alongside the primary balance but is updated by a completely separate code path. The two values must always agree. Divergence means one code path has a bug the other does not share.
+A shadow ledger maintains a second, independently computed balance that runs alongside the primary balance but is updated by a completely separate code path. The two values must agree (at the same point in the event stream). Divergence means one code path has a bug the other does not share.
+
+Keep the shadow balance in **its own table**, updated by a separate consumer of the payment events (e.g. from the outbox). Do not update a `shadow_balance` column on the same `accounts` row from a `REQUIRES_NEW` transaction inside the posting: the outer transaction already holds that row's lock, so the inner transaction waits for the outer one, which is waiting for the inner one — a self-deadlock.
 
 ```sql
--- Add shadow balance column to the accounts table
-ALTER TABLE accounts ADD COLUMN shadow_balance_cents BIGINT NOT NULL DEFAULT 0;
+-- Shadow balances in their own table, owned by the shadow consumer
+CREATE TABLE account_shadow_balances (
+    account_id          UUID    PRIMARY KEY,
+    shadow_balance_cents BIGINT NOT NULL DEFAULT 0,
+    last_event_seq      BIGINT  NOT NULL DEFAULT 0   -- position in the account's event stream
+);
 ```
 
 ```java
@@ -309,33 +337,22 @@ public class ShadowLedgerService {
     private final JdbcTemplate jdbc;
 
     /**
-     * Called AFTER the primary balance update, in a separate nested transaction.
-     * Uses REQUIRES_NEW so a failure here does not roll back the primary posting;
-     * it only triggers a reconciliation flag on the account.
+     * Applied by an independent consumer of payment events — a different code
+     * path (ideally a different team) from the primary posting logic.
+     * Idempotent and ordered: only the next event in sequence changes the row.
      */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void applyShadowDebit(UUID accountId, long amountCents) {
+    @Transactional
+    public void applyShadowEvent(UUID accountId, long eventSeq, long signedAmountCents) {
         int rows = jdbc.update("""
-                UPDATE accounts
-                SET    shadow_balance_cents = shadow_balance_cents - ?
-                WHERE  id = ?
-                """, amountCents, accountId);
+                UPDATE account_shadow_balances
+                SET    shadow_balance_cents = shadow_balance_cents + ?,
+                       last_event_seq       = ?
+                WHERE  account_id = ? AND last_event_seq = ? - 1
+                """, signedAmountCents, eventSeq, accountId, eventSeq);
 
         if (rows != 1) {
-            throw new ShadowLedgerException("Shadow debit failed for account " + accountId);
-        }
-    }
-
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void applyShadowCredit(UUID accountId, long amountCents) {
-        int rows = jdbc.update("""
-                UPDATE accounts
-                SET    shadow_balance_cents = shadow_balance_cents + ?
-                WHERE  id = ?
-                """, amountCents, accountId);
-
-        if (rows != 1) {
-            throw new ShadowLedgerException("Shadow credit failed for account " + accountId);
+            // Duplicate (already applied) or a gap — check which, never double-apply
+            throw new ShadowLedgerException("Shadow event out of sequence for " + accountId);
         }
     }
 }
@@ -345,16 +362,19 @@ public class ShadowLedgerService {
 
 ```sql
 -- Accounts where shadow balance diverges from primary balance.
--- Catches bugs that affect only one of the two code paths.
+-- Compare at the SAME position in each account's event stream (the shadow is
+-- updated asynchronously, so a plain comparison would flag in-flight events).
 SELECT
-    id                   AS account_id,
-    balance_cents        AS primary_balance,
-    shadow_balance_cents AS shadow_balance,
-    balance_cents - shadow_balance_cents AS divergence_cents
-FROM   accounts
-WHERE  balance_cents != shadow_balance_cents
-AND    status = 'ACTIVE'
-ORDER  BY ABS(balance_cents - shadow_balance_cents) DESC;
+    a.id                    AS account_id,
+    a.balance_cents         AS primary_balance,
+    s.shadow_balance_cents  AS shadow_balance,
+    a.balance_cents - s.shadow_balance_cents AS divergence_cents
+FROM   accounts a
+JOIN   account_shadow_balances s ON s.account_id = a.id
+WHERE  a.status = 'ACTIVE'
+AND    a.last_event_seq = s.last_event_seq            -- same point in the stream
+AND    a.balance_cents != s.shadow_balance_cents
+ORDER  BY ABS(a.balance_cents - s.shadow_balance_cents) DESC;
 ```
 
 > [!NOTE]
@@ -402,7 +422,7 @@ CREATE INDEX idx_recon_items_account ON reconciliation_items (account_id)
 
 ## Alert Thresholds and Auto-Resolution
 
-Not all mismatches are equal. A $0.005 drift is a floating-point artefact. A $12,000 drift is a potential fraud incident. The alert routing tier classifies and routes automatically.
+Not all mismatches are equal — but with amounts in integer minor units there are no "floating-point artefacts": any non-zero drift is a real difference that must be explained. Size decides **urgency**, not whether to look. Auto-classification is allowed only for known, explained patterns (a timing difference that the next file will clear, a rounding difference that was booked to a rounding account), and even then the item is recorded, never deleted. A $12,000 drift is a potential fraud incident. The alert routing tier classifies and routes automatically.
 
 ```java
 @Service
@@ -410,13 +430,13 @@ Not all mismatches are equal. A $0.005 drift is a floating-point artefact. A $12
 @Slf4j
 public class AlertThresholdService {
 
-    // All thresholds in cents
-    private static final long CENTS_AUTO_CLOSE        =       1L;   // < $0.01
+    // All thresholds in cents (integer minor units — there is no "sub-cent" drift)
     private static final long CENTS_OPS_ALERT         =     100L;   // >= $1.00
     private static final long CENTS_FINANCE_ESCALATE  = 100_000L;   // >= $1,000
     private static final long CENTS_EMERGENCY_STOP    = 1_000_000L; // >= $10,000
 
     private final ReconciliationItemRepository itemRepository;
+    private final KnownPatternClassifier       knownPatterns;
     private final PagerDutyService             pagerDuty;
     private final SlackNotificationService     slack;
     private final PaymentSuspensionService     paymentSuspension;
@@ -424,12 +444,15 @@ public class AlertThresholdService {
     public void evaluate(long driftCents, Object reference, ReconciliationType type) {
         long absDrift = Math.abs(driftCents);
 
-        if (absDrift < CENTS_AUTO_CLOSE) {
-            autoClose(reference, driftCents);
-            return;
-        }
         if (absDrift >= CENTS_EMERGENCY_STOP) {
             triggerEmergencyStop(reference, driftCents, type);
+            return;
+        }
+        // Known, explained pattern (e.g. timing difference cleared by tomorrow's
+        // file, rounding booked to a rounding account): classify, keep the record
+        Optional<String> explanation = knownPatterns.explain(reference, driftCents, type);
+        if (explanation.isPresent()) {
+            itemRepository.autoClassify(reference, explanation.get());
             return;
         }
         if (absDrift >= CENTS_FINANCE_ESCALATE) {
@@ -440,26 +463,20 @@ public class AlertThresholdService {
             alertOps(reference, driftCents, type);
             return;
         }
-        // $0.01 to $0.99: log only, review in morning stand-up
+        // $0.01 to $0.99, unexplained: still a real difference — queue for review
         log.info("Low-value recon mismatch: ref={} drift={}c type={}", reference, driftCents, type);
-    }
-
-    private void autoClose(Object reference, long driftCents) {
-        itemRepository.autoClose(reference, "Floating-point rounding artefact — drift < $0.01");
-        log.debug("Auto-closed recon item: ref={} drift={}c", reference, driftCents);
     }
 
     private void alertOps(Object reference, long driftCents, ReconciliationType type) {
         slack.sendToChannel("#payments-ops",
-                ":warning: Reconciliation mismatch ref=%s drift=$%.2f type=%s — investigate before 09:00"
-                        .formatted(reference, driftCents / 100.0, type));
+                ":warning: Reconciliation mismatch ref=%s drift=%s type=%s — investigate before 09:00"
+                        .formatted(reference, formatCents(driftCents), type));
     }
 
     private void escalateToFinance(Object reference, long driftCents, ReconciliationType type) {
         pagerDuty.createIncident(PagerDutyIncident.builder()
                 .severity(Severity.HIGH)
-                .summary("Recon mismatch $%.2f — finance review required"
-                        .formatted(driftCents / 100.0))
+                .summary("Recon mismatch %s — finance review required".formatted(formatCents(driftCents)))
                 .details(Map.of("reference", reference.toString(), "type", type.name()))
                 .build());
         log.error("Finance escalation: ref={} drift={}c", reference, driftCents);
@@ -475,12 +492,16 @@ public class AlertThresholdService {
 
         pagerDuty.createIncident(PagerDutyIncident.builder()
                 .severity(Severity.CRITICAL)
-                .summary("EMERGENCY: Recon mismatch $%.2f — payments suspended"
-                        .formatted(driftCents / 100.0))
+                .summary("EMERGENCY: Recon mismatch %s — payments suspended".formatted(formatCents(driftCents)))
                 .details(Map.of("reference", reference.toString(),
                                 "type",      type.name(),
                                 "action",    "OUTBOUND_PAYMENTS_SUSPENDED"))
                 .build());
+    }
+
+    // Exact formatting from integer cents — no double arithmetic
+    private static String formatCents(long cents) {
+        return BigDecimal.valueOf(cents, 2).toPlainString();
     }
 }
 ```
@@ -488,15 +509,15 @@ public class AlertThresholdService {
 ```mermaid
 flowchart TD
     D["Drift detected\n|drift| = X"]
-    D --> C1{"X < $0.01?"}
-    C1 -->|Yes| A1["Auto-close\nFloating-point artefact"]
-    C1 -->|No| C2{"X >= $10,000?"}
-    C2 -->|Yes| A4["Emergency stop payments\n+ CRITICAL PagerDuty"]
+    D --> C1{"X >= $10,000?"}
+    C1 -->|Yes| A4["Emergency stop payments\n+ CRITICAL PagerDuty"]
+    C1 -->|No| C2{"Known, explained pattern?\n(timing, booked rounding)"}
+    C2 -->|Yes| A1["Auto-classify\nrecord kept"]
     C2 -->|No| C3{"X >= $1,000?"}
     C3 -->|Yes| A3["Escalate to Finance\n+ HIGH PagerDuty"]
     C3 -->|No| C4{"X >= $1.00?"}
     C4 -->|Yes| A2["Alert Ops\nSlack #payments-ops"]
-    C4 -->|No| A5["Log only\nMorning review"]
+    C4 -->|No| A5["Review queue\nmorning review"]
 ```
 
 > [!WARNING]
@@ -504,9 +525,9 @@ flowchart TD
 
 ## Knowledge Check
 
-**Q: An account has `balance_cents = 50000` ($500.00). The internal reconciliation query returns a ledger sum of `49999` cents. The shadow balance is also `49999`. What does this pattern tell you, and what does it rule out?**
+**Q: An account has `balance_cents = 50000` ($500.00). The internal reconciliation query returns a ledger sum of `49999` cents. The shadow balance (built by an independent consumer of the payment events) is `50000`. What does this pattern tell you, and what does it rule out?**
 
-**A:** Both the primary balance and the shadow balance agree with each other but disagree with the ledger sum. This rules out a bug that updated `balance_cents` without updating `shadow_balance_cents` — because both columns are wrong in the same direction. The most likely cause is a code path that updated both balance columns atomically but failed to write the corresponding `ledger_entries` row — perhaps a transaction that committed the account UPDATE but rolled back before the ledger INSERT, leaving no ledger record for a real balance change. The fix is to identify the transaction in the application logs, determine whether the payment was actually processed by the external processor, and either post the missing ledger entry or reverse the balance change. The shadow ledger's value here is diagnostic elimination: it narrows the investigation to the ledger-writing code path rather than the balance-update code path.
+**A:** The primary balance and the shadow balance agree with each other but disagree with the ledger sum. Two independent code paths — the primary posting and the shadow consumer — both saw a payment event worth 1 cent more than the ledger recorded. That rules out a bug in the balance-update path alone (the shadow, written by different code, agrees with it). The most likely cause is the ledger-writing path: for example, a design where the balance update and the ledger insert happen in separate transactions (a dual write), and the ledger insert failed — or a rounding difference in the ledger code that the other paths do not have. The fix is to find the transaction in the application logs, confirm with the external processor whether the payment really happened, and then either post the missing or corrected ledger entry or reverse the balance change. The shadow ledger's value here is diagnostic elimination: it narrows the investigation to the ledger-writing code path.
 
 **Q: Your external reconciliation job classifies 12 transactions as `MISSING_EXTERNAL` — present internally, absent from the processor's settlement file. Finance wants to know if these represent money Meridian is owed. What are the three distinct explanations for this category, and how do you distinguish them?**
 
@@ -554,11 +575,11 @@ Your team is building a new reconciliation pipeline for a Buy Now Pay Later prod
       "options": [
         "Floating-point rounding errors in currency conversion",
         "Timing differences between settlement cut-off and internal posting",
-        "Bugs that affect only one of two independently maintained code paths, while both balance columns drift together and therefore still agree with each other",
+        "Bugs in one of two independently maintained code paths — including cases where the balance and the ledger drift together, so internal reconciliation sees nothing",
         "External reconciliation mismatches where the processor amount differs from the internal amount"
       ],
       "correct": 2,
-      "explanation": "The shadow ledger's diagnostic power comes from code-path diversity. If both primary and shadow balances drift in the same direction by the same amount, it means a bug updated both balance columns (possibly atomically) but failed to write the ledger entry. Internal reconciliation catches the ledger drift; the shadow confirms which code path is broken. If only one balance drifts, the bug is isolated to that code path."
+      "explanation": "The shadow ledger's diagnostic power comes from code-path diversity: an independent consumer recomputes balances from the payment events. If the primary posting path has a bug that corrupts both the balance and its ledger entries consistently, internal reconciliation (balance vs ledger) passes — but the independently built shadow disagrees. And when internal reconciliation does fail, comparing with the shadow shows which path is broken."
     }
   ]
 }

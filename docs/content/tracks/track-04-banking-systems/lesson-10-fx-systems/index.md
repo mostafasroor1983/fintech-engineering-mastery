@@ -46,14 +46,16 @@ references:
   - "ISDA 2006 Definitions — FX and Currency Option Transactions"
 ---
 
-Foreign exchange is the largest financial market on earth, turning over approximately **$7.5 trillion per day** (BIS 2022). Every bank that holds multi-currency accounts, processes cross-border payments, or issues cards used abroad operates an FX system — yet FX systems are among the most precision-critical and operationally complex components in a banking technology stack. A single floating-point rounding error compounded across millions of daily conversions can cost a bank hundreds of thousands of pounds; a stale rate served to a customer ten seconds after a market event can generate instant, unhedged exposure. This lesson builds the engineering knowledge required to design FX systems that are correct, low-latency, and operationally safe.
+## Overview
+
+Foreign exchange is the largest financial market on earth, turning over roughly **$9.6 trillion per day** (BIS Triennial Survey, April 2025; $7.5 trillion in 2022). Every bank that holds multi-currency accounts, processes cross-border payments, or issues cards used abroad operates an FX system — yet FX systems are among the most precision-critical and operationally complex components in a banking technology stack. A single floating-point rounding error compounded across millions of daily conversions can cost a bank hundreds of thousands of pounds; a stale rate served to a customer ten seconds after a market event can generate instant, unhedged exposure. This lesson builds the engineering knowledge required to design FX systems that are correct, low-latency, and operationally safe.
 
 ## Learning Objectives
 
 By the end of this lesson you will be able to:
 
 - Distinguish spot, forward, mid, bid, and ask rates and explain when each is applied in a banking context
-- Design an FX rate feed architecture that ingests from Reuters or Bloomberg, caches with TTL, and detects stale rates
+- Design an FX rate feed architecture that ingests from LSEG (Refinitiv) or Bloomberg, caches rates, and detects stale rates
 - Implement `FxRateService` in Java with rate expiry, stale-rate guards, and thread-safe caching
 - Explain why `double` and `float` are categorically unsuitable for FX arithmetic and use `BigDecimal` correctly
 - Implement FX conversion atomicity: rate lock, conversion, and dual-currency ledger entries in a single transaction
@@ -63,7 +65,7 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-In March 2018, TSB Bank's botched core-banking migration left 1.9 million customers locked out of accounts for weeks. Less publicised but financially more damaging: a European retail bank's FX system served a cached USD/GBP rate that was 47 minutes stale during a flash crash triggered by algorithmic trading. In those 47 minutes, 14,000 customers executed currency conversions at a rate 1.3% worse than the live market. The bank absorbed the difference — £2.3 million in a single afternoon — because its SLA promised "live interbank rates." The root cause was a rate-feed consumer that silently swallowed a Reuters TREP connection timeout and continued serving the last cached rate without raising an alert or circuit-breaking the conversion endpoint.
+In March 2018, TSB Bank's botched core-banking migration left 1.9 million customers locked out of accounts for weeks. FX systems fail more quietly. *Composite example (based on common industry failure patterns, not a specific bank):* a retail bank's FX system kept serving a cached GBP/USD rate for most of an hour during a sharp market move. Thousands of customers converted currency at a rate far from the live market; because the bank had promised "live market rates", it absorbed the difference — a large loss in one afternoon. The root cause was a rate-feed consumer that silently swallowed a feed connection timeout and kept serving the last cached rate, without raising an alert or stopping the conversion endpoint.
 
 This incident defines the engineering requirements for this lesson: FX rate feeds must have explicit freshness contracts, every rate lookup must check staleness before use, and the conversion path must be atomic or not proceed at all.
 
@@ -227,7 +229,9 @@ public class FxRateService {
         BigDecimal markupBps = markupConfig.getMarkupBps(base, quote); // e.g. 150 bps
         BigDecimal markupFactor = markupBps
             .divide(BigDecimal.valueOf(10_000), 10, RoundingMode.HALF_UP);
-        // Customer buys quote: add spread to mid (they receive less quote)
+        // Customer sells base and receives quote: SUBTRACT the markup from mid
+        // (the customer receives less quote currency). A real system starts
+        // from bid/ask, not mid, and picks the side from the trade direction
         return midRate.subtract(midRate.multiply(markupFactor))
             .setScale(6, RoundingMode.HALF_UP);
     }
@@ -282,29 +286,37 @@ public BigDecimal deriveCrossRate(BigDecimal eurUsd, BigDecimal usdJpy) {
 
 ## FX Conversion Atomicity
 
-An FX conversion involves at minimum four database writes: debit the source currency account, credit the destination currency account, debit the FX suspense account (source currency), and credit the FX suspense account (destination currency). These four writes must be atomic. Any partial commit leaves the books out of balance.
+An FX conversion involves at minimum four ledger legs: debit the customer's source-currency account, credit the bank's FX position account in that currency, debit the FX position account in the destination currency, and credit the customer's destination-currency account. Each currency balances on its own (you cannot add GBP to EUR). All legs, the trade record and the consumption of the rate lock must commit atomically. Any partial commit leaves the books out of balance.
 
 ```java
 @Transactional(isolation = Isolation.READ_COMMITTED, rollbackFor = Exception.class)
 public FxConversionResult executeConversion(String rateLockId, String customerId) {
-    // 1. Validate and consume the rate lock
-    RateLock lock = rateLockRepository.findByLockIdAndStatus(
-        rateLockId, RateLockStatus.ACTIVE)
+    // 1. Validate and consume the rate lock — locked FOR UPDATE, so two
+    //    concurrent requests with the same lock cannot BOTH convert
+    RateLock lock = rateLockRepository.findByLockIdForUpdate(rateLockId)
+        .filter(l -> l.status() == RateLockStatus.ACTIVE)
         .orElseThrow(() -> new InvalidRateLockException(
             "Lock not found or already consumed: " + rateLockId));
 
-    if (Instant.now().isAfter(lock.expiresAt())) {
-        lock.expire();
-        rateLockRepository.save(lock);
-        throw new RateLockExpiredException(
-            "Rate lock expired at " + lock.expiresAt());
+    if (!lock.customerId().equals(customerId)) {
+        // A lock belongs to one customer — never let another customer use it
+        throw new InvalidRateLockException("Lock does not belong to this customer");
+    }
+    if (clock.instant().isAfter(lock.expiresAt())) {
+        // (marking the lock EXPIRED here would be rolled back with the
+        //  exception — a cleanup job expires old locks instead)
+        throw new RateLockExpiredException("Rate lock expired at " + lock.expiresAt());
     }
 
-    // 2. Debit source account (e.g. GBP account)
-    Account sourceAccount = accountRepository
-        .findByCustomerIdAndCurrencyForUpdate(customerId, lock.baseCurrency())
-        .orElseThrow(() -> new AccountNotFoundException(
-            customerId + "/" + lock.baseCurrency()));
+    // 2. Lock both customer accounts in a CANONICAL order (by account id).
+    //    "Debit first, then credit" is NOT a safe order: a GBP→EUR and a
+    //    EUR→GBP conversion would lock the same two rows in opposite order
+    Account source = accountRepository.findIdByCustomerAndCurrency(customerId, lock.baseCurrency());
+    Account dest   = accountRepository.findIdByCustomerAndCurrency(customerId, lock.quoteCurrency());
+    List<Account> locked = accountRepository.lockAllForUpdateOrderedById(
+        List.of(source.id(), dest.id()));
+    Account sourceAccount = locked.stream().filter(a -> a.id().equals(source.id())).findFirst().orElseThrow();
+    Account destAccount   = locked.stream().filter(a -> a.id().equals(dest.id())).findFirst().orElseThrow();
 
     if (sourceAccount.availableBalance().compareTo(lock.baseAmount()) < 0) {
         throw new InsufficientFundsException(
@@ -312,19 +324,21 @@ public FxConversionResult executeConversion(String rateLockId, String customerId
             " Required: " + lock.baseAmount());
     }
 
-    sourceAccount.debit(lock.baseAmount());
-    accountRepository.save(sourceAccount);
+    // 3. Exposure limit check BEFORE any ledger entry (see the challenge)
+    exposureGuard.checkWithinLimit(lock);
 
-    // 3. Credit destination account (e.g. EUR account)
-    Account destAccount = accountRepository
-        .findByCustomerIdAndCurrencyForUpdate(customerId, lock.quoteCurrency())
-        .orElseThrow(() -> new AccountNotFoundException(
-            customerId + "/" + lock.quoteCurrency()));
+    // 4. Post the ledger entries — balanced PER CURRENCY through the bank's
+    //    FX position accounts:
+    //      DR customer base account   / CR FX position (base currency)
+    //      DR FX position (quote ccy)  / CR customer quote account
+    ledger.post(JournalEntry.of(lock.baseCurrency(),
+        Debit.of(sourceAccount, lock.baseAmount()),
+        Credit.of(fxPositionAccount(lock.baseCurrency()), lock.baseAmount())));
+    ledger.post(JournalEntry.of(lock.quoteCurrency(),
+        Debit.of(fxPositionAccount(lock.quoteCurrency()), lock.quoteAmount()),
+        Credit.of(destAccount, lock.quoteAmount())));
 
-    destAccount.credit(lock.quoteAmount());
-    accountRepository.save(destAccount);
-
-    // 4. Write FX trade record for P&L and exposure tracking
+    // 5. Write FX trade record for P&L and exposure tracking
     FxTrade trade = FxTrade.builder()
         .tradeId(UUID.randomUUID().toString())
         .customerId(customerId)
@@ -334,11 +348,11 @@ public FxConversionResult executeConversion(String rateLockId, String customerId
         .baseAmount(lock.baseAmount())
         .quoteAmount(lock.quoteAmount())
         .rate(lock.lockedRate())
-        .tradedAt(Instant.now())
+        .tradedAt(clock.instant())
         .build();
     fxTradeRepository.save(trade);
 
-    // 5. Mark lock as consumed
+    // 6. Mark lock as consumed
     lock.consume(trade.tradeId());
     rateLockRepository.save(lock);
 
@@ -347,7 +361,7 @@ public FxConversionResult executeConversion(String rateLockId, String customerId
 ```
 
 > [!IMPORTANT]
-> Always acquire account row locks (`SELECT ... FOR UPDATE`) in a consistent, deterministic order — always debit before credit — to prevent deadlocks when two concurrent conversions involve the same currency pair in opposite directions.
+> Always acquire account row locks (`SELECT ... FOR UPDATE`) in a consistent, deterministic order — for example by account id — to prevent deadlocks when two concurrent conversions involve the same accounts in opposite directions. "Debit before credit" is **not** a consistent order: for a GBP→EUR and a EUR→GBP conversion it locks the same two rows in opposite orders.
 
 ## FX P&L and Open Exposure Tracking
 
@@ -389,7 +403,8 @@ CREATE TABLE fx_trades (
 Net open exposure in a given currency can be calculated with a simple aggregation:
 
 ```sql
--- Open USD exposure (sum of unhedged USD legs from all FX trades today)
+-- Unhedged volume per base currency today (simplified: a real position NETS
+-- both legs of every trade by direction — buying EUR and selling EUR cancel)
 SELECT
     base_currency,
     SUM(base_amount) FILTER (WHERE hedge_trade_id IS NULL) AS unhedged_base_amount,
@@ -401,7 +416,7 @@ ORDER BY unhedged_base_amount DESC;
 ```
 
 > [!WARNING]
-> Open FX exposure is a regulatory capital requirement (Basel III market risk framework). Systems that allow exposure to exceed approved treasury limits without blocking new trades create direct regulatory risk. Exposure limits must be enforced synchronously in the conversion path, not in a background job.
+> Open FX positions attract a market-risk capital charge under the Basel framework and are limited by the bank's risk appetite. Systems that allow exposure to exceed approved treasury limits without blocking new trades create direct regulatory risk. Exposure limits must be enforced synchronously in the conversion path, not in a background job.
 
 ## Rate Markup and Customer Rate Calculation
 
@@ -437,15 +452,18 @@ public BigDecimal customerSellRate(BigDecimal mid, BigDecimal markupBps) {
 For a retail customer with 150 bps markup and EUR/GBP mid = 0.8560:
 
 - Customer sell rate (customer sells EUR) = 0.8560 × (1 − 0.0150) = **0.8432**
-- Customer buy rate (customer buys EUR) = 0.8560 × (1 + 0.0150) = **0.8689**
+- Customer buy rate (customer buys EUR) = 0.8560 × (1 + 0.0150) = **0.8688**
 
 ## Hedging and FX Exposure Limits
 
 Treasury hedges the bank's accumulated open FX position by executing offsetting trades in the interbank market. Engineering systems must expose real-time exposure data and support automated hedging triggers.
 
 ```java
+// Gauges are registered ONCE (Micrometer keeps a weak reference to the
+// measured object — a gauge created from a fresh Double each run reads NaN)
+private final Map<String, AtomicReference<BigDecimal>> exposureGauges = new ConcurrentHashMap<>();
+
 @Scheduled(fixedDelayString = "${fx.hedge.check.interval.ms:60000}")
-@Transactional
 public void evaluateHedgeTriggers() {
     Map<String, BigDecimal> exposures = fxExposureRepository.getOpenExposures();
 
@@ -454,19 +472,30 @@ public void evaluateHedgeTriggers() {
         BigDecimal openAmount = entry.getValue();
         BigDecimal limit = limitConfig.getHedgeTriggerLimit(currency);
 
+        exposureGauges.computeIfAbsent(currency, c -> {
+            AtomicReference<BigDecimal> ref = new AtomicReference<>(BigDecimal.ZERO);
+            meterRegistry.gauge("fx.open.exposure", Tags.of("currency", c), ref,
+                r -> r.get().doubleValue());
+            return ref;
+        }).set(openAmount);
+
         if (openAmount.abs().compareTo(limit) > 0) {
+            // The job runs every minute: do NOT send a new hedge request while
+            // one for this currency is still open — that would double-hedge
+            if (hedgeRequestRepository.existsOpenRequest(currency)) {
+                continue;
+            }
             log.warn("FX exposure limit breached: currency={} open={} limit={}",
                 currency, openAmount, limit);
-            meterRegistry.gauge("fx.exposure.breach",
-                Tags.of("currency", currency), openAmount.doubleValue());
 
-            // Raise hedge request to treasury system
-            HedgeRequest hedgeRequest = HedgeRequest.builder()
+            // Raise hedge request to treasury system — recorded first, so a
+            // crash after sending cannot cause a second request
+            HedgeRequest hedgeRequest = hedgeRequestRepository.saveNew(HedgeRequest.builder()
                 .currency(currency)
                 .amount(openAmount)
-                .requestedAt(Instant.now())
-                .build();
-            treasuryGateway.submitHedgeRequest(hedgeRequest);
+                .requestedAt(clock.instant())
+                .build());
+            treasuryGateway.submitHedgeRequest(hedgeRequest);   // idempotent by request id
         }
     }
 }
@@ -479,11 +508,11 @@ public void evaluateHedgeTriggers() {
 
 **Q1: Why is using `double` for FX arithmetic a critical defect rather than a minor coding style issue?**
 
-A: IEEE 754 `double` cannot exactly represent most decimal fractions. The error per individual operation is small (~10⁻¹⁵) but compounds at the transaction volumes of a bank (millions of daily FX conversions). At 150 bps markup on £10 billion of daily FX volume, a systematic rounding error of even 0.0001 represents £10,000 per day. More critically, inconsistency between the amount quoted to a customer and the amount posted to the ledger can cause irreconcilable breaks in the nostro reconciliation and trigger regulatory reporting obligations. `BigDecimal` with explicit scale and `RoundingMode` is the only correct type for financial arithmetic.
+A: IEEE 754 `double` cannot exactly represent most decimal fractions. The error per individual operation is small (about 10⁻¹⁶ relative), but results then depend on the order of operations and on where rounding happens, and across millions of daily conversions small systematic differences add up. More critically, inconsistency between the amount quoted to a customer and the amount posted to the ledger can cause irreconcilable breaks in the nostro reconciliation and trigger regulatory reporting obligations. `BigDecimal` with explicit scale and `RoundingMode` is the only correct type for financial arithmetic.
 
 **Q2: A customer requests a EUR/USD conversion and the most recent rate in the cache is 42 seconds old with a configured `MAX_RATE_AGE_MS` of 30,000. What should the system do, and why?**
 
-A: The system must throw a `StaleRateException` and reject the conversion request. It must not serve the stale rate. The reason is twofold: (1) in 42 seconds during a volatile session, EUR/USD can move 30–50 pips (0.0030–0.0050), creating instant unhedged exposure for the bank if it converts at a 42-second-old rate and then hedges at the current market rate; (2) the bank's customer disclosure obligations under MiFID II require that rates shown to customers reflect current market conditions. The correct operational response is for the system to alert the feed monitoring pipeline, attempt a secondary feed switchover, and either serve a live rate from the backup feed or return an error to the client instructing it to retry.
+A: The system must throw a `StaleRateException` and reject the conversion request. It must not serve the stale rate. The reason is twofold: (1) in 42 seconds during a volatile session, EUR/USD can move 30–50 pips (0.0030–0.0050), creating instant unhedged exposure for the bank if it converts at a 42-second-old rate and then hedges at the current market rate; (2) the bank has promised customers a current rate, and consumer rules on currency-conversion charges (for example in the EU) require the rate and costs shown before the payment to be accurate. The correct operational response is for the system to alert the feed monitoring pipeline, attempt a secondary feed switchover, and either serve a live rate from the backup feed or return an error to the client instructing it to retry.
 
 ## Practical Challenge
 
@@ -507,7 +536,7 @@ A: The system must throw a `StaleRateException` and reject the conversion reques
         "It only matters for currencies with more than 2 decimal places"
       ],
       "correct": 1,
-      "explanation": "IEEE 754 `double` cannot exactly represent most decimal fractions. At millions of daily FX conversions, compounding rounding errors can represent tens of thousands of dollars per day in systematic drift and cause irreconcilable nostro reconciliation breaks. `BigDecimal` with explicit scale and `RoundingMode` is the only correct type for financial arithmetic."
+      "explanation": "IEEE 754 `double` cannot exactly represent most decimal fractions. Results then depend on operation order and rounding points, and across millions of daily FX conversions small systematic differences add up — and an amount quoted to a customer can differ from the amount posted to the ledger, causing irreconcilable reconciliation breaks. `BigDecimal` with explicit scale and `RoundingMode` is the correct type for financial arithmetic."
     },
     {
       "text": "A customer requests EUR/USD conversion and the most recent rate in cache is 42 seconds old with `MAX_RATE_AGE_MS` of 30,000. What should the system do?",
@@ -518,7 +547,7 @@ A: The system must throw a `StaleRateException` and reject the conversion reques
         "Log a warning but proceed with the conversion"
       ],
       "correct": 2,
-      "explanation": "The system must throw `StaleRateException` and reject the conversion. In 42 seconds during volatile sessions, EUR/USD can move 30-50 pips, creating instant unhedged exposure. MiFID II also requires rates shown to customers to reflect current market conditions. The correct response is to alert the feed monitoring pipeline and attempt a secondary feed switchover."
+      "explanation": "The system must throw `StaleRateException` and reject the conversion. In 42 seconds during volatile markets, EUR/USD can move tens of pips, creating instant unhedged exposure, and the rate shown to the customer would no longer be a current rate. The correct response is to alert the feed monitoring pipeline and switch to a secondary feed if one is available."
     },
     {
       "text": "When deriving an inverse rate (e.g., USD/EUR from EUR/USD), how should bid and ask be transformed?",

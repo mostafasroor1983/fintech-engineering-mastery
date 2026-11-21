@@ -47,13 +47,15 @@ references:
   - "PostgreSQL Documentation — Row Security Policies"
 ---
 
-A financial audit trail is not a feature — it is a legal obligation. PCI-DSS, SOX, and PSD2 each require that records of financial transactions be immutable, tamper-evident, and retained for defined periods. When regulators or forensic auditors examine a system after a fraud event, they will ask two questions: can you prove what happened, and can you prove that the records have not been altered? This lesson builds an audit trail that answers both questions definitively, from the database schema and permissions layer through to the cryptographic hash chain and point-in-time query API.
+## Overview
+
+A financial audit trail is not a feature — it is a legal obligation. PCI DSS requires audit logs to be protected from modification; SOX requires reliable financial records and internal controls over them; payment and anti-money-laundering rules require transaction records to be kept for defined periods. When regulators or forensic auditors examine a system after a fraud event, they will ask two questions: can you prove what happened, and can you prove that the records have not been altered? This lesson builds an audit trail that answers both questions definitively, from the database schema and permissions layer through to the cryptographic hash chain and point-in-time query API.
 
 ## Learning Objectives
 
 By the end of this lesson you will be able to:
 
-- Identify the regulatory drivers for immutable audit logs (PCI-DSS, SOX, PSD2)
+- Identify the regulatory drivers for immutable audit logs (PCI DSS, SOX, payment and AML record-keeping rules)
 - Design an append-only ledger schema with running balance and enforce it at the database level
 - Implement PostgreSQL row security and privilege revocation to prevent mutations
 - Build a SHA-256 hash chain in Java that links each ledger entry to its predecessor
@@ -63,9 +65,9 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-In 2022, a major US payments processor was fined $80 million by the OCC after an internal fraud investigation found that a database administrator had retroactively altered transaction timestamps to cover up a settlement timing error. The alteration was possible because the application role had `UPDATE` and `DELETE` privileges on the transaction table. No hash chain or write-once enforcement existed. The DBA's actions went undetected for 11 months because the audit log was implemented as a mutable table in the same database — also modified.
+*Composite example:* a US payments processor faces a regulatory enforcement action after an internal fraud investigation finds that a database administrator had retroactively altered transaction timestamps to cover up a settlement timing error. The alteration was possible because the application role had `UPDATE` and `DELETE` privileges on the transaction table. No hash chain or write-once enforcement existed. The DBA's actions went undetected for 11 months because the audit log was implemented as a mutable table in the same database — also modified.
 
-The remediation required rebuilding the entire transaction history from external bank statement feeds, a process that cost $4.3 million in engineering labour and delayed a planned IPO by two quarters. Had the team implemented an append-only ledger with database-enforced immutability and a cryptographic hash chain, the tampering would have been mathematically detectable on the next nightly verification run.
+The remediation required rebuilding the entire transaction history from external bank statement feeds — months of engineering work. Had the team implemented an append-only ledger with database-enforced immutability and a cryptographic hash chain, the tampering would have been mathematically detectable on the next nightly verification run.
 
 > [!IMPORTANT]
 > The application role that writes ledger entries must never hold `UPDATE` or `DELETE` privileges on the ledger table. Immutability must be enforced by the database — not by application discipline alone.
@@ -88,6 +90,7 @@ CREATE TABLE ledger_entries (
     id               UUID         NOT NULL DEFAULT gen_random_uuid(),
     account_id       UUID         NOT NULL,
     entry_type       ledger_entry_type NOT NULL,
+    sequence_number  BIGINT       NOT NULL,       -- 1, 2, 3 ... per account: the chain order
     amount_cents     BIGINT       NOT NULL,       -- always positive; sign from entry_type
     running_balance  BIGINT       NOT NULL,       -- balance after this entry
     previous_hash    CHAR(64)     NOT NULL,       -- SHA-256 of previous entry (hex)
@@ -96,15 +99,14 @@ CREATE TABLE ledger_entries (
     created_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
     created_by       VARCHAR(128) NOT NULL,       -- service account or user principal
     CONSTRAINT pk_ledger_entries PRIMARY KEY (id),
-    CONSTRAINT uq_transaction_ref UNIQUE (transaction_ref)
+    CONSTRAINT uq_transaction_ref UNIQUE (transaction_ref),
+    -- one entry per position in each account's chain: a forked chain is impossible
+    CONSTRAINT uq_account_sequence UNIQUE (account_id, sequence_number),
+    CONSTRAINT chk_amount_positive CHECK (amount_cents > 0)
 );
 
--- Composite index — most queries filter by account and time range
+-- Account + time range queries, also covering running-balance lookups
 CREATE INDEX idx_ledger_account_time
-    ON ledger_entries (account_id, created_at DESC);
-
--- Covering index for running-balance lookups
-CREATE INDEX idx_ledger_account_balance
     ON ledger_entries (account_id, created_at DESC)
     INCLUDE (running_balance);
 ```
@@ -120,6 +122,7 @@ erDiagram
     LEDGER_ENTRIES {
         uuid id PK
         uuid account_id FK
+        bigint sequence_number
         ledger_entry_type entry_type
         bigint amount_cents
         bigint running_balance
@@ -133,7 +136,7 @@ erDiagram
 ```
 
 > [!NOTE]
-> `amount_cents` is always stored as a positive integer. The semantic sign (credit increases balance, debit decreases it) is derived from `entry_type`. This avoids the ambiguity of a signed amount where the caller must know the account type to interpret the sign correctly.
+> `amount_cents` is always stored as a positive integer. The semantic sign (credit increases balance, debit decreases it) is derived from `entry_type`. This avoids the ambiguity of a signed amount where the caller must know the account type to interpret the sign correctly. `REVERSAL` and `ADJUSTMENT` can go either way, so those commands carry an explicit direction.
 
 ## Database Enforcement: Row Security and Privilege Revocation
 
@@ -169,11 +172,13 @@ GRANT SELECT ON ledger_entries TO dba_audit_role;
 ```
 
 > [!WARNING]
-> `FORCE ROW LEVEL SECURITY` applies policies even to the table owner. Without it, the table owner bypasses RLS. Always set both `ENABLE` and `FORCE` on audit tables.
+> `FORCE ROW LEVEL SECURITY` applies policies even to the table owner. Without it, the table owner bypasses RLS. Always set both `ENABLE` and `FORCE` on audit tables. Two more rules: the application role must **not own** the table (an owner can simply grant itself the privileges back or alter the policies), and superusers and roles with `BYPASSRLS` ignore RLS completely — keep those few accounts separate, logged and tightly controlled.
 
 ## Hash Chain for Tamper Evidence
 
-A hash chain makes tampering mathematically detectable. Each entry stores the SHA-256 hash of the previous entry's hash concatenated with the current entry's data. Altering any historical entry invalidates every subsequent hash in the chain, which a nightly verification job will detect.
+A hash chain makes tampering detectable. Each entry stores the SHA-256 hash of the previous entry's hash concatenated with the current entry's data. Altering any historical entry invalidates every subsequent hash in the chain, which a nightly verification job will detect.
+
+One limit matters: someone who can write to the table can also *recompute* the whole chain after changing an entry. So **anchor** the chain outside the database: regularly (for example every hour) copy each account's latest `entry_hash` — or one hash over all of them — to a separate system the database administrators cannot change, such as WORM object storage, or sign it with a key held in an HSM. The verification job compares against those anchors.
 
 ```mermaid
 graph LR
@@ -195,23 +200,26 @@ graph LR
 @RequiredArgsConstructor
 public class LedgerHashChain {
 
-    private static final String GENESIS_HASH = "0".repeat(64);
+    public static final String GENESIS_HASH = "0".repeat(64);
     private static final String HASH_ALGORITHM = "SHA-256";
 
     /**
      * Compute the entry_hash for a new ledger entry.
-     * previousHash is the entry_hash of the most recent entry for this account,
-     * or GENESIS_HASH if this is the first entry.
+     * previousHash is the entry_hash of the previous entry for this account
+     * (by sequence_number), or GENESIS_HASH if this is the first entry.
      */
     public String computeEntryHash(String previousHash, LedgerEntryData data) {
-        String input = previousHash
-            + data.id()
-            + data.accountId()
-            + data.entryType()
-            + data.amountCents()
-            + data.runningBalance()
-            + data.transactionRef()
-            + data.createdAt().toInstant().toEpochMilli();
+        // A delimiter between fields: without it "12"+"3" and "1"+"23" hash the same
+        String input = String.join("|",
+            previousHash,
+            data.id(),
+            data.accountId(),
+            Long.toString(data.sequenceNumber()),
+            data.entryType(),
+            Long.toString(data.amountCents()),
+            Long.toString(data.runningBalance()),
+            data.transactionRef(),
+            data.createdAt().toString());   // Instant, truncated to microseconds
         try {
             MessageDigest digest = MessageDigest.getInstance(HASH_ALGORITHM);
             byte[] hashBytes = digest.digest(input.getBytes(StandardCharsets.UTF_8));
@@ -223,13 +231,15 @@ public class LedgerHashChain {
 
     /**
      * Verify the full hash chain for a given account.
+     * entries must be ordered by sequence_number ascending.
      * Returns the index of the first broken link, or -1 if the chain is intact.
      */
     public int verifyChain(List<LedgerEntry> entriesAscending) {
         String expectedPreviousHash = GENESIS_HASH;
         for (int i = 0; i < entriesAscending.size(); i++) {
             LedgerEntry entry = entriesAscending.get(i);
-            if (!entry.getPreviousHash().equals(expectedPreviousHash)) {
+            if (entry.getSequenceNumber() != i + 1                      // a deleted entry
+                    || !entry.getPreviousHash().equals(expectedPreviousHash)) {
                 return i;
             }
             String recomputedHash = computeEntryHash(
@@ -240,7 +250,7 @@ public class LedgerHashChain {
             }
             expectedPreviousHash = entry.getEntryHash();
         }
-        return -1; // chain intact
+        return -1; // chain intact (then compare the last hash with the external anchor)
     }
 }
 ```
@@ -251,51 +261,63 @@ public class LedgerHashChain {
 public class LedgerEntryWriter {
 
     private final LedgerEntryRepository repository;
-    private final LedgerHashChain hashChain;
+    private final AccountRepository     accountRepository;
+    private final LedgerHashChain       hashChain;
 
     @Transactional
     public LedgerEntry post(PostEntryCommand command) {
-        // Retrieve the most recent hash for this account, serialising concurrent inserts
-        String previousHash = repository
-            .findTopByAccountIdOrderByCreatedAtDesc(command.accountId())
-            .map(LedgerEntry::getEntryHash)
-            .orElse(LedgerHashChain.GENESIS_HASH);
+        // Serialise posts per account: lock the account row (SELECT ... FOR UPDATE).
+        // Without it, two concurrent posts read the same previous entry and
+        // fork the chain / compute a wrong running balance. The UNIQUE
+        // (account_id, sequence_number) constraint is the backstop.
+        accountRepository.findByIdForUpdate(command.accountId())
+            .orElseThrow(() -> new AccountNotFoundException(command.accountId()));
 
-        long runningBalance = computeRunningBalance(command);
+        Optional<LedgerEntry> previous =
+            repository.findTopByAccountIdOrderBySequenceNumberDesc(command.accountId());
+        String previousHash = previous.map(LedgerEntry::getEntryHash)
+                                      .orElse(LedgerHashChain.GENESIS_HASH);
+        long   sequence     = previous.map(e -> e.getSequenceNumber() + 1).orElse(1L);
+        long   current      = previous.map(LedgerEntry::getRunningBalance).orElse(0L);
+        long   runningBalance = applyEntry(current, command);
 
-        UUID entryId = UUID.randomUUID();
+        UUID    entryId   = UUID.randomUUID();
+        // The SAME timestamp goes into the hash and into the row (PostgreSQL
+        // stores microseconds), so the verifier can recompute the hash later
+        Instant createdAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
+
         String entryHash = hashChain.computeEntryHash(previousHash,
             new LedgerEntryData(
-                entryId.toString(), command.accountId().toString(),
+                entryId.toString(), command.accountId().toString(), sequence,
                 command.entryType().name(), command.amountCents(),
-                runningBalance, command.transactionRef(),
-                Instant.now()));
+                runningBalance, command.transactionRef(), createdAt));
 
         LedgerEntry entry = LedgerEntry.builder()
             .id(entryId)
             .accountId(command.accountId())
+            .sequenceNumber(sequence)
             .entryType(command.entryType())
             .amountCents(command.amountCents())
             .runningBalance(runningBalance)
             .previousHash(previousHash)
             .entryHash(entryHash)
             .transactionRef(command.transactionRef())
+            .createdAt(createdAt)
             .createdBy(command.principal())
             .build();
 
         return repository.save(entry);
     }
 
-    private long computeRunningBalance(PostEntryCommand command) {
-        long current = repository
-            .findTopByAccountIdOrderByCreatedAtDesc(command.accountId())
-            .map(LedgerEntry::getRunningBalance)
-            .orElse(0L);
+    private long applyEntry(long current, PostEntryCommand command) {
+        long amount = command.amountCents();
         return switch (command.entryType()) {
-            case CREDIT, INTEREST -> current + command.amountCents();
-            case DEBIT, FEE       -> current - command.amountCents();
-            case REVERSAL         -> current + command.amountCents();
-            case ADJUSTMENT       -> current + command.amountCents();
+            case CREDIT, INTEREST -> current + amount;
+            case DEBIT, FEE       -> current - amount;
+            // A reversal undoes either a credit or a debit, an adjustment can go
+            // either way: these commands carry an explicit direction
+            case REVERSAL, ADJUSTMENT ->
+                command.direction() == Direction.CREDIT ? current + amount : current - amount;
         };
     }
 }
@@ -340,23 +362,21 @@ public class Account {
 @RequiredArgsConstructor
 public class AccountAuditService {
 
-    private final AuditReader auditReader;  // inject via AuditReaderFactory.get(entityManager)
+    private final AuditReader auditReader;  // a bean you define: AuditReaderFactory.get(entityManager)
 
     /**
      * Retrieve the state of an account as it was at a specific point in time.
      * Used by compliance officers during fraud investigations.
      */
     public Optional<Account> getAccountAtPointInTime(UUID accountId, Instant asOf) {
-        List<Number> revisions = auditReader.getRevisions(Account.class, accountId);
-
-        return revisions.stream()
-            .map(rev -> auditReader.getRevisionDate(rev))
-            .filter(date -> !date.toInstant().isAfter(asOf))
-            .max(Comparator.naturalOrder())
-            .map(date -> {
-                Number rev = auditReader.getRevisionNumberForDate(date);
-                return auditReader.find(Account.class, accountId, rev);
-            });
+        try {
+            // Highest (global) revision committed at or before asOf ...
+            Number rev = auditReader.getRevisionNumberForDate(Date.from(asOf));
+            // ... and the entity state as of that revision (null if it did not exist yet)
+            return Optional.ofNullable(auditReader.find(Account.class, accountId, rev));
+        } catch (RevisionDoesNotExistException e) {
+            return Optional.empty();   // no revision at all before asOf
+        }
     }
 
     /**
@@ -382,17 +402,18 @@ public class AccountAuditService {
 ```
 
 > [!NOTE]
-> Envers audit tables grow without bound. For high-volume accounts with thousands of daily state changes, consider archiving `*_aud` rows older than a configurable horizon to cold storage, keeping only a summary snapshot in the hot table.
+> Envers history is **not** tamper-evident: the `*_aud` tables are ordinary tables that anyone with write access can change. Use Envers for convenient point-in-time *views* of entities, and the append-only, hash-chained ledger as the evidence. Envers audit tables also grow without bound. For high-volume accounts with thousands of daily state changes, consider archiving `*_aud` rows older than a configurable horizon to cold storage, keeping only a summary snapshot in the hot table.
 
 ## Operational: Partitioning and Archival
 
-A ledger for a mid-sized bank with 1 million active accounts at 10 transactions per account per day accumulates 3.65 billion rows per year at approximately 350 bytes per row — roughly 1.3 TB annually. Partition by year to enable efficient archival and time-range queries.
+A ledger for a mid-sized bank with 1 million active accounts at 10 transactions per account per day accumulates 3.65 billion rows per year at approximately 350 bytes per row — roughly 1.3 TB annually. Partition by year to enable efficient archival and time-range queries. Below is the partitioned version of the same table. Note one PostgreSQL rule: a primary key or unique constraint on a partitioned table must include the partition key, so a *global* uniqueness rule such as `UNIQUE (transaction_ref)` has to live in a small separate, non-partitioned table.
 
 ```sql
 -- Range-partition the ledger by year for archival efficiency
 CREATE TABLE ledger_entries (
     id               UUID         NOT NULL,
     account_id       UUID         NOT NULL,
+    sequence_number  BIGINT       NOT NULL,
     entry_type       ledger_entry_type NOT NULL,
     amount_cents     BIGINT       NOT NULL,
     running_balance  BIGINT       NOT NULL,
@@ -400,8 +421,16 @@ CREATE TABLE ledger_entries (
     entry_hash       CHAR(64)     NOT NULL,
     transaction_ref  VARCHAR(64)  NOT NULL,
     created_at       TIMESTAMPTZ  NOT NULL,
-    created_by       VARCHAR(128) NOT NULL
+    created_by       VARCHAR(128) NOT NULL,
+    PRIMARY KEY (id, created_at)          -- must include the partition key
 ) PARTITION BY RANGE (created_at);
+
+-- Global uniqueness of external references (cannot be a constraint on the
+-- partitioned table, because it does not include created_at)
+CREATE TABLE ledger_transaction_refs (
+    transaction_ref  VARCHAR(64)  PRIMARY KEY,
+    entry_id         UUID         NOT NULL
+);
 
 -- Create annual partitions; automate with pg_partman
 CREATE TABLE ledger_entries_2024
@@ -421,30 +450,37 @@ CREATE INDEX ON ledger_entries_2026 (account_id, created_at DESC);
 ```
 
 ```java
-// Archival job — runs annually, moves cold partitions to S3-backed tablespace
+// Archival job — runs annually, exports the oldest partition to cold storage.
+// Runs under a separate, privileged archival role: the application role cannot
+// detach or drop ledger partitions.
 @Component
 @RequiredArgsConstructor
 public class LedgerArchivalJob {
 
-    private final JdbcTemplate jdbc;
+    private final JdbcTemplate archivalJdbc;   // connected as the archival role
     private final S3LedgerArchive s3Archive;
 
     @Scheduled(cron = "0 0 2 1 1 *") // 02:00 on 1 Jan every year
-    public void archivePreviousYear() {
-        int archiveYear = Year.now().getValue() - 7; // retain 7 years hot
+    public void archiveOldestYear() {
+        int archiveYear = Year.now().getValue() - 8; // keep the last 7 full years hot
         String partition = "ledger_entries_" + archiveYear;
 
-        // Export partition to Parquet on S3 for cold storage
+        // 1. Export the partition (with its hash chain) to Parquet on WORM storage
         s3Archive.exportPartition(partition, archiveYear);
 
-        // Detach and drop the hot partition after verification
-        jdbc.execute("ALTER TABLE ledger_entries DETACH PARTITION " + partition);
-        jdbc.execute("DROP TABLE " + partition);
+        // 2. Verify the export: row count and the last entry_hash per account match
+        if (!s3Archive.verifyExport(partition, archiveYear)) {
+            throw new IllegalStateException("Archive verification failed for " + partition);
+        }
+
+        // 3. Only then detach and drop the hot partition
+        archivalJdbc.execute("ALTER TABLE ledger_entries DETACH PARTITION " + partition);
+        archivalJdbc.execute("DROP TABLE " + partition);
     }
 }
 ```
 
-Regulatory retention requirements under PCI-DSS Requirement 10.7 mandate one year online and one year accessible archive. Many banks extend this to 7–10 years to satisfy SOX Section 802 and local banking law requirements.
+Retention rules differ by record type. For *system audit logs*, PCI DSS v4.0 Requirement 10.5.1 asks for at least 12 months of history, with the most recent three months immediately available. Retention of the *financial records* themselves is driven by accounting, tax and anti-money-laundering law (in the EU and UK, AML records are typically kept for five years after the customer relationship ends) and by local banking law — in practice often 7–10 years. Confirm the exact periods with your compliance team.
 
 ## Knowledge Check
 
@@ -456,7 +492,7 @@ A: Updating a `status` column on an existing row violates the append-only constr
 
 **Q2: Hibernate Envers is auditing the `Account` entity. A compliance officer asks for the account's balance as it stood on 14 March 2025 at 09:47 UTC. What Envers API calls accomplish this, and what are the limitations of this approach?**
 
-A: Use `AuditReader.getRevisionNumberForDate(new Date(instant.toEpochMilli()))` to find the revision that was current at that timestamp, then `AuditReader.find(Account.class, accountId, revisionNumber)` to retrieve the entity snapshot. The limitation is that Envers captures state at the Hibernate flush boundary, not at the SQL transaction boundary — if the entity was updated multiple times within a single flush, only the final state within that flush is recorded. Additionally, Envers records the state of JPA-managed fields; any columns updated via native SQL bypass Envers entirely and will not appear in the audit history.
+A: Use `AuditReader.getRevisionNumberForDate(Date.from(instant))` to find the latest revision at or before that timestamp, then `AuditReader.find(Account.class, accountId, revisionNumber)` to retrieve the entity snapshot as of that revision. The limitations: Envers creates **one revision per transaction**, so if the entity changed several times inside one transaction, only the final state is recorded, and the revision timestamp is the application server's clock at commit. Envers only sees changes made through Hibernate — columns updated via native SQL or bulk JPQL updates bypass it entirely. And the audit tables are ordinary, mutable tables, so they are not tamper evidence.
 
 ## Practical Challenge
 
@@ -493,18 +529,18 @@ Your team is building the audit trail infrastructure for a new PSD2-compliant pa
         "The application role should use a read-only connection that prevents all mutations"
       ],
       "correct": 0,
-      "explanation": "The OCC fine in the business context was possible precisely because the application role had UPDATE and DELETE privileges — a DBA used them directly. Application-layer validation is bypassed by any direct database connection, a misconfigured ORM, or a compromised service account. Database-level enforcement (REVOKE UPDATE, DELETE, TRUNCATE from app_role) is the only durable guarantee. Row-level security (FORCE ROW LEVEL SECURITY) adds a belt-and-suspenders layer but is secondary to privilege revocation."
+      "explanation": "In the business context, the tampering was possible precisely because the application role had UPDATE and DELETE privileges — a DBA used them directly. Application-layer validation is bypassed by any direct database connection, a misconfigured ORM, or a compromised service account. Database-level enforcement (REVOKE UPDATE, DELETE, TRUNCATE from an app_role that does not own the table) is the durable guarantee. Row-level security (FORCE ROW LEVEL SECURITY) adds a belt-and-suspenders layer but is secondary to privilege revocation."
     },
     {
-      "text": "What is the operational risk of using pg_partman to manage annual ledger partitions, and what is the retention strategy for partitions older than 7 years under PCI-DSS Requirement 10.7?",
+      "text": "What is the operational risk of using pg_partman to manage annual ledger partitions, and what is the correct way to retire a partition that has passed its retention period?",
       "options": [
         "Annual partitions cause index bloat — use monthly partitions instead and retain 84 monthly partitions",
-        "If pg_partman fails to create next year's partition before year-end, inserts will fail — monitor partition creation; for partitions older than 7 years, detach from the main table and export to cold storage (e.g., S3 Parquet) before dropping, retaining at least 1 year online and 1 year accessible archive",
+        "If pg_partman fails to create next year's partition before year-end, inserts will fail — monitor partition creation; to retire an old partition, export it to cold storage (e.g. Parquet on WORM storage), verify the export, then detach and drop it under a privileged archival role",
         "Partitions cannot be detached without downtime — archive by moving rows to a separate cold table in the same database",
-        "PCI-DSS requires all ledger data to remain in hot storage for 10 years — no archival is permitted"
+        "PCI DSS requires all ledger data to remain in hot storage for 10 years — no archival is permitted"
       ],
       "correct": 1,
-      "explanation": "pg_partman automates partition creation but requires monitoring to ensure the next partition exists before year-end — an INSERT into a date range with no matching partition fails. PCI-DSS Requirement 10.7 mandates 1 year online and 1 year accessible archive. Many banks extend to 7–10 years for SOX Section 802 and local banking law. The correct archival strategy is: detach old partitions from the main table (preserving the partition as a standalone table), export to cold storage (S3/Parquet), verify the export, then drop the partition from the hot database."
+      "explanation": "pg_partman automates partition creation but requires monitoring to ensure the next partition exists before year-end — an INSERT into a date range with no matching partition fails. Retention periods depend on the record type: PCI DSS v4.0 (10.5.1) asks for 12 months of audit log history with three months immediately available, while financial records follow accounting, tax, AML and banking law — often 7–10 years in practice. The correct retirement procedure is: export the partition to cold storage, verify the export (row counts, last hash per account), then detach and drop the partition from the hot database."
     }
   ]
 }

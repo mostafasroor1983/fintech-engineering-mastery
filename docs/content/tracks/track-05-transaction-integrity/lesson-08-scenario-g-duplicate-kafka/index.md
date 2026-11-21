@@ -11,6 +11,8 @@ tags: [Kafka, exactly-once, at-least-once, consumer-idempotency, deduplication]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 A Kafka consumer that processes a `PaymentCompleted` event, posts to the ledger, then crashes before committing its offset will replay that event on restart — and the ledger will silently accept both copies. This is not a theoretical edge case; it is the default behaviour of every at-least-once Kafka consumer that does not defend itself. This lesson exposes exactly how the failure window opens, then closes it with three complementary techniques: a database-level idempotency table, Kafka's own transactional exactly-once semantics, and a Redis deduplication window for high-throughput paths. You will leave with the production configuration and the Spring Kafka code to implement all three.
 
 ## Learning Objectives
@@ -24,9 +26,9 @@ A Kafka consumer that processes a `PaymentCompleted` event, posts to the ledger,
 
 ## Business Context
 
-Nexus Payments, a UK-licensed payment institution processing 2.1 million transactions per day, operates a Kafka-based event pipeline between its payment gateway and its double-entry ledger. At 02:17 on a Tuesday, a routine rolling restart of the ledger consumer pods caused fifteen pods to crash between processing and offset commit due to a JVM OOM error triggered by an unexpected spike in event payload size. On restart, those fifteen pods replayed between 1 and 23 events each. In total, 94 `PaymentCompleted` events were processed twice. Each replay caused `ledgerService.post()` to execute a second time, creating 94 duplicate credit entries totalling £127,340.
+*Composite example:* "Nexus Payments", a fictional UK-licensed payment institution processing 2.1 million transactions per day, operates a Kafka-based event pipeline between its payment gateway and its double-entry ledger. At 02:17 on a Tuesday, a routine rolling restart of the ledger consumer pods caused fifteen pods to crash between processing and offset commit due to a JVM OOM error triggered by an unexpected spike in event payload size. On restart, those fifteen pods replayed between 1 and 23 events each. In total, 94 `PaymentCompleted` events were processed twice. Each replay caused `ledgerService.post()` to execute a second time, creating 94 duplicate credit entries totalling £127,340.
 
-The duplicate entries were not detected until the morning reconciliation job ran at 06:00. By that point, 11 customers had already seen the inflated balances and 3 had initiated secondary transfers against the phantom funds. The remediation required manual ledger adjustments, 11 customer communications, and a Suspicious Activity Report filing under the Proceeds of Crime Act 2002. The root cause was a single missing property: `enable.auto.commit=false` combined with no idempotency check.
+The duplicate entries were not detected until the morning reconciliation job ran at 06:00. By that point, 11 customers had already seen the inflated balances and 3 had initiated secondary transfers against the phantom funds. The remediation required manual ledger adjustments, recovery of the over-spent funds, 11 customer communications and an incident report to the regulator. The root cause: the consumer had no idempotency check, so the at-least-once redelivery that Kafka *promises* turned straight into duplicate postings.
 
 ## Kafka Delivery Semantics
 
@@ -65,7 +67,9 @@ The failure window exists for every at-least-once consumer. The only question is
 
 ## Fix 1 — Idempotent Consumer with Deduplication Table
 
-The most portable fix is a `processed_events` table that records every event ID after successful processing. The check and the business logic execute in the same database transaction, making the entire operation atomic.
+The most portable fix is a `processed_events` table that records every event ID. The claim (insert of the event ID) and the business logic execute in the **same database transaction**, making the entire operation atomic — and the offset is acknowledged only **after** that transaction has committed.
+
+Two mistakes to avoid. Running the dedup INSERT on its own connection (`dataSource.getConnection()`) commits it immediately and separately: if the ledger post then fails, the event is marked processed but never posted — lost. And acknowledging inside the transaction commits the Kafka offset before the database commit: if the commit then fails, the message is gone too. (A `KafkaTransactionManager` does not help here — it covers Kafka, not your database.)
 
 ### Schema
 
@@ -90,9 +94,7 @@ CREATE INDEX idx_processed_events_at ON processed_events (processed_at);
 @Slf4j
 public class PaymentCompletedConsumer {
 
-    private final LedgerService ledgerService;
-    private final ProcessedEventRepository processedEventRepository;
-    private final DataSource dataSource;
+    private final PaymentPostingService postingService;
 
     private static final String CONSUMER_GROUP = "ledger-posting-service";
 
@@ -101,52 +103,43 @@ public class PaymentCompletedConsumer {
             groupId = CONSUMER_GROUP,
             containerFactory = "manualAckContainerFactory"
     )
-    @Transactional("kafkaTransactionManager")          // wraps DB + ack in one TX
     public void onPaymentCompleted(
             @Payload PaymentCompletedEvent event,
             Acknowledgment acknowledgment) {
 
-        if (isDuplicate(event.eventId())) {
-            log.warn("Duplicate event detected, skipping: eventId={}", event.eventId());
-            acknowledgment.acknowledge();
-            return;
-        }
-
-        ledgerService.post(LedgerPostingRequest.from(event));
-        recordProcessed(event.eventId());
+        // DB transaction (claim + ledger post) commits inside this call...
+        postingService.postOnce(event, CONSUMER_GROUP);
+        // ...and only THEN is the offset committed. A crash between the two
+        // causes a redelivery, which postOnce recognises as a duplicate.
         acknowledgment.acknowledge();
-
-        log.info("Payment posted to ledger: eventId={} paymentId={}",
-                event.eventId(), event.paymentId());
     }
+}
 
-    /**
-     * Atomically insert the event ID. Returns true if this is a duplicate.
-     * INSERT ... ON CONFLICT DO NOTHING means the second call inserts 0 rows.
-     */
-    private boolean isDuplicate(UUID eventId) {
-        String sql = """
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PaymentPostingService {
+
+    private final LedgerService ledgerService;
+    private final JdbcTemplate jdbc;   // joins the Spring-managed DB transaction
+
+    @Transactional   // the DATABASE transaction manager — claim and post commit together
+    public void postOnce(PaymentCompletedEvent event, String consumerGroup) {
+        // Claim the event: 1 row inserted = first time; 0 rows = duplicate
+        int claimed = jdbc.update("""
                 INSERT INTO processed_events (event_id, consumer_group)
                 VALUES (?, ?)
                 ON CONFLICT (event_id, consumer_group) DO NOTHING
-                RETURNING event_id
-                """;
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setObject(1, eventId);
-            ps.setString(2, CONSUMER_GROUP);
-            ResultSet rs = ps.executeQuery();
-            // If RETURNING returns a row → new insertion (not duplicate)
-            // If RETURNING returns nothing → conflict occurred (duplicate)
-            return !rs.next();
-        } catch (SQLException e) {
-            throw new DataAccessResourceFailureException("Idempotency check failed", e);
-        }
-    }
+                """, event.eventId(), consumerGroup);
 
-    private void recordProcessed(UUID eventId) {
-        // Already recorded by the INSERT above; this is a no-op.
-        // Kept for clarity in call sites that call recordProcessed explicitly.
+        if (claimed == 0) {
+            log.warn("Duplicate event detected, skipping: eventId={}", event.eventId());
+            return;
+        }
+
+        ledgerService.post(LedgerPostingRequest.from(event));   // same transaction
+        log.info("Payment posted to ledger: eventId={} paymentId={}",
+                event.eventId(), event.paymentId());
     }
 }
 ```
@@ -171,10 +164,13 @@ public class KafkaConsumerConfig {
         return factory;
     }
 
+    // "${...}" placeholders are NOT resolved inside Java string literals —
+    // inject the value instead
     @Bean
-    public ConsumerFactory<String, PaymentCompletedEvent> consumerFactory() {
+    public ConsumerFactory<String, PaymentCompletedEvent> consumerFactory(
+            @Value("${kafka.bootstrap-servers}") String bootstrapServers) {
         Map<String, Object> props = new HashMap<>();
-        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "${kafka.bootstrap-servers}");
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ConsumerConfig.GROUP_ID_CONFIG, "ledger-posting-service");
         props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);       // critical
         props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 100);
@@ -198,16 +194,21 @@ When both the producer and the consumer are within the Kafka ecosystem (the cons
 
 ```java
 @Bean
-public ProducerFactory<String, Object> transactionalProducerFactory() {
+public ProducerFactory<String, Object> transactionalProducerFactory(
+        @Value("${kafka.bootstrap-servers}") String bootstrapServers,
+        @Value("${POD_NAME:local}") String podName) {
     Map<String, Object> props = new HashMap<>();
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "${kafka.bootstrap-servers}");
-    // transactional.id MUST be unique per producer instance and stable across restarts
-    props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "ledger-poster-${POD_NAME}");
+    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
     props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
     props.put(ProducerConfig.ACKS_CONFIG, "all");
     props.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
     props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
-    return new DefaultKafkaProducerFactory<>(props);
+    DefaultKafkaProducerFactory<String, Object> pf = new DefaultKafkaProducerFactory<>(props);
+    // The transactional.id must be unique per producer instance and STABLE across
+    // restarts (a restarted pod reuses it, which fences off its old "zombie" self).
+    // Spring appends a suffix to this prefix for each producer it creates.
+    pf.setTransactionIdPrefix("ledger-poster-" + podName + "-");
+    return pf;
 }
 
 @Bean
@@ -230,6 +231,8 @@ With `read_committed`, the consumer will not see messages produced inside an unc
 
 ### Overhead Trade-off
 
+Rough, illustrative costs — measure your own:
+
 | Approach | Throughput impact | Complexity | Cross-system support |
 |---|---|---|---|
 | Idempotent consumer (DB table) | ~5 ms per event (index lookup) | Low | Yes |
@@ -238,7 +241,7 @@ With `read_committed`, the consumer will not see messages produced inside an unc
 
 ## Fix 3 — Redis Deduplication Window
 
-For high-throughput consumers where the database round-trip cost of the idempotency table is too high, a Redis `SETNX` check provides a sub-millisecond guard. It is a probabilistic (not guaranteed) guard: Redis data can be lost on failure. Use it in front of the DB check, not instead of it.
+For high-throughput consumers where the database round-trip cost of the idempotency table is too high, a Redis check provides a sub-millisecond guard. It is a probabilistic (not guaranteed) guard: Redis data can be lost on failure, so use it in front of the DB check, never instead of it. One ordering rule is critical: **write the Redis marker only after the database transaction has committed.** If you set it *before* processing and processing then fails, every redelivery is skipped by Redis and the event is never processed.
 
 ```java
 @Service
@@ -250,17 +253,14 @@ public class RedisDeduplicationService {
     private static final Duration DEDUP_WINDOW = Duration.ofHours(24);
     private static final String KEY_PREFIX = "dedup:payment:";
 
-    /**
-     * Returns true if this event has NOT been seen before (safe to process).
-     * Returns false if it was already seen within the deduplication window.
-     *
-     * Uses SET NX EX which is atomic: check-and-set in one Redis command.
-     */
-    public boolean markIfAbsent(UUID eventId) {
-        String key = KEY_PREFIX + eventId;
-        Boolean wasAbsent = redisTemplate.opsForValue()
-                .setIfAbsent(key, "1", DEDUP_WINDOW);
-        return Boolean.TRUE.equals(wasAbsent);
+    /** Fast path: true if this event is KNOWN to be processed already. */
+    public boolean isKnownProcessed(UUID eventId) {
+        return Boolean.TRUE.equals(redisTemplate.hasKey(KEY_PREFIX + eventId));
+    }
+
+    /** Call only AFTER the database transaction has committed. */
+    public void markProcessed(UUID eventId) {
+        redisTemplate.opsForValue().set(KEY_PREFIX + eventId, "1", DEDUP_WINDOW);
     }
 }
 ```
@@ -270,30 +270,25 @@ public class RedisDeduplicationService {
 ```java
 @KafkaListener(topics = "payments.completed", groupId = "ledger-posting-service",
                containerFactory = "manualAckContainerFactory")
-@Transactional
 public void onPaymentCompleted(PaymentCompletedEvent event, Acknowledgment ack) {
 
-    // Layer 1: Redis fast path — sub-millisecond, probabilistic
-    if (!redisDeduplicationService.markIfAbsent(event.eventId())) {
+    // Layer 1: Redis fast path — sub-millisecond, read-only, probabilistic
+    if (redisDeduplicationService.isKnownProcessed(event.eventId())) {
         log.debug("Redis dedup hit for eventId={}", event.eventId());
         ack.acknowledge();
         return;
     }
 
-    // Layer 2: DB authoritative check — ~5ms, guaranteed
-    if (isDuplicate(event.eventId())) {
-        log.warn("DB dedup hit for eventId={} (Redis miss — possible Redis restart)",
-                event.eventId());
-        ack.acknowledge();
-        return;
-    }
+    // Layer 2: DB authoritative claim + ledger post, in ONE transaction
+    postingService.postOnce(event, "ledger-posting-service");   // see Fix 1
 
-    ledgerService.post(LedgerPostingRequest.from(event));
+    // After commit: remember it in Redis, then commit the offset
+    redisDeduplicationService.markProcessed(event.eventId());
     ack.acknowledge();
 }
 ```
 
-The Redis layer handles the 99.9 % case at minimal cost. The DB layer handles the rare case where Redis lost its state (pod restart, eviction policy). Both layers must be present in a financial system.
+The Redis layer short-circuits redeliveries cheaply. The DB layer is the real guarantee, including the cases where Redis lost its state (restart, eviction). In a financial system the DB layer is mandatory; Redis is an optimisation.
 
 ## Dead Letter Topic and Poison Message Handling
 
@@ -310,6 +305,8 @@ public DefaultErrorHandler errorHandler(KafkaOperations<?, ?> template) {
     backoff.setMultiplier(2.0);           // 1s → 2s → 4s
     backoff.setMaxInterval(30_000L);      // cap at 30 seconds
 
+    // Same partition number on the DLT: the DLT topic needs at least as many
+    // partitions as the source topic
     DeadLetterPublishingRecoverer recoverer =
             new DeadLetterPublishingRecoverer(template,
                     (record, ex) -> new TopicPartition("payments.DLT", record.partition()));
@@ -329,11 +326,14 @@ public class PaymentDltHandler {
     private final AlertingService alertingService;
     private final DltEventRepository dltEventRepository;
 
-    @DltHandler
+    // With DefaultErrorHandler + DeadLetterPublishingRecoverer the DLT is an
+    // ordinary topic, so it is consumed by an ordinary @KafkaListener.
+    // (@DltHandler belongs to the @RetryableTopic mechanism.)
+    @KafkaListener(topics = "payments.DLT", groupId = "payments-dlt-handler")
     public void handleDlt(
             PaymentCompletedEvent event,
-            @Header(KafkaHeaders.RECEIVED_TOPIC) String topic,
-            @Header(KafkaHeaders.EXCEPTION_MESSAGE) String exceptionMessage) {
+            @Header(KafkaHeaders.DLT_ORIGINAL_TOPIC) String topic,
+            @Header(KafkaHeaders.DLT_EXCEPTION_MESSAGE) String exceptionMessage) {
 
         log.error("Poison message routed to DLT: topic={} eventId={} error={}",
                 topic, event.eventId(), exceptionMessage);
@@ -386,7 +386,7 @@ spring:
         heartbeat.interval.ms: 10000
         max.poll.interval.ms: 300000     # allow 5 minutes for slow processing batches
     producer:
-      transactional-id: ledger-poster-${POD_NAME:default}
+      transaction-id-prefix: ledger-poster-${POD_NAME:default}-   # enables Kafka transactions
       acks: all
       retries: 2147483647
       enable-idempotence: true
@@ -396,7 +396,7 @@ spring:
 
 **Q1: A PaymentCompleted consumer calls `ledgerService.post()` successfully, then JVM crashes before `acknowledgment.acknowledge()` is called. What happens on restart, and what is the minimum change required to make the consumer safe?**
 
-A: On restart, the Kafka broker replays the message because the offset was never committed. `ledgerService.post()` executes a second time, creating a duplicate ledger entry. The minimum change is to add an idempotency check using `INSERT INTO processed_events (event_id, consumer_group) ON CONFLICT DO NOTHING RETURNING event_id` inside the same database transaction as the ledger post. If the INSERT returns no rows (conflict), the event has already been processed and should be acknowledged and skipped. This check must be inside the same transaction as the ledger write so that a crash between the two cannot leave them in an inconsistent state.
+A: On restart, the Kafka broker replays the message because the offset was never committed. `ledgerService.post()` executes a second time, creating a duplicate ledger entry. The minimum change is to add an idempotency check using `INSERT INTO processed_events (event_id, consumer_group) ON CONFLICT DO NOTHING RETURNING event_id` inside the same database transaction as the ledger post. If the INSERT inserts no row (conflict), the event has already been processed and should be acknowledged and skipped. This check must be inside the same transaction as the ledger write so that a crash between the two cannot leave them in an inconsistent state — and the offset must be acknowledged only after that transaction commits.
 
 **Q2: When should you prefer Kafka Transactions over an idempotency table, and what is the key limitation of each?**
 
@@ -449,7 +449,7 @@ Write a failing JUnit 5 test that sends the same `FraudAlertEvent` twice to an e
         "No — idempotent production is disabled during the first 60 seconds after a broker failover"
       ],
       "correct": 1,
-      "explanation": "enable.idempotence=true deduplicates within a single producer session (epoch). After a JVM restart, the broker assigns a new Producer ID with epoch 0. The broker cannot match new-epoch sequence numbers against the previous epoch's records. Consumer-side deduplication using a processed_events table with a unique constraint is mandatory to handle cross-session duplicates."
+      "explanation": "enable.idempotence=true deduplicates retries within one producer session. A restarted non-transactional producer gets a new Producer ID, and the broker cannot match its sequence numbers against the old session's records. (A transactional producer that reuses the same transactional.id keeps its identity and fences its old instance, but that still covers only Kafka writes.) Consumer-side deduplication with a processed_events table and a unique constraint remains mandatory."
     }
   ]
 }

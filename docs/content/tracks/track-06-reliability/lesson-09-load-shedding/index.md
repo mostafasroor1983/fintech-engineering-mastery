@@ -81,10 +81,15 @@ public enum RequestPriority {
     BACKGROUND(5);
 
     private final int level;
+
+    RequestPriority(int level) { this.level = level; }
+
+    public int getLevel() { return level; }
 }
 
 @Component
 @RequiredArgsConstructor
+@Slf4j
 public class PriorityAdmissionController {
 
     private final SystemLoadMonitor loadMonitor;
@@ -96,14 +101,7 @@ public class PriorityAdmissionController {
      */
     public boolean shouldAdmit(RequestPriority priority) {
         double currentLoad = loadMonitor.getCurrentLoadRatio();
-
-        boolean admitted = switch (priority) {
-            case CRITICAL -> true;  // Never shed critical requests
-            case HIGH -> currentLoad < 0.90;
-            case NORMAL -> currentLoad < 0.75;
-            case LOW -> currentLoad < 0.60;
-            case BACKGROUND -> currentLoad < 0.50;
-        };
+        boolean admitted = wouldAdmit(priority, currentLoad);
 
         meterRegistry.counter("admission.control",
             "priority", priority.name(),
@@ -112,11 +110,26 @@ public class PriorityAdmissionController {
         ).increment();
 
         if (!admitted) {
-            log.warn("Shedding {} priority request: currentLoad={:.1f}%",
-                priority.name(), currentLoad * 100);
+            // SLF4J has no {:.1f} placeholders — format first
+            log.warn("Shedding {} priority request: currentLoad={}%",
+                priority.name(), String.format("%.1f", currentLoad * 100));
         }
 
         return admitted;
+    }
+
+    /** Pure decision — no metrics, no logging (safe for status endpoints). */
+    public boolean wouldAdmit(RequestPriority priority, double currentLoad) {
+        return switch (priority) {
+            // CRITICAL is never shed for the sake of lower priorities — but a
+            // hard concurrency limit (bulkhead) still protects the service
+            // from being overrun by critical traffic alone
+            case CRITICAL -> true;
+            case HIGH -> currentLoad < 0.90;
+            case NORMAL -> currentLoad < 0.75;
+            case LOW -> currentLoad < 0.60;
+            case BACKGROUND -> currentLoad < 0.50;
+        };
     }
 
     private String loadBucket(double load) {
@@ -137,13 +150,24 @@ public class PriorityAdmissionController {
  * and request queue depth into a single 0.0–1.0 load ratio.
  */
 @Component
-@RequiredArgsConstructor
 public class SystemLoadMonitor {
 
     private final HikariDataSource dataSource;
-    private final MeterRegistry meterRegistry;
+    private final ThreadPoolTaskExecutor requestExecutor;   // where request work queues up
 
     private volatile double currentLoadRatio = 0.0;
+
+    public SystemLoadMonitor(HikariDataSource dataSource,
+                             ThreadPoolTaskExecutor requestExecutor,
+                             MeterRegistry meterRegistry) {
+        this.dataSource = dataSource;
+        this.requestExecutor = requestExecutor;
+        // Register the gauge ONCE; it reads the field on every scrape.
+        // (Calling meterRegistry.gauge(name, aDouble) every second registers a
+        //  boxed value that is garbage-collected — the gauge then reports NaN.)
+        Gauge.builder("system.load.composite", this, m -> m.currentLoadRatio)
+             .register(meterRegistry);
+    }
 
     @Scheduled(fixedDelay = 1_000)  // Update every second
     public void updateLoadRatio() {
@@ -157,8 +181,6 @@ public class SystemLoadMonitor {
             + (memoryLoad * 0.15)
             + (dbPoolLoad * 0.40)     // DB pool is the most common bottleneck
             + (requestQueueLoad * 0.25);
-
-        meterRegistry.gauge("system.load.composite", currentLoadRatio);
     }
 
     public double getCurrentLoadRatio() {
@@ -166,16 +188,18 @@ public class SystemLoadMonitor {
     }
 
     private double getCpuLoad() {
+        // com.sun.management.OperatingSystemMXBean (not java.lang.management)
         OperatingSystemMXBean os =
             (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
         double load = os.getProcessCpuLoad();
-        return Double.isNaN(load) ? 0.0 : load;
+        return (Double.isNaN(load) || load < 0) ? 0.0 : load;
     }
 
     private double getHeapMemoryLoad() {
-        MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
-        MemoryUsage heap = memory.getHeapMemoryUsage();
-        return (double) heap.getUsed() / heap.getMax();
+        // Heap use is a noisy signal (it saw-tooths with GC) — keep its weight low
+        MemoryUsage heap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+        long max = heap.getMax();
+        return max <= 0 ? 0.0 : (double) heap.getUsed() / max;   // getMax() can be -1
     }
 
     private double getDbConnectionPoolLoad() {
@@ -188,9 +212,11 @@ public class SystemLoadMonitor {
     }
 
     private double getRequestQueueLoad() {
-        // Monitor thread pool queue depth
-        // Obtain from ThreadPoolExecutor metrics
-        return requestQueueDepthGauge.value() / maxQueueDepth;
+        // Queue depth of the executor that runs request work
+        ThreadPoolExecutor executor = requestExecutor.getThreadPoolExecutor();
+        int depth = executor.getQueue().size();
+        int capacity = depth + executor.getQueue().remainingCapacity();
+        return capacity == 0 ? 0.0 : Math.min(1.0, (double) depth / capacity);
     }
 }
 ```
@@ -238,32 +264,36 @@ public class LoadSheddingFilter extends OncePerRequestFilter {
 }
 
 /**
- * Classify incoming requests by priority based on URI, method, and headers.
+ * Classify incoming requests by priority based on URI, method, and caller.
  */
 @Component
 public class RequestPriorityClassifier {
 
-    private static final Map<String, RequestPriority> URI_PRIORITIES = Map.of(
-        "/api/v1/payments", RequestPriority.CRITICAL,
-        "/api/v1/payments/authorize", RequestPriority.CRITICAL,
-        "/api/v1/accounts/{id}/balance", RequestPriority.HIGH,
-        "/api/v1/payments/{id}/status", RequestPriority.HIGH,
-        "/api/v1/accounts/{id}/transactions", RequestPriority.NORMAL,
-        "/api/v1/accounts/{id}/statements", RequestPriority.LOW,
-        "/api/v1/analytics", RequestPriority.BACKGROUND,
-        "/api/v1/reports", RequestPriority.BACKGROUND
+    // ORDERED, most specific first: Map.of() has no defined iteration order,
+    // so "/api/v1/payments" could match "/api/v1/payments/{id}/status" first
+    private static final List<Map.Entry<String, RequestPriority>> URI_PRIORITIES = List.of(
+        Map.entry("/api/v1/payments/{id}/status", RequestPriority.HIGH),
+        Map.entry("/api/v1/payments/authorize", RequestPriority.CRITICAL),
+        Map.entry("/api/v1/payments", RequestPriority.CRITICAL),
+        Map.entry("/api/v1/accounts/{id}/balance", RequestPriority.HIGH),
+        Map.entry("/api/v1/accounts/{id}/transactions", RequestPriority.NORMAL),
+        Map.entry("/api/v1/accounts/{id}/statements", RequestPriority.LOW),
+        Map.entry("/api/v1/analytics", RequestPriority.BACKGROUND),
+        Map.entry("/api/v1/reports", RequestPriority.BACKGROUND)
     );
 
     public RequestPriority classify(HttpServletRequest request) {
-        // Internal system calls (service-to-service) get elevated priority
-        String internalHeader = request.getHeader("X-Internal-Service");
-        if (internalHeader != null && isKnownInternalService(internalHeader)) {
+        // Internal system calls (service-to-service) get elevated priority —
+        // but only when the caller's identity is PROVEN (mTLS / service mesh).
+        // A plain header such as X-Internal-Service can be set by anyone.
+        String verifiedService = (String) request.getAttribute("verified.client.service");
+        if (verifiedService != null && isKnownInternalService(verifiedService)) {
             return RequestPriority.HIGH;
         }
 
         // Check URI pattern
         String uri = request.getRequestURI();
-        return URI_PRIORITIES.entrySet().stream()
+        return URI_PRIORITIES.stream()
             .filter(e -> uriMatches(uri, e.getKey()))
             .map(Map.Entry::getValue)
             .findFirst()
@@ -310,16 +340,22 @@ public class LoadSheddingFraudService {
 
     /**
      * Fallback when fraud service is overloaded (circuit open).
-     * FAIL OPEN: allow payment through with elevated monitoring.
-     * Fail-safe behavior: a delayed fraud decision is better than
-     * blocking a customer's legitimate payment.
+     * Documented RISK decision (agreed with the fraud team): fail open only
+     * below a low amount threshold, with async review; above it, hold the
+     * payment for review instead of letting it through unchecked.
      */
     public FraudDecision fraudCheckFallback(PaymentRequest request,
                                              CallNotPermittedException ex) {
+        if (request.getAmountMinor() > FAIL_OPEN_LIMIT_MINOR) {
+            return FraudDecision.builder()
+                .decision(FraudDecisionType.HOLD_FOR_REVIEW)
+                .reason("Fraud service unavailable — held for review")
+                .build();
+        }
         log.warn("Fraud service circuit open — failing open for payment key={}",
             request.getIdempotencyKey());
 
-        // Record for async fraud review
+        // Record for async fraud review (durably — e.g. an outbox row)
         asyncFraudReviewQueue.add(request);
 
         return FraudDecision.builder()
@@ -354,7 +390,7 @@ public enum ServiceMode {
     DEGRADED_ANALYTICS,
 
     /**
-     * READ_ONLY_HISTORY: Transaction history served from cache only.
+     * DEGRADED_HISTORY: Transaction history served from cache only.
      * Load: 75–90%
      * Impact: History may be up to 5 minutes stale
      */
@@ -374,27 +410,53 @@ public enum ServiceMode {
 @Slf4j
 public class ServiceModeManager {
 
+    private static final double HYSTERESIS = 0.05;   // step DOWN only 5 points below a threshold
+
     private final SystemLoadMonitor loadMonitor;
     private volatile ServiceMode currentMode = ServiceMode.FULL;
+    private volatile ServiceMode manualOverride;      // set by ops via Actuator; null = automatic
 
     @Scheduled(fixedDelay = 5_000)  // Re-evaluate every 5s
     public void updateServiceMode() {
         double load = loadMonitor.getCurrentLoadRatio();
-        ServiceMode newMode = determineMode(load);
+        ServiceMode newMode = manualOverride != null ? manualOverride : determineMode(load);
 
         if (newMode != currentMode) {
-            log.warn("SERVICE MODE CHANGE: {} → {} (load={:.1f}%)",
-                currentMode, newMode, load * 100);
+            log.warn("SERVICE MODE CHANGE: {} → {} (load={}%)",
+                currentMode, newMode, String.format("%.1f", load * 100));
             currentMode = newMode;
             publishModeChangeEvent(newMode);
         }
     }
 
     private ServiceMode determineMode(double load) {
-        if (load < 0.60) return ServiceMode.FULL;
-        if (load < 0.75) return ServiceMode.DEGRADED_ANALYTICS;
-        if (load < 0.90) return ServiceMode.DEGRADED_HISTORY;
-        return ServiceMode.PAYMENTS_ONLY;
+        ServiceMode byLoad;
+        if (load < 0.60) byLoad = ServiceMode.FULL;
+        else if (load < 0.75) byLoad = ServiceMode.DEGRADED_ANALYTICS;
+        else if (load < 0.90) byLoad = ServiceMode.DEGRADED_HISTORY;
+        else byLoad = ServiceMode.PAYMENTS_ONLY;
+
+        // Hysteresis: moving to a MORE degraded mode happens at once; moving
+        // back up only once load is clearly below that mode's threshold —
+        // otherwise a load hovering at 75% flips the mode every 5 seconds
+        if (byLoad.ordinal() < currentMode.ordinal()
+                && load > thresholdOf(currentMode) - HYSTERESIS) {
+            return currentMode;
+        }
+        return byLoad;
+    }
+
+    private double thresholdOf(ServiceMode mode) {
+        return switch (mode) {
+            case FULL -> 0.0;
+            case DEGRADED_ANALYTICS -> 0.60;
+            case DEGRADED_HISTORY -> 0.75;
+            case PAYMENTS_ONLY -> 0.90;
+        };
+    }
+
+    public void setManualOverride(ServiceMode mode) {   // null clears it
+        this.manualOverride = mode;
     }
 
     public ServiceMode getCurrentMode() {
@@ -412,7 +474,7 @@ public class AccountController {
 
     @GetMapping("/api/v1/accounts/{id}/transactions")
     public ResponseEntity<List<Transaction>> getTransactions(
-            @PathVariable String accountId,
+            @PathVariable("id") String accountId,   // must match {id} in the path
             @RequestParam(defaultValue = "0") int page) {
 
         ServiceMode mode = modeManager.getCurrentMode();
@@ -458,9 +520,16 @@ public class PaymentPriorityQueueConfig {
 
     @Bean
     public PriorityBlockingQueue<PrioritizedPayment> paymentProcessingQueue() {
-        // Comparator: lower priority number = higher queue priority
+        // Lower priority number = served first; FIFO within the same priority
+        // (PriorityBlockingQueue gives no order among equal elements otherwise)
         return new PriorityBlockingQueue<>(1000,
-            Comparator.comparingInt(p -> p.getPriority().getLevel()));
+            Comparator.comparingInt((PrioritizedPayment p) -> p.getPriority().getLevel())
+                      .thenComparing(PrioritizedPayment::getEnqueuedAt));
+        // CAUTION: 1000 is only the INITIAL capacity — this queue is unbounded.
+        // Under overload it would grow until the heap runs out, which is the
+        // opposite of load shedding. Enqueue through a guard that rejects
+        // (503 / retry later) once size() passes a hard limit, and watch for
+        // starvation of low priorities (age them if they wait too long).
     }
 }
 
@@ -516,6 +585,7 @@ public class PriorityPaymentProcessor {
                 ).record(queueWait);
 
                 // Alert if critical payments are waiting too long
+                // (the queue-depth monitor below pages; this logs the detail)
                 if (payment.getPriority() == RequestPriority.CRITICAL &&
                         queueWait.toSeconds() > 5) {
                     log.error("CRITICAL payment waited {}s in queue — queue backlog?",
@@ -537,44 +607,51 @@ public class PriorityPaymentProcessor {
 
 ```java
 @Component
-@RequiredArgsConstructor
 public class QueueDepthMonitoring {
 
     private final PriorityBlockingQueue<PrioritizedPayment> queue;
-    private final MeterRegistry meterRegistry;
     private final AlertingService alerting;
+    // One holder per priority, registered ONCE as a gauge
+    private final Map<RequestPriority, AtomicLong> depthByPriority = new EnumMap<>(RequestPriority.class);
+    private final AtomicLong oldestWaitSeconds = new AtomicLong();
+
+    public QueueDepthMonitoring(PriorityBlockingQueue<PrioritizedPayment> queue,
+                                AlertingService alerting,
+                                MeterRegistry meterRegistry) {
+        this.queue = queue;
+        this.alerting = alerting;
+        for (RequestPriority priority : RequestPriority.values()) {
+            AtomicLong holder = new AtomicLong();
+            depthByPriority.put(priority, holder);
+            meterRegistry.gauge("payment.queue.depth",
+                Tags.of("priority", priority.name()), holder);
+        }
+        meterRegistry.gauge("payment.queue.oldest.wait.seconds", oldestWaitSeconds);
+    }
 
     @Scheduled(fixedDelay = 5_000)
     public void monitorQueueDepth() {
-        int totalDepth = queue.size();
-
-        // Count by priority
-        Map<RequestPriority, Long> depthByPriority = queue.stream()
+        // Count by priority (iterates a snapshot of the queue)
+        Map<RequestPriority, Long> counts = queue.stream()
             .collect(Collectors.groupingBy(PrioritizedPayment::getPriority,
                 Collectors.counting()));
-
-        depthByPriority.forEach((priority, count) ->
-            meterRegistry.gauge("payment.queue.depth",
-                Tags.of("priority", priority.name()), count));
+        depthByPriority.forEach((priority, holder) ->
+            holder.set(counts.getOrDefault(priority, 0L)));
 
         // Alert on queue buildup
-        long criticalBacklog = depthByPriority.getOrDefault(
-            RequestPriority.CRITICAL, 0L);
+        long criticalBacklog = counts.getOrDefault(RequestPriority.CRITICAL, 0L);
         if (criticalBacklog > 100) {
             alerting.page(PagerDutyAlert.critical(
                 "Critical payment queue depth: " + criticalBacklog +
                 " — processing may be falling behind"));
         }
 
-        // Find oldest payment in queue
-        queue.stream()
-            .min(Comparator.comparing(PrioritizedPayment::getEnqueuedAt))
-            .ifPresent(oldest -> {
-                long waitSeconds = Duration.between(oldest.getEnqueuedAt(),
-                    Instant.now()).toSeconds();
-                meterRegistry.gauge("payment.queue.oldest.wait.seconds",
-                    Tags.of("priority", oldest.getPriority().name()), waitSeconds);
-            });
+        // Oldest payment in queue
+        oldestWaitSeconds.set(queue.stream()
+            .map(PrioritizedPayment::getEnqueuedAt)
+            .min(Comparator.naturalOrder())
+            .map(t -> Duration.between(t, Instant.now()).toSeconds())
+            .orElse(0L));
     }
 }
 ```
@@ -587,8 +664,9 @@ public class QueueDepthMonitoring {
  * Ops teams use this to understand current service mode.
  */
 @Component
-@Endpoint(id = "loadShedding")
+@Endpoint(id = "loadshedding")   // endpoint IDs: lowercase, no camelCase
 @RequiredArgsConstructor
+@Slf4j
 public class LoadSheddingActuatorEndpoint {
 
     private final ServiceModeManager modeManager;
@@ -603,15 +681,17 @@ public class LoadSheddingActuatorEndpoint {
         return Map.of(
             "currentMode", currentMode.name(),
             "systemLoad", String.format("%.1f%%", currentLoad * 100),
+            // wouldAdmit(): a pure check — calling shouldAdmit() here would
+            // record fake admission decisions in the metrics on every read
             "admissionPolicy", Map.of(
                 "CRITICAL", "always admitted",
-                "HIGH", admissionController.shouldAdmit(RequestPriority.HIGH)
+                "HIGH", admissionController.wouldAdmit(RequestPriority.HIGH, currentLoad)
                     ? "admitted" : "SHED",
-                "NORMAL", admissionController.shouldAdmit(RequestPriority.NORMAL)
+                "NORMAL", admissionController.wouldAdmit(RequestPriority.NORMAL, currentLoad)
                     ? "admitted" : "SHED",
-                "LOW", admissionController.shouldAdmit(RequestPriority.LOW)
+                "LOW", admissionController.wouldAdmit(RequestPriority.LOW, currentLoad)
                     ? "admitted" : "SHED",
-                "BACKGROUND", admissionController.shouldAdmit(RequestPriority.BACKGROUND)
+                "BACKGROUND", admissionController.wouldAdmit(RequestPriority.BACKGROUND, currentLoad)
                     ? "admitted" : "SHED"
             ),
             "timestamp", Instant.now()
@@ -620,7 +700,8 @@ public class LoadSheddingActuatorEndpoint {
 
     @WriteOperation
     public void setManualMode(@Selector String mode) {
-        // Allow ops to manually force a service mode (emergency override)
+        // Allow ops to manually force a service mode (emergency override).
+        // Expose only on a secured management port, and audit who called it.
         ServiceMode newMode = ServiceMode.valueOf(mode.toUpperCase());
         modeManager.setManualOverride(newMode);
         log.warn("SERVICE MODE MANUALLY OVERRIDDEN to {} by actuator call", newMode);
@@ -633,9 +714,9 @@ public class LoadSheddingActuatorEndpoint {
 ```java
 /**
  * Graduated load shedding — probabilistic shedding that scales with load.
- * At 70% load, shed 10% of LOW priority requests.
- * At 80% load, shed 50% of LOW priority requests.
- * At 90% load, shed 100% of LOW priority requests.
+ * Each priority has a start threshold; above it the shed share rises
+ * linearly to 100% at full load. For LOW (starts at 55%):
+ *   70% load -> ~33% shed, 80% -> ~56% shed, 90% -> ~78% shed, 100% -> all.
  *
  * This creates a gradual pressure valve rather than a hard cutoff.
  */
@@ -685,21 +766,36 @@ public class GraduatedAdmissionController {
   "questions": [
     {
       "text": "What HTTP status code should a payment service return when it sheds a request due to system overload?",
-      "options": ["429 Too Many Requests", "503 Service Unavailable", "504 Gateway Timeout", "400 Bad Request"],
+      "options": [
+        "429 Too Many Requests",
+        "503 Service Unavailable",
+        "504 Gateway Timeout",
+        "400 Bad Request"
+      ],
       "correct": 1,
       "explanation": "503 Service Unavailable signals that the system is temporarily unable to handle the request due to overload. 429 is used for per-client rate limiting (quota enforcement), not system-wide load shedding."
     },
     {
       "text": "During severe overload (>90% capacity), which request type should NEVER be shed in a payment service?",
-      "options": ["Account history queries", "Analytics dashboard requests", "Real-time payment submissions", "Monthly statement generation"],
+      "options": [
+        "Account history queries",
+        "Analytics dashboard requests",
+        "Real-time payment submissions",
+        "Monthly statement generation"
+      ],
       "correct": 2,
       "explanation": "Real-time payment submissions are CRITICAL priority and should never be shed. If the service cannot process payments at all, it is effectively down. Analytics, history, and batch reports are lower priority and can be safely deferred or rejected."
     },
     {
       "text": "What is the advantage of graduated (probabilistic) load shedding over hard threshold-based shedding?",
-      "options": ["It is easier to implement", "It creates a gradual pressure valve that provides early relief before full shedding kicks in", "It guarantees all requests eventually get served", "It eliminates the need for priority classification"],
+      "options": [
+        "It is easier to implement",
+        "It creates a gradual pressure valve that provides early relief before full shedding kicks in",
+        "It guarantees all requests eventually get served",
+        "It eliminates the need for priority classification"
+      ],
       "correct": 1,
-      "explanation": "Graduated shedding starts probabilistically dropping requests as load approaches the threshold (e.g., 10% shed at 70% load, 50% at 80%, 100% at 90%). This provides earlier relief to the system than a hard cutoff which suddenly rejects everything at the threshold."
+      "explanation": "Graduated shedding starts probabilistically dropping a growing share of requests once load passes each priority's threshold (for example, LOW requests: about a third shed at 70% load, more than half at 80%, all at 100%). This gives the system earlier, smoother relief than a hard cutoff, which suddenly rejects everything of that priority at one exact load level — and tends to make load oscillate around it."
     }
   ]
 }

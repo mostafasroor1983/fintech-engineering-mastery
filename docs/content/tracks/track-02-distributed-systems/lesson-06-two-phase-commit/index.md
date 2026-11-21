@@ -42,7 +42,7 @@ Two-phase commit is the classic protocol that guarantees atomicity across multip
 
 ## Business Context
 
-In October 2019, a major European payment processor experienced a 47-minute outage affecting 2.3 million transactions. The root cause was a 2PC coordinator failure during a database failover. The coordinator had sent Prepare to both the PostgreSQL participant and the ActiveMQ participant and received both Prepare-OK votes — but crashed before writing its Commit decision to the transaction log. Both participants held their locks and waited for the coordinator to recover. The database connection pool exhausted within 90 seconds. The fallback restarted the coordinator, which found the transaction in a prepared-but-undecided state and correctly committed it — but by then the connection pool starvation had cascaded. The recovery log showed 14,200 transactions left in the PREPARED state, requiring 3 hours of manual intervention. The incident illustrated the core vulnerability of 2PC: the window between the coordinator receiving all Prepare-OK votes and writing the commit decision is a single point of failure that no amount of participant-level redundancy can protect against.
+Consider a composite example drawn from typical incidents. A payment processor coordinates PostgreSQL and ActiveMQ with 2PC. During a database failover, the coordinator sends Prepare to both participants, receives both Prepare-OK votes — and crashes before writing its Commit decision to the transaction log. Both participants now hold their locks and wait. Within about 90 seconds the database connection pool is exhausted, and new payments start failing. When the coordinator restarts, it finds no Commit record for these transactions, so it rolls them back (presumed abort) — but by then the pool starvation has cascaded, and thousands of transactions whose coordinator log was damaged are left in the PREPARED state, needing hours of manual resolution. The example shows the core weakness of 2PC: once a participant has voted yes, it cannot decide on its own and must wait for the coordinator, however long that takes.
 
 ## The Two-Phase Commit Protocol
 
@@ -102,16 +102,16 @@ sequenceDiagram
     Note over DB,MQ: Lock holders: connections, rows, queue segments
     Note over DB: DB connections exhausted after pool timeout
 
-    Note over C: Coordinator restarts, reads tx log
-    C-->>DB: XA COMMIT tx-9921 (or ROLLBACK if log says abort)
-    C-->>MQ: XA COMMIT tx-9921
+    Note over C: Coordinator restarts, reads tx log — no COMMIT record
+    C-->>DB: XA ROLLBACK tx-9921 (presumed abort)
+    C-->>MQ: XA ROLLBACK tx-9921
     Note over DB,MQ: Unblocked — but damage from pool exhaustion done
 ```
 
 This is the **blocking problem**: participants in the PREPARED state cannot unilaterally decide to commit or abort. They must wait for the coordinator. This is a fundamental protocol property, not an implementation flaw. No participant knows whether other participants voted commit or abort.
 
 > [!WARNING]
-> The blocking problem is not solvable within the 2PC protocol. Three-phase commit (3PC) addresses it theoretically but introduces new failure modes and is almost never used in practice. In modern distributed systems, the preferred solution is to avoid 2PC and use alternative patterns.
+> The blocking problem is not solvable within the 2PC protocol. Three-phase commit (3PC) addresses it theoretically but introduces new failure modes and is almost never used in practice. The practical fix is to make the coordinator itself fault-tolerant by replicating its decision log with consensus (Paxos Commit; Spanner runs 2PC over Paxos groups). For most application teams, the preferred solution is to avoid 2PC and use alternative patterns.
 
 ## XA Transactions in Java
 
@@ -143,6 +143,7 @@ public class XAProtocolDemo {
             /* branchQualifier */ "branch-1".getBytes()
         );
 
+        boolean decidedCommit = false;
         try {
             // Enlist resource managers
             rm1.start(xid, XAResource.TMNOFLAGS);
@@ -171,9 +172,10 @@ public class XAProtocolDemo {
             int vote2 = rm2.prepare(xid);
 
             // *** Write commit decision to durable log here ***
-            // If coordinator crashes here, recovery must commit
+            // If coordinator crashes after this point, recovery must commit
+            decidedCommit = true;
 
-            // Phase 2 — Commit
+            // Phase 2 — Commit (after the decision, failures are RETRIED, never rolled back)
             if (vote1 != XAResource.XA_RDONLY) {
                 rm1.commit(xid, false); // false = one-phase not used
             }
@@ -182,7 +184,12 @@ public class XAProtocolDemo {
             }
 
         } catch (Exception e) {
-            // Phase 2 — Rollback
+            if (decidedCommit) {
+                // Decision is COMMIT: keep retrying commit (recovery does this
+                // after a crash). Rolling back now would create a mixed outcome.
+                throw new CommitPendingException(xid, e);
+            }
+            // Before the decision: roll back every branch
             try { rm1.rollback(xid); } catch (Exception ignored) {}
             try { rm2.rollback(xid); } catch (Exception ignored) {}
             throw e;
@@ -196,13 +203,14 @@ public class XAProtocolDemo {
 
 ## Atomikos JTA with PostgreSQL and ActiveMQ
 
-In production, you do not implement 2PC manually. Atomikos is the most widely used embedded JTA transaction manager for Spring Boot. It manages the transaction log, coordinator recovery, and participant coordination.
+In production, you do not implement 2PC manually. Atomikos is the most widely used embedded JTA transaction manager for Spring Boot. It manages the transaction log, coordinator recovery, and participant coordination. Note: Spring Boot 3 removed its own `spring-boot-starter-jta-atomikos`; use the starter that Atomikos publishes, and PostgreSQL's `max_prepared_transactions` must be above 0 (the default is 0, which disables XA).
 
 ```xml
-<!-- pom.xml -->
+<!-- pom.xml (Spring Boot 3) -->
 <dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-jta-atomikos</artifactId>
+    <groupId>com.atomikos</groupId>
+    <artifactId>transactions-spring-boot3-starter</artifactId>
+    <version>6.0.0</version>
 </dependency>
 <dependency>
     <groupId>org.postgresql</groupId>
@@ -210,7 +218,7 @@ In production, you do not implement 2PC manually. Atomikos is the most widely us
 </dependency>
 <dependency>
     <groupId>org.apache.activemq</groupId>
-    <artifactId>activemq-broker</artifactId>
+    <artifactId>activemq-client</artifactId>
 </dependency>
 ```
 
@@ -220,7 +228,7 @@ public class XaTransactionConfig {
 
     @Bean
     @Primary
-    public DataSource xaDataSource() {
+    public DataSource xaDataSource(@Value("${DB_PASSWORD}") String dbPassword) {
         AtomikosDataSourceBean ds = new AtomikosDataSourceBean();
         ds.setUniqueResourceName("postgres-xa");
         ds.setXaDataSourceClassName("org.postgresql.xa.PGXADataSource");
@@ -230,7 +238,7 @@ public class XaTransactionConfig {
         props.setProperty("portNumber", "5432");
         props.setProperty("databaseName", "payments");
         props.setProperty("user", "app");
-        props.setProperty("password", "${DB_PASSWORD}");
+        props.setProperty("password", dbPassword);   // injected, never hard-coded
         ds.setXaProperties(props);
 
         ds.setMinPoolSize(5);
@@ -250,18 +258,15 @@ public class XaTransactionConfig {
         return cf;
     }
 
-    @Bean
-    public JtaTransactionManager jtaTransactionManager() {
-        return new JtaTransactionManager();
-        // Atomikos UserTransactionManager and UserTransactionImp
-        // are auto-configured by Spring Boot's Atomikos auto-config
-    }
+    // No transaction manager bean here: the Atomikos starter auto-configures
+    // a JtaTransactionManager (bean name "transactionManager") backed by
+    // its UserTransactionManager.
 }
 ```
 
 ```java
 @Service
-@Transactional(transactionManager = "jtaTransactionManager")
+@Transactional   // the JTA transaction manager from the Atomikos starter
 public class PaymentExecutionService {
 
     private final AccountRepository accountRepository;
@@ -276,7 +281,8 @@ public class PaymentExecutionService {
 
     // Both the DB write and the JMS send are covered by the same XA transaction.
     // If JMS send fails after DB update, the whole transaction rolls back.
-    // If the coordinator crashes after prepare, Atomikos recovery commits on restart.
+    // If the coordinator crashes after logging COMMIT, Atomikos recovery commits on
+    // restart; if it crashes before, recovery rolls the prepared branches back.
     public PaymentResult executePayment(PaymentCommand cmd) {
         Account source = accountRepository.findByIdForUpdate(cmd.sourceAccountId())
             .orElseThrow(() -> new AccountNotFoundException(cmd.sourceAccountId()));
@@ -344,28 +350,20 @@ public class HeuristicRecoveryService {
 
 ## Atomikos Transaction Log and Recovery Configuration
 
-```yaml
-# application.yml — Atomikos JTA configuration
-spring:
-  jta:
-    atomikos:
-      datasource:
-        borrow-connection-timeout: 30
-        max-lifetime: 600
-        min-pool-size: 5
-        max-pool-size: 20
-      connectionfactory:
-        borrow-connection-timeout: 30
-      properties:
-        service:
-          # Transaction log directory — must survive restarts
-          log-base-dir: /var/data/atomikos/tx-logs
-          # How long to keep completed transaction entries
-          max-timeout: 300000
-          # Allow Atomikos to recover incomplete transactions on startup
-          enable-logging: true
-          # Checkpoint interval for log compaction
-          checkpoint-interval: 500
+```properties
+# jta.properties — Atomikos transaction service settings
+# Transaction log directory — must be on durable storage that survives restarts
+com.atomikos.icatch.log_base_dir=/var/data/atomikos/tx-logs
+# Logging must stay on: without the log, crashed transactions cannot be recovered
+com.atomikos.icatch.enable_logging=true
+# Maximum timeout (ms) any transaction may request
+com.atomikos.icatch.max_timeout=300000
+# Default transaction timeout (ms)
+com.atomikos.icatch.default_jta_timeout=10000
+# Log checkpoint interval (number of writes) for log compaction
+com.atomikos.icatch.checkpoint_interval=500
+# Unique name per instance — two pods must never share a log directory
+com.atomikos.icatch.tm_unique_name=payment-service-${POD_NAME}
 ```
 
 > [!NOTE]
@@ -377,18 +375,18 @@ The costs of 2PC are significant and compound at scale:
 
 | Factor | 2PC Cost | Impact |
 |---|---|---|
-| Latency | 2 round-trips (Prepare + Commit) across all RMs | P99 adds 20–80ms per remote participant |
+| Latency | 2 extra round-trips (Prepare + Commit) and forced log writes | Adds milliseconds to every transaction; more across data centres |
 | Lock holding | Locks held from Prepare until final Commit across all RMs | Contention spikes during coordinator slowness |
 | Coordinator SPOF | All transactions block during coordinator unavailability | Availability limited by coordinator uptime |
-| Cloud hostility | Most managed cloud services do not support XA | Cannot use RDS, Cloud Spanner, Pub/Sub with 2PC |
-| Throughput | Coordinator is a bottleneck above ~5,000 TPS | Does not scale horizontally |
+| Cloud hostility | Many managed services offer no XA (SQS, DynamoDB, Pub/Sub, Kafka) | Only XA-capable RMs can join; on RDS/Aurora PostgreSQL `max_prepared_transactions` must be raised |
+| Throughput | Coordinator log fsyncs and lock hold time cap throughput | Hard to scale horizontally |
 | Operational complexity | Heuristic resolution, tx log management, recovery testing | High SRE burden |
 
 Modern alternatives:
 
 - **Saga pattern** — a sequence of local transactions with compensating transactions for rollback. No distributed locking. Eventual consistency. Preferred for microservices.
-- **Outbox pattern** — write an event to an outbox table in the same local DB transaction as the state change. A relay process publishes from the outbox atomically. No XA required.
-- **Transactional inbox** — idempotent event consumers deduplication achieves at-least-once-effectively-exactly-once without 2PC.
+- **Outbox pattern** — write an event to an outbox table in the same local DB transaction as the state change. A relay process (polling or CDC with Debezium) later publishes from the outbox, at least once. No XA required.
+- **Transactional inbox** — consumers record each processed event ID in the same local transaction as their effect, so at-least-once delivery has an exactly-once effect without 2PC.
 
 ## When 2PC Remains Appropriate
 
@@ -399,11 +397,11 @@ Modern alternatives:
 | Single data centre, all RMs on same hardware | Latency and availability concerns minimal |
 | All RMs from same vendor (Oracle DB + Oracle AQ) | Optimised XA paths, vendor-managed recovery |
 | Strict regulatory ACID requirement across two stores | Compliance mandates synchronous atomicity |
-| Low transaction volume (< 500 TPS per coordinator) | Throughput ceiling acceptable |
+| Moderate transaction volume | Throughput ceiling acceptable |
 | Short-lived project with no cloud migration planned | Operational complexity justified |
 
 > [!TIP]
-> When in doubt, prefer the outbox pattern over 2PC. The outbox pattern achieves the same effective guarantee (DB write and message publish are atomic) with lower latency, no blocking, and full compatibility with managed cloud services. 2PC is a last resort, not a first choice.
+> When in doubt, prefer the outbox pattern over 2PC. The outbox pattern guarantees that a committed state change is eventually published (at least once — consumers must deduplicate), with lower latency, no blocking, and full compatibility with managed cloud services. 2PC is a last resort, not a first choice.
 
 ## Knowledge Check
 
@@ -413,19 +411,19 @@ A: It must commit the transaction. The write of the global-commit decision to th
 
 **Q2: Your payment service uses Atomikos JTA to coordinate a PostgreSQL XA datasource and an ActiveMQ XA connection factory. Under load testing at 8,000 TPS you observe that P99 latency doubles and PostgreSQL row locks are held for 180ms on average. What is the most likely cause, and what should you do?**
 
-A: The latency increase is caused by lock contention during the Prepare phase: PostgreSQL holds row locks from the time `XA PREPARE` is received until `XA COMMIT` is sent. At 8,000 TPS the coordinator is saturated, increasing the gap between Prepare and Commit and extending lock hold time. The doubling of P99 is a classic 2PC throughput ceiling. The correct architectural response is to migrate to the outbox pattern: write the payment event to an outbox table in the same local PostgreSQL transaction, and use Debezium or a polling relay to publish to ActiveMQ. This eliminates XA entirely, removes the coordinator bottleneck, and reduces lock hold time to the duration of a single local transaction.
+A: The latency increase is caused by lock contention: PostgreSQL holds the row locks taken by the UPDATE until `XA COMMIT` arrives, and the prepared transaction keeps them across both phases. At 8,000 TPS the coordinator is saturated, increasing the gap between Prepare and Commit and extending lock hold time. The doubling of P99 is a classic 2PC throughput ceiling. The correct architectural response is to migrate to the outbox pattern: write the payment event to an outbox table in the same local PostgreSQL transaction, and use Debezium or a polling relay to publish to ActiveMQ. This eliminates XA entirely, removes the coordinator bottleneck, and reduces lock hold time to the duration of a single local transaction.
 
 ## Practical Challenge
 
-**Scenario:** You are the principal engineer at a payment processor. The current implementation uses Atomikos JTA to coordinate a PostgreSQL XA datasource and an ActiveMQ XA connection factory for all payment executions. The system processes 3,000 TPS at peak and is about to migrate to AWS (RDS Aurora, Amazon MQ).
+**Scenario:** You are the principal engineer at a payment processor. The current implementation uses Atomikos JTA to coordinate a PostgreSQL XA datasource and an ActiveMQ XA connection factory for all payment executions. The system processes 3,000 TPS at peak and is about to migrate to AWS: Aurora PostgreSQL for the database and Amazon SQS instead of ActiveMQ, running on Kubernetes.
 
 **Tasks:**
 
-1. **Identify the migration blocker:** Explain why the existing 2PC/XA approach will not work with Amazon RDS Aurora and Amazon MQ. What specific AWS limitation prevents XA support, and what error would you expect when attempting to use `PGXADataSource` against Aurora?
+1. **Identify the migration blockers:** Explain why the existing 2PC/XA approach will not work after the move. SQS has no XA support at all. For Aurora PostgreSQL, what error do you get from `PGXADataSource` while `max_prepared_transactions` is 0, and why is a durable, per-pod Atomikos transaction log hard to keep on Kubernetes?
 
 2. **Design the outbox replacement:** Sketch the table schema for a `payment_outbox` table in PostgreSQL and write a Spring `@Transactional` service method that atomically debits an account and inserts a row into the outbox — all within a single local transaction, no JTA required.
 
-3. **Write a Debezium-compatible relay query:** Write the SQL query a relay process would use to poll unpublished outbox entries, and write the update statement that marks them as published. Explain why the relay must use a row-level lock (`SELECT FOR UPDATE SKIP LOCKED`) rather than a plain `SELECT`.
+3. **Write a polling relay query:** Write the SQL query a relay process would use to poll unpublished outbox entries, and write the update statement that marks them as published. Explain why the relay must use a row-level lock (`SELECT FOR UPDATE SKIP LOCKED`) rather than a plain `SELECT`.
 
 4. **Handle the heuristic incident runbook:** Write a step-by-step runbook (minimum 5 steps) for responding to a `HeuristicMixedException` alert in the current 2PC system. Include how to query PostgreSQL for transactions in PREPARED state, how to query ActiveMQ for incomplete XA sessions, and what the resolution criteria for each resource manager are.
 
@@ -462,25 +460,25 @@ A: The latency increase is caused by lock contention during the Prepare phase: P
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Two-Phase Commit and XA Transactions \u2014 Production Implementation",
+  "title": "Replace XA 2PC with the Outbox Pattern Before a Cloud Migration",
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
     {
       "id": "1",
-      "description": "Identify the migration blocker:"
+      "description": "Identify the migration blockers: explain why the Atomikos PostgreSQL + ActiveMQ XA setup will not work after moving to Aurora PostgreSQL and Amazon SQS on Kubernetes — SQS has no XA, PGXADataSource fails while max_prepared_transactions is 0, and a durable per-pod transaction log is hard to keep."
     },
     {
       "id": "2",
-      "description": "Design the outbox replacement:"
+      "description": "Design the outbox replacement: define a payment_outbox table in PostgreSQL and write a Spring @Transactional service method that debits an account and inserts the outbox row in one local transaction, with no JTA."
     },
     {
       "id": "3",
-      "description": "Write a Debezium-compatible relay query:"
+      "description": "Write a polling relay: the SQL that selects unpublished outbox rows with SELECT ... FOR UPDATE SKIP LOCKED and the UPDATE that marks them published. Explain why SKIP LOCKED is needed when several relay instances run, and why consumers must still deduplicate."
     },
     {
       "id": "4",
-      "description": "Handle the heuristic incident runbook:"
+      "description": "Write a HeuristicMixedException runbook (at least 5 steps) for the current 2PC system: how to list prepared transactions in PostgreSQL (pg_prepared_xacts), how to inspect incomplete XA sessions in ActiveMQ, and the criteria for committing or rolling back each branch."
     }
   ]
 }

@@ -261,16 +261,29 @@ public class RacingPaymentService {
 ```
 
 ```java17
-// FIX: computeIfAbsent — atomic check-and-insert
+// FIX: putIfAbsent of a future — atomic check-and-insert, with the payment
+// itself run OUTSIDE the map's lock. (computeIfAbsent(key, k -> executePayment(p))
+// would hold the bucket lock during a slow remote call — see lesson 6.)
 public class IdempotentPaymentService {
 
-    private final ConcurrentHashMap<String, PaymentResult> processed
+    private final ConcurrentHashMap<String, CompletableFuture<PaymentResult>> processed
         = new ConcurrentHashMap<>();
 
     public PaymentResult process(String idempotencyKey, Payment payment) {
-        // computeIfAbsent is atomic: only one thread executes the function
-        // If key already exists, the existing result is returned immediately
-        return processed.computeIfAbsent(idempotencyKey, k -> executePayment(payment));
+        CompletableFuture<PaymentResult> mine = new CompletableFuture<>();
+        CompletableFuture<PaymentResult> existing = processed.putIfAbsent(idempotencyKey, mine);
+        if (existing != null) {
+            return existing.join();          // another thread owns this key: wait for it
+        }
+        try {
+            PaymentResult result = executePayment(payment);   // only one thread gets here
+            mine.complete(result);
+            return result;
+        } catch (RuntimeException e) {
+            processed.remove(idempotencyKey, mine);  // let a later retry try again
+            mine.completeExceptionally(e);
+            throw e;
+        }
     }
 
     private PaymentResult executePayment(Payment payment) { /* ... */ return null; }
@@ -278,26 +291,31 @@ public class IdempotentPaymentService {
 ```
 
 ```java21
-// FIX (Java 21 / Spring): Database-level unique constraint + @Transactional
-// The correct solution for distributed systems — in-memory maps don't survive restarts
+// FIX (Java 21 / Spring): database unique constraint — CLAIM FIRST
+// The correct solution for distributed systems — in-memory maps don't survive
+// restarts. Order matters: a "find, then execute, then save" version lets two
+// requests both execute the payment before one hits the constraint.
 @Service
-@Transactional
 public class IdempotentPaymentService {
 
-    private final PaymentRepository repository;
     private final IdempotencyKeyRepository idempotencyRepository;
+    private final TransactionTemplate tx;
 
     public PaymentResult process(String idempotencyKey, Payment payment) {
-        // Check for existing result (uses database index — fast)
-        return idempotencyRepository.findByKey(idempotencyKey)
-            .map(IdempotencyRecord::getResult) // Return cached result
-            .orElseGet(() -> {
-                // Unique constraint on idempotency_key column prevents duplicates
-                // If two transactions try to insert same key, one gets a constraint violation
-                PaymentResult result = executePayment(payment);
-                idempotencyRepository.save(new IdempotencyRecord(idempotencyKey, result));
-                return result;
-            });
+        // 1. Claim the key in its own committed transaction:
+        //    INSERT ... (key, status = 'IN_PROGRESS') ON CONFLICT DO NOTHING
+        boolean claimed = tx.execute(s -> idempotencyRepository.insertClaim(idempotencyKey));
+        if (!claimed) {
+            // Someone else owns this key: return their result, or 409 while in progress
+            return idempotencyRepository.findByKey(idempotencyKey)
+                .map(IdempotencyRecord::resultOrInProgress)
+                .orElseThrow();
+        }
+        // 2. Only the claim winner executes the payment
+        PaymentResult result = executePayment(payment, idempotencyKey);
+        // 3. Store the result
+        tx.executeWithoutResult(s -> idempotencyRepository.complete(idempotencyKey, result));
+        return result;
     }
 }
 ```
@@ -368,37 +386,42 @@ account.setBalance(balance - amount); // ← Lost update possible
 // FIX: synchronized block or CAS or database transaction
 ```
 
-### ThreadSanitizer / jcstress
+### jcstress
 
 ```java17
 // jcstress — write a stress test that reveals the race condition
 // Run with: java -jar jcstress.jar -t CheckThenActTest
 
 @JCStressTest
-@Outcome(id = "0",   expect = Expect.FORBIDDEN, desc = "Overdraft — race condition!")
-@Outcome(id = "100", expect = Expect.ACCEPTABLE, desc = "Thread 1 won")
-@Outcome(id = "200", expect = Expect.ACCEPTABLE, desc = "Thread 2 won")
+@Outcome(id = "-700", expect = Expect.FORBIDDEN,  desc = "Both debited — overdraft!")
+@Outcome(id = "100",  expect = Expect.ACCEPTABLE, desc = "Thread 1 (900) won")
+@Outcome(id = "200",  expect = Expect.ACCEPTABLE, desc = "Thread 2 (800) won")
 @State
 public class CheckThenActTest {
 
     private final AtomicLong balance = new AtomicLong(1000);
 
     @Actor
-    public void thread1(I_Result r) {
+    public void thread1() {
         if (balance.get() >= 900) {
             balance.addAndGet(-900);
         }
     }
 
     @Actor
-    public void thread2(I_Result r) {
+    public void thread2() {
         if (balance.get() >= 800) {
             balance.addAndGet(-800);
-            r.r1 = (int) balance.get();
         }
     }
+
+    // Runs after both actors: records the FINAL balance as the outcome
+    @Arbiter
+    public void arbiter(J_Result r) {
+        r.r1 = balance.get();
+    }
 }
-// jcstress reveals the -700 outcome — the race condition
+// jcstress reports the FORBIDDEN -700 outcome — the race condition
 ```
 
 ## Financial Race Condition Mitigation Hierarchy
@@ -426,10 +449,10 @@ graph TD
 |---|---|
 | Balance debit (in-memory) | CAS loop on `AtomicLong` |
 | Balance debit (database) | `SELECT ... FOR UPDATE` in `@Transactional` |
-| Duplicate payment prevention (JVM) | `ConcurrentHashMap.computeIfAbsent` |
+| Duplicate payment prevention (JVM) | `ConcurrentHashMap.putIfAbsent` of a `CompletableFuture` |
 | Duplicate payment prevention (distributed) | DB unique constraint on idempotency key |
 | Reward point accumulation | `ConcurrentHashMap.merge` |
-| Idempotency check + process | Atomic DB insert with unique constraint |
+| Idempotency check + process | Claim first: atomic DB insert with unique constraint, then process |
 | Account freeze + debit | Single DB transaction with row lock |
 | Rate snapshot update | `AtomicReference.set` on immutable snapshot |
 
@@ -482,7 +505,7 @@ graph TD
       "No problem — JPA @Transactional uses SERIALIZABLE isolation by default"
     ],
     "correct": 1,
-    "explanation": "Default Spring @Transactional uses READ_COMMITTED isolation. Two transactions can both read the account balance, both validate it as sufficient, and both proceed with a debit — the later save() overwrites the first. The fix: SELECT FOR UPDATE (findByIdForUpdate()) acquires a row lock preventing concurrent reads of the same row for update, or use @Version for optimistic locking which causes one transaction to fail with OptimisticLockException on conflict."
+    "explanation": "Spring's @Transactional uses the database's default isolation — READ COMMITTED in PostgreSQL. Two transactions can both read the account balance, both validate it as sufficient, and both proceed with a debit — the later save() overwrites the first (a lost update). The fix: SELECT FOR UPDATE (findByIdForUpdate()) takes a row lock so the second transaction waits for the first, or @Version optimistic locking makes one transaction fail with OptimisticLockException on conflict."
   }
 ] -->
 
@@ -499,11 +522,11 @@ graph TD
     },
     {
       "id": "pc-rc-02",
-      "description": "Implement a database-backed idempotent payment processor. The `processPayment(idempotencyKey, payment)` method must: (1) check for existing result, (2) execute payment, (3) store result — all within a @Transactional boundary with a unique constraint on idempotency_key. Handle the ConstraintViolationException that occurs when two threads race to insert the same key."
+      "description": "Implement a database-backed idempotent payment processor. `processPayment(idempotencyKey, payment)` must first CLAIM the key (an INSERT protected by a unique constraint, committed in its own transaction), then execute the payment only if the claim won, then store the result. Explain why the order \"check, execute, then save\" still allows a duplicate payment, and what callers that lose the claim should receive."
     },
     {
       "id": "pc-rc-03",
-      "description": "Write a jcstress test that reliably demonstrates the overdraft race condition in `RacingAccount.withdraw()` (check-then-act with AtomicLong). The test should have two actors each attempting to withdraw 70% of the balance simultaneously and an arbiter that checks for negative balance outcomes."
+      "description": "Write a jcstress test that reliably demonstrates the overdraft race condition in `RacingAccount.withdraw()` (check-then-act with AtomicLong). Use two actors that each try to withdraw 70% of the balance and an arbiter that records the final balance, with the negative-balance outcome marked FORBIDDEN."
     },
     {
       "id": "pc-rc-04",

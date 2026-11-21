@@ -47,6 +47,8 @@ references:
   - "PostgreSQL Documentation — Window Functions"
 ---
 
+## Overview
+
 Balance reconciliation is the control mechanism that detects when the financial system lies. A running balance stored on an account row is a performance optimisation — a cache of the mathematical truth that lives in the ledger entry sequence. Like all caches, it can drift. Concurrent update races, rolled-back transactions whose balance update landed, infrastructure failover mid-write, or a silent ORM bug can all cause the account row to report a balance that disagrees with the sum of its entries. Reconciliation finds those disagreements before a customer, a regulator, or an auditor does. This lesson builds the full reconciliation stack: internal spot checks, shadow balances, external ISO 20022 statement matching, and the schema that makes the results auditable.
 
 ## Learning Objectives
@@ -63,9 +65,9 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-In 2021, a UK challenger bank discovered during a routine audit that 1,247 customer accounts had balances that disagreed with the sum of their ledger entries, with discrepancies ranging from 1 cent to £4,312. The total gross discrepancy was £127,000. The root cause was a Kafka consumer that updated the account balance using an optimistic locking pattern but silently swallowed `OptimisticLockingFailureException` and logged a warning rather than retrying. The consumer had been deployed nine months earlier; the discrepancy had been accumulating since then.
+*Composite example:* a UK challenger bank discovers during a routine audit that 1,247 customer accounts had balances that disagreed with the sum of their ledger entries, with discrepancies ranging from 1 cent to £4,312. The total gross discrepancy was £127,000. The root cause was a Kafka consumer that updated the account balance using an optimistic locking pattern but silently swallowed `OptimisticLockingFailureException` and logged a warning rather than retrying. The consumer had been deployed nine months earlier; the discrepancy had been accumulating since then.
 
-The bank was required to report the incident to the FCA under COND 2.4 (Adequate Resources). It took three weeks and £380,000 in engineering labour to reconcile the affected accounts against the correct ledger sums and determine which customers were owed refunds. The correct balance was computed from the append-only ledger, confirming the value of maintaining the ledger as the source of truth. A nightly reconciliation job catching the first divergence the morning after the bad deployment would have reduced the correction window from nine months to 24 hours.
+The bank had to report the incident to its regulator. It took three weeks of engineering work to reconcile the affected accounts against the correct ledger sums and determine which customers were owed refunds. The correct balance was computed from the append-only ledger, confirming the value of maintaining the ledger as the source of truth. A nightly reconciliation job catching the first divergence the morning after the bad deployment would have reduced the correction window from nine months to 24 hours.
 
 > [!IMPORTANT]
 > Never auto-correct a balance discrepancy from code. Always raise an alert, produce an audit record, and require manual sign-off from two authorised officers before any corrective entry is posted. Auto-correction can mask the root cause and compound errors.
@@ -77,38 +79,29 @@ The definitive test is a SQL query that computes the sum of all ledger entries p
 ```sql
 -- Identify accounts where the stored balance disagrees with the ledger sum.
 -- Run against a consistent read snapshot (REPEATABLE READ or point-in-time replica).
+-- REVERSAL and ADJUSTMENT can go either way, so they carry an explicit direction.
+WITH ledger_sum AS (
+    SELECT
+        le.account_id,
+        SUM(CASE
+                WHEN le.entry_type IN ('CREDIT', 'INTEREST')
+                  OR (le.entry_type IN ('REVERSAL', 'ADJUSTMENT') AND le.direction = 'CREDIT')
+                    THEN  le.amount_cents
+                ELSE      -le.amount_cents
+            END) AS computed_balance
+    FROM ledger_entries le
+    GROUP BY le.account_id
+)
 SELECT
-    a.id                                              AS account_id,
+    a.id                                        AS account_id,
     a.iban,
-    a.balance_cents                                   AS stored_balance,
-    COALESCE(SUM(
-        CASE
-            WHEN le.entry_type IN ('CREDIT', 'INTEREST', 'REVERSAL', 'ADJUSTMENT')
-                THEN  le.amount_cents
-            WHEN le.entry_type IN ('DEBIT', 'FEE')
-                THEN -le.amount_cents
-        END
-    ), 0)                                             AS computed_balance,
-    a.balance_cents - COALESCE(SUM(
-        CASE
-            WHEN le.entry_type IN ('CREDIT', 'INTEREST', 'REVERSAL', 'ADJUSTMENT')
-                THEN  le.amount_cents
-            WHEN le.entry_type IN ('DEBIT', 'FEE')
-                THEN -le.amount_cents
-        END
-    ), 0)                                             AS drift_cents
+    a.balance_cents                             AS stored_balance,
+    COALESCE(ls.computed_balance, 0)            AS computed_balance,
+    a.balance_cents - COALESCE(ls.computed_balance, 0) AS drift_cents
 FROM accounts a
-LEFT JOIN ledger_entries le ON le.account_id = a.id
-GROUP BY a.id, a.iban, a.balance_cents
-HAVING a.balance_cents != COALESCE(SUM(
-    CASE
-        WHEN le.entry_type IN ('CREDIT', 'INTEREST', 'REVERSAL', 'ADJUSTMENT')
-            THEN  le.amount_cents
-        WHEN le.entry_type IN ('DEBIT', 'FEE')
-            THEN -le.amount_cents
-    END
-), 0)
-ORDER BY ABS(drift_cents) DESC;
+LEFT JOIN ledger_sum ls ON ls.account_id = a.id
+WHERE a.balance_cents <> COALESCE(ls.computed_balance, 0)
+ORDER BY ABS(a.balance_cents - COALESCE(ls.computed_balance, 0)) DESC;
 ```
 
 ```mermaid
@@ -131,51 +124,69 @@ flowchart TD
 
 ## Shadow Balance Pattern
 
-A shadow balance is a second `balance_cents` column (`shadow_balance_cents`) updated by an entirely independent code path — typically a Kafka consumer that processes a separate event stream, using different ORM queries and different connection pools. If the two balances agree, both code paths are correct. If they diverge, at least one is broken.
+A shadow balance is a second balance updated by an entirely independent code path — typically a Kafka consumer that processes the payment event stream, using different queries and a different connection pool. If the two balances agree, both code paths are probably correct. If they diverge, at least one is broken. Keep the shadow in **its own table**: a shadow column on the `accounts` row would make every shadow update lock the same hot row as the primary path.
 
 ```sql
-ALTER TABLE accounts
-    ADD COLUMN shadow_balance_cents BIGINT NOT NULL DEFAULT 0;
+-- Separate table: shadow updates never contend with the primary path's row locks
+CREATE TABLE shadow_balances (
+    account_id            UUID        PRIMARY KEY,
+    balance_cents         BIGINT      NOT NULL DEFAULT 0,
+    last_event_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
--- Index for fast nightly comparison
-CREATE INDEX idx_accounts_balance_drift
-    ON accounts (id)
-    WHERE balance_cents != shadow_balance_cents;
+-- Consumer-side deduplication: each event is applied at most once
+CREATE TABLE processed_shadow_events (
+    event_id              UUID        PRIMARY KEY,
+    processed_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
 ```java
 // Primary path — HTTP request handler → @Transactional service
 @Transactional
 public void creditAccount(UUID accountId, long amountCents, String ref) {
-    Account account = accountRepository.findByIdForUpdate(accountId);
+    Account account = accountRepository.findByIdForUpdate(accountId)
+        .orElseThrow(() -> new AccountNotFoundException(accountId));
     account.setBalanceCents(account.getBalanceCents() + amountCents);
-    accountRepository.save(account);
     ledgerRepository.save(LedgerEntry.credit(accountId, amountCents, ref));
 }
 
-// Shadow path — independent Kafka consumer on a different consumer group
-// Uses a separate Spring application context with a different datasource bean
+// Shadow path — independent Kafka consumer on its own consumer group and
+// its own data source / transaction manager. Deliberately different queries.
 @KafkaListener(topics = "payment-events", groupId = "shadow-balance-consumer")
-@Transactional("shadowTransactionManager")
+@Transactional("shadowTransactionManager")   // the offset is acked after this commits
 public void updateShadowBalance(PaymentEvent event) {
-    // Deliberately uses a different query to avoid sharing a code path
-    jdbcTemplate.update(
-        "UPDATE accounts SET shadow_balance_cents = shadow_balance_cents + ? WHERE id = ?",
-        event.amountCents(), event.accountId());
+    // Claim first: a redelivered event must not be counted twice
+    int claimed = shadowJdbc.update(
+        "INSERT INTO processed_shadow_events (event_id) VALUES (?) ON CONFLICT DO NOTHING",
+        event.eventId());
+    if (claimed == 0) {
+        return;   // duplicate delivery
+    }
+    shadowJdbc.update("""
+        INSERT INTO shadow_balances (account_id, balance_cents, last_event_at)
+        VALUES (?, ?, now())
+        ON CONFLICT (account_id) DO UPDATE
+           SET balance_cents = shadow_balances.balance_cents + EXCLUDED.balance_cents,
+               last_event_at = now()
+        """,
+        event.accountId(), event.signedAmountCents());   // + for credits, - for debits
 }
 ```
 
 ```sql
--- Nightly shadow balance comparison
+-- Nightly shadow balance comparison (outside the grace window)
 SELECT
-    id,
-    iban,
-    balance_cents,
-    shadow_balance_cents,
-    balance_cents - shadow_balance_cents AS drift_cents
-FROM accounts
-WHERE balance_cents != shadow_balance_cents
-ORDER BY ABS(balance_cents - shadow_balance_cents) DESC;
+    a.id,
+    a.iban,
+    a.balance_cents,
+    COALESCE(sb.balance_cents, 0)                 AS shadow_balance_cents,
+    a.balance_cents - COALESCE(sb.balance_cents, 0) AS drift_cents
+FROM accounts a
+LEFT JOIN shadow_balances sb ON sb.account_id = a.id
+WHERE a.balance_cents <> COALESCE(sb.balance_cents, 0)
+  AND COALESCE(sb.last_event_at, 'epoch') < now() - INTERVAL '60 seconds'
+ORDER BY ABS(a.balance_cents - COALESCE(sb.balance_cents, 0)) DESC;
 ```
 
 > [!NOTE]
@@ -183,7 +194,7 @@ ORDER BY ABS(balance_cents - shadow_balance_cents) DESC;
 
 ## Zero-Tolerance Policy
 
-Reconciliation in banking operates on a zero-tolerance basis. Any discrepancy greater than zero cents requires investigation. There is no "acceptable rounding error". The reasons are both regulatory (PCI-DSS Requirement 12.3, SOX Section 404) and operational — small discrepancies that are tolerated tend to grow.
+Reconciliation in banking operates on a zero-tolerance basis. Any discrepancy greater than zero cents requires investigation. There is no "acceptable rounding error" — with amounts in integer minor units there is nothing to round. The reasons are both regulatory (internal controls over financial reporting under SOX Section 404; safeguarding rules such as the UK's CASS 15 regime for payment and e-money firms, in force since May 2026, which requires regular internal and external reconciliations) and operational — small discrepancies that are tolerated tend to grow.
 
 ```java
 @Component
@@ -215,7 +226,7 @@ Correction requires a formal process: two authorised officers sign off, a correc
 
 ## External Reconciliation: ISO 20022 CAMT.053
 
-Internal reconciliation checks ledger entries against account balances. External reconciliation checks ledger entries against the bank's own bank statement — the CAMT.053 "Bank-to-Customer Account Report" published by the correspondent bank or card scheme each business day.
+Internal reconciliation checks ledger entries against account balances. External reconciliation checks ledger entries against the institution's own bank statement — the CAMT.053 "Bank-to-Customer Statement" that the account-servicing bank (for example a correspondent or safeguarding bank) sends each business day.
 
 ```mermaid
 flowchart LR
@@ -247,26 +258,31 @@ flowchart LR
 public class Camt053Parser {
 
     /**
-     * Parse a CAMT.053 XML statement using JAXB-generated classes
-     * from the ISO 20022 schema (pain.001.001.11, camt.053.001.08).
+     * Parse a CAMT.053 XML statement using JAXB (jakarta.xml.bind) classes
+     * generated from the ISO 20022 schema camt.053.001.08.
      */
     public List<ExternalTransaction> parse(InputStream camt053Xml) {
         try {
-            JAXBContext context = JAXBContext.newInstance(BankToCustomerStatementV08.class);
+            JAXBContext context = JAXBContext.newInstance(Document.class);
             Unmarshaller unmarshaller = context.createUnmarshaller();
-            BankToCustomerStatementV08 statement =
-                (BankToCustomerStatementV08) unmarshaller.unmarshal(camt053Xml);
+            // Bank files are external input: parse with external entities disabled (no XXE)
+            XMLStreamReader reader = secureXmlInputFactory().createXMLStreamReader(camt053Xml);
+            // The root element is <Document>, which wraps <BkToCstmrStmt>
+            Document document = unmarshaller.unmarshal(reader, Document.class).getValue();
+            BankToCustomerStatementV08 statement = document.getBkToCstmrStmt();
 
             return statement.getStmt().stream()
                 .flatMap(stmt -> stmt.getNtry().stream())
                 .map(entry -> new ExternalTransaction(
-                    entry.getNtryRef(),
-                    entry.getAmt().getValue().movePointRight(2).longValueExact(), // to cents
+                    matchingReference(entry),   // see note below
+                    // to minor units — assumes a 2-decimal currency; use the
+                    // currency's exponent for JPY (0) or BHD (3)
+                    entry.getAmt().getValue().movePointRight(2).longValueExact(),
                     entry.getCdtDbtInd().value(),  // "CRDT" or "DBIT"
                     entry.getBookgDt().getDt().toGregorianCalendar()
-                        .toZonedDateTime().toInstant()))
+                        .toZonedDateTime().toLocalDate()))
                 .toList();
-        } catch (JAXBException e) {
+        } catch (JAXBException | XMLStreamException e) {
             throw new Camt053ParseException("Failed to parse CAMT.053 statement", e);
         }
     }
@@ -292,8 +308,15 @@ public class ExternalReconciliationJob {
                 valueDate.atStartOfDay(ZoneOffset.UTC).toInstant(),
                 valueDate.plusDays(1).atStartOfDay(ZoneOffset.UTC).toInstant());
 
-        Map<String, ExternalTransaction> externalByRef = external.stream()
-            .collect(Collectors.toMap(ExternalTransaction::reference, Function.identity()));
+        // toMap() throws on duplicate keys — a duplicated statement line is itself
+        // a break, so detect it explicitly instead of crashing
+        Map<String, ExternalTransaction> externalByRef = new HashMap<>();
+        List<ExternalTransaction> duplicates = new ArrayList<>();
+        for (ExternalTransaction ext : external) {
+            if (externalByRef.putIfAbsent(ext.reference(), ext) != null) {
+                duplicates.add(ext);
+            }
+        }
         Map<String, LedgerEntry> internalByRef = internal.stream()
             .collect(Collectors.toMap(LedgerEntry::getTransactionRef, Function.identity()));
 
@@ -310,8 +333,10 @@ public class ExternalReconciliationJob {
         internalByRef.forEach((ref, internalEntry) -> {
             if (externalByRef.containsKey(ref)) {
                 ExternalTransaction ext = externalByRef.get(ref);
-                ReconciliationItemStatus status = internalEntry.getAmountCents()
-                    == ext.amountCents()
+                // Compare the amount AND the direction (a credit is not a debit)
+                boolean sameDirection = internalEntry.isCredit() == ext.isCredit();
+                ReconciliationItemStatus status =
+                    internalEntry.getAmountCents() == ext.amountCents() && sameDirection
                     ? ReconciliationItemStatus.MATCHED
                     : ReconciliationItemStatus.AMOUNT_MISMATCH;
                 items.add(ReconciliationItem.matched(run, ref, internalEntry, ext, status));
@@ -327,6 +352,8 @@ public class ExternalReconciliationJob {
                 items.add(ReconciliationItem.externalOnly(run, ref, ext));
             }
         });
+
+        duplicates.forEach(ext -> items.add(ReconciliationItem.duplicateExternal(run, ext.reference(), ext)));
 
         itemRepository.saveAll(items);
 
@@ -344,9 +371,14 @@ public class ExternalReconciliationJob {
 }
 ```
 
+> [!NOTE]
+> Choosing the matching key is the hardest part of external reconciliation. `NtryRef` is optional and often empty; the reference you sent usually comes back as the `EndToEndId` (or the bank's `AcctSvcrRef`) inside `NtryDtls/TxDtls/Refs`. One statement entry can also be a *batch* holding many transactions. Store the reference you sent on every ledger entry so this join is possible.
+
 ## Reconciliation Schema
 
-The reconciliation schema is itself append-only: runs and items are never updated after the fact. Corrections produce new runs.
+The reconciliation schema is itself append-only in spirit: items are never changed after a run completes, and corrections produce new runs. The only update allowed is the run's own status — `IN_PROGRESS` → `PASSED`/`FAILED`, and later `SUPERSEDED` when a rerun replaces it.
+
+One practical detail: an internal entry booked at 23:59 may appear on the next day's statement. Matching strictly by calendar date then produces false breaks. Treat an unmatched item as a *timing* difference for one business day, and escalate it only if it is still unmatched on the next day's statement.
 
 ```sql
 CREATE TYPE reconciliation_status AS ENUM (
@@ -357,7 +389,8 @@ CREATE TYPE reconciliation_item_status AS ENUM (
     'MATCHED',
     'AMOUNT_MISMATCH',
     'INTERNAL_ONLY',
-    'EXTERNAL_ONLY'
+    'EXTERNAL_ONLY',
+    'DUPLICATE_EXTERNAL'
 );
 
 CREATE TABLE reconciliation_runs (
@@ -403,7 +436,7 @@ CREATE INDEX idx_recon_runs_account_date
 
 **Q1: The nightly spot-check query runs at 02:00 UTC and reports zero discrepancies. At 09:00 UTC, an analyst notices that account `acc-7781` has a stored balance of £10,000 but its ledger entries sum to £9,850. How did this discrepancy appear after a clean nightly run, and what does this tell you about the architecture?**
 
-A: The discrepancy was introduced by a transaction that committed between 02:00 UTC (when the snapshot was taken) and 09:00 UTC (when the analyst noticed it). The nightly run was correct at the time of its snapshot — the bug surfaced in the subsequent nine hours. This tells you two things: (1) the spot-check is not real-time; discrepancies can accumulate for up to 24 hours before detection, and (2) the system has a code path that can update `balance_cents` without posting a corresponding ledger entry, or vice versa. The shadow balance pattern would have provided an earlier warning: if the shadow balance (updated by the independent Kafka consumer) also shows £10,000, the bug is in the primary write path; if the shadow shows £9,850, the bug is in the event that drives the shadow.
+A: The discrepancy was introduced by a transaction that committed between 02:00 UTC (when the snapshot was taken) and 09:00 UTC (when the analyst noticed it). The nightly run was correct at the time of its snapshot — the bug surfaced in the following seven hours. This tells you two things: (1) the spot-check is not real-time; discrepancies can accumulate for up to 24 hours before detection, and (2) the system has a code path that can update `balance_cents` without posting a corresponding ledger entry, or vice versa. The shadow balance pattern would have provided an earlier warning: if the shadow balance (updated by the independent Kafka consumer) also shows £10,000, the bug is in the primary write path; if the shadow shows £9,850, the bug is in the event that drives the shadow.
 
 ---
 
@@ -451,13 +484,13 @@ Your team is building the reconciliation infrastructure for a PSD2-licensed paym
     {
       "text": "Why must a zero-tolerance policy (any drift > 0 cents requires investigation) be maintained for balance reconciliation, and what is the correct process when a discrepancy is found?",
       "options": [
-        "Zero-tolerance is a regulatory requirement under PCI-DSS; small discrepancies can be auto-corrected by code if below $1 to avoid alert fatigue",
-        "Zero-tolerance is required by PCI-DSS Requirement 12.3 and SOX Section 404; small discrepancies that are tolerated tend to grow; the correct process is alert, audit record, and manual sign-off from two authorised officers before posting any corrective entry — code must never auto-correct silently",
+        "Zero-tolerance is a regulatory requirement; small discrepancies can be auto-corrected by code if below $1 to avoid alert fatigue",
+        "Zero-tolerance follows from internal-control and safeguarding rules (e.g. SOX Section 404, the UK CASS 15 safeguarding regime) and from experience that tolerated small discrepancies grow; the correct process is alert, audit record, and manual sign-off from two authorised officers before posting any corrective entry — code must never auto-correct silently",
         "Zero-tolerance means all discrepancies pause payment processing until resolved",
         "Zero-tolerance applies only to external reconciliation; internal reconciliation allows a $0.01 rounding tolerance"
       ],
       "correct": 1,
-      "explanation": "Zero-tolerance is both regulatory (PCI-DSS, SOX) and operational — tolerating small discrepancies creates a normalisation of deviance where growing errors go unnoticed. The correct correction process requires: (1) raise an alert and create an audit record of the discrepancy, (2) manual investigation to identify the root cause, (3) explicit sign-off from two authorised officers (four-eyes control), (4) post a corrective ledger entry of type ADJUSTMENT referencing the reconciliation run ID. Auto-correction from code masks root causes and can compound errors."
+      "explanation": "Zero-tolerance is both regulatory (internal controls over financial reporting, safeguarding reconciliation rules) and operational — tolerating small discrepancies creates a normalisation of deviance where growing errors go unnoticed. With integer minor units there is no rounding to excuse. The correct correction process requires: (1) raise an alert and create an audit record of the discrepancy, (2) manual investigation to identify the root cause, (3) explicit sign-off from two authorised officers (four-eyes control), (4) post a corrective ledger entry of type ADJUSTMENT referencing the reconciliation run ID. Auto-correction from code masks root causes and can compound errors."
     }
   ]
 }
@@ -469,10 +502,22 @@ Your team is building the reconciliation infrastructure for a PSD2-licensed paym
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Write the production SQL spot-check query inside a BEGIN; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; block. Extend it with a window function (LAST_VALUE or first_value OVER PARTITION BY account_id ORDER BY created_at DESC) to also identify accounts where the running_balance on the most recent ledger entry disagrees with balance_cents on the account row. These are two distinct failure modes — explain both: (a) balance updated without ledger entry, and (b) ledger entry posted without balance update."},
-    {"id": "2", "description": "Design the Kafka consumer that maintains shadow_balance_cents. The consumer must be idempotent (at-least-once delivery) using a processed_shadow_events table. Define the grace window policy: skip shadow comparison for accounts with payment_events posted within the last 60 seconds. Write the nightly comparison SQL query and implement a @Scheduled job that publishes ShadowBalanceDriftEvent for any account where |balance_cents - shadow_balance_cents| > 0 outside the grace window."},
-    {"id": "3", "description": "Implement ReconciliationAlertService that, upon receiving a ReconciliationFailureEvent, sends a structured Slack webhook alert (account_id, drift_cents, run_id, link to reconciliation_items) and creates an IncidentTicket in the incident management system. The service must be idempotent at the alert level — if the same run_id fires the event twice, only one Slack message and one ticket are created. The alert payload must NOT include any instruction to auto-correct the balance."},
-    {"id": "4", "description": "Implement the ExternalReconciliationJob Spring Batch step as an idempotent job: before processing, check if a reconciliation_run already exists for the same account_id and value_date with status != SUPERSEDED — if so, UPDATE its status to SUPERSEDED before creating a new run. Use a Spring Batch JobParameters with account_id+value_date as the unique key to prevent two simultaneous runs for the same parameters. The job must produce a summary with counts of MATCHED/INTERNAL_ONLY/EXTERNAL_ONLY/AMOUNT_MISMATCH and store the counts in reconciliation_runs.break_count."}
+    {
+      "id": "1",
+      "description": "Write the production SQL spot-check query inside a BEGIN; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; block. Extend it with a window function (LAST_VALUE or first_value OVER PARTITION BY account_id ORDER BY created_at DESC) to also identify accounts where the running_balance on the most recent ledger entry disagrees with balance_cents on the account row. These are two distinct failure modes — explain both: (a) balance updated without ledger entry, and (b) ledger entry posted without balance update."
+    },
+    {
+      "id": "2",
+      "description": "Design the Kafka consumer that maintains the shadow_balances table. The consumer must be idempotent (at-least-once delivery) using a processed_shadow_events table claimed with INSERT ... ON CONFLICT DO NOTHING in the same transaction as the balance update. Define the grace window policy: skip shadow comparison for accounts with events in the last 60 seconds. Write the nightly comparison SQL query and implement a @Scheduled job that publishes ShadowBalanceDriftEvent for any account where |balance_cents - shadow balance| > 0 outside the grace window."
+    },
+    {
+      "id": "3",
+      "description": "Implement ReconciliationAlertService that, upon receiving a ReconciliationFailureEvent, sends a structured Slack webhook alert (account_id, drift_cents, run_id, link to reconciliation_items) and creates an IncidentTicket in the incident management system. The service must be idempotent at the alert level — if the same run_id fires the event twice, only one Slack message and one ticket are created. The alert payload must NOT include any instruction to auto-correct the balance."
+    },
+    {
+      "id": "4",
+      "description": "Implement the ExternalReconciliationJob Spring Batch step as an idempotent job: before processing, check if a reconciliation_run already exists for the same account_id and value_date with status != SUPERSEDED — if so, UPDATE its status to SUPERSEDED before creating a new run. Use a Spring Batch JobParameters with account_id+value_date as the unique key to prevent two simultaneous runs for the same parameters. The job must produce a summary with counts of MATCHED/INTERNAL_ONLY/EXTERNAL_ONLY/AMOUNT_MISMATCH and store the counts in reconciliation_runs.break_count."
+    }
   ]
 }
 -->

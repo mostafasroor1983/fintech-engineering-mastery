@@ -66,13 +66,13 @@ Node A (thinks it's primary):       Node B (thinks it's primary):
 Partition heals:
   Conflict detected on account balance
   Which state is "true"? Neither and both.
-  Customer has overspent by £300. 
+  Customer has overspent by £300.
   Bank may have settled payments it cannot fund.
-  Potential regulatory breach: FCA requires accurate records within T+1.
+  The books no longer agree: records must be reconciled by hand.
 ```
 
-This is not a hypothetical. High-profile financial incidents caused by split-brain have resulted in:
-- Duplicate payments requiring manual reversal (average cost: £80–£200 per payment)
+Split-brain incidents in financial systems typically lead to:
+- Duplicate payments requiring manual reversal, each costing staff time and customer trust
 - Overdraft positions the customer did not authorise
 - Audit trails that contradict each other (Requirement 10 PCI DSS violation risk)
 - Reputational damage from customer-visible errors
@@ -102,9 +102,10 @@ Timeline of heartbeat failure detection:
 
 **The problem**: heartbeat timeout is a heuristic, not a proof. The primary might be alive but temporarily overloaded (GC pause, network blip). Too short a timeout causes false positives (unnecessary failovers). Too long a timeout increases mean time to detection.
 
-For fintech, recommended heartbeat settings for PostgreSQL/Patroni:
-- Heartbeat interval: 2 seconds
-- Failover timeout: 10–30 seconds (depending on RPO/RTO trade-off)
+For PostgreSQL with Patroni, the defaults are a good starting point:
+- `loop_wait: 10` — each node checks the cluster state every 10 seconds
+- `ttl: 30` — the leader key expires 30 seconds after the last renewal, which starts failover
+- Shorter values detect failure faster but cause more false failovers
 
 ### 2.2 Witness Node
 
@@ -123,9 +124,11 @@ A witness (tiebreaker) node is a lightweight third node that holds no data but p
             │  (no data)  │
             └─────────────┘
 
-If A and B are partitioned:
+If the partition cuts B off from both A and the witness:
   A cannot reach B, but CAN reach Witness → A has quorum (2/3) → stays primary
-  B cannot reach A, but CANNOT reach Witness → B has no quorum (1/3) → stays standby
+  B cannot reach A or the Witness → B has no quorum (1/3) → stays standby
+If both A and B can still reach the witness, the witness votes for only
+one of them, so there is still exactly one primary.
 ```
 
 ---
@@ -199,9 +202,10 @@ public class EpochAwareLeaderService {
         if (!isLeader.get()) {
             throw new NotLeaderException(currentEpoch.get());
         }
-        // Double-check after acquiring intent — epoch may have changed
         long epochAtStart = currentEpoch.get();
         action.run();
+        // This check DETECTS a lost leadership but cannot undo the action —
+        // only fencing at the storage layer actually prevents the damage
         if (currentEpoch.get() != epochAtStart) {
             throw new EpochChangedDuringExecutionException(epochAtStart, currentEpoch.get());
         }
@@ -270,18 +274,19 @@ public class FencedWriteService {
     /**
      * Writes a payment ledger entry only if our fencing token is still the
      * highest the database has seen. The check and write are atomic within
-     * the PostgreSQL stored procedure.
+     * the PostgreSQL function, which returns 1 (written) or 0 (rejected).
      */
     public void writeLedgerEntry(LedgerEntry entry) {
-        int rowsAffected = jdbc.update(
+        Integer rowsAffected = jdbc.queryForObject(   // a SELECT returns a result set
             "SELECT write_ledger_entry(?, ?, ?, ?)",
+            Integer.class,
             entry.accountId(),
             entry.amount(),
             entry.description(),
             myToken.value()   // passed to the stored procedure
         );
 
-        if (rowsAffected == 0) {
+        if (rowsAffected == null || rowsAffected == 0) {
             throw new StaleTokenException(
                 "Write rejected: our fencing token " + myToken +
                 " has been superseded. We are no longer the leader."
@@ -294,7 +299,10 @@ public class FencedWriteService {
 ### 4.3 PostgreSQL Stored Procedure Enforcing Fencing Tokens
 
 ```sql
--- Stores the highest fencing token this node has ever seen
+-- Stores the highest fencing token the database has seen.
+-- One row serialises ALL fenced writes; at high volume use one row per
+-- resource or shard. Note: this fences stale APPLICATION leaders — it cannot
+-- help if the database itself is split-brained (that is what quorum is for).
 CREATE TABLE cluster_fence_state (
     singleton_key  CHAR(1)  PRIMARY KEY DEFAULT 'X',
     max_token      BIGINT   NOT NULL DEFAULT 0,
@@ -352,24 +360,27 @@ STONITH is the guarantee that a potentially-alive-but-unreachable node is defini
 For on-premise servers, IPMI (Intelligent Platform Management Interface) provides out-of-band power control:
 
 ```bash
-# Confirm old primary is reachable before attempting STONITH
-ipmitool -H 10.10.0.5 -U admin -P secret chassis power status
+# -E reads the password from the IPMI_PASSWORD environment variable
+# (never put it on the command line, where it shows up in ps and shell history)
+
+# Confirm the old primary's BMC is reachable before attempting STONITH
+ipmitool -I lanplus -H 10.10.0.5 -U admin -E chassis power status
 
 # STONITH: power off the old primary node
-ipmitool -H 10.10.0.5 -U admin -P secret chassis power off
+ipmitool -I lanplus -H 10.10.0.5 -U admin -E chassis power off
 
 # Verify power state
-ipmitool -H 10.10.0.5 -U admin -P secret chassis power status
+ipmitool -I lanplus -H 10.10.0.5 -U admin -E chassis power status
 # → Chassis Power is off
 
-# Only after confirmation: bring up new primary
+# Only after confirmation: promote the new primary (if Patroni has not already)
 patronictl -c /etc/patroni/config.yml failover payment-cluster \
-  --master node-b --force
+  --candidate node-b --force
 ```
 
 ### 5.2 STONITH via AWS EC2 Stop API
 
-For cloud deployments, the equivalent is stopping (not rebooting) the EC2 instance:
+For cloud deployments, the equivalent is stopping (not rebooting) the EC2 instance. If a stop hangs, network fencing is the fallback: replace the instance's security groups with one that blocks all database traffic.
 
 ```java
 @Service
@@ -438,7 +449,8 @@ flowchart TD
     E -->|Yes| F[Promote new primary<br/>Begin accepting writes]
     E -->|No timeout| G[ALERT: Manual intervention<br/>required. Do NOT promote.]
     D --> H{Quorum available?<br/>N/2+1 nodes reachable}
-    H -->|Yes - old primary<br/>must be isolated| C
+    H -->|Yes| K[Fence another way:<br/>cut network or storage access,<br/>or wait out its lease + watchdog]
+    K --> F
     H -->|No - cannot determine| G
     F --> I[Update DNS / VIP]
     I --> J[Cluster operational]
@@ -501,13 +513,15 @@ public class QuorumVoter {
      * Attempt to gather votes for leader election in the given epoch.
      * Returns true only if we obtained quorum.
      */
+    // One executor for all vote requests (not one per request, which leaks)
+    private final ExecutorService voteExecutor =
+        Executors.newVirtualThreadPerTaskExecutor();
+
     public boolean seekQuorum(long epoch) {
         List<CompletableFuture<VoteResponse>> futures = allNodes.stream()
             .filter(node -> !node.isSelf())
             .map(node -> CompletableFuture.supplyAsync(
-                () -> node.requestVote(epoch),
-                Executors.newVirtualThreadPerTaskExecutor()
-            ))
+                () -> node.requestVote(epoch), voteExecutor))
             .collect(Collectors.toList());
 
         // We always vote for ourselves
@@ -543,7 +557,7 @@ public class QuorumVoter {
 
 ## 7. PostgreSQL Synchronous Replication
 
-PostgreSQL synchronous replication ensures that a transaction commit is not acknowledged to the client until at least one standby has written the WAL to disk. This guarantees zero data loss on primary failure.
+PostgreSQL synchronous replication ensures that a transaction commit is not acknowledged to the client until at least one standby has written the WAL to disk. This gives zero data loss on primary failure — provided failover promotes that synchronous standby (Patroni's `synchronous_mode` guarantees this).
 
 ### 7.1 postgresql.conf Settings
 
@@ -626,7 +640,8 @@ restapi:
   connect_address: 10.10.0.1:8008
   authentication:
     username: patroni
-    password: "${PATRONI_REST_PASSWORD}"  # from environment / secrets manager
+    # password: set PATRONI_RESTAPI_PASSWORD in the environment (Patroni does
+    # not expand ${...} inside this file)
 
 etcd3:
   hosts:
@@ -634,7 +649,7 @@ etcd3:
     - 10.10.1.2:2379
     - 10.10.1.3:2379
   username: patroni
-  password: "${ETCD_PASSWORD}"
+  # password: PATRONI_ETCD3_PASSWORD environment variable
 
 bootstrap:
   dcs:
@@ -643,7 +658,7 @@ bootstrap:
     retry_timeout: 10                      # timeout for DCS operations
     maximum_lag_on_failover: 1048576       # 1 MB max WAL lag allowed for promotion
     synchronous_mode: true                 # enforce synchronous replication
-    synchronous_mode_strict: true          # refuse to promote async standby
+    synchronous_mode_strict: true          # never fall back to async: block writes if no sync standby
 
     postgresql:
       use_pg_rewind: true                  # use pg_rewind to resync old primary
@@ -665,22 +680,21 @@ postgresql:
     hot_standby:               "on"
     max_connections:           500
     synchronous_commit:        "on"
-    synchronous_standby_names: "FIRST 1 (payment-db-2, payment-db-3)"
+    # synchronous_standby_names is managed by Patroni in synchronous_mode
     max_wal_senders:           10
     wal_keep_size:             "1024"
 
   authentication:
+    # Passwords: PATRONI_REPLICATION_PASSWORD and PATRONI_SUPERUSER_PASSWORD
     replication:
       username: replicator
-      password: "${REPLICATION_PASSWORD}"
     superuser:
       username: postgres
-      password: "${POSTGRES_SUPERUSER_PASSWORD}"
 
 tags:
   nofailover:  false
   noloadbalance: false
-  clonedfrom:  false
+  clonefrom:   false
   nosync:      false
 
 watchdog:
@@ -739,7 +753,7 @@ CAP theorem states that in the presence of a network partition, a distributed sy
 | Downtime risk | Yes — system is unavailable during partition | No — both sides remain operational |
 | Suitable for | Financial accounts, ledgers, payment state | Shopping carts, user preferences, counters |
 
-**For payment systems, CP is non-negotiable.** A £1,000 account cannot be £2,000 even temporarily. It is always better to reject a payment with an error than to accept it and create a double-debit. FCA Principle 3 (management and control) and PS 2/22 (operational resilience) require that the system maintains accurate data, not just availability.
+**For payment systems, CP is non-negotiable for balances and ledgers.** A £1,000 account cannot be £2,000 even temporarily. It is always better to reject a payment with an error than to accept it and create a double-debit. Operational-resilience rules (FCA PS21/3) also ask firms to stay within impact tolerances for outages — which is why a CP system must fail over quickly and automatically, but never by accepting writes on both sides of a partition.
 
 ```java
 // CP-first configuration: fail writes if quorum is unavailable
@@ -749,17 +763,16 @@ public class PaymentDataSourceConfig {
     @Bean
     public DataSource paymentDataSource(DataSourceProperties props) {
         HikariDataSource ds = new HikariDataSource();
-        ds.setJdbcUrl(props.getUrl());
+        // List every node; the PostgreSQL JDBC driver connects only to the one
+        // that is currently primary (read-write) and never to a standby
+        ds.setJdbcUrl("jdbc:postgresql://payment-db-1:5432,payment-db-2:5432,"
+            + "payment-db-3:5432/payments?targetServerType=primary");
         ds.setUsername(props.getUsername());
         ds.setPassword(props.getPassword());
 
         // Fail fast if no primary is available — do NOT fall back to a stale standby
         ds.setConnectionTimeout(5_000);    // 5s to get a connection
         ds.setMaximumPoolSize(50);
-        ds.setConnectionTestQuery(
-            "SELECT 1 FROM pg_is_in_recovery() WHERE pg_is_in_recovery() = false"
-            // This query fails on standbys — ensures we only connect to primary
-        );
         return ds;
     }
 }
@@ -890,7 +903,7 @@ WHERE name = 'synchronous_commit'
   AND setting != 'on';
 ```
 
-**Mitigation**: Configure `synchronous_standby_names` with a list of standbys and use `FIRST 1 (...)` semantics so there is always at least one candidate. Add monitoring that alerts within 60 seconds if the synchronous standby falls behind or disconnects.
+**Mitigation**: Configure `synchronous_standby_names` with a list of standbys and use `FIRST 1 (...)` semantics so there is always at least one candidate. With Patroni, non-strict `synchronous_mode` makes this choice explicit: it switches to another standby, or to async when none is left (accepting a small data-loss risk), while `synchronous_mode_strict` blocks writes instead. Add monitoring that alerts within 60 seconds if the synchronous standby falls behind or disconnects.
 
 ### Pitfall 2: False Split-Brain Detection Causing Unnecessary Failover
 
@@ -965,6 +978,9 @@ public ProcessingResult processPayment(Payment payment) {
     if (balance.isSufficient(payment.amount())) {
         ledgerService.writeLedgerEntry(payment); // also fenced
     }
+    // The leader checks only narrow the window. The robust fix is to do the
+    // balance check and the fenced write in ONE transaction (lock the balance
+    // row with SELECT ... FOR UPDATE inside write_ledger_entry).
 }
 ```
 
@@ -990,13 +1006,13 @@ etcd3:
 @Component
 public class ConsensusStoreHealthIndicator implements HealthIndicator {
 
-    private final EtcdClient etcdClient;
+    private final Client etcdClient;   // io.etcd.jetcd.Client
 
     @Override
     public Health health() {
         try {
-            StatusResponse status = etcdClient.maintenance()
-                .statusMember(0L)
+            StatusResponse status = etcdClient.getMaintenanceClient()
+                .statusMember("http://10.10.1.1:2379")   // check each member in turn
                 .get(2, TimeUnit.SECONDS);
 
             long leader = status.getLeader();
@@ -1025,7 +1041,7 @@ public class ConsensusStoreHealthIndicator implements HealthIndicator {
 
 - [ ] PostgreSQL cluster has minimum 3 nodes (1 primary + 2 standbys)
 - [ ] `synchronous_commit = on` with at least 1 named synchronous standby
-- [ ] `synchronous_standby_names` uses `FIRST 1 (...)` with 2 candidates listed
+- [ ] `synchronous_standby_names` uses `FIRST 1 (...)` with 2 candidates listed (or Patroni `synchronous_mode` manages it)
 - [ ] etcd cluster has 3 nodes across separate availability zones
 - [ ] Patroni watchdog mode set to `required`
 - [ ] STONITH mechanism tested quarterly in controlled failover drill
@@ -1052,7 +1068,7 @@ public class ConsensusStoreHealthIndicator implements HealthIndicator {
 - [ ] Split-brain recovery runbook reviewed and practised annually
 - [ ] Dual-primary simulation tested in staging environment
 - [ ] RTO confirmed: < 30 seconds for automatic failover
-- [ ] RPO confirmed: 0 data loss with synchronous_commit = on
+- [ ] RPO confirmed: 0 data loss with synchronous_commit = on and failover only to the sync standby
 - [ ] Recovery coordinator can categorise and route conflicts automatically
 
 ---
@@ -1062,5 +1078,5 @@ public class ConsensusStoreHealthIndicator implements HealthIndicator {
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{"title":"Implement Split-Brain Prevention for a Payment Cluster","difficulty":"advanced","estimatedMinutes":130,"tasks":[{"id":"1","description":"Implement a FencingToken record class and a FencedWriteService that calls a PostgreSQL stored procedure write_ledger_entry. The stored procedure must atomically check that the incoming token is not less than the max_token in a cluster_fence_state table, update the max_token, and perform the ledger insert. The service must throw StaleTokenException when the stored procedure returns 0 rows affected."},{"id":"2","description":"Implement an AwsStonithService that calls the EC2 stopInstances API with force=true, then polls DescribeInstances until the instance state is STOPPED or a 120-second timeout is reached. The service must record an audit entry at initiation and at completion or timeout. On timeout it must log an error and return a StonithResult.timeout() — it must NOT proceed with leader promotion."},{"id":"3","description":"Write a Patroni configuration YAML for a 3-node payment cluster using etcd3 for consensus. The configuration must enable synchronous_mode: true, synchronous_mode_strict: true, set synchronous_standby_names to FIRST 1 with two named standbys, set maximum_lag_on_failover to 1 MB, and configure the watchdog as required. Include pg_hba rules for replication connections from a 10.10.0.0/24 subnet."},{"id":"4","description":"Implement a QuorumVoter that tracks all cluster nodes, computes quorumSize as (N/2)+1, and solicits votes from all non-self nodes using CompletableFuture with a 500ms timeout per node vote. The method must return true as soon as it accumulates quorum votes (counting self-vote as 1), and log a warning with the final vote tally if quorum is not achieved. Add a GraduatedFailoverService that only calls QuorumVoter after a CONFIRM_THRESHOLD of missed heartbeats, never on the first miss."}]}
+{"title": "Implement Split-Brain Prevention for a Payment Cluster", "difficulty": "advanced", "estimatedMinutes": 130, "tasks": [{"id": "1", "description": "Implement a FencingToken record class and a FencedWriteService that calls a PostgreSQL stored procedure write_ledger_entry. The stored procedure must atomically check that the incoming token is not less than the max_token in a cluster_fence_state table, update the max_token, and perform the ledger insert. The service must throw StaleTokenException when the stored procedure returns 0 rows affected."}, {"id": "2", "description": "Implement an AwsStonithService that calls the EC2 stopInstances API with force=true, then polls DescribeInstances until the instance state is STOPPED or a 120-second timeout is reached. The service must record an audit entry at initiation and at completion or timeout. On timeout it must log an error and return a StonithResult.timeout() — it must NOT proceed with leader promotion."}, {"id": "3", "description": "Write a Patroni configuration YAML for a 3-node payment cluster using etcd3 for consensus. The configuration must enable synchronous_mode: true and synchronous_mode_strict: true (letting Patroni manage synchronous_standby_names, with synchronous_node_count: 1), set maximum_lag_on_failover to 1 MB, configure the watchdog as required, and take all passwords from PATRONI_* environment variables. Include pg_hba rules for replication connections from a 10.10.0.0/24 subnet."}, {"id": "4", "description": "Implement a QuorumVoter that tracks all cluster nodes, computes quorumSize as (N/2)+1, and solicits votes from all non-self nodes using CompletableFuture with a 500ms timeout per node vote. The method must return true as soon as it accumulates quorum votes (counting self-vote as 1), and log a warning with the final vote tally if quorum is not achieved. Add a GraduatedFailoverService that only calls QuorumVoter after a CONFIRM_THRESHOLD of missed heartbeats, never on the first miss."}]}
 -->

@@ -11,6 +11,8 @@ tags: [outbox-pattern, transactional-outbox, CDC, Debezium, reliable-messaging]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 Every distributed system built on microservices eventually confronts the same brutal constraint: you cannot atomically commit a database write and publish a message to a broker in a single operation. The Transactional Outbox pattern resolves this by treating the outbox table as a durable, append-only staging area that is part of the same local ACID transaction as your business data. What reaches the message broker is derived from what is already committed to the database — not the other way around. For payment systems where a missed event means a frozen transfer or an unsettled ledger entry, this distinction is the difference between a minor anomaly and a regulatory incident.
 
 ## Learning Objectives
@@ -25,7 +27,7 @@ Every distributed system built on microservices eventually confronts the same br
 
 ## Business Context
 
-In March 2022, a European neobank processing roughly 400,000 intraday payments lost event delivery for 11 minutes during a rolling JVM restart. The root cause was a classic dual-write race: the payment service wrote the payment record to PostgreSQL, then published the `payment.initiated` event to Kafka, then returned HTTP 200. During the restart window, the JVM was killed after the database commit but before the Kafka `send()` returned an acknowledgment. Approximately 1,400 payments never received their `payment.initiated` event. The fraud-screening service, the ledger-posting service, and the external processor adapter were all event-driven — none of them saw those payments. Settlement reconciliation the following morning surfaced a €2.3 million discrepancy. The engineering post-mortem identified two contributing factors: no outbox table, and no idempotent consumer design. Both were absent because the architects had assumed the Kafka producer client's internal retry would cover transient failures. It does not cover a JVM crash.
+*Composite example:* a European neobank processing roughly 400,000 intraday payments lost event delivery for 11 minutes during a rolling JVM restart. The root cause was a classic dual-write race: the payment service wrote the payment record to PostgreSQL, then published the `payment.initiated` event to Kafka, then returned HTTP 200. During the restart window, the JVM was killed after the database commit but before the Kafka `send()` returned an acknowledgment. Approximately 1,400 payments never received their `payment.initiated` event. The fraud-screening service, the ledger-posting service, and the external processor adapter were all event-driven — none of them saw those payments. Settlement reconciliation the following morning surfaced a €2.3 million discrepancy. The engineering post-mortem identified two contributing factors: no outbox table, and no idempotent consumer design. Both were absent because the architects had assumed the Kafka producer client's internal retry would cover transient failures. It does not cover a JVM crash.
 
 ## The Dual-Write Problem
 
@@ -44,7 +46,7 @@ The database transaction commits at the closing brace of `@Transactional`. The K
 
 1. **JVM crash after DB commit, before Kafka send** — event is lost permanently.
 2. **Kafka broker unavailable at send time** — event is lost unless the producer retries and succeeds before the connection pool times out.
-3. **DB commit succeeds but rollback is triggered by an exception thrown after the send** — the event was already delivered to Kafka, but the payment does not exist in the database. The consumer sees a ghost event.
+3. **An exception thrown after the send rolls back the database transaction** — the event was already delivered to Kafka, but the payment does not exist in the database. The consumer sees a ghost event.
 
 No amount of Kafka producer retry configuration closes window 1 or window 3. The only correct solution moves event publication inside the same ACID boundary as the business data.
 
@@ -183,23 +185,32 @@ public class OutboxRelay {
     private final KafkaTemplate<String, String> kafkaTemplate;
 
     @Scheduled(fixedDelay = 100) // milliseconds
-    @Transactional
+    @Transactional   // the row locks from FOR UPDATE SKIP LOCKED last as long as this
     public void relay() {
         List<OutboxEvent> batch = relayRepo.findPendingBatch(BATCH_SIZE);
         if (batch.isEmpty()) return;
 
+        Set<String> blocked = new HashSet<>();   // aggregates with a failed event
         for (OutboxEvent event : batch) {
+            // Do not publish a later event of an aggregate whose earlier event
+            // failed — consumers would see that aggregate out of order
+            if (blocked.contains(event.getAggregateId())) continue;
             String topic = resolveTopicName(event.getEventType());
             try {
-                kafkaTemplate
-                    .send(topic, event.getAggregateId(), event.getPayload())
-                    .get(5, TimeUnit.SECONDS); // synchronous ack
+                ProducerRecord<String, String> record =
+                        new ProducerRecord<>(topic, event.getAggregateId(), event.getPayload());
+                // The outbox row id travels as a header: consumers use it as
+                // their idempotency key
+                record.headers().add("outbox_event_id",
+                        event.getId().toString().getBytes(StandardCharsets.UTF_8));
+                kafkaTemplate.send(record).get(5, TimeUnit.SECONDS); // synchronous ack
 
                 event.setPublishedAt(OffsetDateTime.now());
                 relayRepo.save(event);
 
             } catch (Exception ex) {
                 // Leave published_at NULL — will be retried next cycle
+                blocked.add(event.getAggregateId());
                 log.error("Relay failed for event {}: {}",
                     event.getId(), ex.getMessage());
             }
@@ -273,6 +284,7 @@ Configure Debezium via Kafka Connect REST API:
     "database.user":      "debezium",
     "database.password":  "${file:/secrets/debezium.properties:password}",
     "database.dbname":    "payments",
+    "topic.prefix":       "payments-db",
     "table.include.list": "public.outbox_events",
     "plugin.name":        "pgoutput",
     "transforms":         "outbox",
@@ -280,6 +292,10 @@ Configure Debezium via Kafka Connect REST API:
         "io.debezium.transforms.outbox.EventRouter",
     "transforms.outbox.table.field.event.type": "event_type",
     "transforms.outbox.table.field.event.key":  "aggregate_id",
+    "transforms.outbox.table.field.event.id":   "id",
+    "transforms.outbox.table.field.event.payload": "payload",
+    "transforms.outbox.route.by.field":         "aggregate_type",
+    "transforms.outbox.table.fields.additional.placement": "id:header:outbox_event_id",
     "transforms.outbox.route.topic.replacement":
         "payments.${routedByValue}"
   }
@@ -309,11 +325,12 @@ Configure the Kafka producer to prevent broker-side duplicates within a single p
 @Configuration
 public class KafkaProducerConfig {
 
+    // "${...}" is not resolved inside a Java string literal — inject it
     @Bean
-    public ProducerFactory<String, String> producerFactory() {
+    public ProducerFactory<String, String> producerFactory(
+            @Value("${kafka.bootstrap-servers}") String bootstrapServers) {
         Map<String, Object> props = new HashMap<>();
-        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG,
-            "${kafka.bootstrap-servers}");
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
         props.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
@@ -341,7 +358,10 @@ public void handlePaymentInitiated(
 
     UUID eventId = UUID.fromString(outboxEventId);
 
-    if (processedEventRepo.existsById(eventId)) {
+    // Claim first: INSERT ... ON CONFLICT (event_id) DO NOTHING.
+    // (existsById-then-save is check-then-act: two deliveries of the same
+    //  event, e.g. around a rebalance, could both pass the check.)
+    if (processedEventRepo.insertIfAbsent(eventId) == 0) {
         log.info("Skipping duplicate event {}", eventId);
         return;
     }
@@ -349,14 +369,12 @@ public void handlePaymentInitiated(
     PaymentInitiatedEvent event =
         mapper.readValue(record.value(), PaymentInitiatedEvent.class);
 
+    // Same @Transactional as the claim — both commit or neither does
     ledgerService.postEntry(event);
-
-    // Both writes in the same @Transactional — atomically safe
-    processedEventRepo.save(new ProcessedEvent(eventId, Instant.now()));
 }
 ```
 
-Store the `processedEventRepo` write in the same transaction as `ledgerService.postEntry`. If the ledger post fails, the event is not marked processed and will be retried on the next delivery.
+Keep the claim in the same transaction as `ledgerService.postEntry`. If the ledger post fails, the claim rolls back too, so the event is not marked processed and will be retried on the next delivery.
 
 ## Knowledge Check
 
@@ -366,7 +384,7 @@ Without `FOR UPDATE SKIP LOCKED`, two relay instances running concurrently will 
 
 **Q2: Debezium's replication slot can cause PostgreSQL disk usage to grow unexpectedly. Under what condition does this happen, and how do you prevent it?**
 
-PostgreSQL retains WAL segments until every replication slot has confirmed it has consumed them by advancing its `confirmed_flush_lsn`. If the Debezium connector falls behind — because Kafka is slow, the connector is paused, or the Kafka Connect worker is down — the slot stops advancing. PostgreSQL cannot delete WAL segments the slot has not yet read, so WAL accumulates on disk. In production clusters with high write throughput this can exhaust disk space in hours. Mitigations: monitor replication slot lag with `pg_replication_slots`, alert on `pg_wal_lsn_diff`, and set `max_slot_wal_keep_size` to allow PostgreSQL to drop the slot under extreme pressure. This triggers a connector restart but prevents a full database outage.
+PostgreSQL retains WAL segments until every replication slot has confirmed it has consumed them by advancing its `confirmed_flush_lsn`. If the Debezium connector falls behind — because Kafka is slow, the connector is paused, or the Kafka Connect worker is down — the slot stops advancing. PostgreSQL cannot delete WAL segments the slot has not yet read, so WAL accumulates on disk. In production clusters with high write throughput this can exhaust disk space in hours. Mitigations: monitor replication slot lag with `pg_replication_slots`, alert on `pg_wal_lsn_diff`, and set `max_slot_wal_keep_size` (PostgreSQL 13+) so that under extreme pressure PostgreSQL *invalidates* the slot instead of filling the disk. The connector then has to re-snapshot (and the outbox rows it missed must be re-published), but the database stays up.
 
 ## Practical Challenge
 
@@ -400,12 +418,12 @@ As an extension, evaluate whether Debezium CDC would be preferable to the pollin
       "text": "Identify the three distinct failure windows in the dual-write pattern where kafkaTemplate.send() is called after paymentRepository.save() inside the same @Transactional method.",
       "options": [
         "Kafka timeout, network partition, and consumer group rebalance",
-        "JVM crash after DB commit before Kafka send (event lost); Kafka broker unavailable at send time (event lost unless retried); DB commit success but exception thrown after send causes rollback (ghost event in Kafka)",
+        "JVM crash after DB commit before Kafka send (event lost); Kafka broker unavailable at send time (event lost unless retried); an exception after the send rolls back the DB transaction (ghost event in Kafka)",
         "DB transaction timeout, Kafka producer buffer overflow, and consumer offset reset",
         "Duplicate events on retry, stale consumer offsets, and Kafka partition rebalance"
       ],
       "correct": 1,
-      "explanation": "The three windows are: (1) JVM crash after the @Transactional commits the DB write but before kafkaTemplate.send() executes — event is permanently lost; (2) Kafka broker unavailable when send is called — event is lost unless the producer retries and succeeds within timeout; (3) DB commits but an exception thrown after the send triggers rollback — the event was already delivered to Kafka but the payment does not exist in the database (ghost event). No producer retry configuration closes windows 1 or 3."
+      "explanation": "The three windows are: (1) JVM crash after the @Transactional commits the DB write but before kafkaTemplate.send() executes — the event is permanently lost; (2) Kafka broker unavailable when send is called — the event is lost unless the producer retries and succeeds within timeout; (3) an exception thrown after the send rolls back the DB transaction — the event was already delivered to Kafka but the payment does not exist in the database (ghost event). No producer retry configuration closes windows 1 or 3."
     },
     {
       "text": "A Debezium PostgreSQL replication slot stops advancing because the Kafka Connect worker is paused for maintenance. What is the operational risk and how do you prevent it from causing a database outage?",
@@ -416,7 +434,7 @@ As an extension, evaluate whether Debezium CDC would be preferable to the pollin
         "The slot will block all PostgreSQL writes until it is manually dropped"
       ],
       "correct": 1,
-      "explanation": "PostgreSQL cannot delete WAL segments until every replication slot has confirmed it has consumed them. A paused Debezium connector stops advancing its confirmed_flush_lsn, causing WAL to accumulate. On a high-write database this can exhaust disk in hours. Set max_slot_wal_keep_size to allow PostgreSQL to forcibly drop the slot under pressure (triggering a connector restart) rather than a full DB outage. Monitor with pg_replication_slots and alert on pg_wal_lsn_diff."
+      "explanation": "PostgreSQL cannot delete WAL segments until every replication slot has confirmed it has consumed them. A paused Debezium connector stops advancing its confirmed_flush_lsn, so WAL accumulates. On a high-write database this can exhaust disk in hours. Set max_slot_wal_keep_size so PostgreSQL invalidates the slot under pressure (the connector must then re-snapshot) instead of suffering a full DB outage. Monitor with pg_replication_slots and alert on pg_wal_lsn_diff."
     }
   ]
 }

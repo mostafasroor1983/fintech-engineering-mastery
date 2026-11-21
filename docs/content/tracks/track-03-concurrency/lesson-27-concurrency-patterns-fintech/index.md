@@ -11,6 +11,8 @@ tags: [concurrency-patterns, financial, idempotency, event-ordering, partitionin
 java-versions: [17, 21]
 ---
 
+## Overview
+
 Distributed payment systems fail in ways that sequential programs never do. A network timeout does not mean a transaction failed — it means you do not know. A consumer that processes events out of order can reverse a debit before it was applied. A thread pool that shares a work queue can starve time-sensitive authorizations behind bulk settlement jobs. These are not theoretical problems: they are the class of incident that makes the front page of financial news. This lesson catalogues the six concurrency patterns that every principal engineer in financial services must know deeply, with production-grade Java implementations and the operational reasoning behind each design choice.
 
 ## Learning Objectives
@@ -26,9 +28,9 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-A European payments processor handles cross-border transfers for 400 banks. The system processes both real-time retail payments (target: sub-500ms end-to-end) and bulk payroll batches (millions of records overnight). Over an eighteen-month period the team accumulated four production incidents, each traceable to a concurrency pattern misapplication:
+*Composite example (based on common industry failure patterns, not a specific company):* a payments processor handles cross-border transfers for hundreds of banks. The system processes both real-time retail payments (target: sub-500ms end-to-end) and bulk payroll batches (millions of records overnight). Over an eighteen-month period the team accumulated four production incidents, each traceable to a concurrency pattern misapplication:
 
-1. A retry storm during a downstream timeout created 11,000 duplicate debits (idempotency failure).
+1. A retry storm during a downstream timeout created thousands of duplicate debits (idempotency failure).
 2. A credit reversal was processed before the original credit arrived, leaving accounts in a negative state (ordering failure).
 3. A single slow merchant's fraud check blocked authorization threads for all merchants (partitioning failure).
 4. A customer's balance read returned the pre-debit value three seconds after a confirmed debit, causing a declined payment at a POS terminal (read-your-writes failure).
@@ -105,57 +107,60 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 @Service
 public class IdempotentTransferService {
 
-    // In-memory deduplication window: 5 minutes TTL.
-    // Handles retry storms; DB unique constraint handles cross-instance duplicates.
+    // In-memory window of COMPLETED results: 5 minutes TTL.
+    // Only a fast path for retries — the DB unique constraint is the real guard.
     private final Cache<String, TransferResponse> recentResults = Caffeine.newBuilder()
         .expireAfterWrite(5, TimeUnit.MINUTES)
         .maximumSize(100_000)
         .build();
 
-    private final TransferRepository repository;
-    private final AccountLedger ledger;
+    private final TransferRepository  repository;
+    private final AccountLedger       ledger;
+    private final TransactionTemplate txTemplate;   // not @Transactional on a private method:
+                                                    // the Spring proxy would ignore it
 
     public TransferResponse transfer(String idempotencyKey, TransferRequest request) {
-        // 1. Fast path: check in-memory cache (no DB hit)
+        // 1. Fast path: a completed result for this key (no DB hit)
         TransferResponse cached = recentResults.getIfPresent(idempotencyKey);
         if (cached != null) {
-            return cached; // idempotent response — no processing
+            return cached;
         }
 
-        // 2. Slow path: execute with DB-level idempotency guard.
-        //    Caffeine.get() guarantees only one thread executes the loader
-        //    for a given key — prevents the race where two threads both miss
-        //    the cache and both attempt the DB insert.
-        return recentResults.get(idempotencyKey, key -> executeTransfer(key, request));
+        // 2. Slow path: claim the key and do the work in ONE DB transaction.
+        //    Do NOT run this inside Caffeine's get(key, loader): the loader runs
+        //    while a map bin is locked, and long I/O there blocks other keys.
+        TransferResponse response = txTemplate.execute(status -> executeTransfer(idempotencyKey, request));
+
+        // 3. Cache only finished results
+        if (response.isFinal()) {
+            recentResults.put(idempotencyKey, response);
+        }
+        return response;
     }
 
-    @Transactional
     private TransferResponse executeTransfer(String idempotencyKey, TransferRequest request) {
-        // DB-level idempotency: unique constraint on idempotency_key column.
-        // If two threads race past the cache simultaneously, only one will
-        // succeed the DB insert; the other gets a unique constraint violation.
-        try {
-            TransferRecord record = repository.insertWithIdempotencyKey(
-                idempotencyKey, request);
-            ledger.debit(request.fromAccount(), request.amount());
-            ledger.credit(request.toAccount(), request.amount());
-            repository.markComplete(record.id());
-            return TransferResponse.success(record.id());
-        } catch (DuplicateIdempotencyKeyException e) {
-            // Another thread/instance already processed this key.
-            // Retrieve and return the existing result.
+        // INSERT ... ON CONFLICT (idempotency_key) DO NOTHING — returns null on a
+        // duplicate. A concurrent duplicate WAITS on the unique index until the
+        // first transaction commits, then gets null. (Catching a unique-violation
+        // exception instead would abort the PostgreSQL transaction.)
+        TransferRecord record = repository.claimIdempotencyKey(idempotencyKey, request);
+        if (record == null) {
             return repository.findByIdempotencyKey(idempotencyKey)
-                .map(r -> TransferResponse.success(r.id()))
+                .map(TransferResponse::fromExisting)          // COMPLETED → same result
                 .orElseThrow(() -> new IllegalStateException(
                     "Idempotency key exists but record not found: " + idempotencyKey));
         }
+        ledger.debit(request.fromAccount(), request.amount());
+        ledger.credit(request.toAccount(), request.amount());
+        repository.markComplete(record.id());
+        return TransferResponse.success(record.id());
     }
 }
 ```
 
 ### Distributed Idempotency with Redis SETNX
 
-Across multiple service instances, an in-memory cache is insufficient — another node may also receive the retry. Redis `SETNX` (Set if Not eXists) with a TTL provides distributed exactly-once semantics:
+Across multiple service instances, an in-memory cache is insufficient — another node may also receive the retry. Redis `SETNX` (Set if Not eXists) with a TTL is a fast **distributed pre-check** that stops most concurrent duplicates before they reach the database. It is not exactly-once on its own: Redis and the database do not commit together, so the database unique constraint (in the same transaction as the ledger change) stays the source of truth. While the key is claimed but no result is stored yet, answer duplicates with "still processing" (for example HTTP 409), not "success":
 
 ```java
 @Service
@@ -238,15 +243,13 @@ sequenceDiagram
     participant C as Consumer
     participant L as Ledger
 
-    K->>C: seq=1 CREDIT  ACC-001 +$500
-    K->>C: seq=2 DEBIT   ACC-001 -$200
-    K->>C: seq=3 REVERSAL ACC-001 -$500
+    Note over C: Correct order: seq=1 CREDIT +$500, then seq=2 REVERSAL of seq 1 (-$500)
+    Note over C: Balance: 0 → 500 → 0
 
-    Note over C: Correct order: 0 → 500 → 300 → -200
-
-    K-->>C: seq=3 arrives BEFORE seq=2 (network reorder)
-    C->>L: REVERSAL seq=3 applied (balance: 0 → -500 — WRONG)
-    C->>L: DEBIT seq=2 applied (balance: -500 → -700 — WRONG)
+    K-->>C: seq=2 REVERSAL arrives BEFORE seq=1 (e.g. two upstream sources)
+    C->>L: REVERSAL applied first (balance: 0 → -500 — WRONG, or rejected and lost)
+    K-->>C: seq=1 CREDIT arrives late
+    C->>L: CREDIT applied (balance ends at 0, but the account was negative in between)
 ```
 
 ### Per-Account Event Sequencer
@@ -292,6 +295,9 @@ public class PerAccountSequencer {
         }
     }
 
+    // NOTE: expectedSeq lives in memory and is lost on restart. In production,
+    // store the last applied sequence per account in the SAME DB transaction as
+    // the ledger change — that also makes redelivered events harmless.
     private void processAndDrain(String accountId, AccountEvent event) {
         processor.process(event);
         expectedSeq.put(accountId, event.sequenceNumber() + 1);
@@ -375,27 +381,27 @@ public class AccountEventProducer {
     }
 }
 
-// Consumer: one thread per partition → serial execution per account
-@KafkaListener(
-    topics = "account-events",
-    concurrency = "12",  // 12 threads = 12 partitions processed in parallel
-    containerFactory = "accountEventListenerFactory")
+// Consumer: each partition is handled by exactly one thread at a time
+@Component
 public class AccountEventConsumer {
 
     private final AccountEventProcessor processor;
 
-    // Each listener instance owns one partition: serial within partition,
-    // parallel across partitions. No sequencing logic needed here when
-    // partition-per-account is correctly maintained.
+    // Up to 12 consumer threads; a partition is never processed by two threads
+    // at once → serial within a partition, parallel across partitions.
+    @KafkaListener(
+        topics = "account-events",
+        concurrency = "12",
+        containerFactory = "accountEventListenerFactory")
     public void onEvent(AccountEvent event, Acknowledgment ack) {
-        processor.process(event);
-        ack.acknowledge(); // commit offset only after successful processing
+        processor.process(event);   // must be idempotent: delivery is at-least-once
+        ack.acknowledge();          // commit offset only after successful processing
     }
 }
 ```
 
 > [!IMPORTANT]
-> Partition-per-account strategy creates a **partition rebalancing risk**: if the number of partitions changes, the hash of an account ID may map to a different partition, breaking ordering for in-flight events. Never reduce partition count on a live financial event topic. Plan partition count at topic creation for the expected 3-5 year growth horizon, using a generous multiple of your expected maximum consumer count.
+> Partition-per-account strategy creates a **repartitioning risk**: Kafka can only *increase* a topic's partition count, and increasing it changes which partition an account ID hashes to — breaking ordering for in-flight events. Plan the partition count at topic creation for the expected 3–5 year growth horizon, using a generous multiple of your expected maximum consumer count. If you must grow, drain the topic first or migrate to a new topic.
 
 ## Pattern 3: Partitioned Concurrency
 
@@ -416,8 +422,15 @@ import java.util.concurrent.Executors;
  *
  * Performance model:
  *   - N partitions × M accounts → no cross-account lock contention
- *   - 32 partitions on 32 vCPUs → near-linear throughput scaling
  *   - Per-account serial order maintained implicitly by partition assignment
+ *
+ * LIMITS:
+ *   - Serial only INSIDE this JVM. With several service instances, route all
+ *     requests for an account to one instance (e.g. via Kafka partitions) —
+ *     and keep a database guard (conditional UPDATE) as the final safety net
+ *   - A slow task blocks every account that shares its partition: keep remote
+ *     calls (fraud, HTTP) OUT of the partition thread
+ *   - newSingleThreadExecutor has an unbounded queue: monitor queue depth
  */
 public class PartitionedAuthorizationExecutor {
 
@@ -473,27 +486,30 @@ public class AuthorizationService {
 
     private final AccountRepository accountRepository;
     private final FraudEngine fraudEngine;
+    private final Executor ioExecutor;
 
     public CompletableFuture<AuthorizationResult> authorize(AuthorizationRequest request) {
-        return executor.submit(request.accountId(), () -> {
-            // This block runs serially per account —
-            // no two authorizations for ACC-001 execute concurrently.
-            // No synchronized, no ReentrantLock, no optimistic retry.
-            Account account = accountRepository.load(request.accountId());
-
-            if (account.balance().compareTo(request.amount()) < 0) {
-                return AuthorizationResult.declined("INSUFFICIENT_FUNDS");
-            }
-
-            FraudScore fraud = fraudEngine.evaluate(request);
-            if (fraud.score() > 0.85) {
-                return AuthorizationResult.declined("FRAUD_SUSPECTED");
-            }
-
-            account.reserve(request.amount());
-            accountRepository.save(account);
-            return AuthorizationResult.approved(account.reservationId());
-        });
+        // 1. Slow remote call OUTSIDE the partition: a slow fraud check must not
+        //    block other accounts that share the partition thread
+        return CompletableFuture.supplyAsync(() -> fraudEngine.evaluate(request), ioExecutor)
+            .thenCompose(fraud -> {
+                if (fraud.score() > 0.85) {
+                    return CompletableFuture.completedFuture(
+                        AuthorizationResult.declined("FRAUD_SUSPECTED"));
+                }
+                // 2. Short critical section, serial per account, inside the partition
+                return executor.submit(request.accountId(), () -> {
+                    Account account = accountRepository.load(request.accountId());
+                    if (account.balance().compareTo(request.amount()) < 0) {
+                        return AuthorizationResult.declined("INSUFFICIENT_FUNDS");
+                    }
+                    account.reserve(request.amount());
+                    // save() should still be a conditional/versioned update:
+                    // another instance may hold the same account
+                    accountRepository.save(account);
+                    return AuthorizationResult.approved(account.reservationId());
+                });
+            });
     }
 }
 ```
@@ -506,16 +522,17 @@ Partitioned executors are vulnerable to hot partitions when a small number of ac
 @Component
 public class PartitionHealthMonitor {
 
-    private final long[] taskCounts;
-    private final int    numPartitions;
+    // Updated by many threads: a plain long[] with ++ would lose counts
+    private final AtomicLongArray taskCounts;
+    private final int             numPartitions;
 
     public PartitionHealthMonitor(int numPartitions) {
         this.numPartitions = numPartitions;
-        this.taskCounts    = new long[numPartitions];
+        this.taskCounts    = new AtomicLongArray(numPartitions);
     }
 
     public void recordTask(int partition) {
-        taskCounts[partition]++;
+        taskCounts.incrementAndGet(partition);
     }
 
     /**
@@ -526,7 +543,8 @@ public class PartitionHealthMonitor {
     public double skewRatio() {
         long total = 0;
         long max   = 0;
-        for (long count : taskCounts) {
+        for (int i = 0; i < numPartitions; i++) {
+            long count = taskCounts.get(i);
             total += count;
             if (count > max) max = count;
         }
@@ -537,7 +555,7 @@ public class PartitionHealthMonitor {
     public List<Map.Entry<Integer, Long>> hotPartitions(int topN) {
         List<Map.Entry<Integer, Long>> entries = new ArrayList<>();
         for (int i = 0; i < numPartitions; i++) {
-            entries.add(Map.entry(i, taskCounts[i]));
+            entries.add(Map.entry(i, taskCounts.get(i)));
         }
         entries.sort((a, b) -> Long.compare(b.getValue(), a.getValue()));
         return entries.subList(0, Math.min(topN, entries.size()));
@@ -579,7 +597,10 @@ public class BalanceService {
     private final DataSource primaryDataSource;
     private final DataSource replicaDataSource;
 
-    // Tracks sessions with recent writes: maps sessionToken → write timestamp
+    // Tracks sessions with recent writes: maps sessionToken → write timestamp.
+    // In-memory per instance: needs sticky sessions — or put the "wrote at"
+    // marker in the session/cookie or a shared store if requests can move
+    // between instances
     private final Cache<String, Instant> recentWriteTokens = Caffeine.newBuilder()
         .expireAfterWrite(30, TimeUnit.SECONDS)
         .build();
@@ -624,11 +645,13 @@ public class VersionedBalanceService {
 
     @Transactional
     public DebitResult debit(String accountId, BigDecimal amount) {
+        // Conditional debit: no row returned (EmptyResultDataAccessException)
+        // = insufficient funds or unknown account
         return primaryJdbc.queryForObject(
             "UPDATE accounts SET balance = balance - ?, version = version + 1 " +
-            "WHERE id = ? RETURNING balance, version",
+            "WHERE id = ? AND balance >= ? RETURNING balance, version",
             (rs, i) -> new DebitResult(rs.getBigDecimal("balance"), rs.getLong("version")),
-            amount, accountId);
+            amount, accountId, amount);
     }
 
     /**
@@ -665,7 +688,7 @@ public class VersionedBalanceService {
 ```
 
 > [!NOTE]
-> The version-based approach adds ~5 ms of average read latency (waiting for replica sync) but eliminates 99.9% of stale reads without routing all reads to primary. The session-token approach is simpler but routes every post-write read to primary. At 85,000 TPS with one balance read per transaction, that is a substantial increase in primary query load. Choose based on your primary's available capacity headroom.
+> The version-based approach adds a few milliseconds of read latency when the replica is behind, but avoids stale reads without routing all reads to the primary. The session-token approach is simpler but routes every post-write read to the primary — at high TPS that is a substantial increase in primary load. Choose based on your primary's capacity headroom. (PostgreSQL also lets you compare WAL positions directly: `pg_current_wal_lsn()` on the primary after the write, `pg_last_wal_replay_lsn()` on the replica.)
 
 ### Leader-Read vs Follower-Read Trade-offs
 
@@ -673,7 +696,7 @@ public class VersionedBalanceService {
 |---|---|---|---|---|
 | Always primary | Lowest absolute | High | Zero | Low |
 | Session token (sticky) | Low | Medium-high | Zero for affected sessions | Low |
-| Version polling | Low + ~5ms avg | Low | Zero | Medium |
+| Version polling | Low + a few ms when replica lags | Low | Zero (falls back to primary) | Medium |
 | Eventual (no guarantee) | Lowest | Low | High | Low |
 
 ## Pattern 5: The Competing Consumers Pattern
@@ -717,7 +740,7 @@ public class SettlementProcessor {
                 SettlementJob job = workQueue.poll(100, TimeUnit.MILLISECONDS);
                 if (job == null) continue;
 
-                // LinkedBlockingQueue.take() HB with put() on the producer:
+                // LinkedBlockingQueue: put() HB the poll()/take() that receives it:
                 // all state written to 'job' before put() is visible here.
                 processJob(workerId, job);
 
@@ -760,6 +783,7 @@ For durability across restarts and cross-service work distribution, a database q
 //   id         BIGSERIAL PRIMARY KEY,
 //   status     VARCHAR(20) NOT NULL DEFAULT 'PENDING',
 //   created_at TIMESTAMP   NOT NULL DEFAULT NOW(),
+//   claimed_at TIMESTAMP,
 //   payload    JSONB       NOT NULL,
 //   error_msg  TEXT
 // );
@@ -773,27 +797,32 @@ public class DatabaseSettlementQueue {
     private final ObjectMapper  objectMapper;
 
     /**
-     * Claims the next available job atomically.
+     * Claims the next available job atomically, in ONE statement.
      * SKIP LOCKED: other consumers transparently skip rows already
      * locked by concurrent transactions — no queue-behind-a-lock bottleneck.
      */
     @Transactional
     public Optional<SettlementJob> claimNext() {
-        return jdbc.query(
-            "SELECT id, payload FROM settlement_jobs " +
-            "WHERE status = 'PENDING' " +
-            "ORDER BY created_at " +
-            "LIMIT 1 " +
-            "FOR UPDATE SKIP LOCKED",
-            rs -> {
-                if (!rs.next()) return Optional.empty();
-                long   id      = rs.getLong("id");
-                String payload = rs.getString("payload");
-                jdbc.update(
-                    "UPDATE settlement_jobs SET status = 'PROCESSING' WHERE id = ?",
-                    id);
-                return Optional.of(parseJob(id, payload));
-            });
+        List<SettlementJob> jobs = jdbc.query(
+            "UPDATE settlement_jobs SET status = 'PROCESSING', claimed_at = NOW() " +
+            "WHERE id = (SELECT id FROM settlement_jobs " +
+            "            WHERE status = 'PENDING' ORDER BY created_at " +
+            "            LIMIT 1 FOR UPDATE SKIP LOCKED) " +
+            "RETURNING id, payload",
+            (rs, i) -> parseJob(rs.getLong("id"), rs.getString("payload")));
+        return jobs.stream().findFirst();
+    }
+
+    /**
+     * A worker that crashes leaves its job in PROCESSING forever. A periodic
+     * reaper returns jobs claimed too long ago to PENDING (the job handler
+     * must therefore be idempotent).
+     */
+    @Transactional
+    public int requeueStuckJobs() {
+        return jdbc.update(
+            "UPDATE settlement_jobs SET status = 'PENDING', claimed_at = NULL " +
+            "WHERE status = 'PROCESSING' AND claimed_at < NOW() - INTERVAL '10 minutes'");
     }
 
     @Transactional
@@ -868,6 +897,7 @@ flowchart LR
     B -->|FAIL| B2[No compensation needed]
     C -->|FAIL| C2[Release Reservation]
     D -->|FAIL| D2[Release Reservation + Reverse FX]
+    D -->|TIMEOUT| D3[Unknown outcome:<br/>status enquiry, then decide]
     E -->|TIMEOUT| E2[Full Compensation Chain]
 ```
 
@@ -883,9 +913,12 @@ import java.util.concurrent.TimeUnit;
  * Concurrency model:
  *   - Steps execute sequentially (financial ordering requirement)
  *   - Compensation steps execute concurrently where independent
- *   - Each stage runs on a dedicated sagaExecutor to avoid blocking
- *     the calling thread or the event loop
- *   - orTimeout() enforces per-step SLAs with TimeoutException compensation
+ *   - Each stage runs on a dedicated sagaExecutor
+ *   - Each step's timeout is put on THAT step's future (inside thenCompose),
+ *     so it measures only that step — a timeout chained on the pipeline
+ *     would start when the pipeline is built
+ *   - An exceptionally() stage runs for ANY earlier failure, so each one
+ *     first re-throws failures it does not own (rethrowIfAborted)
  */
 @Service
 public class CrossBorderPaymentSaga {
@@ -904,9 +937,9 @@ public class CrossBorderPaymentSaga {
         return CompletableFuture
             // Step 1: Fraud check — no compensating action needed on failure
             .supplyAsync(() -> fraudService.check(sagaId, request), sagaExecutor)
-            .orTimeout(5, TimeUnit.SECONDS)
+            .orTimeout(5, TimeUnit.SECONDS)           // first stage: starts now
             .exceptionally(ex -> {
-                sagaLog.failed(sagaId, "FRAUD_CHECK_TIMEOUT");
+                sagaLog.failed(sagaId, "FRAUD_CHECK_FAILED");
                 throw new SagaAbortException("FRAUD_CHECK_FAILED", ex);
             })
 
@@ -918,18 +951,27 @@ public class CrossBorderPaymentSaga {
                         new SagaAbortException("FRAUD_REJECTED", fraudResult));
                 }
                 sagaLog.stepCompleted(sagaId, "FRAUD_CHECKED", fraudResult.toString());
-                return fundsService.reserve(sagaId, request.fromAccount(), request.amount());
+                return fundsService.reserve(sagaId, request.fromAccount(), request.amount())
+                    .orTimeout(3, TimeUnit.SECONDS);   // this step only
             }, sagaExecutor)
-            .orTimeout(3, TimeUnit.SECONDS)
+            .exceptionally(ex -> {
+                rethrowIfAborted(ex);
+                // Reserve failed or timed out: the outcome may be unknown —
+                // release is idempotent, so it is safe to call either way
+                fundsService.releaseAsync(sagaId, request.fromAccount());
+                sagaLog.failed(sagaId, "RESERVE_FAILED");
+                throw new SagaAbortException("RESERVE_FAILED", ex);
+            })
 
             // Step 3: FX conversion
             .thenComposeAsync(reservation -> {
                 sagaLog.stepCompleted(sagaId, "FUNDS_RESERVED", reservation.id());
                 return fxService.convert(sagaId, request.amount(),
-                    request.sourceCurrency(), request.targetCurrency());
+                        request.sourceCurrency(), request.targetCurrency())
+                    .orTimeout(10, TimeUnit.SECONDS);
             }, sagaExecutor)
-            .orTimeout(10, TimeUnit.SECONDS)
             .exceptionally(ex -> {
+                rethrowIfAborted(ex);
                 // FX failed or timed out: release the reservation
                 log.error("[{}] FX conversion failed — compensating reservation", sagaId, ex);
                 fundsService.releaseAsync(sagaId, request.fromAccount());
@@ -940,12 +982,20 @@ public class CrossBorderPaymentSaga {
             // Step 4: SWIFT submission
             .thenComposeAsync(fxResult -> {
                 sagaLog.stepCompleted(sagaId, "FX_CONVERTED", fxResult.rate().toString());
-                return swiftService.submit(sagaId, request, fxResult);
+                return swiftService.submit(sagaId, request, fxResult)
+                    .orTimeout(30, TimeUnit.SECONDS);
             }, sagaExecutor)
-            .orTimeout(30, TimeUnit.SECONDS)
             .exceptionally(ex -> {
-                // SWIFT failed: compensate FX and reservation in parallel
-                log.error("[{}] SWIFT failed — full compensation chain", sagaId, ex);
+                rethrowIfAborted(ex);
+                if (rootCause(ex) instanceof TimeoutException) {
+                    // A TIMEOUT is an UNKNOWN outcome — the message may already be
+                    // on the SWIFT network. Do NOT compensate blindly: mark the saga
+                    // for status enquiry / reconciliation, then decide
+                    sagaLog.failed(sagaId, "SWIFT_OUTCOME_UNKNOWN");
+                    throw new SagaAbortException("SWIFT_OUTCOME_UNKNOWN", ex);
+                }
+                // A definite rejection: compensate FX and reservation in parallel
+                log.error("[{}] SWIFT rejected — full compensation chain", sagaId, ex);
                 compensateFullAsync(sagaId, request);
                 sagaLog.failed(sagaId, "SWIFT_FAILED");
                 throw new SagaAbortException("SWIFT_FAILED", ex);
@@ -958,11 +1008,21 @@ public class CrossBorderPaymentSaga {
             }, sagaExecutor)
 
             .exceptionally(ex -> {
-                if (!(ex.getCause() instanceof SagaAbortException)) {
+                if (!(rootCause(ex) instanceof SagaAbortException)) {
                     sagaLog.failed(sagaId, "UNEXPECTED: " + ex.getMessage());
                 }
                 return PaymentResult.failed(sagaId, ex.getMessage());
             });
+    }
+
+    /** A failure from an EARLIER step passes through unchanged. */
+    private static void rethrowIfAborted(Throwable ex) {
+        Throwable cause = rootCause(ex);
+        if (cause instanceof SagaAbortException abort) throw abort;
+    }
+
+    private static Throwable rootCause(Throwable ex) {
+        return (ex instanceof CompletionException && ex.getCause() != null) ? ex.getCause() : ex;
     }
 
     /**
@@ -1053,6 +1113,21 @@ public class SagaLogRepository {
             error, sagaId);
     }
 
+    /**
+     * Atomically claims a failed saga for compensation: only ONE instance
+     * gets 1 row back. (No separate Redis lock needed — and no risk of
+     * deleting another instance's lock after it expired.)
+     */
+    @Transactional
+    public boolean claimForCompensation(String sagaId) {
+        return jdbc.update(
+            "UPDATE saga_log SET status = 'COMPENSATING', updated_at = NOW() " +
+            "WHERE saga_id = ? AND status = 'FAILED'", sagaId) == 1;
+    }
+
+    // Sagas that failed before reserving anything (e.g. FRAUD_REJECTED) need
+    // no compensation — the last completed step tells the recovery job
+    // what has to be undone
     public List<String> findUncompensatedFailedSagas() {
         return jdbc.queryForList(
             "SELECT saga_id FROM saga_log " +
@@ -1074,26 +1149,20 @@ public class SagaRecoveryJob {
 
     private final SagaLogRepository sagaLog;
     private final CrossBorderPaymentSaga saga;
-    private final StringRedisTemplate redis;
 
     @Scheduled(fixedDelay = 60_000)
     public void recoverFailedSagas() {
         List<String> failedIds = sagaLog.findUncompensatedFailedSagas();
 
         for (String sagaId : failedIds) {
-            // Distributed lock per saga: only one instance compensates each saga.
-            // Prevents duplicate compensation across service instances.
-            String lockKey = "saga-recovery:" + sagaId;
-            Boolean locked = redis.opsForValue().setIfAbsent(
-                lockKey, "locked", Duration.ofMinutes(5));
-
-            if (Boolean.TRUE.equals(locked)) {
+            // Claim in the database: the conditional UPDATE lets exactly one
+            // instance move FAILED → COMPENSATING. Others get false and skip.
+            if (sagaLog.claimForCompensation(sagaId)) {
                 try {
-                    saga.compensate(sagaId);
+                    saga.compensate(sagaId);   // each compensating action is idempotent
                 } catch (Exception e) {
                     log.error("Recovery failed for saga {}", sagaId, e);
-                } finally {
-                    redis.delete(lockKey);
+                    sagaLog.compensationFailed(sagaId, e.getMessage());
                 }
             }
         }
@@ -1114,7 +1183,7 @@ public class SagaRecoveryJob {
 
 **Q: Your payment authorization service uses a `PartitionedAuthorizationExecutor` with 32 single-threaded partitions. You observe that one partition is consistently running at 100% utilization while others are at 10%. Authorizations are routed by account ID hash. What is the likely cause and how do you diagnose and fix it?**
 
-**A:** This is a **hot partition** problem caused by skewed key distribution. Likely causes: (1) a small number of account IDs have disproportionately high transaction volume — a corporate card used by hundreds of employees, or a shared service account — and those IDs all hash to the same partition; (2) Java's `String.hashCode()` produces uneven distribution for certain character patterns common in your account ID format. Diagnosis: log the `(accountId, partitionIndex)` mapping for the top 50 busiest accounts and look for partition clustering; compute the skew ratio (max partition load / average partition load) — healthy is below 2.0, problematic is above 5.0. Fix options: (1) replace `String.hashCode()` with MurmurHash3 or xxHash for better distribution; (2) for known hot accounts, pre-assign them to dedicated overflow partitions outside the main ring; (3) if the hot traffic is a service account performing batch operations, rate-limit it at the API layer to prevent it from saturating a partition and causing backpressure on all other accounts sharing that partition's queue.
+**A:** This is a **hot partition** problem caused by skewed key distribution. Likely causes: (1) a small number of account IDs have disproportionately high transaction volume — a corporate card used by hundreds of employees, or a shared service account — and those IDs all hash to the same partition; (2) Java's `String.hashCode()` produces uneven distribution for certain character patterns common in your account ID format. Diagnosis: log the `(accountId, partitionIndex)` mapping for the top 50 busiest accounts and look for partition clustering; compute the skew ratio (max partition load / average partition load) — healthy is below 2.0, problematic is above 5.0. Fix options: (1) replace `String.hashCode()` with MurmurHash3 or xxHash for better distribution (this helps when several busy accounts collide — no hash function can split ONE hot account); (2) for known hot accounts, pre-assign them to dedicated overflow partitions outside the main ring; (3) if the hot traffic is a service account performing batch operations, rate-limit it at the API layer to prevent it from saturating a partition and causing backpressure on all other accounts sharing that partition's queue.
 
 ## Practical Challenge
 
@@ -1129,7 +1198,7 @@ You are the principal engineer for a **real-time ACH payment processing system**
 
 1. **Design the idempotency strategy** for the full stack: HTTP layer (idempotency key header), service layer (Caffeine in-memory window), and database layer (unique constraint + atomic saga log). Specify the TTL at each layer and explain why each TTL choice makes sense for the payment use case.
 
-2. **Implement a partitioned processor** that handles both individual authorizations and batch payment entries. Individual authorizations must preempt batch entries within the same account partition (priority within partition). Show how you would implement priority ordering without introducing cross-partition locks — hint: replace the single-threaded executor's `LinkedBlockingQueue` with a `PriorityBlockingQueue` keyed on `(priority, arrivalTime)`.
+2. **Implement a partitioned processor** that handles both individual authorizations and batch payment entries. Individual authorizations must preempt batch entries within the same account partition (priority within partition). Show how you would implement priority ordering without introducing cross-partition locks — hint: replace the single-threaded executor's `LinkedBlockingQueue` with a `PriorityBlockingQueue` keyed on `(priority, arrivalTime)`. (Use `execute()` with tasks that implement `Comparable`: `submit()` wraps tasks in `FutureTask`, which is not comparable.)
 
 3. **Model the event ordering requirement**: payroll batches arrive as a single Kafka message per file, then fan out to per-account events. Each account may receive multiple credits from the same batch (multiple pay components). Design the sequencing scheme: how do you assign sequence numbers to batch entries, detect gaps, and ensure a partial batch does not leave accounts in an inconsistent state?
 
@@ -1162,7 +1231,7 @@ Expected deliverable: a working Spring Boot module with the complete implementat
         "An overloaded database causing all queries to slow down on one partition"
       ],
       "correct": 1,
-      "explanation": "Hot partitions occur when a small number of keys (e.g., a corporate card used by hundreds of employees, or a service account) generate disproportionate volume and all hash to the same partition. The diagnostic is to log the (accountId, partitionIndex) mapping for the top 50 busiest accounts and compute the skew ratio (max partition load / average load). A healthy ratio is below 2.0; above 5.0 indicates a hot partition. Fixes include replacing String.hashCode() with MurmurHash3, pre-assigning hot accounts to dedicated overflow partitions, or rate-limiting service accounts at the API layer."
+      "explanation": "Hot partitions occur when a small number of keys (e.g. a corporate card used by hundreds of employees, or a service account) generate disproportionate volume and all hash to the same partition. The diagnostic is to log the (accountId, partitionIndex) mapping for the top 50 busiest accounts and compute the skew ratio (max partition load / average load). A healthy ratio is below 2.0; above 5.0 indicates a hot partition. Fixes include a better hash function such as MurmurHash3 (helps when several busy accounts collide), dedicated overflow partitions for known hot accounts, or rate-limiting service accounts at the API layer. No hash function can split a single hot account."
     },
     {
       "text": "The Saga pattern is used for a cross-border payment touching four services. What isolation problem does the Saga pattern NOT solve, and how must it be addressed?",
@@ -1185,10 +1254,22 @@ Expected deliverable: a working Spring Boot module with the complete implementat
   "difficulty": "advanced",
   "estimatedMinutes": 90,
   "tasks": [
-    {"id": "1", "description": "Design a three-layer idempotency strategy for ACH payment processing: (1) HTTP layer — accept an Idempotency-Key header, check a Caffeine cache with 60-second TTL to reject duplicate requests within the in-flight window; (2) service layer — use a Caffeine cache with 5-minute TTL as a fast deduplication guard before hitting the database; (3) database layer — persist the idempotency key alongside the transaction record in a single ACID transaction using a unique constraint. Document why each TTL is appropriate for the payment use case."},
-    {"id": "2", "description": "Implement a PartitionedAuthorizationExecutor with 32 single-threaded partitions. Replace the standard LinkedBlockingQueue with a PriorityBlockingQueue ordered by (priority, arrivalTime) so that individual authorizations (priority=HIGH) preempt batch payment entries (priority=LOW) within the same account partition. Implement a PartitionHealthMonitor that tracks per-partition task counts and reports a skew ratio (max/average) with alerting when it exceeds 5.0."},
-    {"id": "3", "description": "Implement a PayrollBatchSaga that orchestrates: (1) validate the payer has sufficient funds for the entire batch total using SELECT FOR UPDATE, (2) create individual fund reservations per recipient (parallelised with up to 20 concurrent reservations), (3) apply final credits to all recipients. Implement the compensation chain for the case where a credit fails mid-batch: release the payer's reservation and log all failed recipients to a reconciliation queue. Use a SagaLogRepository backed by PostgreSQL to make all state transitions durable and idempotent."},
-    {"id": "4", "description": "Write a load test using JMH or Gatling that simulates 1,000 concurrent individual authorizations simultaneously with 5 concurrent payroll batch files of 10,000 entries each. Measure: (a) p99 latency for individual authorizations under full batch load, (b) partition utilization distribution (skew ratio at peak), (c) saga compensation rate under a simulated 1% step failure rate. The p99 latency for individual authorizations must remain below 200ms regardless of batch throughput."}
+    {
+      "id": "1",
+      "description": "Design a three-layer idempotency strategy for ACH payment processing: (1) HTTP layer — accept an Idempotency-Key header, check a Caffeine cache with 60-second TTL to reject duplicate requests within the in-flight window; (2) service layer — use a Caffeine cache with 5-minute TTL as a fast deduplication guard before hitting the database; (3) database layer — persist the idempotency key alongside the transaction record in a single ACID transaction using a unique constraint. Document why each TTL is appropriate for the payment use case."
+    },
+    {
+      "id": "2",
+      "description": "Implement a PartitionedAuthorizationExecutor with 32 single-threaded partitions. Replace the standard LinkedBlockingQueue with a PriorityBlockingQueue ordered by (priority, arrivalTime) so that individual authorizations (priority=HIGH) preempt batch payment entries (priority=LOW) within the same account partition (submit Comparable tasks with execute(), since submit() wraps them in a non-comparable FutureTask). Implement a thread-safe PartitionHealthMonitor (AtomicLongArray) that tracks per-partition task counts and reports a skew ratio (max/average) with alerting when it exceeds 5.0."
+    },
+    {
+      "id": "3",
+      "description": "Implement a PayrollBatchSaga that orchestrates: (1) validate the payer has sufficient funds for the entire batch total using SELECT FOR UPDATE, (2) create individual fund reservations per recipient (parallelised with up to 20 concurrent reservations), (3) apply final credits to all recipients. Implement the compensation chain for the case where a credit fails mid-batch: release the payer's reservation and log all failed recipients to a reconciliation queue. Use a SagaLogRepository backed by PostgreSQL to make all state transitions durable and idempotent."
+    },
+    {
+      "id": "4",
+      "description": "Write a load test using JMH or Gatling that simulates 1,000 concurrent individual authorizations simultaneously with 5 concurrent payroll batch files of 10,000 entries each. Measure: (a) p99 latency for individual authorizations under full batch load, (b) partition utilization distribution (skew ratio at peak), (c) saga compensation rate under a simulated 1% step failure rate. The p99 latency for individual authorizations must remain below 200ms regardless of batch throughput."
+    }
   ]
 }
 -->

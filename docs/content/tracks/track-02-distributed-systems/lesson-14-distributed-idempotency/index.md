@@ -83,8 +83,9 @@ CREATE TABLE idempotent_requests (
     created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     expires_at        TIMESTAMPTZ  NOT NULL,
     request_hash      VARCHAR(64)  NOT NULL,  -- SHA-256 of request body
-    response_status   SMALLINT     NOT NULL,
-    response_body     JSONB        NOT NULL,
+    status            VARCHAR(16)  NOT NULL,  -- IN_PROGRESS | COMPLETED
+    response_status   SMALLINT,               -- NULL while IN_PROGRESS
+    response_body     JSONB,                  -- NULL while IN_PROGRESS
     lock_acquired_at  TIMESTAMPTZ,            -- set during processing, NULL = done
     CONSTRAINT pk_idempotent_requests PRIMARY KEY (idempotency_key)
 );
@@ -103,7 +104,7 @@ The `UNIQUE` constraint on `idempotency_key` (via PRIMARY KEY) is the database-l
 
 ---
 
-## `IdempotentPaymentService` — Check Before Processing
+## `IdempotentPaymentService` — Claim First, Then Process
 
 ```java
 @Service
@@ -112,69 +113,64 @@ public class IdempotentPaymentService {
 
     private final IdempotentRequestRepository idempotentRepo;
     private final PaymentProcessor            paymentProcessor;
+    private final TransactionTemplate         tx;   // short, separate transactions
     private final ObjectMapper                objectMapper;
 
-    @Transactional
-    public PaymentResponse processPayment(
-            String idempotencyKey,
-            PaymentRequest request) {
-
+    // NOT one big @Transactional: inside a single transaction the claim row is
+    // invisible to other requests until commit, so "in progress" could never
+    // be seen, and a rollback would erase the record of a payment that the
+    // processor (often another service) has already executed.
+    public PaymentResponse processPayment(String idempotencyKey, PaymentRequest request) {
         String requestHash = sha256(request);
 
-        // 1. Check for existing record (SELECT ... FOR UPDATE to prevent races)
-        Optional<IdempotentRequest> existing =
-            idempotentRepo.findByKeyForUpdate(idempotencyKey);
+        // 1. CLAIM the key first, in its own committed transaction:
+        //    INSERT ... (status = 'IN_PROGRESS', lock_acquired_at = now())
+        //    ON CONFLICT (idempotency_key) DO NOTHING
+        //    The PRIMARY KEY lets exactly one concurrent request win.
+        boolean claimed = tx.execute(st ->
+            idempotentRepo.insertClaimIfAbsent(idempotencyKey, requestHash,
+                Instant.now().plus(Duration.ofHours(24))));
 
-        if (existing.isPresent()) {
-            IdempotentRequest record = existing.get();
+        if (!claimed) {
+            IdempotentRequest record = idempotentRepo.findByKey(idempotencyKey).orElseThrow();
 
-            // Guard: same key but different body = client bug
+            // Guard: same key but different body = client bug -> 422
             if (!record.getRequestHash().equals(requestHash)) {
                 throw new IdempotencyKeyConflictException(
-                    "Idempotency key reused with different request body: "
-                    + idempotencyKey);
+                    "Idempotency key reused with different request body: " + idempotencyKey);
             }
-
-            if (record.getLockAcquiredAt() != null) {
-                // Another thread is mid-flight — return 409 so client backs off
+            if ("IN_PROGRESS".equals(record.getStatus())) {
+                // Another request is mid-flight -> 409 so the client backs off
                 throw new RequestInProgressException(idempotencyKey);
             }
-
-            // Replay stored response — do NOT reprocess
+            // COMPLETED: replay the stored response — do NOT reprocess
             log.info("Replaying idempotent response for key={}", idempotencyKey);
             return deserialize(record.getResponseBody(), PaymentResponse.class);
         }
 
-        // 2. Insert lock record — will fail with ConstraintViolationException if race
-        IdempotentRequest lock = IdempotentRequest.builder()
-            .idempotencyKey(idempotencyKey)
-            .requestHash(requestHash)
-            .expiresAt(Instant.now().plus(Duration.ofHours(24)))
-            .lockAcquiredAt(Instant.now())
-            .build();
-        idempotentRepo.save(lock);  // throws on duplicate key → let caller handle
-
-        // 3. Process the payment
+        // 2. Process the payment (pass the key on, so the processor is idempotent too)
         PaymentResponse response;
         try {
-            response = paymentProcessor.execute(request);
-        } catch (Exception e) {
-            // Remove lock so client can retry
-            idempotentRepo.deleteByKey(idempotencyKey);
+            response = paymentProcessor.execute(request, idempotencyKey);
+        } catch (DefinitelyNotProcessedException e) {
+            // e.g. validation failure: nothing happened, so release the claim
+            tx.executeWithoutResult(st -> idempotentRepo.deleteByKey(idempotencyKey));
             throw e;
         }
+        // Any OTHER failure (timeout, crash) leaves the claim IN_PROGRESS: the
+        // outcome is unknown. A recovery job finds claims older than a few
+        // minutes and asks the processor what really happened, by this key.
 
-        // 4. Persist the response and release the lock
-        lock.setResponseStatus((short) 200);
-        lock.setResponseBody(serialize(response));
-        lock.setLockAcquiredAt(null);  // lock released — record is now a replay cache
-        idempotentRepo.save(lock);
-
+        // 3. Store the response and mark the claim COMPLETED
+        tx.executeWithoutResult(st ->
+            idempotentRepo.complete(idempotencyKey, 200, serialize(response)));
         return response;
     }
 
     private String sha256(Object obj) {
         try {
+            // Hash a canonical form (fixed field order) so that the same request
+            // always produces the same hash
             byte[] bytes = objectMapper.writeValueAsBytes(obj);
             return DigestUtils.sha256Hex(bytes);
         } catch (JsonProcessingException e) {
@@ -196,18 +192,18 @@ sequenceDiagram
     participant L as LedgerService
 
     C->>S: POST /payments (Idempotency-Key: abc123)
-    S->>DB: INSERT lock record (abc123)
-    DB-->>S: OK
+    S->>DB: INSERT claim (abc123, IN_PROGRESS) ON CONFLICT DO NOTHING
+    DB-->>S: 1 row inserted — claim won
     S->>L: Debit account
     L-->>S: txn-id: TXN-001
-    S->>DB: UPDATE response_body, clear lock
+    S->>DB: UPDATE status=COMPLETED, response_body
     DB-->>S: OK
     S-->>C: 200 OK {txnId: TXN-001}
 
     Note over C: Network timeout — response lost
     C->>S: POST /payments RETRY (Idempotency-Key: abc123)
-    S->>DB: SELECT FOR UPDATE (abc123)
-    DB-->>S: Row found, lock=NULL, response={txnId: TXN-001}
+    S->>DB: INSERT claim (abc123) ON CONFLICT DO NOTHING
+    DB-->>S: 0 rows — key exists: COMPLETED, response={txnId: TXN-001}
     Note over S: Replay — do NOT call LedgerService again
     S-->>C: 200 OK {txnId: TXN-001} (replayed)
 ```
@@ -229,8 +225,8 @@ public class PaymentEventConsumer {
     @KafkaListener(topics = "payment-instructions", groupId = "ledger-processor")
     @Transactional
     public void consume(ConsumerRecord<String, PaymentInstruction> record) {
-        String messageId = record.headers()
-            .lastHeader("message-id")
+        // lastHeader() returns a Header or null — not an Optional
+        String messageId = Optional.ofNullable(record.headers().lastHeader("message-id"))
             .map(h -> new String(h.value(), StandardCharsets.UTF_8))
             .orElseThrow(() -> new InvalidMessageException("Missing message-id header"));
 
@@ -240,10 +236,13 @@ public class PaymentEventConsumer {
             return;
         }
 
-        // Process and record atomically within the same transaction
+        // Process and record atomically within the same DB transaction
+        // (the PRIMARY KEY on message_id also stops a concurrent duplicate)
         ledgerService.applyInstruction(record.value());
         deduplicationRepo.save(new ProcessedMessage(messageId, Instant.now()));
-        // Offset committed on transaction commit — no gap between process + dedup record
+        // The Kafka offset is committed separately, after this method returns.
+        // A crash in between redelivers the message — and the dedup row,
+        // committed with the ledger change, makes the redelivery a no-op.
     }
 }
 ```
@@ -303,8 +302,11 @@ public class RedisIdempotencyGuard {
 
 ```lua
 -- KEYS[1] = idempotency key,  KEYS[2] = response cache key
+-- (in Redis Cluster both keys need the same hash tag, e.g. idmp:{abc123})
 -- ARGV[1] = TTL in seconds
--- Returns: 1 = acquired (first time), 0 = duplicate
+-- Returns: 1 = acquired (first time)
+--          the stored response = duplicate of a completed request
+--          0 = duplicate whose first attempt is still in progress
 local acquired = redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1])
 if acquired then
     return 1
@@ -314,7 +316,7 @@ return response or 0
 ```
 
 > [!WARNING]
-> Redis is not durable by default. If Redis restarts before `appendfsync always`, idempotency keys written in the last second may be lost. Use `appendfsync always` for critical idempotency stores, or accept the slim window and fall back to database idempotency for genuinely critical operations.
+> Redis is not durable by default. With the common `appendfsync everysec`, a crash can lose up to a second of keys; and because replication is asynchronous, a failover to a replica can lose keys even with `appendfsync always`. Use Redis as a fast first check, and keep a durable database record (with a unique constraint) for money-moving operations.
 
 ---
 
@@ -330,7 +332,7 @@ Idempotency keys must expire. Storing them forever is neither practical nor nece
 | FX trade booking | 1 hour | Same-day settlement only |
 | Account creation | 72 hours | Operational retry window |
 
-Expired records should be cleaned up by a scheduled job, not on the hot path:
+Expired records should be cleaned up by a scheduled job, not on the hot path — and in batches (for example 10,000 rows per transaction), so that one huge DELETE does not lock or bloat the table:
 
 ```java
 @Scheduled(cron = "0 0 2 * * *")  // 02:00 daily
@@ -354,7 +356,7 @@ Step 2: Send notification  ✗  (HTTP 503 from notification service)
 Step 3: Client retries entire request
 ```
 
-The retry must NOT re-debit. The pattern is **workflow state tracking**:
+The retry must NOT re-debit. The pattern is **workflow state tracking**. (Better still, the notification should not be part of the request at all: write it to an outbox and send it asynchronously.)
 
 ```java
 @Entity
@@ -376,7 +378,9 @@ public enum WorkflowState {
 ```
 
 ```java
-@Transactional
+// No @Transactional around the whole method: if the notification failed, a
+// single transaction would roll back the DEBITED state too — and the retry
+// would debit again. Each state change commits on its own.
 public PaymentResponse processWithPartialSuccessHandling(
         String idempotencyKey, PaymentRequest request) {
 
@@ -386,21 +390,24 @@ public PaymentResponse processWithPartialSuccessHandling(
 
     // Resume from wherever we left off
     if (workflow.getState() == WorkflowState.PENDING) {
-        String txnId = ledgerService.debit(request);
+        // The ledger call carries a child key, so a crash between the debit and
+        // the state save is safe: the retried debit returns the same txnId
+        String txnId = ledgerService.debit(request,
+            deriveChildKey(idempotencyKey, "ledger", "debit"));
         workflow.setTransactionId(txnId);
         workflow.setState(WorkflowState.DEBITED);
-        workflowRepo.save(workflow);
+        tx.executeWithoutResult(st -> workflowRepo.save(workflow));   // commit now
     }
 
     if (workflow.getState() == WorkflowState.DEBITED) {
         notificationService.send(workflow.getTransactionId(), request);
         workflow.setState(WorkflowState.NOTIFIED);
-        workflowRepo.save(workflow);
+        tx.executeWithoutResult(st -> workflowRepo.save(workflow));
     }
 
     if (workflow.getState() == WorkflowState.NOTIFIED) {
         workflow.setState(WorkflowState.COMPLETE);
-        workflowRepo.save(workflow);
+        tx.executeWithoutResult(st -> workflowRepo.save(workflow));
     }
 
     return PaymentResponse.success(workflow.getTransactionId());
@@ -411,11 +418,12 @@ public PaymentResponse processWithPartialSuccessHandling(
 
 ## End-to-End Idempotency Across Service Boundaries
 
-A single payment crosses multiple services. Idempotency must be propagated, not regenerated:
+A single payment crosses multiple services. Idempotency must be propagated, never replaced with a fresh random key — a new random key on each retry would defeat it:
 
 ```
 Client → API Gateway → Payment Service → Ledger Service → Notification Service
-         (key: abc123)   (key: abc123)     (key: abc123)     (key: abc123)
+         (key: abc123)   (key: abc123)     (key: H(abc123:ledger:debit))
+                                                              (key: H(abc123:notification:send))
 ```
 
 Each service generates a **child key** derived from the parent key and its own operation:
@@ -446,9 +454,9 @@ request.getHeaders().set("Idempotency-Key",
 
 - At-least-once delivery is the default in every distributed protocol; idempotency is the client-side and server-side defence.
 - UUID v4 keys are simpler; composite keys are more resilient to client crash-before-persist.
-- The `idempotent_requests` table with a UNIQUE PRIMARY KEY is the foundation; the `SELECT FOR UPDATE` prevents concurrent duplicate processing.
+- The `idempotent_requests` table with a UNIQUE PRIMARY KEY is the foundation; claim the key first (`INSERT ... ON CONFLICT DO NOTHING`, committed) so that exactly one concurrent request processes it.
 - Redis `SETNX` suits low-latency paths but requires careful durability configuration.
-- Partial success requires workflow state tracking, not just request deduplication.
+- Partial success requires workflow state tracking, with each step committed separately, not just request deduplication.
 - Propagate idempotency keys across service boundaries using deterministic child key derivation.
 
 <!-- KNOWLEDGE-CHECK
@@ -496,25 +504,25 @@ request.getHeaders().set("Idempotency-Key",
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Idempotency in Distributed Financial Systems \u2014 Production Implementation",
+  "title": "Idempotent Cross-Border Payment: FX Lock, Sanctions Check, and SWIFT Dispatch",
   "difficulty": "principal",
   "estimatedMinutes": 85,
   "tasks": [
     {
       "id": "1",
-      "description": "Design the `idempotent_requests` table with appropriate indexes for 10 million records with a 24-hour TTL cleanup job"
+      "description": "Design the idempotent_requests table (claim status, request hash, stored response, expiry) with indexes for 10 million records, and a batched cleanup job that deletes expired rows 10,000 at a time."
     },
     {
       "id": "2",
-      "description": "Implement `IdempotentSWIFTDispatcher` that uses Redis SETNX for the first-pass fast check but falls back to PostgreSQL for durability on the SWIFT disp"
+      "description": "Implement IdempotentSWIFTDispatcher: a Redis SET NX check as the fast first pass, and a claim-first PostgreSQL record (INSERT ... ON CONFLICT DO NOTHING) as the durable guard before the SWIFT message is sent."
     },
     {
       "id": "3",
-      "description": "Implement child key derivation so that the FX lock, sanctions check, and SWIFT dispatch each have isolated idempotency namespaces derived from the clie"
+      "description": "Implement deterministic child-key derivation so the FX rate lock, the sanctions check, and the SWIFT dispatch each get their own idempotency key derived from the client's key, and pass each key to the downstream call."
     },
     {
       "id": "4",
-      "description": "Write a test that simulates a network timeout after the debit succeeds but before the SWIFT dispatch completes, then verifies that the retry does not d"
+      "description": "Write a test that simulates a network timeout after the debit succeeds but before the SWIFT dispatch completes, then verifies that the retry neither debits again nor sends a second SWIFT message, and that it resumes from the recorded workflow state."
     }
   ]
 }

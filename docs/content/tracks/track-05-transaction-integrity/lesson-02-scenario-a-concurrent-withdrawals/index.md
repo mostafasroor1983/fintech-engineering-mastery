@@ -66,18 +66,18 @@ By the end of this lesson you will be able to:
 - Implement optimistic locking using a version column and `@Version` in JPA
 - Implement atomic conditional SQL UPDATE as a lock-free alternative
 - Choose the correct strategy based on contention, latency, and consistency requirements
-- Write a jcstress test to detect a concurrent withdrawal race condition
+- Write a concurrent integration test (Testcontainers + a start latch) that detects a withdrawal race condition
 
 ## Business Context
 
-A challenger bank's current account service receives a critical incident report: a customer's account shows a balance of −£150. The account never had an overdraft facility. Post-mortem investigation reveals:
+*Composite example:* a challenger bank's current account service receives a critical incident report: a customer's ledger shows the account at −£300, while the cached balance column on the account row still says £150. The account never had an overdraft facility. Post-mortem investigation reveals:
 
 - The account had a balance of £450
 - At 14:23:07.142, a web payment for £450 was initiated (browser)
 - At 14:23:07.149, a card payment for £300 was initiated (POS terminal)
 - Both transactions passed the balance check
 - Both transactions posted their debit
-- Final balance: £450 − £450 − £300 = −£300. But the balance column stored −£150
+- Ledger balance: £450 − £450 − £300 = −£300. But the balance column stored £150 — the second request overwrote the first one's update (a lost update)
 
 The 7-millisecond gap between requests was enough for the race to occur. The root cause: a **read-modify-write** cycle implemented without any concurrency control.
 
@@ -159,7 +159,7 @@ sequenceDiagram
 
 ## Solution 1: Pessimistic Locking — SELECT FOR UPDATE
 
-The most reliable solution. The database acquires an exclusive row lock at read time. Any other transaction attempting to read or modify the same row must wait until the first transaction commits or rolls back.
+The most reliable solution. The database acquires an exclusive row lock at read time. Any other transaction that tries to lock or modify the same row (`SELECT ... FOR UPDATE`, `UPDATE`, `DELETE`) must wait until the first transaction commits or rolls back. Plain `SELECT`s are not blocked — under MVCC they keep reading the last committed version — so every code path that checks this balance must take the lock too.
 
 ```java17
 // Java 17 — Pessimistic locking via JPA @Lock
@@ -203,7 +203,7 @@ public class WithdrawalService {
 
 **What the SQL looks like:**
 
-```java17
+```sql
 -- JPA generates this under the hood
 SELECT id, balance, version FROM accounts WHERE id = 'acc-1' FOR UPDATE;
 
@@ -260,14 +260,24 @@ public class Account {
 
 ```java17
 // Optimistic withdrawal with retry on conflict
+// The RETRY must wrap the WHOLE transaction: put @Retryable on a caller bean
+// (or make sure the retry advice runs outside the transaction advice).
+// A retry inside a failed transaction cannot help — that transaction is
+// already marked rollback-only.
 @Service
 public class WithdrawalService {
 
+    // In WithdrawalFacade (a separate bean) — calls the transactional method below:
     @Retryable(
-        value = OptimisticLockingFailureException.class,
+        retryFor = OptimisticLockingFailureException.class,
         maxAttempts = 3,
-        backoff = @Backoff(delay = 50, multiplier = 1.5)
+        backoff = @Backoff(delay = 50, multiplier = 1.5, random = true) // jitter
     )
+    public WithdrawalResult withdrawWithRetry(String accountId, long amountMinorUnits) {
+        return withdrawalService.withdraw(accountId, amountMinorUnits);
+    }
+
+    // In WithdrawalService:
     @Transactional
     public WithdrawalResult withdraw(String accountId, long amountMinorUnits) {
 
@@ -285,8 +295,10 @@ public class WithdrawalService {
         // JPA generates: UPDATE accounts SET balance=?, version=version+1
         //                WHERE id=? AND version=<version-we-read>
         // If another transaction committed in the meantime, version has changed
-        // JPA detects 0 rows updated → throws OptimisticLockException → @Retryable retries
-        accountRepo.save(account);
+        // JPA detects 0 rows updated → throws OptimisticLockException → @Retryable retries.
+        // saveAndFlush makes the version check happen NOW; with plain save() it
+        // happens at commit, after this method has returned.
+        accountRepo.saveAndFlush(account);
 
         ledgerService.postDebit(accountId, amountMinorUnits);
         return WithdrawalResult.success();
@@ -296,7 +308,7 @@ public class WithdrawalService {
 
 **How the version check works:**
 
-```java17
+```sql
 -- Thread 1 reads: version = 5
 -- Thread 2 reads: version = 5
 
@@ -315,18 +327,19 @@ WHERE id = 'acc-1' AND version = 5;  -- 0 rows updated → JPA throws Optimistic
 > [!WARNING]
 > Optimistic locking works well when **conflicts are rare**. If the account is a hot account (e.g., a corporate settlement account receiving thousands of transactions per second), you will see constant `OptimisticLockException` and retry storms. Under high contention, pessimistic locking or atomic SQL performs better.
 
-## Solution 3: Atomic SQL UPDATE (Lock-Free)
+## Solution 3: Atomic Conditional UPDATE (No Application-Level Read)
 
-The most performant solution for simple balance checks: push the entire read-check-write into a single atomic SQL statement. The database engine serialises the check and update in one operation, with no application-level read required.
+The most performant solution for simple balance checks: push the entire read-check-write into a single SQL statement. The database checks the condition and updates the row in one operation, with no application-level read. (It is not lock-free: the UPDATE takes a row lock that is held until commit — but it holds it for the shortest possible time.)
 
 ```java17
 // Atomic conditional UPDATE — the most efficient approach for simple withdrawals
 @Repository
 public interface AccountRepository extends JpaRepository<Account, String> {
 
-    // Returns 1 if the update succeeded, 0 if balance was insufficient
+    // Returns 1 if the update succeeded, 0 if balance was insufficient.
+    // nativeQuery = true: this is SQL on the table, not JPQL on the entity
     @Modifying
-    @Query("""
+    @Query(nativeQuery = true, value = """
         UPDATE accounts
         SET balance = balance - :amount
         WHERE id = :accountId
@@ -362,9 +375,9 @@ public class WithdrawalService {
 
 **How it works:**
 
-The SQL `UPDATE accounts SET balance = balance - :amount WHERE id = :id AND balance >= :amount` is atomic at the row level. The database acquires an implicit row lock, reads and decrements the balance, and releases the lock — all in one operation. No application code can interfere between the read and the write.
+The SQL `UPDATE accounts SET balance = balance - :amount WHERE id = :id AND balance >= :amount` is atomic at the row level. The database takes a row lock, evaluates the condition on the **latest committed** row version (in PostgreSQL, a concurrent UPDATE waits for the first one to commit and then re-checks the WHERE clause), and decrements the balance. The row lock is held until the transaction commits. No application code can interfere between the check and the write.
 
-```java17
+```sql
 -- Thread 1: balance=45000, amount=45000
 UPDATE accounts SET balance = 45000 - 45000 WHERE id='acc-1' AND 45000 >= 45000;
 -- → 1 row updated, balance = 0
@@ -381,7 +394,7 @@ UPDATE accounts SET balance = 0 - 30000 WHERE id='acc-1' AND 0 >= 30000;
 |---|---|---|---|
 | **SELECT FOR UPDATE** | DB row lock at read time | High-value accounts, complex multi-step logic | Serialises all access; deadlock risk on multi-row |
 | **Optimistic (@Version)** | Conflict detection at commit | Low-contention accounts, retry-friendly flows | Retry storms under high contention |
-| **Atomic SQL UPDATE** | Single atomic statement | Simple balance checks, highest throughput | Cannot express complex multi-step business logic |
+| **Atomic conditional UPDATE** | Single statement checks and updates | Simple balance checks, highest throughput | Cannot express complex multi-step business logic |
 
 ```mermaid
 graph TD
@@ -397,39 +410,37 @@ graph TD
     style OPT  fill:#4c1d95,color:#ffffff
 ```
 
-## Testing: Detecting the Race with jcstress
+## Testing: Detecting the Race with a Concurrent Integration Test
 
 ```java17
-// jcstress concurrency stress test — detects the lost update race
-// Run with: java -jar jcstress.jar -t WithdrawalRaceTest
-@JCStressTest
-@Outcome(id = "BOTH_SUCCEED", expect = Expect.FORBIDDEN,
-         desc = "Both withdrawals succeeded — overdraft!")
-@Outcome(id = "ONE_SUCCEEDS", expect = Expect.ACCEPTABLE,
-         desc = "Exactly one withdrawal succeeded — correct")
-@State
-public class WithdrawalRaceTest {
+// Concurrent integration test against a REAL PostgreSQL (Testcontainers).
+// (jcstress is the right tool for in-memory JVM concurrency — memory model,
+//  atomics — but it cannot drive a Spring service and a database.)
+@SpringBootTest
+@Testcontainers
+class WithdrawalRaceIT {
 
-    private Account account;
+    @Autowired WithdrawalService withdrawalService;
+    @Autowired AccountRepository accountRepo;
 
-    @Actor
-    public void thread1(StringResult r) {
-        WithdrawalResult result = withdrawalService.withdraw(account.getId(), 450_00L);
-        r.r1 = result.isSuccess() ? "T1_OK" : "T1_DECLINED";
-    }
+    @RepeatedTest(50)   // races are probabilistic: repeat many times
+    void twoConcurrentWithdrawalsNeverOverdraw() throws Exception {
+        String accountId = createAccountWithBalance(450_00L);
+        CountDownLatch start = new CountDownLatch(1);
 
-    @Actor
-    public void thread2(StringResult r) {
-        WithdrawalResult result = withdrawalService.withdraw(account.getId(), 300_00L);
-        r.r2 = result.isSuccess() ? "T2_OK" : "T2_DECLINED";
-    }
+        try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
+            Future<WithdrawalResult> f1 = pool.submit(() -> { start.await(); return withdrawalService.withdraw(accountId, 450_00L); });
+            Future<WithdrawalResult> f2 = pool.submit(() -> { start.await(); return withdrawalService.withdraw(accountId, 300_00L); });
+            start.countDown();   // release both threads at the same moment
 
-    @Arbiter
-    public void arbiter(StringResult r) {
-        long finalBalance = accountRepo.findById(account.getId()).get().getBalance();
-        // If both succeeded, balance should be negative — a forbidden state
-        if (finalBalance < 0) {
-            r.r1 = "BOTH_SUCCEED"; // Will trigger FORBIDDEN → test failure
+            long successes = Stream.of(f1.get(), f2.get()).filter(WithdrawalResult::isSuccess).count();
+
+            // FORBIDDEN outcome: both succeed
+            assertThat(successes).isEqualTo(1);
+            assertThat(ledgerBalance(accountId)).isGreaterThanOrEqualTo(0);
+            // the cached column must agree with the journal
+            assertThat(accountRepo.findById(accountId).orElseThrow().getBalance())
+                .isEqualTo(ledgerBalance(accountId));
         }
     }
 }
@@ -456,7 +467,7 @@ public class InstrumentedWithdrawalService {
                 return result;
             } catch (OptimisticLockingFailureException e) {
                 optimisticRetryCounter.increment();
-                throw e; // @Retryable will catch and retry
+                throw e; // the retrying caller (outside the transaction) retries
             }
         });
     }
@@ -477,7 +488,7 @@ public class InstrumentedWithdrawalService {
 <!-- KNOWLEDGE-CHECK [
   {
     "id": "kc-sca-01",
-    "question": "Two concurrent transactions both read an account balance of £500 at READ COMMITTED isolation. Transaction 1 debits £500, Transaction 2 debits £400. After both commit, the balance is -£400. What class of problem is this?",
+    "question": "Two concurrent transactions both read an account balance of £500 at READ COMMITTED isolation. Transaction 1 debits £500, Transaction 2 debits £400. After both commit, the journal shows £900 debited, but the cached balance column says £100. What class of problem is this?",
     "options": [
       "Dirty read — Transaction 2 read uncommitted data",
       "Phantom read — a row was inserted between the two reads",
@@ -485,7 +496,7 @@ public class InstrumentedWithdrawalService {
       "Deadlock — the two transactions are waiting for each other"
     ],
     "correct": 2,
-    "explanation": "This is a classic lost update. Both transactions read £500, both decide it's sufficient. Transaction 1 commits: balance = 100. Transaction 2 also read 500 as its base, so it commits: balance = 500 - 400 = 100 (overwriting T1's result). The net debit was £900 from a £500 account, but no error was detected. Transaction 1's update was 'lost'."
+    "explanation": "This is a classic lost update. Both transactions read £500 and both decide it is sufficient. Transaction 1 commits: balance = 0. Transaction 2 also used 500 as its base, so it writes 500 − 400 = 100, overwriting T1's result. £900 was debited from a £500 account, yet no error was detected — Transaction 1's update was 'lost'."
   },
   {
     "id": "kc-sca-02",
@@ -542,7 +553,7 @@ public class InstrumentedWithdrawalService {
     },
     {
       "id": "pc-sca-03",
-      "description": "Implement the atomic SQL UPDATE solution. Write the JPQL @Query annotation and the calling service code that correctly interprets a 0-row-update result as INSUFFICIENT_FUNDS."
+      "description": "Implement the atomic conditional UPDATE solution. Write the @Query annotation (native SQL with nativeQuery = true, or JPQL on the entity) and the calling service code that correctly interprets a 0-row-update result as INSUFFICIENT_FUNDS."
     },
     {
       "id": "pc-sca-04",

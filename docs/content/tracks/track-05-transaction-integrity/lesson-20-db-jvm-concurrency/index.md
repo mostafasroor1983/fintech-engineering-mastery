@@ -48,13 +48,15 @@ references:
   - "Hibernate ORM Documentation — Session and Transaction"
 ---
 
+## Overview
+
 The gap between JVM concurrency primitives and database transaction semantics is one of the most reliable sources of production incidents in banking systems. A thread holds a database connection for the entire duration of a `@Transactional` method, isolation levels determine which concurrent anomalies are possible, and Hibernate's first-level cache can silently serve stale data while balances diverge on-screen. These are not theoretical concerns — they appear repeatedly in post-incident reviews at digital banks, payment processors, and core banking vendors. This lesson maps the exact interaction points between Spring, Hibernate, and PostgreSQL so that you can reason about them precisely before they cause a production outage.
 
 ## Learning Objectives
 
 By the end of this lesson you will be able to:
 
-- Explain why the N+1 connection problem occurs and how virtual threads change the calculus
+- Explain why connection pool exhaustion occurs and how virtual threads change the calculus
 - Identify the thread-boundary rules of Spring `@Transactional` and avoid the `@Async` propagation trap
 - Select the correct isolation level for a given concurrent anomaly scenario
 - Explain PostgreSQL MVCC and how it differs from lock-based isolation
@@ -64,14 +66,14 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-In Q3 2023, a European neo-bank operating on a Spring Boot 3 / PostgreSQL stack experienced a full payment processing outage lasting 47 minutes during morning peak hours. The root cause was connection pool exhaustion: HikariCP was configured with `maximumPoolSize=50`, while the Tomcat thread pool had grown to 200 threads under load. Each inbound HTTP request held a connection open for an average of 340 ms due to a downstream KYC service call made *inside* the `@Transactional` boundary. The pool hit zero available connections, new requests queued, timeouts cascaded, and the payment API returned 503s to 180,000 customers.
+*Composite example:* a European neo-bank operating on a Spring Boot 3 / PostgreSQL stack experiences a full payment processing outage lasting 47 minutes during morning peak hours. The root cause was connection pool exhaustion: HikariCP was configured with `maximumPoolSize=50`, while the Tomcat thread pool had grown to 200 threads under load. Each inbound HTTP request held a connection open for an average of 340 ms due to a downstream KYC service call made *inside* the `@Transactional` boundary. The pool hit zero available connections, new requests queued, timeouts cascaded, and the payment API returned 503s to 180,000 customers.
 
-The fix required three changes: moving the KYC call outside the transaction boundary, reducing the Tomcat thread pool, and migrating to virtual threads with a connection pool sized to the actual database capacity (120 connections on a 32-vCPU RDS instance). Recovery of lost customer trust cost the bank approximately €2.1 million in regulatory fines and customer compensation under PSD2 Article 90.
+The fix required three changes: moving the KYC call outside the transaction boundary, reducing the Tomcat thread pool, and migrating to virtual threads with a connection pool sized to the database's real capacity. The bank also had to compensate affected customers and explain the outage to its regulator.
 
 > [!WARNING]
 > Never call a remote HTTP service, send a Kafka message, or perform any I/O with unpredictable latency inside a `@Transactional` method. The database connection is held open for the entire duration of the method.
 
-## The N+1 Connection Problem
+## The Connection Pool Exhaustion Problem
 
 Every `@Transactional` method acquires a connection from the pool at method entry and returns it only at method exit (commit or rollback). With a traditional thread-per-request model, one HTTP thread equals one potential concurrent connection holder.
 
@@ -92,7 +94,7 @@ sequenceDiagram
     Note over H: 150 threads waiting — pool exhausted
 ```
 
-With 200 Tomcat threads and a 50-connection pool, 150 threads stall the moment all connections are taken. The fix is not simply to increase the pool — PostgreSQL has hard limits on concurrent connections (typically `max_connections = 100–200` on managed instances), and each connection consumes approximately 5 MB of server memory plus a backend process.
+With 200 Tomcat threads and a 50-connection pool, 150 threads stall the moment all connections are taken. The fix is not simply to increase the pool — PostgreSQL has hard limits on concurrent connections (typically `max_connections = 100–200` on managed instances), and each connection is a separate backend process that uses several megabytes of server memory.
 
 **Sizing rule:** `pool_size ≈ (db_cpu_cores × 2) + effective_spindle_count`. For a 32-vCPU RDS instance: `32 × 2 = 64` connections is a reasonable ceiling.
 
@@ -100,8 +102,8 @@ With 200 Tomcat threads and a 50-connection pool, 150 threads stall the moment a
 
 Java 21 virtual threads (JEP 444) are cheap: millions can exist simultaneously, and when a virtual thread blocks on I/O it unmounts from its carrier thread without consuming an OS thread. This means you can have thousands of in-flight requests without thousands of OS threads. However, **database connections are still a finite resource** — virtual threads do not eliminate pool exhaustion; they make it *more* likely without deliberate sizing because the JVM can now create far more concurrent `@Transactional` contexts than before.
 
-```java
-// application.properties — Project Loom virtual thread executor
+```properties
+# application.properties — Project Loom virtual thread executor
 spring.threads.virtual.enabled=true
 
 # HikariCP — size to DB capacity, NOT to request concurrency
@@ -200,12 +202,15 @@ UPDATE accounts SET balance = 1000 - 200 WHERE id = 42; -- balance = 800
 COMMIT;
 
 -- Transaction B writes (based on stale read of 1000)
+-- (this UPDATE waits for A's row lock, then overwrites A's result)
 UPDATE accounts SET balance = 1000 - 300 WHERE id = 42; -- balance = 700
 COMMIT;
 
 -- Final balance: 700 — the 200 debit from Transaction A is LOST
 -- Correct balance should be: 1000 - 200 - 300 = 500
 ```
+
+The bug is the *absolute* value computed in the application from a stale read. A relative, conditional update — `UPDATE accounts SET balance = balance - 300 WHERE id = 42 AND balance >= 300` — is safe even in `READ COMMITTED`: after waiting for A's lock, PostgreSQL re-checks the row's latest version.
 
 ### REPEATABLE_READ Prevents It
 
@@ -215,7 +220,7 @@ Under `REPEATABLE READ`, Transaction B's snapshot was taken at its `BEGIN`. When
 ERROR: could not serialize access due to concurrent update
 ```
 
-The application must catch this error, retry the transaction, and re-read the balance.
+The application must catch this error (SQLSTATE `40001`, surfaced by Spring as a `ConcurrencyFailureException` subtype), retry the whole transaction in a **new** transaction, and re-read the balance.
 
 ```java
 @Transactional(isolation = Isolation.REPEATABLE_READ)
@@ -229,11 +234,14 @@ public void debit(UUID accountId, long amountCents) {
 
     account.setBalanceCents(account.getBalanceCents() - amountCents);
     accountRepository.save(account);
-    // PostgreSQL raises SerializationFailure if a concurrent UPDATE
-    // has committed since this transaction's snapshot.
-    // The caller must catch and retry.
+    // PostgreSQL raises a serialization failure (40001) if a concurrent
+    // UPDATE has committed since this transaction's snapshot.
+    // The caller must catch and retry OUTSIDE this @Transactional method.
 }
 ```
+
+> [!TIP]
+> Alternatives that avoid serialization retries: lock the row first (`SELECT ... FOR UPDATE`, lesson 17), or use a conditional relative update (lesson 16).
 
 ### PostgreSQL MVCC
 
@@ -247,7 +255,7 @@ graph LR
     end
 
     TxA["Tx 110 (READ COMMITTED)\nSees V2 (balance=800)"] --> V2
-    TxB["Tx 95 snapshot\nStill sees V1 (balance=1000)"] --> V1
+    TxB["Tx 103 snapshot, taken before 105 committed\nStill sees V1 (balance=1000)"] --> V1
 
     style V1 fill:#fef3c7
     style V2 fill:#d1fae5
@@ -274,7 +282,7 @@ public void demonstrateStaleness(UUID accountId) {
 }
 ```
 
-**Fix:** call `entityManager.refresh(entity)` to discard the cached version and reload from the database.
+**Fix:** call `entityManager.refresh(entity)` to discard the cached version and reload from the database. For a check that a write depends on (such as an authorisation), refresh *with a lock*, so the row cannot change between the check and the write.
 
 ```java
 @Service
@@ -284,14 +292,16 @@ public class BalanceService {
     private final AccountRepository accountRepository;
     private final EntityManager entityManager;
 
-    @Transactional(isolation = Isolation.REPEATABLE_READ)
+    @Transactional   // READ COMMITTED
     public long getAuthorizedBalance(UUID accountId) {
         Account account = accountRepository.findById(accountId).orElseThrow();
 
-        // Force reload from database, bypassing first-level cache.
-        // Use when you must observe the most recent committed state
-        // and cannot rely on the session snapshot.
-        entityManager.refresh(account);
+        // Reload the latest committed row, bypassing the first-level cache,
+        // AND lock it (SELECT ... FOR UPDATE), so no one can change it between
+        // this check and the hold we insert next in the same transaction.
+        // (Under REPEATABLE READ a plain refresh() would only re-read this
+        //  transaction's snapshot — it could never see newer commits.)
+        entityManager.refresh(account, LockModeType.PESSIMISTIC_WRITE);
 
         return account.getBalanceCents();
     }
@@ -306,7 +316,7 @@ public class BalanceService {
 Marking a transaction read-only achieves two things in a Spring + Hibernate stack:
 
 1. **Hibernate skips dirty checking** at flush time, since no writes are expected. For sessions that load many entities, this avoids the full entity comparison scan at flush.
-2. **Spring routes to a read replica** if a `LazyConnectionDataSourceProxy` with a routing datasource is configured — a common pattern for high-read payment dashboards.
+2. **Spring routes to a read replica** if a `LazyConnectionDataSourceProxy` with a routing datasource is configured — a common pattern for high-read payment dashboards. Remember that the replica may lag: never use a read-only replica transaction for a read that a later write depends on.
 
 ```java
 @Service
@@ -320,11 +330,12 @@ public class AccountQueryService {
     @Transactional(readOnly = true)
     public AccountStatement getStatement(UUID accountId, LocalDate from, LocalDate to) {
         Account account = accountRepository.findById(accountId).orElseThrow();
+        // Half-open range [from, to + 1 day): no gap in the last second of the day
         List<LedgerEntry> entries = ledgerRepository
-            .findByAccountIdAndCreatedAtBetween(
+            .findByAccountIdAndCreatedAtGreaterThanEqualAndCreatedAtLessThan(
                 accountId,
                 from.atStartOfDay(),
-                to.atTime(23, 59, 59));
+                to.plusDays(1).atStartOfDay());
         return AccountStatement.of(account, entries);
     }
 }
@@ -333,12 +344,16 @@ public class AccountQueryService {
 ```java
 // Replica routing datasource configuration
 @Bean
-public DataSource routingDataSource(
+@Primary
+public DataSource dataSource(
         @Qualifier("primaryDataSource") DataSource primary,
         @Qualifier("replicaDataSource") DataSource replica) {
     TransactionRoutingDataSource routing = new TransactionRoutingDataSource();
-    routing.setPrimary(primary);
-    routing.setReplica(replica);
+    routing.setTargetDataSources(Map.of("primary", primary, "replica", replica));
+    routing.setDefaultTargetDataSource(primary);
+    routing.afterPropertiesSet();
+    // Lazy proxy: the real connection is fetched at the first statement, when
+    // the transaction's read-only flag is already known
     return new LazyConnectionDataSourceProxy(routing);
 }
 
@@ -423,9 +438,9 @@ Your team operates a card-authorization service that processes 2,000 authorizati
 
 **Task 1 — Pool Sizing:** Calculate the optimal HikariCP `maximumPoolSize`. Show your reasoning. What `connection-timeout` value would you set, and why?
 
-**Task 2 — Isolation Bug:** A load test reveals occasional double-spend: a customer's balance goes negative despite a check at the start of the transaction. Identify which isolation level would prevent this, write the corrected `@Transactional` annotation, and explain what happens at the database level when a conflict is detected.
+**Task 2 — Isolation Bug:** A load test reveals occasional double-spend: a customer's balance goes negative despite a check at the start of the transaction. Identify which isolation level would prevent this, write the corrected `@Transactional` annotation, and explain what happens at the database level when a conflict is detected. Then name one alternative that needs no serialization retries.
 
-**Task 3 — Cache Bug:** The authorization service loads an `Account` entity, checks the available credit, then posts a hold entry. Under load, stale balances are being used for the credit check because a previous read in the same session cached the account. Write the corrected service method using `entityManager.refresh()`. Explain when you would *not* use `refresh()`.
+**Task 3 — Cache Bug:** The authorization service loads an `Account` entity, checks the available credit, then posts a hold entry. Under load, stale balances are being used for the credit check because a previous read in the same session cached the account. Write the corrected service method using `entityManager.refresh(account, LockModeType.PESSIMISTIC_WRITE)`. Explain when you would *not* use `refresh()`.
 
 **Task 4 — OSIV Removal:** `spring.jpa.open-in-view` is `true` (the Spring Boot default). The service has a REST endpoint that returns an `AccountDto` including a list of recent transactions fetched via a lazy `@OneToMany`. Disable OSIV and rewrite the service layer to fix the resulting `LazyInitializationException` using a DTO projection JPQL query.
 
@@ -475,10 +490,22 @@ Your team operates a card-authorization service that processes 2,000 authorizati
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Calculate the optimal HikariCP maximumPoolSize for a 24-vCPU RDS PostgreSQL instance running the card authorization service. Show your reasoning using the formula pool_size ≈ (db_cpu_cores × 2) + effective_spindle_count. Set connection-timeout to 3000 ms and explain why 3 seconds is preferable to 30 seconds as a timeout value. Identify the current production anti-pattern where a KYC HTTP call with a 10-second timeout runs inside the @Transactional boundary and calculate how many concurrent requests exhaust the pool."},
-    {"id": "2", "description": "A load test reveals occasional double-spend: a customer's balance goes negative despite an insufficient-funds check at the start of the transaction. Write the corrected @Transactional annotation using REPEATABLE_READ isolation and explain what PostgreSQL does at the database level when it detects a concurrent UPDATE on the same row during the transaction. Write a test that launches two concurrent debit threads and asserts exactly one succeeds while the other receives a SerializationFailureException that the service retries."},
-    {"id": "3", "description": "The authorization service loads an Account entity, checks available credit, then posts a hold entry. Under load, stale balances from the Hibernate first-level cache are being used for the credit check. Write the corrected BalanceService.getAuthorizedBalance() method using entityManager.refresh() to bypass the cache. Explain in comments under what two conditions you would NOT call refresh(): (a) after modifying the entity but before saving, and (b) in read-only transactions where the first-level cache is intentionally providing a consistent snapshot."},
-    {"id": "4", "description": "spring.jpa.open-in-view is true. A REST endpoint returns AccountDto including recent transactions from a lazy @OneToMany. Disable OSIV by setting spring.jpa.open-in-view=false in application.properties. Fix the resulting LazyInitializationException by rewriting the service method as a DTO projection JPQL query that selects id, iban, balanceCents, and COUNT of recent transactions in a single query without loading full entity objects. Annotate the new method with @Transactional(readOnly = true) and explain how this enables replica routing."}
+    {
+      "id": "1",
+      "description": "Calculate the optimal HikariCP maximumPoolSize for a 24-vCPU RDS PostgreSQL instance running the card authorization service. Show your reasoning using the formula pool_size ≈ (db_cpu_cores × 2) + effective_spindle_count. Set connection-timeout to 3000 ms and explain why 3 seconds is preferable to 30 seconds as a timeout value. Identify the current production anti-pattern where a KYC HTTP call with a 10-second timeout runs inside the @Transactional boundary and calculate how many concurrent requests exhaust the pool."
+    },
+    {
+      "id": "2",
+      "description": "A load test reveals occasional double-spend: a customer's balance goes negative despite an insufficient-funds check at the start of the transaction. Write the corrected @Transactional annotation using REPEATABLE_READ isolation and explain what PostgreSQL does at the database level when it detects a concurrent UPDATE on the same row during the transaction (a serialization failure, SQLSTATE 40001). Write a test that launches two concurrent debit threads: one commits first, the other hits the serialization failure, is retried in a new transaction, and then either succeeds or fails cleanly with insufficient funds — and the final balance is never negative."
+    },
+    {
+      "id": "3",
+      "description": "The authorization service loads an Account entity, checks available credit, then posts a hold entry. Under load, stale balances from the Hibernate first-level cache are being used for the credit check. Write the corrected BalanceService.getAuthorizedBalance() method using entityManager.refresh(account, LockModeType.PESSIMISTIC_WRITE) to bypass the cache and lock the row until the hold is inserted. Explain in comments under what two conditions you would NOT call refresh(): (a) after modifying the entity but before saving, and (b) in read-only transactions where the first-level cache is intentionally providing a consistent snapshot."
+    },
+    {
+      "id": "4",
+      "description": "spring.jpa.open-in-view is true. A REST endpoint returns AccountDto including recent transactions from a lazy @OneToMany. Disable OSIV by setting spring.jpa.open-in-view=false in application.properties. Fix the resulting LazyInitializationException by rewriting the service method as a DTO projection JPQL query that selects id, iban, balanceCents, and COUNT of recent transactions in a single query without loading full entity objects. Annotate the new method with @Transactional(readOnly = true) and explain how this enables replica routing."
+    }
   ]
 }
 -->

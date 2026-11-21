@@ -21,6 +21,7 @@ EM.Icons = {
   check:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
   arrow:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>',
   build:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6"/><path d="M9 12h6"/><path d="M9 15h4"/></svg>',
+  globe:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
   threads:    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="15" y2="12"/><line x1="3" y1="18" x2="18" y2="18"/><circle cx="18" cy="6" r="2"/><circle cx="18" cy="12" r="2"/><circle cx="21" cy="18" r="2"/></svg>'
 };
 
@@ -61,9 +62,9 @@ EM.progressRing = function (pct, color) {
 ------------------------------------------------------------ */
 EM.difficultyBadge = function (difficulty) {
   var map = {
-    'advanced':  { cls: 'badge-advanced',  label: 'Advanced'  },
-    'principal': { cls: 'badge-principal', label: 'Principal' },
-    'intermediate': { cls: 'badge-high',   label: 'Intermediate' }
+    'advanced':  { cls: 'badge-advanced',  label: EM.t('badge.advanced')  },
+    'principal': { cls: 'badge-principal', label: EM.t('badge.principal') },
+    'intermediate': { cls: 'badge-intermediate', label: EM.t('badge.intermediate') }
   };
   var d = map[difficulty] || map['advanced'];
   return '<span class="badge ' + d.cls + '">' + d.label + '</span>';
@@ -71,15 +72,15 @@ EM.difficultyBadge = function (difficulty) {
 
 EM.statusBadge = function (status, priority) {
   if (status === 'in-development') {
-    return '<span class="badge badge-in-development">In Development</span>';
+    return '<span class="badge badge-in-development">' + EM.t('badge.inDev') + '</span>';
   }
   if (priority === 'critical') {
-    return '<span class="badge badge-critical">Critical Priority</span>';
+    return '<span class="badge badge-critical">' + EM.t('badge.critical') + '</span>';
   }
   if (priority === 'high') {
-    return '<span class="badge badge-high">High Priority</span>';
+    return '<span class="badge badge-high">' + EM.t('badge.high') + '</span>';
   }
-  return '<span class="badge badge-planned">Planned</span>';
+  return '<span class="badge badge-planned">' + EM.t('badge.planned') + '</span>';
 };
 
 /* ------------------------------------------------------------
@@ -94,10 +95,27 @@ EM.App = {
   init: async function () {
     this._applyTheme();
     await this._loadData();
-    this._renderTopBar();
-    this._renderSidebar();
+    this._renderShell();
     this._registerRoutes();
     EM.Router.init();
+
+    // Language switch: reload translated track data, then redraw everything
+    document.addEventListener('em:lang-changed', function () {
+      EM.App._loadData().then(function () {
+        EM.App._renderShell();
+        EM.Router.handle();
+      });
+    });
+  },
+
+  _renderShell: function () {
+    document.title = EM.t('app.name');
+    var skip = document.querySelector('.skip-link');
+    if (skip) skip.textContent = EM.t('app.skip');
+    var sb = document.getElementById('sidebar');
+    if (sb) sb.setAttribute('aria-label', EM.t('side.navigation'));
+    this._renderTopBar();
+    this._renderSidebar();
   },
 
   /* ----------------------------------------------------------
@@ -123,9 +141,8 @@ EM.App = {
   ---------------------------------------------------------- */
   _loadData: async function () {
     try {
-      var resp = await fetch('data/tracks.json');
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      this.tracks = await resp.json();
+      var res = await EM.I18n.fetchJSON('data/tracks.json');
+      this.tracks = res.body;
     } catch (e) {
       console.error('[EM.App] Failed to load tracks.json:', e);
       this.tracks = [];
@@ -141,28 +158,33 @@ EM.App = {
 
     var isCollapsed = localStorage.getItem('em_sidebar_collapsed') === '1';
     document.getElementById('top-bar').innerHTML =
-      '<button id="menu-btn" class="topbar-btn" onclick="EM.App.toggleMobile()" aria-label="Toggle menu">' +
+      '<button id="menu-btn" class="topbar-btn" onclick="EM.App.toggleMobile()" aria-label="' + EM.t('top.menu') + '">' +
         EM.Icons.menu +
       '</button>' +
       '<button id="sidebar-toggle-btn" class="topbar-btn sidebar-toggle-btn" onclick="EM.App.toggleSidebar()" ' +
-        'aria-label="' + (isCollapsed ? 'Expand sidebar' : 'Collapse sidebar') + '" ' +
-        'title="' + (isCollapsed ? 'Expand sidebar' : 'Collapse sidebar') + '">' +
+        'aria-label="' + EM.t(isCollapsed ? 'side.expand' : 'side.collapse') + '" ' +
+        'title="' + EM.t(isCollapsed ? 'side.expand' : 'side.collapse') + '">' +
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>' +
       '</button>' +
       '<a class="topbar-logo" href="#/" onclick="EM.Router.navigate(\'/\');return false;">' +
         '<div class="logo-mark">EM</div>' +
         '<div class="logo-text">' +
-          '<span class="logo-name">Engineering Mastery</span>' +
-          '<span class="logo-tagline">Principal Engineer Program</span>' +
+          '<span class="logo-name">' + EM.t('app.name') + '</span>' +
+          '<span class="logo-tagline">' + EM.t('app.tagline') + '</span>' +
         '</div>' +
       '</a>' +
       '<div class="topbar-spacer"></div>' +
       '<div class="topbar-actions">' +
-        '<button class="topbar-btn" onclick="EM.Router.navigate(\'/search\')" aria-label="Search" title="Search (press / or Ctrl+K)">' +
+        '<button class="topbar-btn" onclick="EM.Router.navigate(\'/search\')" aria-label="' + EM.t('top.search') + '" title="' + EM.t('top.searchTitle') + '">' +
           EM.Icons.search +
         '</button>' +
-        '<button id="theme-btn" class="topbar-btn" onclick="EM.App.toggleTheme()" aria-label="Toggle theme" title="Toggle theme">' +
+        '<button id="theme-btn" class="topbar-btn" onclick="EM.App.toggleTheme()" aria-label="' + EM.t('top.theme') + '" title="' + EM.t('top.theme') + '">' +
           themeIc +
+        '</button>' +
+        '<button id="lang-btn" class="lang-switch" onclick="EM.I18n.toggle()" ' +
+          'lang="' + (EM.I18n.lang() === 'ar' ? 'en' : 'ar') + '" ' +
+          'aria-label="' + EM.t('top.langTitle') + '" title="' + EM.t('top.langTitle') + '">' +
+          EM.Icons.globe + '<span class="lang-switch-label">' + EM.t('top.lang') + '</span>' +
         '</button>' +
       '</div>';
   },
@@ -172,20 +194,20 @@ EM.App = {
   ---------------------------------------------------------- */
   _renderSidebar: function () {
     var nav = [
-      { route: '/',             icon: EM.Icons.dashboard,  label: 'Dashboard'       },
-      { route: '/curriculum',   icon: EM.Icons.curriculum, label: 'Curriculum'      },
-      { route: '/decision-lab',      icon: EM.Icons.lab,        label: 'Decision Lab'       },
-      { route: '/concurrency-lab',   icon: EM.Icons.threads,    label: 'Concurrency Lab'    },
-      { route: '/capstone',     icon: EM.Icons.capstone,   label: 'Capstone Projects' },
-      { route: '/search',       icon: EM.Icons.search,     label: 'Search'          },
-      { route: '/about',        icon: EM.Icons.about,      label: 'About'           }
+      { route: '/',                icon: EM.Icons.dashboard,  label: EM.t('nav.dashboard')      },
+      { route: '/curriculum',      icon: EM.Icons.curriculum, label: EM.t('nav.curriculum')     },
+      { route: '/decision-lab',    icon: EM.Icons.lab,        label: EM.t('nav.decisionLab')    },
+      { route: '/concurrency-lab', icon: EM.Icons.threads,    label: EM.t('nav.concurrencyLab') },
+      { route: '/capstone',        icon: EM.Icons.capstone,   label: EM.t('nav.capstone')       },
+      { route: '/search',          icon: EM.Icons.search,     label: EM.t('nav.search')         },
+      { route: '/about',           icon: EM.Icons.about,      label: EM.t('nav.about')          }
     ];
 
     var navHtml = nav.map(function (item) {
       return '<button class="nav-item" data-route="' + item.route + '" ' +
         'onclick="EM.Router.navigate(\'' + item.route + '\')" ' +
         'aria-label="' + item.label + '">' +
-        item.icon + item.label +
+        item.icon + '<span class="nav-item-label">' + item.label + '</span>' +
       '</button>';
     }).join('');
 
@@ -193,7 +215,7 @@ EM.App = {
     var trackHtml = '';
     if (EM.App.tracks.length) {
       trackHtml = '<div class="sidebar-section">' +
-        '<div class="sidebar-label">Tracks</div>' +
+        '<div class="sidebar-label">' + EM.t('side.tracks') + '</div>' +
         '<div class="sidebar-tracks">' +
         EM.App.tracks.map(function (t) {
           var num = String(t.sequence).padStart(2, '0');
@@ -211,15 +233,18 @@ EM.App = {
 
     document.getElementById('sidebar').innerHTML =
       '<div class="sidebar-section">' +
-        '<div class="sidebar-label">Navigation</div>' +
+        '<div class="sidebar-label">' + EM.t('side.navigation') + '</div>' +
         navHtml +
       '</div>' +
       trackHtml +
       '<button class="sidebar-collapse-btn" id="sidebar-collapse-btn" ' +
         'onclick="EM.App.toggleSidebar()" ' +
-        'title="Collapse sidebar" aria-label="Collapse sidebar">' +
+        'title="' + EM.t('side.collapse') + '" aria-label="' + EM.t('side.collapse') + '">' +
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>' +
       '</button>';
+
+    // Re-apply the active highlight after a redraw
+    if (EM.Router && EM.Router.setActiveNav) EM.Router.setActiveNav(EM.Router.currentPath());
 
     // Restore collapsed state
     if (localStorage.getItem('em_sidebar_collapsed') === '1') {
@@ -268,7 +293,7 @@ EM.App = {
     // Update topbar toggle button label to reflect new state
     var btn = document.getElementById('sidebar-toggle-btn');
     if (btn) {
-      var label = isCollapsed ? 'Expand sidebar' : 'Collapse sidebar';
+      var label = EM.t(isCollapsed ? 'side.expand' : 'side.collapse');
       btn.setAttribute('aria-label', label);
       btn.setAttribute('title', label);
     }
@@ -335,11 +360,8 @@ EM.Pages.dashboard = function () {
     '<div class="dashboard-hero">' +
     '<div class="dashboard-hero-inner">' +
       '<div>' +
-        '<h1 class="dashboard-title">Engineering<br><span>Mastery</span></h1>' +
-        '<p class="dashboard-subtitle">' +
-          'Principal Software Engineer development program for Staff and Principal roles ' +
-          'in international banks and FinTech companies.' +
-        '</p>' +
+        '<h1 class="dashboard-title">' + EM.t('dash.title1') + '<br><span>' + EM.t('dash.title2') + '</span></h1>' +
+        '<p class="dashboard-subtitle">' + EM.t('dash.subtitle') + '</p>' +
         '<div class="dashboard-stack">' +
           ['Java 17', 'Java 21', 'Spring Boot 4.x', 'Spring Framework 7.x',
            'Apache Kafka', 'PostgreSQL', 'Redis', 'Kubernetes', 'JMH', 'jcstress', 'Testcontainers']
@@ -348,9 +370,9 @@ EM.Pages.dashboard = function () {
         '</div>' +
       '</div>' +
       '<div class="dashboard-stats">' +
-        _statCard(String(tracks.length), 'Learning Tracks') +
-        _statCard(_totalLessons(tracks), 'Total Lessons') +
-        _statCard(stats.overallPct + '%', 'Completed') +
+        _statCard(String(tracks.length), EM.t('dash.tracks')) +
+        _statCard(_totalLessons(tracks), EM.t('dash.lessons')) +
+        _statCard(stats.overallPct + '%', EM.t('dash.completed')) +
       '</div>' +
     '</div>' +
     '</div>';
@@ -359,7 +381,7 @@ EM.Pages.dashboard = function () {
   var progressBar =
     '<div class="progress-overview">' +
       '<div>' +
-        '<div class="progress-overview-label">Overall Progress</div>' +
+        '<div class="progress-overview-label">' + EM.t('dash.overall') + '</div>' +
         '<div class="progress-overview-value">' + stats.completedLessons + ' / ' + stats.totalLessons + '</div>' +
       '</div>' +
       '<div class="progress-overview-bar">' +
@@ -376,13 +398,13 @@ EM.Pages.dashboard = function () {
     '<div class="dashboard-body">' +
       progressBar +
       '<div class="priority-section">' +
-        '<div class="priority-label"><span>Critical Priority</span><div class="priority-label-line"></div></div>' +
+        '<div class="priority-label"><span>' + EM.t('dash.critical') + '</span><div class="priority-label-line"></div></div>' +
         '<div class="tracks-grid">' +
           critical.map(_trackCard).join('') +
         '</div>' +
       '</div>' +
       '<div class="priority-section">' +
-        '<div class="priority-label"><span>All Tracks</span><div class="priority-label-line"></div></div>' +
+        '<div class="priority-label"><span>' + EM.t('dash.allTracks') + '</span><div class="priority-label-line"></div></div>' +
         '<div class="tracks-grid">' +
           rest.map(_trackCard).join('') +
         '</div>' +
@@ -406,7 +428,6 @@ function _totalLessons(tracks) {
 function _trackCard(track) {
   var pct    = EM.Progress.getTrackProgress(track.id, track.lessonCount);
   var num    = String(track.sequence).padStart(2, '0');
-  var hours  = track.estimatedHours + 'h';
 
   return '<a class="track-card" ' +
     'style="--tc:' + track.color + '" ' +
@@ -414,7 +435,7 @@ function _trackCard(track) {
     'onclick="EM.Router.navigate(\'/curriculum/track/' + track.id + '\');return false;">' +
     '<div class="track-card-top">' +
       '<div class="track-card-meta">' +
-        '<div class="track-num">TRACK ' + num + '</div>' +
+        '<div class="track-num">' + EM.t('common.track', { n: num }) + '</div>' +
         '<div class="track-title">' + EM.esc(track.title) + '</div>' +
       '</div>' +
       '<div class="progress-ring-wrap">' +
@@ -427,7 +448,7 @@ function _trackCard(track) {
         EM.difficultyBadge(track.difficulty) +
         EM.statusBadge(track.status, track.priority) +
       '</div>' +
-      '<span class="track-lessons">' + track.lessonCount + ' lessons · ' + hours + '</span>' +
+      '<span class="track-lessons">' + EM.t('common.lessonsHours', { n: track.lessonCount, h: track.estimatedHours }) + '</span>' +
     '</div>' +
   '</a>';
 }
@@ -451,14 +472,14 @@ EM.Pages.curriculum = function () {
       'style="--tc:' + t.color + '" ' +
       'href="#/curriculum/track/' + t.id + '" ' +
       'onclick="EM.Router.navigate(\'/curriculum/track/' + t.id + '\');return false;">' +
-      '<span class="curriculum-row-num">TRACK ' + num + '</span>' +
+      '<span class="curriculum-row-num">' + EM.t('common.track', { n: num }) + '</span>' +
       '<div class="curriculum-row-info">' +
         '<div class="curriculum-row-title">' + EM.esc(t.title) + '</div>' +
         '<div class="curriculum-row-desc">' + EM.esc(t.description) + '</div>' +
       '</div>' +
       '<div class="curriculum-row-tags">' + tags + '</div>' +
       '<div class="curriculum-row-actions">' +
-        '<span class="curriculum-row-lessons">' + t.lessonCount + ' lessons</span>' +
+        '<span class="curriculum-row-lessons">' + EM.t('common.lessons', { n: t.lessonCount }) + '</span>' +
         '<div class="curriculum-progress-bar">' +
           '<div class="curriculum-progress-fill" style="width:' + pct + '%"></div>' +
         '</div>' +
@@ -469,10 +490,9 @@ EM.Pages.curriculum = function () {
 
   return '<div class="page">' +
     '<div class="page-header">' +
-      '<h1 class="page-title">Curriculum</h1>' +
+      '<h1 class="page-title">' + EM.t('cur.title') + '</h1>' +
       '<p class="page-subtitle">' +
-        total + ' lessons across 14 learning tracks &mdash; ' + hours + ' estimated hours. ' +
-        'From Advanced Architecture to Staff &amp; Principal Engineering Leadership.' +
+        EM.esc(EM.t('cur.subtitle', { lessons: total, tracks: tracks.length, hours: Math.round(hours) })) +
       '</p>' +
     '</div>' +
     '<div class="curriculum-grid">' + rows + '</div>' +
@@ -490,8 +510,8 @@ EM.Pages.trackDetail = async function (trackId) {
 
   if (!appTrack) {
     return '<div class="page"><div class="page-header">' +
-      '<h1 class="page-title">Track Not Found</h1>' +
-      '<p class="page-subtitle">Track ID: ' + EM.esc(trackId) + '</p>' +
+      '<h1 class="page-title">' + EM.t('cur.notFound') + '</h1>' +
+      '<p class="page-subtitle">' + EM.esc(EM.t('cur.trackId', { id: trackId })) + '</p>' +
     '</div></div>';
   }
 
@@ -503,8 +523,8 @@ EM.Pages.trackDetail = async function (trackId) {
   // Try to load the _track.json for this track
   var trackData = null;
   try {
-    var resp = await fetch('content/tracks/' + appTrack.id + '-' + appTrack.slug + '/_track.json');
-    if (resp.ok) trackData = await resp.json();
+    var res = await EM.I18n.fetchJSON('content/tracks/' + appTrack.id + '-' + appTrack.slug + '/_track.json');
+    trackData = res.body;
   } catch (e) { /* will fall through to coming-soon */ }
 
   var lessonListHtml = trackData && trackData.lessons && trackData.lessons.length
@@ -516,22 +536,22 @@ EM.Pages.trackDetail = async function (trackId) {
       '<div style="margin-bottom:var(--sp-3)">' +
         '<button class="btn btn-ghost" onclick="EM.Router.navigate(\'/curriculum\')" ' +
           'style="font-size:var(--text-sm);padding:4px var(--sp-3)">' +
-          '&larr; Curriculum' +
+          EM.esc(EM.t('cur.back')) +
         '</button>' +
       '</div>' +
       '<div style="display:flex;align-items:flex-start;gap:var(--sp-5)">' +
         '<div style="flex:1">' +
           '<div style="font-size:11px;font-family:var(--font-mono);font-weight:600;' +
             'letter-spacing:0.08em;color:var(--text-muted);margin-bottom:var(--sp-2)">' +
-            'TRACK ' + num +
+            EM.t('common.track', { n: num }) +
           '</div>' +
           '<h1 class="page-title" style="color:' + appTrack.color + '">' + EM.esc(appTrack.title) + '</h1>' +
           '<p class="page-subtitle">' + EM.esc(appTrack.description) + '</p>' +
           '<div style="display:flex;flex-wrap:wrap;gap:var(--sp-2);margin-top:var(--sp-4)">' +
             EM.difficultyBadge(appTrack.difficulty) +
             EM.statusBadge(appTrack.status, appTrack.priority) +
-            '<span class="badge badge-planned">' + appTrack.lessonCount + ' lessons</span>' +
-            '<span class="badge badge-planned">' + appTrack.estimatedHours + 'h</span>' +
+            '<span class="badge badge-planned">' + EM.t('common.lessons', { n: appTrack.lessonCount }) + '</span>' +
+            '<span class="badge badge-planned">' + EM.t('common.hours', { n: appTrack.estimatedHours }) + '</span>' +
           '</div>' +
         '</div>' +
         '<div>' + EM.progressRing(EM.Progress.getTrackProgress(appTrack.id, appTrack.lessonCount), appTrack.color) + '</div>' +
@@ -539,7 +559,7 @@ EM.Pages.trackDetail = async function (trackId) {
     '</div>' +
     '<div style="margin-bottom:var(--sp-6)">' +
       '<div style="font-size:var(--text-xs);font-weight:600;color:var(--text-muted);text-transform:uppercase;' +
-        'letter-spacing:0.06em;margin-bottom:var(--sp-3)">Topics Covered</div>' +
+        'letter-spacing:0.06em;margin-bottom:var(--sp-3)">' + EM.t('cur.topics') + '</div>' +
       '<div style="display:flex;flex-wrap:wrap;gap:var(--sp-2)">' + tags + '</div>' +
     '</div>' +
     lessonListHtml +
@@ -558,24 +578,24 @@ function _renderLessonList(lessons, appTrack) {
   function _lessonRow(lesson, idx) {
     var status = EM.Progress.getLessonStatus(lesson.id);
     var num    = String(lesson.sequence || idx + 1).padStart(2, '0');
-    var mins   = lesson.estimatedMinutes ? lesson.estimatedMinutes + ' min' : '';
+    var mins   = lesson.estimatedMinutes ? EM.t('common.min', { n: lesson.estimatedMinutes }) : '';
 
     var statusDot = status === 'completed'
-      ? '<span style="color:var(--green);font-size:1rem" title="Completed">✓</span>'
+      ? '<span style="color:var(--green);font-size:1rem" title="' + EM.t('cur.statusDone') + '">✓</span>'
       : status === 'in-progress'
         ? '<span style="color:var(--blue);font-size:0.75rem;border:2px solid var(--blue);' +
-            'border-radius:50%;width:14px;height:14px;display:inline-flex;align-items:center;justify-content:center" title="In Progress"></span>'
-        : '<span style="width:14px;height:14px;border:2px solid var(--border);border-radius:50%;display:inline-block" title="Not Started"></span>';
+            'border-radius:50%;width:14px;height:14px;display:inline-flex;align-items:center;justify-content:center" title="' + EM.t('cur.statusProgress') + '"></span>'
+        : '<span style="width:14px;height:14px;border:2px solid var(--border);border-radius:50%;display:inline-block" title="' + EM.t('cur.statusNone') + '"></span>';
 
     return '<button class="curriculum-row" ' +
       'style="--tc:' + appTrack.color + '" ' +
       'onclick="EM.Router.navigate(\'/tracks/' + appTrack.id + '/lessons/' + lesson.id + '\')">' +
-      '<span class="curriculum-row-num">LESSON ' + num + '</span>' +
+      '<span class="curriculum-row-num">' + EM.t('common.lesson', { n: num }) + '</span>' +
       '<div class="curriculum-row-info">' +
         '<div class="curriculum-row-title">' + EM.esc(lesson.title) + '</div>' +
         '<div style="font-size:var(--text-xs);color:var(--text-muted);margin-top:2px">' +
           EM.difficultyBadge(lesson.difficulty) +
-          (mins ? '<span style="margin-left:8px">' + mins + '</span>' : '') +
+          (mins ? '<span style="margin-inline-start:8px">' + mins + '</span>' : '') +
         '</div>' +
       '</div>' +
       '<div style="display:flex;align-items:center;gap:var(--sp-3);flex-shrink:0">' +
@@ -586,10 +606,10 @@ function _renderLessonList(lessons, appTrack) {
 
   return '<div>' +
     '<div style="font-size:var(--text-xs);font-weight:600;color:var(--text-muted);text-transform:uppercase;' +
-      'letter-spacing:0.06em;margin-bottom:var(--sp-4)">Lessons (' + mainLessons.length + ')</div>' +
+      'letter-spacing:0.06em;margin-bottom:var(--sp-4)">' + EM.t('cur.lessons', { n: mainLessons.length }) + '</div>' +
     '<div class="curriculum-grid">' + rows(mainLessons) + '</div>' +
     (optionalLessons.length
-      ? heading('Optional: read if time allows (' + optionalLessons.length + ')') +
+      ? heading(EM.t('cur.optional', { n: optionalLessons.length })) +
         '<div class="curriculum-grid">' + rows(optionalLessons) + '</div>'
       : '') +
   '</div>';
@@ -597,8 +617,8 @@ function _renderLessonList(lessons, appTrack) {
 
 function _comingSoonSection(track) {
   var messages = {
-    'in-development': 'This track is being developed. Lessons will appear here as they are published.',
-    'planned':        'This track is on the roadmap. Priority tracks (Track 03, 04, 05) are developed first.'
+    'in-development': EM.t('cur.soonDev'),
+    'planned':        EM.t('cur.soonPlanned')
   };
   var msg = messages[track.status] || messages['planned'];
 
@@ -607,13 +627,13 @@ function _comingSoonSection(track) {
     'border-top:3px solid ' + track.color + '">' +
     '<div style="font-size:2rem;margin-bottom:var(--sp-4)">🏗</div>' +
     '<h2 style="font-size:var(--text-xl);font-weight:600;color:var(--text-primary);margin-bottom:var(--sp-3)">' +
-      'Lessons Coming Soon' +
+      EM.t('cur.soonTitle') +
     '</h2>' +
     '<p style="font-size:var(--text-base);color:var(--text-secondary);max-width:480px;margin:0 auto var(--sp-5)">' +
       EM.esc(msg) +
     '</p>' +
     '<button class="btn btn-secondary" onclick="EM.Router.navigate(\'/curriculum\')">' +
-      '&larr; Back to Curriculum' +
+      EM.esc(EM.t('cur.backToCur')) +
     '</button>' +
   '</div>';
 }
@@ -643,7 +663,7 @@ EM.Pages.comingSoon = function (title, iconKey) {
   ];
 
   var roadmapHtml = '<div class="coming-soon-roadmap">' +
-    '<h4>What\'s Coming</h4>' +
+    '<h4>' + EM.esc(EM.t('soon.whatsComing')) + '</h4>' +
     items.map(function (item) {
       return '<div class="roadmap-item">' + EM.Icons.check + EM.esc(item) + '</div>';
     }).join('') +
@@ -653,11 +673,11 @@ EM.Pages.comingSoon = function (title, iconKey) {
     '<div class="coming-soon-icon">' + icon + '</div>' +
     '<h1 class="coming-soon-title">' + EM.esc(title) + '</h1>' +
     '<p class="coming-soon-desc">' +
-      'This section is on the development roadmap and will be released in an upcoming phase.' +
+      EM.t('soon.desc') +
     '</p>' +
     roadmapHtml +
     '<button class="btn btn-secondary" onclick="EM.Router.navigate(\'/\')">' +
-      '&larr; Back to Dashboard' +
+      EM.esc(EM.t('soon.back')) +
     '</button>' +
   '</div>';
 };
@@ -666,20 +686,22 @@ EM.Pages.comingSoon = function (title, iconKey) {
    About
 ---------------------------------------------------------- */
 EM.Pages.about = function () {
+  var ar = EM.I18n.lang() === 'ar';
+
   var techStack = [
-    { name: 'Java 17 / 21',     role: 'Primary runtime' },
-    { name: 'Spring Boot 4.x',  role: 'Application framework' },
-    { name: 'Spring Framework 7.x', role: 'Core framework' },
-    { name: 'Maven',            role: 'Build & dependency management' },
-    { name: 'PostgreSQL',       role: 'Primary database' },
-    { name: 'Apache Kafka',     role: 'Messaging & streaming' },
-    { name: 'Redis',            role: 'Caching & distributed locks' },
-    { name: 'JUnit 5',          role: 'Unit & integration testing' },
-    { name: 'Testcontainers',   role: 'Infrastructure testing' },
-    { name: 'JMH',              role: 'Microbenchmarking' },
-    { name: 'jcstress',         role: 'Concurrency stress testing' },
-    { name: 'Docker',           role: 'Containerization' },
-    { name: 'Kubernetes',       role: 'Orchestration' }
+    { name: 'Java 17 / 21',         role: ar ? 'بيئة التشغيل الأساسية'            : 'Primary runtime' },
+    { name: 'Spring Boot 4.x',      role: ar ? 'إطار بناء التطبيقات'              : 'Application framework' },
+    { name: 'Spring Framework 7.x', role: ar ? 'الإطار الأساسي'                    : 'Core framework' },
+    { name: 'Maven',                role: ar ? 'البناء وإدارة المكتبات'           : 'Build & dependency management' },
+    { name: 'PostgreSQL',           role: ar ? 'قاعدة البيانات الأساسية'          : 'Primary database' },
+    { name: 'Apache Kafka',         role: ar ? 'الرسائل وتدفق البيانات'           : 'Messaging & streaming' },
+    { name: 'Redis',                role: ar ? 'التخزين المؤقت والأقفال الموزعة'  : 'Caching & distributed locks' },
+    { name: 'JUnit 5',              role: ar ? 'اختبارات الوحدات والتكامل'        : 'Unit & integration testing' },
+    { name: 'Testcontainers',       role: ar ? 'اختبار البنية التحتية الحقيقية'   : 'Infrastructure testing' },
+    { name: 'JMH',                  role: ar ? 'قياس الأداء الدقيق'               : 'Microbenchmarking' },
+    { name: 'jcstress',             role: ar ? 'اختبار ضغط التزامن'               : 'Concurrency stress testing' },
+    { name: 'Docker',               role: ar ? 'الحاويات'                          : 'Containerization' },
+    { name: 'Kubernetes',           role: ar ? 'تشغيل وإدارة الحاويات'            : 'Orchestration' }
   ];
 
   var orgs = [
@@ -705,71 +727,60 @@ EM.Pages.about = function () {
 
   var techHtml = techStack.map(function (t) {
     return '<div class="tech-item">' +
-      '<div class="tech-item-name">' + EM.esc(t.name) + '</div>' +
+      '<div class="tech-item-name" dir="ltr">' + EM.esc(t.name) + '</div>' +
       '<div class="tech-item-role">' + EM.esc(t.role) + '</div>' +
     '</div>';
   }).join('');
 
-  var orgHtml = orgs.map(function (o) {
-    return '<li>' + EM.esc(o) + '</li>';
-  }).join('');
+  var orgHtml = orgs.map(function (o) { return '<li dir="ltr">' + EM.esc(o) + '</li>'; }).join('');
+  var refHtml = refs.map(function (r) { return '<div class="ref-item" dir="ltr">' + EM.esc(r) + '</div>'; }).join('');
 
-  var refHtml = refs.map(function (r) {
-    return '<div class="ref-item">' + EM.esc(r) + '</div>';
-  }).join('');
+  var trackCount = EM.App.tracks.length;
+
+  var T = ar ? {
+    h1: 'إتقان الهندسة',
+    p1: '<strong>إتقان الهندسة</strong> بيئة تعلّم متقدمة لبناء المعرفة الهندسية والمهارات العملية والحس المعماري والقيادة التقنية المتوقعة من <strong>مهندسي البرمجيات على مستوى Staff وPrincipal</strong> في البنوك الكبرى وشركات التقنية المالية.',
+    p2: 'يركّز البرنامج على تحديات هندسية حقيقية وليس على أساسيات البرمجة. المحتوى موجّه لمهندسين لديهم خبرة جيدة في Java وSpring Boot والخدمات المصغّرة (Microservices) والأنظمة البنكية والأنظمة الموزعة.',
+    p3: '<strong>تركيز خاص على:</strong> التزامن، والمعالجة غير المتزامنة، وأمان الخيوط (Thread Safety)، وحالات التسابق (Race Conditions)، وسلامة البيانات المالية، والمعاملات الموزعة، وأعطال بيئة الإنتاج.',
+    h2: 'التقنيات المستخدمة',
+    h3: 'الجهات المستهدفة',
+    p4: 'يعكس المنهج المتطلبات التقنية للمؤسسات المالية الكبيرة، ويُعِدّ المهندسين لوظائف Staff وPrincipal في جهات مثل:',
+    h4: 'هيكل المنهج',
+    p5: 'يضم البرنامج <strong>' + trackCount + ' مسارًا تعليميًا</strong> و<strong>5 مشاريع تطبيقية</strong> و<strong>مختبر قرارات</strong> تفاعليًا فيه سيناريوهات معمارية واقعية، إضافة إلى <strong>مختبر التزامن والأعطال</strong>.',
+    p6: 'يتبع كل درس بنية ثابتة تشمل: نظرة عامة، وأهداف التعلّم، والمتطلبات السابقة، وسياق العمل، وشرحًا تقنيًا معمّقًا، وأمثلة بـ Java 17 و21، وتطبيقًا بـ Spring Boot، وسيناريوهات الأعطال، وتحليل الأداء والأمان، والمفاضلات، ورأي المهندس الرئيسي.',
+    h5: 'المراجع المعتمدة',
+    h6: 'بنية الموقع',
+    p7: 'هذا <strong>موقع ثابت</strong> مبني بـ HTML5 وCSS3 وJavaScript بدون أطر عمل، وبدون تسجيل دخول أو خوادم خلفية. يُستضاف على GitHub Pages، ويُحفظ تقدّمك في متصفحك (LocalStorage).',
+    p8: 'محتوى الدروس مكتوب بصيغة Markdown ويُعرض باستخدام marked.js. المخططات بـ Mermaid.js، وتلوين الشيفرة بـ Prism.js، والمعادلات بـ KaTeX عند الحاجة.',
+    h7: 'اللغة',
+    p9: 'الموقع متاح بالعربية والإنجليزية. استخدم زر اللغة في أعلى الصفحة للتبديل. المصطلحات التقنية الشائعة (مثل Kafka وidempotency وSELECT FOR UPDATE) تبقى بالإنجليزية لأنها الصيغة المستخدمة في العمل والمقابلات. الصفحات التي لم تُترجم بعد تظهر بالإنجليزية مع تنبيه.'
+  } : {
+    h1: 'Engineering Mastery',
+    p1: '<strong>Engineering Mastery</strong> is a personal, advanced-level learning environment designed to develop the engineering knowledge, practical skills, architectural judgment, and technical leadership expected from <strong>Staff and Principal Software Engineers</strong> in major banks and FinTech companies.',
+    p2: 'The program emphasizes real-world engineering challenges rather than introductory programming. Content is written for experienced engineers with deep existing knowledge of Java, Spring Boot, microservices, banking applications, and distributed systems.',
+    p3: '<strong>Special emphasis:</strong> Concurrency, asynchronous processing, thread safety, race conditions, financial data integrity, distributed transactions, and production failures.',
+    h2: 'Technical Learning Stack',
+    h3: 'Target Organizations',
+    p4: 'The curriculum reflects the technical requirements of large-scale financial institutions. The program prepares engineers for Staff and Principal roles at:',
+    h4: 'Curriculum Structure',
+    p5: 'The program contains <strong>' + trackCount + ' learning tracks</strong>, <strong>5 capstone projects</strong>, an interactive <strong>Principal Engineer Decision Lab</strong> of real-world architecture scenarios, and the <strong>Concurrency &amp; Failure Lab</strong>.',
+    p6: 'Every lesson follows a consistent structure covering: Overview, Learning Objectives, Prerequisites, Business Context, Deep Technical Explanation, Java 17 &amp; 21 implementations, Spring Boot implementation, Failure Scenarios, Performance Analysis, Security Analysis, Trade-offs, and Principal Engineer Perspective.',
+    h5: 'Authoritative References',
+    h6: 'Website Architecture',
+    p7: 'This is a <strong>static website</strong> built with HTML5, CSS3, and Vanilla JavaScript. No React, Next.js, authentication, or backend services. Hosted on GitHub Pages. Progress is stored in your browser\'s LocalStorage.',
+    p8: 'Lesson content is Markdown-based and rendered at runtime using marked.js. Architecture diagrams use Mermaid.js. Code examples use Prism.js for syntax highlighting. Mathematical notation uses KaTeX where needed.',
+    h7: 'Language',
+    p9: 'The site is available in English and Arabic. Use the language button in the top bar to switch. Pages that are not translated yet are shown in English with a short notice.'
+  };
 
   return '<div class="about-page">' +
-
-    '<div class="about-section">' +
-      '<h2>Engineering Mastery</h2>' +
-      '<p><strong>Engineering Mastery</strong> is a personal, advanced-level learning environment ' +
-        'designed to develop the engineering knowledge, practical skills, architectural judgment, ' +
-        'and technical leadership expected from <strong>Staff and Principal Software Engineers</strong> ' +
-        'in major banks and FinTech companies.</p>' +
-      '<p>The program emphasizes real-world engineering challenges rather than introductory programming. ' +
-        'Content is written for experienced engineers with deep existing knowledge of Java, Spring Boot, ' +
-        'microservices, banking applications, and distributed systems.</p>' +
-      '<p><strong>Special emphasis:</strong> Concurrency, asynchronous processing, thread safety, ' +
-        'race conditions, financial data integrity, distributed transactions, and production failures.</p>' +
-    '</div>' +
-
-    '<div class="about-section">' +
-      '<h2>Technical Learning Stack</h2>' +
-      '<div class="tech-grid">' + techHtml + '</div>' +
-    '</div>' +
-
-    '<div class="about-section">' +
-      '<h2>Target Organizations</h2>' +
-      '<p>The curriculum reflects the technical requirements of large-scale financial institutions. ' +
-        'The program prepares engineers for Staff and Principal roles at:</p>' +
-      '<ul class="org-list">' + orgHtml + '</ul>' +
-    '</div>' +
-
-    '<div class="about-section">' +
-      '<h2>Curriculum Structure</h2>' +
-      '<p>The program contains <strong>14 learning tracks</strong>, <strong>5 capstone projects</strong>, ' +
-        'and an interactive <strong>Principal Engineer Decision Lab</strong> with 20+ architecture scenarios.</p>' +
-      '<p>Every lesson follows a structured 27-section format covering: Overview, Learning Objectives, ' +
-        'Prerequisites, Business Context, Deep Technical Explanation, Java 17 &amp; 21 implementations, ' +
-        'Spring Boot implementation, Failure Scenarios, Performance Analysis, Security Analysis, ' +
-        'Trade-offs, and Principal Engineer Perspective.</p>' +
-    '</div>' +
-
-    '<div class="about-section">' +
-      '<h2>Authoritative References</h2>' +
-      '<div class="ref-list">' + refHtml + '</div>' +
-    '</div>' +
-
-    '<div class="about-section">' +
-      '<h2>Website Architecture</h2>' +
-      '<p>This is a <strong>static website</strong> built with HTML5, CSS3, and Vanilla JavaScript. ' +
-        'No React, Next.js, authentication, or backend services. ' +
-        'Hosted on GitHub Pages. Progress is stored in your browser\'s LocalStorage.</p>' +
-      '<p>Lesson content is Markdown-based and rendered at runtime using marked.js. ' +
-        'Architecture diagrams use Mermaid.js. Code examples use Prism.js for syntax highlighting. ' +
-        'Mathematical notation uses KaTeX where needed.</p>' +
-    '</div>' +
-
+    '<div class="about-section"><h2>' + T.h1 + '</h2><p>' + T.p1 + '</p><p>' + T.p2 + '</p><p>' + T.p3 + '</p></div>' +
+    '<div class="about-section"><h2>' + T.h2 + '</h2><div class="tech-grid">' + techHtml + '</div></div>' +
+    '<div class="about-section"><h2>' + T.h3 + '</h2><p>' + T.p4 + '</p><ul class="org-list">' + orgHtml + '</ul></div>' +
+    '<div class="about-section"><h2>' + T.h4 + '</h2><p>' + T.p5 + '</p><p>' + T.p6 + '</p></div>' +
+    '<div class="about-section"><h2>' + T.h5 + '</h2><div class="ref-list">' + refHtml + '</div></div>' +
+    '<div class="about-section"><h2>' + T.h6 + '</h2><p>' + T.p7 + '</p><p>' + T.p8 + '</p></div>' +
+    '<div class="about-section"><h2>' + T.h7 + '</h2><p>' + T.p9 + '</p></div>' +
   '</div>';
 };
 
@@ -782,9 +793,8 @@ document.addEventListener('DOMContentLoaded', function () {
     document.getElementById('main-content').innerHTML =
       '<div class="error-wrap">' +
         '<div class="error-icon">&#9888;</div>' +
-        '<h2 class="error-title">Failed to initialize</h2>' +
-        '<p class="error-msg">Could not load application data. ' +
-        'Please ensure you are serving this site via HTTP (not file://).</p>' +
+        '<h2 class="error-title">' + EM.t('err.init') + '</h2>' +
+        '<p class="error-msg">' + EM.t('err.initMsg') + '</p>' +
       '</div>';
   });
 });

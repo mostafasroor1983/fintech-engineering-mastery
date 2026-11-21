@@ -47,6 +47,8 @@ references:
   - "Hibernate ORM — LockModeType Javadoc"
 ---
 
+## Overview
+
 A digital wallet processes peer-to-peer transfers in milliseconds. That speed is a feature — until two requests for the same account arrive within the same window and the balance check races itself into negative territory. This lesson dissects the exact sequence that causes a double-spend, then builds three layers of defence: a pessimistic database lock, a funds-reservation model that separates "authorise" from "settle", and a CAS-based in-memory guard for wallets that cache balances. By the end you will be able to choose the right mechanism for a given throughput/consistency trade-off and test it with a 50-thread concurrent harness that proves correctness under load.
 
 ## Learning Objectives
@@ -59,9 +61,9 @@ A digital wallet processes peer-to-peer transfers in milliseconds. That speed is
 
 ## Business Context
 
-Moneta Pay, a European e-money institution with 4.2 million active wallets, operates a P2P transfer feature with a 99.95 % availability SLA. During a Black Friday cashback campaign, marketing sent a push notification to all users simultaneously. The campaign triggered a spike of 38 000 transfer requests per second. Within 90 seconds, the fraud operations team received automated alerts: 1 247 wallet balances had gone negative, with the aggregate overdraft reaching €83 400. The root cause was not a code path that allowed overdrafts by design — Moneta Pay had a balance check. The root cause was that the balance check and the debit were two separate, non-atomic operations, and at 38 000 RPS the gap between them was wide enough for a second request to slip through.
+*Composite example:* "Moneta Pay", a fictional European e-money institution with 4.2 million active wallets, operates a P2P transfer feature with a 99.95 % availability SLA. During a Black Friday cashback campaign, marketing sent a push notification to all users simultaneously. The campaign triggered a spike of 38 000 transfer requests per second. Within 90 seconds, the fraud operations team received automated alerts: 1 247 wallet balances had gone negative, with the aggregate overdraft reaching €83 400. The root cause was not a code path that allowed overdrafts by design — Moneta Pay had a balance check. The root cause was that the balance check and the debit were two separate, non-atomic operations, and at 38 000 RPS the gap between them was wide enough for a second request to slip through.
 
-The incident cost €83 400 in direct liability, €12 000 in manual remediation labour, and triggered a supervisory inquiry from the national competent authority under PSD2 Article 83. Fixing the race condition took four hours. The reputational review took four months.
+The incident cost €83 400 in direct liability, €12 000 in manual remediation labour, and triggered a supervisory inquiry from the national regulator. Fixing the race condition took four hours. The reputational review took four months.
 
 ## The Bug: Check-Then-Act Race Condition
 
@@ -129,7 +131,7 @@ sequenceDiagram
 ```
 
 > [!WARNING]
-> The default Spring `@Transactional` isolation level is READ COMMITTED on most databases. Under READ COMMITTED, the `findById` in T2 sees the row *before* T1's `UPDATE` is committed — because T1 has not committed yet. Both transactions proceed, both write, and the last writer's value wins. The first writer's debit is silently overwritten.
+> Spring's `@Transactional` uses the database's default isolation level unless you set one: READ COMMITTED in PostgreSQL, Oracle and SQL Server (REPEATABLE READ in MySQL InnoDB). Under READ COMMITTED, the `findById` in T2 sees the row *before* T1's `UPDATE` is committed — because T1 has not committed yet. Both transactions proceed, both write, and the last writer's value wins. The first writer's debit is silently overwritten.
 
 The underlying pattern is the classic **check-then-act** anti-pattern:
 
@@ -164,7 +166,7 @@ FOR UPDATE;
 ```
 
 > [!NOTE]
-> `FOR UPDATE` on PostgreSQL acquires a row-level `RowExclusiveLock`. It does not lock the entire table. Two concurrent transactions updating *different* accounts proceed in parallel without blocking each other. Lock contention is proportional to how often the same account appears in concurrent requests — which is exactly the case we need to handle.
+> `FOR UPDATE` on PostgreSQL takes an exclusive **row-level** lock on the selected rows (plus a weak `ROW SHARE` lock on the table, which does not block other writers). It does not lock the entire table. Two concurrent transactions updating *different* accounts proceed in parallel without blocking each other. Lock contention is proportional to how often the same account appears in concurrent requests — which is exactly the case we need to handle.
 
 ### Service
 
@@ -178,20 +180,19 @@ public class TransferService {
 
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public TransferResult transfer(UUID senderId, UUID recipientId, BigDecimal amount) {
-        // Acquire exclusive lock before reading balance — no gap possible
-        Account sender = accountRepository.findByIdForUpdate(senderId)
-                .orElseThrow(() -> new AccountNotFoundException(senderId));
+        // Lock BOTH accounts in canonical (UUID) order before reading anything —
+        // locking sender first and recipient second would deadlock against a
+        // concurrent transfer in the opposite direction
+        Map<UUID, Account> locked = lockAccountsOrdered(senderId, recipientId);
+        Account sender    = locked.get(senderId);
+        Account recipient = locked.get(recipientId);
 
         if (sender.getBalance().compareTo(amount) < 0) {
             throw new InsufficientFundsException(senderId, sender.getBalance(), amount);
         }
 
-        // Safe: no other transaction can modify sender.balance until this commit
+        // Safe: no other transaction can modify either balance until this commit
         sender.setBalance(sender.getBalance().subtract(amount));
-
-        // Lock recipient too — prevents concurrent credits from racing
-        Account recipient = accountRepository.findByIdForUpdate(recipientId)
-                .orElseThrow(() -> new AccountNotFoundException(recipientId));
         recipient.setBalance(recipient.getBalance().add(amount));
 
         accountRepository.saveAll(List.of(sender, recipient));
@@ -212,15 +213,13 @@ public class TransferService {
 
 ```java
 // Deadlock-safe multi-account lock acquisition
-private List<Account> lockAccountsOrdered(UUID id1, UUID id2) {
-    // Sort so both threads always acquire locks in the same order
-    List<UUID> ordered = Stream.of(id1, id2)
-            .sorted()
-            .toList();
-    return ordered.stream()
-            .map(id -> accountRepository.findByIdForUpdate(id)
-                    .orElseThrow(() -> new AccountNotFoundException(id)))
-            .toList();
+private Map<UUID, Account> lockAccountsOrdered(UUID id1, UUID id2) {
+    // Sort so every thread always acquires the locks in the same order
+    Map<UUID, Account> locked = new HashMap<>();
+    Stream.of(id1, id2).sorted().forEach(id ->
+            locked.put(id, accountRepository.findByIdForUpdate(id)
+                    .orElseThrow(() -> new AccountNotFoundException(id))));
+    return locked;
 }
 ```
 
@@ -237,13 +236,13 @@ When T1 acquires `FOR UPDATE` on Alice's row:
 The second request does not fail silently — it blocks, then fails fast with a business exception the caller can present to the user as "insufficient funds". No overdraft occurs.
 
 > [!WARNING]
-> `SELECT FOR UPDATE` with the default PostgreSQL lock timeout of *infinite* means T2 blocks indefinitely if T1 is slow. In production, always set `spring.datasource.hikari.connection-timeout` and pair it with a PostgreSQL `lock_timeout` session setting, or add `@QueryHints(@QueryHint(name = "javax.persistence.lock.timeout", value = "2000"))` (milliseconds) to the repository method. A timed-out lock acquisition throws `LockTimeoutException` which is a recoverable error — surface it as HTTP 409 Conflict and let the client retry.
+> PostgreSQL's default `lock_timeout` is 0 — wait forever — so T2 blocks indefinitely if T1 is slow. In production, set a PostgreSQL `lock_timeout` (per session or per transaction with `SET LOCAL lock_timeout = '2s'`), or add `@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "2000"))` (milliseconds; `javax.` on older Spring/Hibernate) to the repository method. (Hikari's `connection-timeout` is a different thing: how long to wait for a pool connection, not for a row lock.) A timed-out lock acquisition throws `LockTimeoutException`, a retryable error — surface it as e.g. HTTP 409 or 503 with Retry-After and let the client retry with the same idempotency key.
 
 ## Solution 2 — Funds Reservation Model
 
 Pessimistic locking serialises all transfers through a single account. For high-throughput wallets (think a merchant account receiving thousands of small payments per second), this creates a bottleneck. The funds-reservation model achieves correctness without long-held row locks.
 
-The insight: separate the moment of *authorisation* (reserve the funds) from the moment of *settlement* (commit the debit). A hold is a lightweight record that says "this amount is spoken for". The available balance is computed as `totalBalance − sumOfActiveHolds`. Two concurrent transfers each create their own hold atomically. Even if both holds succeed, the available balance check is part of hold creation — and that check is atomic.
+The insight: separate the moment of *authorisation* (reserve the funds) from the moment of *settlement* (commit the debit). A hold is a lightweight record that says "this amount is spoken for". The available balance is computed as `totalBalance − sumOfActiveHolds`. The check and the hold insert happen together under a **very short** row lock on the account, so two concurrent authorisations cannot both see the same available balance. The slow work (fraud checks, calls to other systems, settlement) then happens without holding that lock.
 
 ### Database Schema
 
@@ -404,6 +403,11 @@ public interface FundsHoldRepository extends JpaRepository<FundsHold, UUID> {
                               @Param("now") Instant now);
 
     Optional<FundsHold> findByTransferRef(UUID transferRef);
+
+    @Modifying
+    @Query("UPDATE FundsHold h SET h.status = 'SETTLED' " +
+           "WHERE h.transferRef = :ref AND h.status = 'ACTIVE' AND h.expiresAt > :now")
+    int settleIfActive(@Param("ref") UUID transferRef, @Param("now") Instant now);
 }
 ```
 
@@ -452,32 +456,37 @@ public class ReservationTransferService {
 
     /**
      * Phase 2 — Settle: convert hold into actual debit + credit.
-     * Idempotent on transferRef.
+     * Idempotent on transferRef, and safe against concurrent settles.
      */
     @Transactional
     public void settleTransfer(UUID transferRef, UUID recipientId) {
+        // Claim the hold with ONE conditional update: only an ACTIVE, unexpired
+        // hold can be settled, and only once. Two concurrent settle calls for
+        // the same ref cannot both get 1 row — read-then-settle() could.
+        //   UPDATE funds_holds SET status = 'SETTLED'
+        //   WHERE transfer_ref = :ref AND status = 'ACTIVE' AND expires_at > now()
+        int claimed = fundsHoldRepository.settleIfActive(transferRef, Instant.now());
         FundsHold hold = fundsHoldRepository.findByTransferRef(transferRef)
                 .orElseThrow(() -> new HoldNotFoundException(transferRef));
 
-        if (hold.getStatus() == FundsHold.Status.SETTLED) {
-            log.info("Transfer {} already settled — idempotent return", transferRef);
-            return;
+        if (claimed == 0) {
+            if (hold.getStatus() == FundsHold.Status.SETTLED) {
+                log.info("Transfer {} already settled — idempotent return", transferRef);
+                return;
+            }
+            // RELEASED or EXPIRED: the reserved money is no longer counted as
+            // held, so settling now could spend it twice
+            throw new HoldNotActiveException(transferRef, hold.getStatus());
         }
 
-        hold.settle();
-
-        // Deduct from sender's actual balance
-        Account sender = accountRepository.findByIdForUpdate(hold.getAccountId())
-                .orElseThrow(() -> new AccountNotFoundException(hold.getAccountId()));
+        // Lock both accounts in canonical order, then move the money
+        Map<UUID, Account> locked = lockAccountsOrdered(hold.getAccountId(), recipientId);
+        Account sender    = locked.get(hold.getAccountId());
+        Account recipient = locked.get(recipientId);
         sender.deductBalance(hold.getAmount());
-
-        // Credit recipient
-        Account recipient = accountRepository.findByIdForUpdate(recipientId)
-                .orElseThrow(() -> new AccountNotFoundException(recipientId));
         recipient.addBalance(hold.getAmount());
 
         accountRepository.saveAll(List.of(sender, recipient));
-        fundsHoldRepository.save(hold);
 
         ledgerEntryRepository.saveAll(List.of(
                 LedgerEntry.debit(hold.getAccountId(), hold.getAmount()),
@@ -516,7 +525,7 @@ sequenceDiagram
     Note over App,DB: Phase 2 — Settle (actual debit)
 
     App->>Svc: settleTransfer(ref=X, recipient=bob)
-    Svc->>DB: UPDATE funds_holds SET status=SETTLED WHERE ref=X
+    Svc->>DB: UPDATE funds_holds SET status=SETTLED WHERE ref=X AND status=ACTIVE AND not expired
     Svc->>DB: UPDATE accounts SET balance=20 WHERE id=alice
     Svc->>DB: UPDATE accounts SET balance=balance+80 WHERE id=bob
     Svc->>DB: INSERT INTO ledger_entries (DEBIT alice $80, CREDIT bob $80)
@@ -554,8 +563,10 @@ public class InMemoryBalanceCache {
      * @return true if the debit succeeded; false if insufficient balance.
      */
     public boolean tryDebit(UUID accountId, long amountInMinorUnits) {
-        AtomicLong balance = balances.computeIfAbsent(
-                accountId, id -> new AtomicLong(0));
+        AtomicLong balance = balances.get(accountId);
+        if (balance == null) {
+            return true;   // not cached: no fast rejection — let the database decide
+        }
 
         long current;
         long next;
@@ -575,8 +586,12 @@ public class InMemoryBalanceCache {
     }
 
     public void credit(UUID accountId, long amountInMinorUnits) {
-        balances.computeIfAbsent(accountId, id -> new AtomicLong(0))
-                .addAndGet(amountInMinorUnits);
+        // Only adjust accounts that are already cached. Creating an entry at 0
+        // here would make the cache show just this credit, not the real balance.
+        AtomicLong bal = balances.get(accountId);
+        if (bal != null) {
+            bal.addAndGet(amountInMinorUnits);
+        }
     }
 
     public long getBalance(UUID accountId) {
@@ -586,7 +601,7 @@ public class InMemoryBalanceCache {
 }
 ```
 
-The CAS loop guarantees atomicity because `compareAndSet` is a single hardware instruction (`CMPXCHG` on x86). If two threads read `current = 10000` and both attempt `compareAndSet(10000, 2000)`, only one will succeed. The losing thread re-reads the new value (`2000`), computes `next = 2000 − 8000 = −6000 < 0`, and returns `false`.
+The CAS loop guarantees atomicity because `compareAndSet` is a single atomic hardware instruction (`LOCK CMPXCHG` on x86). If two threads read `current = 10000` and both attempt `compareAndSet(10000, 2000)`, only one will succeed. The losing thread re-reads the new value (`2000`), computes `next = 2000 − 8000 = −6000 < 0`, and returns `false`.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -611,7 +626,7 @@ The CAS loop guarantees atomicity because `compareAndSet` is a single hardware i
         "It uses Redis instead of PostgreSQL, which is faster for financial data"
       ],
       "correct": 1,
-      "explanation": "The funds reservation model creates a lightweight hold record atomically, checking available balance as (total balance - sum of active holds). Two concurrent transfers each create their own hold atomically. This avoids a centralised lock held for the full transaction duration, enabling higher throughput while maintaining correctness."
+      "explanation": "The funds reservation model creates a lightweight hold record, checking available balance as (total balance − sum of active holds) under a very short row lock. This avoids a centralised lock held for the full duration of the operation, enabling higher throughput while maintaining correctness."
     },
     {
       "text": "An in-memory AtomicLong balance cache is used to short-circuit payment requests. The JVM crashes after the database commits a debit but before the cache is updated. What is the consequence and how is it mitigated?",
@@ -634,10 +649,22 @@ The CAS loop guarantees atomicity because `compareAndSet` is a single hardware i
   "difficulty": "advanced",
   "estimatedMinutes": 50,
   "tasks": [
-    {"id": "1", "description": "Implement the pessimistic locking solution with SELECT FOR UPDATE and canonical lock ordering for two-account transfers. Write a deadlock-safe lockAccountsOrdered method that sorts account IDs before acquiring locks."},
-    {"id": "2", "description": "Implement the funds reservation model with an authoriseTransfer method that atomically checks available balance (total balance minus active holds) and creates a hold record, and a settleTransfer method that converts the hold into a ledger debit/credit pair."},
-    {"id": "3", "description": "Implement the InMemoryBalanceCache using ConcurrentHashMap<UUID, AtomicLong> with a CAS-based tryDebit method. Wrap it in a CachedTransferService that fast-rejects requests against the cache before hitting the database, with cache rollback if the database write fails."},
-    {"id": "4", "description": "Write a concurrent integration test using 50 threads all attempting to debit $80 from an account with $100 balance. Assert that exactly one debit succeeds, all others are rejected, and the final database balance is exactly $20 with no overdraft."}
+    {
+      "id": "1",
+      "description": "Implement the pessimistic locking solution with SELECT FOR UPDATE and canonical lock ordering for two-account transfers. Write a deadlock-safe lockAccountsOrdered method that sorts account IDs before acquiring locks."
+    },
+    {
+      "id": "2",
+      "description": "Implement the funds reservation model with an authoriseTransfer method that checks available balance (total balance minus active holds) and creates a hold record under a short row lock, and a settleTransfer method that claims the hold with a conditional update and converts it into a ledger debit/credit pair."
+    },
+    {
+      "id": "3",
+      "description": "Implement the InMemoryBalanceCache using ConcurrentHashMap<UUID, AtomicLong> with a CAS-based tryDebit method. Wrap it in a CachedTransferService that fast-rejects requests against the cache before hitting the database, with cache rollback if the database write fails."
+    },
+    {
+      "id": "4",
+      "description": "Write a concurrent integration test using 50 threads all attempting to debit $80 from an account with $100 balance. Assert that exactly one debit succeeds, all others are rejected, and the final database balance is exactly $20 with no overdraft."
+    }
   ]
 }
 -->
@@ -653,7 +680,8 @@ public class CachedTransferService {
 
     public TransferResult transfer(UUID senderId, UUID recipientId,
                                     BigDecimal amount) {
-        long amountMinor = amount.movePointRight(2).longValueExact();
+        // Minor units depend on the currency: 2 for EUR/USD, 0 for JPY, 3 for BHD
+        long amountMinor = amount.movePointRight(currencyDigits(senderId)).longValueExact();
 
         // Fast rejection without hitting the database
         if (!cache.tryDebit(senderId, amountMinor)) {
@@ -667,7 +695,9 @@ public class CachedTransferService {
             cache.credit(recipientId, amountMinor);
             return result;
         } catch (Exception e) {
-            // Roll back the in-memory debit if persistence fails
+            // Roll back the in-memory debit if persistence fails. (If the failure
+            // was a timeout AFTER the database committed, the cache is now too
+            // high — which is why the reconciliation job below is mandatory.)
             cache.credit(senderId, amountMinor);
             throw e;
         }
@@ -682,11 +712,11 @@ public class CachedTransferService {
 
 **Q1: Under READ COMMITTED isolation, two concurrent transactions both read Alice's balance as $100 and both pass a `>= $80` check. Transaction T1 commits first, writing $20. What does T2 write, and what is the final balance?**
 
-A: T2 also writes $20. It computed `100 − 80 = 20` before T1 committed. When T2's `UPDATE` executes, it unconditionally sets the balance to 20 regardless of what T1 wrote. The final balance is $20, not −$60 as Alice experienced — wait. Actually T2 writes $20 which *looks* correct, but T1 already sent $80 and T2 is about to send $80: a total outflow of $160 against a starting balance of $100. The database balance of $20 is wrong because it only reflects one of the two debits. The last-writer-wins update silently drops T1's debit. Alice effectively sent $160 but her balance only decreased by $80. The correct final balance should be −$60. The database shows $20. The discrepancy is exactly $80 — the amount of the overwritten debit.
+A: T2 also writes $20. It computed `100 − 80 = 20` from its own read, before T1 committed. Under READ COMMITTED its `UPDATE` waits for T1's row lock, then sets the balance to 20 regardless of what T1 wrote. So the final balance is $20 — which *looks* plausible but is wrong. Two transfers of $80 each left the account ($160 in total) against a starting balance of $100. The correct result would have been −$60 (which should never have been allowed); the stored balance of $20 reflects only one of the two debits. The last-writer-wins update silently dropped T1's debit — a discrepancy of exactly $80.
 
 **Q2: Why does the funds-reservation model still use `SELECT FOR UPDATE` during the hold-creation phase, if its main advantage is avoiding long-held locks?**
 
-A: The `SELECT FOR UPDATE` during hold creation is a very *short* lock — it lasts only for the duration of the "compute available balance + insert hold" transaction, which completes in milliseconds. Without it, two concurrent requests could both read the same active-hold sum, both compute the same available balance, both pass the funds-sufficiency check, and both insert their holds. The sum of the two holds could then exceed the actual balance. The key difference from the original bug is that the pessimistic lock is now held for a tiny, bounded duration (no downstream HTTP calls, no slow I/O inside the lock). The settlement phase runs without any lock on the sender's account — it simply settles a hold that already exists.
+A: The `SELECT FOR UPDATE` during hold creation is a very *short* lock — it lasts only for the duration of the "compute available balance + insert hold" transaction, which completes in milliseconds. Without it, two concurrent requests could both read the same active-hold sum, both compute the same available balance, both pass the funds-sufficiency check, and both insert their holds. The sum of the two holds could then exceed the actual balance. The key difference from the original bug is that the pessimistic lock is now held for a tiny, bounded duration (no downstream HTTP calls, no slow I/O inside the lock). The settlement phase does not need to re-check the balance — the money is already reserved by the hold. It only claims the hold with a conditional update and then takes brief, ordered locks to move the money.
 
 ## Practical Challenge
 

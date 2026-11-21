@@ -41,7 +41,7 @@ references:
   - "Java Concurrency in Practice — Goetz, Peierls, Bloch et al. (2006)"
   - "JEP 444 — Virtual Threads (Java 21)"
   - "JSR-133: Java Memory Model and Thread Specification"
-  - "OpenJDK JMM Documentation — https://openjdk.org/jeps/0"
+  - "Java Language Specification §17.4 — Memory Model"
 ---
 
 ## Overview
@@ -74,7 +74,7 @@ Thread 1 debits £200 from an account with balance £1,000. Thread 2 reads the b
 
 **Without correct JMM awareness:** Thread 2 may read the stale value £1,000 — the debit by Thread 1 is simply invisible to it. Thread 2 approves the £900 withdrawal. The account is now overdrawn by £100. No exception was thrown. No lock was violated. The system behaved exactly as coded — incorrectly.
 
-This is not a hypothetical. Lost updates in banking systems caused by JMM ignorance have resulted in real overdrafts, compliance failures, and regulatory fines. The JMM is not an academic curiosity. It is the first line of financial data correctness.
+(Strictly, this example combines two problems: the stale read is a visibility problem, and the unprotected read-check-write is a race condition. Both come from missing synchronization.) Bugs of this kind are a classic source of overdrafts and reconciliation breaks. The JMM is not an academic curiosity — it is the first line of financial data correctness.
 
 ## The Java Memory Model
 
@@ -101,6 +101,9 @@ The JMM defines two abstract memory regions:
 **Working Memory** — a thread-private cache of variables the thread is currently working with. Corresponds roughly to CPU registers and L1/L2 caches.
 
 A thread does **not** read directly from main memory on every access. It may read from its working memory — a copy that was loaded at some earlier point and may be stale.
+
+> [!NOTE]
+> "Main memory / working memory" is a teaching model (it was how the pre-Java 5 specification was written). Today's JMM is defined purely by the happens-before rules below. In real hardware, CPU caches are kept coherent; stale values come mainly from the JIT keeping a value in a register, from store buffers, and from reordering by the compiler and the CPU. The practical conclusion is the same: without synchronization, there is no visibility guarantee.
 
 ```mermaid
 flowchart TB
@@ -151,7 +154,7 @@ public class PaymentProcessor {
 This code has a **visibility bug**. The JMM provides no guarantee that Thread 2 will ever observe the write `running = false` made by Thread 1. The JVM is permitted to cache `running` in a register and never re-read it from main memory.
 
 > [!DANGER]
-> This is not a theoretical edge case. On modern JVMs running with JIT compilation and on multi-core architectures (all production hardware), this bug will manifest. Thread 2 will loop indefinitely after `shutdown()` is called. In a payment system, this means the processor cannot be gracefully stopped without a forced kill.
+> This is not a theoretical edge case. Once the JIT compiles the loop, it is allowed to read `running` once and keep it in a register — and HotSpot really does this for simple loops. Thread 2 can then loop forever after `shutdown()` is called. Whether it happens depends on what the loop body does, which is exactly why the bug can pass every test and still appear in production. In a payment system, this means the processor cannot be gracefully stopped without a forced kill.
 
 ## The Happens-Before Relationship
 
@@ -178,11 +181,13 @@ sequenceDiagram
 
 > [!NOTE]
 > **Happens-before sources in the JMM:**
+> - Program order: each action in a thread happens-before every later action in the same thread
 > - A `synchronized` lock release happens-before every subsequent acquisition of the **same** lock
 > - A `volatile` write happens-before every subsequent read of the **same** variable
 > - Thread start: `Thread.start()` happens-before all actions in the new thread
 > - Thread join: all actions in a thread happen-before `Thread.join()` returns
-> - Object construction: the constructor completing happens-before the first use of the object (for safely published objects)
+> - Interruption: a call to `interrupt()` happens-before the interrupted thread detects it
+> - Related guarantee: the `final` fields of a properly constructed object are visible to any thread that obtains a reference to it (final-field semantics) — non-final fields need safe publication
 
 The happens-before relationship is **transitive**: if A HB B and B HB C, then A HB C.
 
@@ -194,8 +199,9 @@ The `volatile` keyword establishes a happens-before relationship between a write
 // Java 17 — volatile for shutdown flag visibility
 public class PaymentProcessor {
 
-    // volatile guarantees: writes are flushed to main memory,
-    // reads always load from main memory, no register caching
+    // volatile guarantees: every read sees the latest write to this field
+    // (in the teaching model: writes reach main memory, reads load from it,
+    // and the JIT cannot keep the value in a register)
     private volatile boolean running = true;
 
     public void shutdown() {
@@ -218,9 +224,9 @@ public class PaymentProcessor {
 ```java21
 // Java 21 — volatile with Virtual Threads
 // volatile semantics are IDENTICAL for virtual threads.
-// Key Java 21 consideration: synchronized blocks can PIN a virtual
-// thread to its carrier platform thread, hurting scalability.
-// Prefer ReentrantLock over synchronized inside virtual thread tasks.
+// Java 21-23 consideration: blocking inside a synchronized block PINS a
+// virtual thread to its carrier platform thread, hurting scalability, so
+// prefer ReentrantLock there. JDK 24 (JEP 491) removed this limitation.
 
 public class PaymentProcessor {
 
@@ -299,6 +305,7 @@ public class Account {
 // Option 3: Database-level locking (the correct answer for persistent balances)
 // SELECT balance FROM accounts WHERE id = ? FOR UPDATE
 // UPDATE accounts SET balance = balance - ? WHERE id = ? AND balance >= ?
+//   -> check the updated row count: 0 rows means insufficient funds
 ```
 
 ## JMM Summary
@@ -339,7 +346,7 @@ For financial systems, the right answer is almost always: **push correctness int
 - `volatile` establishes happens-before on a single variable and prevents register caching
 - `volatile` does **not** make compound operations atomic
 - Financial balances require database-level locking, not in-memory volatile fields
-- Virtual threads (Java 21) obey identical JMM rules; avoid `synchronized` inside virtual thread tasks to prevent carrier thread pinning
+- Virtual threads (Java 21) obey identical JMM rules; on Java 21–23 avoid blocking inside `synchronized` in virtual thread tasks to prevent carrier thread pinning (fixed in JDK 24 by JEP 491)
 
 ## References
 
@@ -390,12 +397,12 @@ For financial systems, the right answer is almost always: **push correctness int
     "q": "In Java 21, how do virtual threads interact with the Java Memory Model?",
     "options": [
       "Virtual threads have a separate, simplified memory model with automatic visibility",
-      "Virtual threads obey identical JMM rules; avoid synchronized inside virtual threads to prevent carrier thread pinning",
+      "Virtual threads obey identical JMM rules; on Java 21-23, avoid blocking inside synchronized in virtual threads to prevent carrier thread pinning",
       "Virtual threads eliminate the need for volatile because they run on a single platform thread",
       "Virtual threads use structured concurrency which automatically handles all visibility"
     ],
     "answer": 1,
-    "explanation": "Virtual threads obey exactly the same JMM rules as platform threads. The key Java 21 consideration is that synchronized blocks can PIN a virtual thread to its carrier platform thread, potentially negating the scalability benefits of virtual threads. For lock-based mutual exclusion inside virtual thread tasks, prefer ReentrantLock over synchronized. volatile remains necessary and correct with virtual threads."
+    "explanation": "Virtual threads obey exactly the same JMM rules as platform threads. The Java 21-23 consideration is that blocking inside a synchronized block PINS a virtual thread to its carrier platform thread, which can negate the scalability benefits of virtual threads; there, prefer ReentrantLock. JDK 24 (JEP 491) removed this limitation. volatile remains necessary and correct with virtual threads."
   }
 ]
 -->

@@ -26,7 +26,7 @@ references:
   - "PostgreSQL Documentation, 'Row Security Policies', version 16"
 ---
 
-When a European payment infrastructure provider launched its SaaS platform in 2019, it initially gave every bank customer a dedicated database. Within two years, with 400 clients onboarded, the operational cost of managing 400 separate database clusters had consumed the entire platform margin. The re-architecture to a shared-database multi-tenant model — done correctly, with strong isolation guarantees — reduced infrastructure cost by 73% while maintaining strict data separation auditable under GDPR. This lesson covers the full spectrum of tenancy models and the engineering patterns needed to build them correctly.
+Consider a European payment infrastructure provider (a composite example) that launched its SaaS platform by giving every bank customer a dedicated database. Within two years, with 400 clients onboarded, the operational cost of managing 400 separate database clusters had consumed the entire platform margin. The re-architecture to a shared-database multi-tenant model — done correctly, with strong isolation guarantees — reduced infrastructure cost by 73% while maintaining strict data separation auditable under GDPR. This lesson covers the full spectrum of tenancy models and the engineering patterns needed to build them correctly.
 
 ## Learning Objectives
 
@@ -41,7 +41,7 @@ When a European payment infrastructure provider launched its SaaS platform in 20
 
 ## Business Context
 
-In 2023, a UK embedded finance platform experienced a data isolation breach in its multi-tenant environment. A missing `tenant_id` filter in a single JPQL query in the account history service caused one tenant's transaction history to be visible in another tenant's dashboard for approximately 90 minutes before automated anomaly detection raised an alert. The affected query had bypassed row-level security because it used a native SQL path that the RLS policy did not cover. The incident cost the platform its FCA authorisation for three months and triggered a mandatory audit of all 1,400 database queries. The lesson is not that multi-tenancy is dangerous — it is that tenant isolation must be enforced at the database layer, not only at the application layer.
+Consider a UK embedded finance platform (a composite example) that suffers a data isolation breach. A missing `tenant_id` filter in a single native SQL query in the account history service makes one tenant's transaction history visible in another tenant's dashboard for about 90 minutes before anomaly detection raises an alert. The table had row-level security *enabled* but not *forced*, and the application connected as the table owner — so the policy never applied. The incident brings regulatory scrutiny and a mandatory audit of all 1,400 database queries. The lesson is not that multi-tenancy is dangerous — it is that tenant isolation must be enforced at the database layer, not only at the application layer.
 
 ## Tenancy Models
 
@@ -89,20 +89,24 @@ PostgreSQL's native RLS enforces tenant isolation at the storage layer. Even if 
 ALTER TABLE payments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payments FORCE ROW LEVEL SECURITY;
 
--- Policy: each database session can only see rows for its tenant
+-- Policy: each database session can only see (and write) rows for its tenant.
+-- current_setting() raises an error if the variable is unset: fail closed.
 CREATE POLICY tenant_isolation_policy ON payments
-    USING (tenant_id = current_setting('app.current_tenant')::uuid);
+    USING (tenant_id = current_setting('app.current_tenant')::uuid)
+    WITH CHECK (tenant_id = current_setting('app.current_tenant')::uuid);
 
--- Application sets the tenant before any query in the session.
--- Spring interceptor calls: SET LOCAL app.current_tenant = '<uuid>';
+-- The application sets the tenant at the start of every transaction:
+--   SELECT set_config('app.current_tenant', '<uuid>', true);   -- true = SET LOCAL
+-- SET LOCAL lasts until the transaction ends, so it cannot leak to the next
+-- user of a pooled connection.
 
 -- Verify: even without a WHERE clause, only current tenant rows returned
 SELECT count(*) FROM payments;
 -- Returns only rows where tenant_id = current_setting('app.current_tenant')
 
--- Administrative bypass for platform operations (superuser only)
-CREATE POLICY admin_bypass ON payments
-    USING (current_user = 'platform_admin');
+-- Platform operations: a separate role that is allowed to bypass RLS
+-- (never the role the application uses)
+ALTER ROLE platform_admin BYPASSRLS;
 ```
 
 > [!WARNING]
@@ -116,7 +120,10 @@ The `TenantContext` thread-local is the single source of truth for tenant identi
 // Thread-local tenant context
 public final class TenantContext {
 
-    private static final ThreadLocal<String> CURRENT_TENANT = new InheritableThreadLocal<>();
+    // Plain ThreadLocal, NOT InheritableThreadLocal: pooled worker threads would keep
+    // a stale tenant from whichever request created them. Propagate explicitly
+    // (TaskDecorator, message headers). On Java 25+, ScopedValue is a safer option.
+    private static final ThreadLocal<String> CURRENT_TENANT = new ThreadLocal<>();
 
     private TenantContext() {}
 
@@ -164,9 +171,11 @@ public class TenantResolutionInterceptor implements HandlerInterceptor {
     }
 
     private String extractTenantFromJwt(HttpServletRequest request) {
-        String bearer = request.getHeader("Authorization");
-        Jwt jwt = jwtDecoder.decode(bearer.substring(7));
-        return jwt.getClaimAsString(TENANT_CLAIM);
+        // Use the token Spring Security has already validated (signature, expiry,
+        // audience) — never trust a tenant id from a header or the request body
+        JwtAuthenticationToken auth = (JwtAuthenticationToken)
+            SecurityContextHolder.getContext().getAuthentication();
+        return auth.getToken().getClaimAsString(TENANT_CLAIM);
     }
 }
 ```
@@ -197,17 +206,21 @@ public class MultiTenantDataSourceConfig {
     }
 }
 
-// For pool model: sets PostgreSQL session variable before each query
+// For the pool model: set the PostgreSQL variable at the start of every transaction
+// (call it from an aspect around @Transactional service methods)
 @Component
-public class TenantSchemaConnectionDecorator implements ConnectionPreparer {
+public class TenantTransactionInitializer {
 
-    @Override
-    public void prepare(Connection connection) throws SQLException {
-        String tenantId = TenantContext.getCurrentTenant();
-        try (Statement stmt = connection.createStatement()) {
-            stmt.execute("SET LOCAL app.current_tenant = '"
-                + tenantId.replace("'", "''") + "'");
-        }
+    private final JdbcTemplate jdbc;
+
+    public TenantTransactionInitializer(JdbcTemplate jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    public void applyTenant() {
+        // Bind parameter — no string concatenation; 'true' makes it SET LOCAL
+        jdbc.queryForObject("SELECT set_config('app.current_tenant', ?, true)",
+            String.class, TenantContext.getCurrentTenant());
     }
 }
 ```
@@ -225,7 +238,9 @@ public class TenantIdentifierResolver implements CurrentTenantIdentifierResolver
         try {
             return TenantContext.getCurrentTenant();
         } catch (TenantContextMissingException e) {
-            return "system";  // For platform-level operations only
+            // Hibernate calls this at bootstrap and for platform jobs: "system" must
+            // map to a schema that holds NO tenant data
+            return "system";
         }
     }
 
@@ -262,6 +277,9 @@ public class SchemaBasedMultiTenantConnectionProvider
     private String sanitize(String tenantId) {
         return tenantId.replaceAll("[^a-zA-Z0-9_]", "");
     }
+
+    // Other required methods (getAnyConnection, releaseAnyConnection,
+    // supportsAggressiveRelease, isUnwrappableAs, unwrap) omitted for brevity
 }
 
 @Configuration
@@ -289,12 +307,11 @@ public class HibernateMultiTenancyConfig {
 
 ## Tenant Onboarding Automation
 
-Tenant onboarding must be atomic, idempotent, and auditable. A partial onboarding that fails mid-way leaves the platform in an inconsistent state.
+Tenant onboarding must be idempotent and auditable. It cannot be one database transaction — schema DDL and migrations run on their own connections — so it uses a status column (PROVISIONING → ACTIVE) and makes every step safe to repeat. A partial onboarding is then finished by simply running it again.
 
 ```java
 @Service
-@Transactional
-public class TenantOnboardingService {
+public class TenantOnboardingService {   // deliberately NOT @Transactional
 
     private final TenantRepository tenantRepository;
     private final SchemaProvisioner schemaProvisioner;
@@ -302,19 +319,21 @@ public class TenantOnboardingService {
     private final AuditLogService auditLog;
 
     public TenantOnboardingResult onboard(TenantOnboardingRequest request) {
-        // Idempotency check — safe to retry
-        if (tenantRepository.existsById(request.tenantId())) {
+        Optional<Tenant> existing = tenantRepository.findById(request.tenantId());
+        if (existing.filter(t -> t.getStatus() == TenantStatus.ACTIVE).isPresent()) {
             return TenantOnboardingResult.alreadyExists(request.tenantId());
         }
 
         try {
-            Tenant tenant = tenantRepository.save(Tenant.builder()
+            // A tenant left in PROVISIONING by a crash is simply provisioned again:
+            // every step below is idempotent (CREATE SCHEMA IF NOT EXISTS, Flyway, upserts)
+            Tenant tenant = existing.orElseGet(() -> tenantRepository.save(Tenant.builder()
                 .id(request.tenantId())
                 .name(request.name())
                 .tier(request.tier())
                 .region(request.region())
                 .status(TenantStatus.PROVISIONING)
-                .build());
+                .build()));
 
             schemaProvisioner.createSchema(request.tenantId());
             schemaProvisioner.runMigrations(request.tenantId());
@@ -327,8 +346,9 @@ public class TenantOnboardingService {
             return TenantOnboardingResult.success(request.tenantId());
 
         } catch (Exception e) {
+            // Leave the PROVISIONING row so a retry (or an operator) can finish or
+            // clean up; drop the schema only if nothing was written into it
             schemaProvisioner.dropSchemaIfEmpty(request.tenantId());
-            tenantRepository.deleteById(request.tenantId());
             throw new TenantOnboardingException(
                 "Onboarding failed for " + request.tenantId(), e);
         }
@@ -338,7 +358,7 @@ public class TenantOnboardingService {
 
 ## Noisy-Neighbour Mitigation
 
-In a pool model, one tenant executing heavy batch queries degrades performance for all others. Per-tenant connection-pool limits combined with PostgreSQL statement timeouts per role provide defence-in-depth.
+In a pool model, one tenant executing heavy batch queries degrades performance for all others. Per-tenant connection-pool limits combined with PostgreSQL statement timeouts per role provide defence-in-depth. Give dedicated pools only to large tenants: with hundreds of tenants, one pool each would exceed `max_connections`. Small tenants share a pool with a per-tenant concurrency limit (a semaphore or bulkhead), usually behind PgBouncer.
 
 ```java
 @Component
@@ -350,6 +370,7 @@ public class TenantAwareConnectionPoolManager {
         return tenantPools.computeIfAbsent(tenantId, id -> {
             HikariConfig config = new HikariConfig();
             config.setJdbcUrl(databaseUrl);
+            config.setUsername(tier.databaseRole());   // e.g. tenant_bronze: carries the tier's statement_timeout
             // Tier-based caps: GOLD=20, SILVER=10, BRONZE=5 connections max
             config.setMaximumPoolSize(tier.maxConnections());
             config.setMinimumIdle(tier.minIdleConnections());
@@ -411,25 +432,25 @@ ORDER BY connections DESC;
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Multi-Tenancy Architecture in FinTech Platforms \u2014 Production Implementation",
+  "title": "Multi-Tenancy Architecture in FinTech Platforms — Production Implementation",
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
     {
       "id": "1",
-      "description": "Write an ADR for the tenancy model. How do you support all three tenants from a single platform without maintaining three entirely separate codebases? Define the tiering model that maps tenant require"
+      "description": "Your platform has three tenants: a Tier-1 bank that forbids sharing a database instance, a mid-sized lender, and a fast-growing fintech startup. Write an ADR for the tenancy model: how do you support all three from a single platform without maintaining three separate codebases? Define the tiering model that maps tenant requirements to silo, bridge and pool deployments."
     },
     {
       "id": "2",
-      "description": "Implement the full PostgreSQL RLS setup for the pool-model tenant. Include the policy, the session variable setting mechanism, and a test that proves RLS blocks cross-tenant reads even when the WHERE"
+      "description": "Implement the full PostgreSQL RLS setup for the pool-model tenants: the policy (USING and WITH CHECK), the mechanism that sets the session variable at the start of every transaction, and a test that proves RLS blocks cross-tenant reads even when the WHERE clause is missing."
     },
     {
       "id": "3",
-      "description": "When a payment event triggers an async Kafka consumer, `TenantContext` (a ThreadLocal) is not automatically propagated to the consumer thread. Design and implement a solution that correctly propagates"
+      "description": "When a payment event triggers an async Kafka consumer, `TenantContext` (a ThreadLocal) is not automatically propagated to the consumer thread. Design and implement a solution that propagates the tenant correctly — for example a tenant header on every message that the consumer sets and always clears, and a TaskDecorator for @Async work."
     },
     {
       "id": "4",
-      "description": "Your monitoring shows that the fintech startup tenant is running a nightly batch job consuming 80% of database connections, causing timeouts for other tenants. Design and implement the connection pool"
+      "description": "Your monitoring shows the fintech startup tenant running a nightly batch job that consumes 80% of database connections, causing timeouts for other tenants. Design and implement the connection-pool and query limits that stop one tenant from starving the others, and explain how you would detect the problem automatically."
     }
   ]
 }

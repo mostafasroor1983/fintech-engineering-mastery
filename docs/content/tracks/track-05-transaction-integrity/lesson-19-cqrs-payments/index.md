@@ -11,7 +11,9 @@ tags: [CQRS, command-query, read-model, eventual-consistency, payments]
 java-versions: [17, 21]
 ---
 
-Command Query Responsibility Segregation is not an architecture pattern that solves performance — it is a pattern that honestly reflects that writing and reading in a high-throughput payment system have fundamentally different requirements. Writes need serialisable isolation, row-level locks, and strict consistency; reads need sub-millisecond latency at scale, often serving hundreds of queries per second for dashboards, mobile apps, and downstream APIs simultaneously. Attempting to serve both from a single normalised schema under a single data model is the root cause of most payment system read-performance problems.
+## Overview
+
+Command Query Responsibility Segregation is not an architecture pattern that solves performance — it is a pattern that honestly reflects that writing and reading in a high-throughput payment system have fundamentally different requirements. Writes need strong isolation (row-level locks or serializable transactions) and strict consistency; reads need sub-millisecond latency at scale, often serving hundreds of queries per second for dashboards, mobile apps, and downstream APIs simultaneously. Attempting to serve both from a single normalised schema under a single data model is the root cause of most payment system read-performance problems.
 
 ## Learning Objectives
 
@@ -24,9 +26,9 @@ Command Query Responsibility Segregation is not an architecture pattern that sol
 
 ## Business Context
 
-In November 2022 a Southeast Asian super-app processed 2.4 million payment transactions per hour during a regional double-11 sale. The engineering team had a single PostgreSQL write primary serving both payment mutations and balance queries. At peak load, balance read queries — triggered by the mobile app polling every 3 seconds for 15 million active users — consumed 60% of the primary's I/O capacity. Lock wait times on the `accounts` table reached 800 ms. Payment authorisation latency degraded from a P99 of 90 ms to 4.2 seconds and 340,000 payment attempts failed with timeout errors during the 90-minute peak window. The revenue impact was estimated at $2.3 million USD.
+*Composite example:* a Southeast Asian super-app processes 2.4 million payment transactions per hour during a regional double-11 sale. The engineering team had a single PostgreSQL write primary serving both payment mutations and balance queries. At peak load, balance read queries — triggered by the mobile app polling every 3 seconds for millions of active users — consumed 60% of the primary's I/O capacity. (Plain reads take no row locks in PostgreSQL, but the I/O saturation slowed every write transaction, so locks were held longer.) Lock wait times on the `accounts` table reached 800 ms. Payment authorisation latency degraded from a P99 of 90 ms to 4.2 seconds and 340,000 payment attempts failed with timeout errors during the 90-minute peak window. The lost revenue ran into millions.
 
-Post-incident the team implemented CQRS with a PostgreSQL streaming replica serving all read traffic. The write primary handled only mutations. During the following year's double-11 event under higher load, write-path P99 latency was 87 ms and no payment failures were attributed to database contention. The read replica served 420 million balance queries during the peak hour with a P99 of 11 ms.
+Post-incident the team implemented CQRS with PostgreSQL streaming replicas serving all read traffic, plus a less aggressive app polling interval. The write primary handled only mutations. During the following year's double-11 event under higher load, write-path P99 latency stayed under 100 ms and no payment failures were attributed to database contention.
 
 ## The Core Separation: Why Payments Need CQRS
 
@@ -34,7 +36,7 @@ The write path and read path in a payment system have opposed requirements that 
 
 | Dimension | Write Path | Read Path |
 |---|---|---|
-| Consistency | Serialisable or repeatable-read; overdraft impossible | Eventual; milliseconds of lag is acceptable |
+| Consistency | Strong (locks or serializable); overdraft impossible | Eventual; milliseconds of lag is acceptable |
 | Locking | Row-level exclusive locks for balance mutations | No locks; plain `SELECT` |
 | Schema | Normalised; enforces referential integrity | Denormalised; balance pre-aggregated |
 | Throughput | Bounded by lock contention on hot accounts | Horizontally scalable across replicas |
@@ -90,8 +92,11 @@ public class PaymentCommandHandler {
 
     @Transactional
     public void handle(DebitAccountCommand command) {
-        // Idempotency guard: reject duplicates before touching the account
-        if (idempotencyRepository.exists(command.idempotencyKey())) {
+        // Idempotency guard — CLAIM first: INSERT ... ON CONFLICT DO NOTHING.
+        // (exists()-then-record() is check-then-act: two concurrent duplicates
+        //  could both pass the check.) A concurrent duplicate waits on the
+        //  unique index until this transaction commits, then gets false.
+        if (!idempotencyRepository.claim(command.idempotencyKey())) {
             log.info("Duplicate command {}; skipping", command.idempotencyKey());
             return;
         }
@@ -114,7 +119,6 @@ public class PaymentCommandHandler {
             .build();
 
         outboxRepository.save(outbox);
-        idempotencyRepository.record(command.idempotencyKey());
     }
 }
 ```
@@ -130,6 +134,7 @@ The read model is not a normalised relational schema — it is a pre-computed an
 CREATE TABLE account_summary_view (
     account_id              UUID           NOT NULL PRIMARY KEY,
     account_number          VARCHAR(34)    NOT NULL,
+    owner_user_id           UUID           NOT NULL,
     owner_display_name      TEXT           NOT NULL,
     current_balance         NUMERIC(19, 4) NOT NULL,
     available_balance       NUMERIC(19, 4) NOT NULL,  -- balance minus pending holds
@@ -144,37 +149,43 @@ CREATE TABLE account_summary_view (
 
 -- Supports the common "accounts owned by user" query
 CREATE INDEX ix_account_summary_view_owner
-    ON account_summary_view (owner_display_name);
+    ON account_summary_view (owner_user_id);
 ```
 
-The query handler reads exclusively from this view:
+The query handler reads exclusively from this view — through the **read** data source. (A Spring Data JPA repository would use the single, primary `EntityManagerFactory`, which is bound to the write database, so here the query side uses its own `JdbcTemplate`.)
 
 ```java
 @Service
-@RequiredArgsConstructor
 public class AccountQueryHandler {
 
-    private final AccountSummaryViewRepository readRepository;
+    private final JdbcTemplate readJdbc;   // bound to the READ replica
+
+    public AccountQueryHandler(@Qualifier("readJdbcTemplate") JdbcTemplate readJdbc) {
+        this.readJdbc = readJdbc;
+    }
 
     // No transaction needed — read replica, plain SELECT
     public AccountSummaryDto getAccountSummary(UUID accountId) {
-        return readRepository.findById(accountId)
-            .map(this::toDto)
-            .orElseThrow(() -> new AccountNotFoundException(accountId));
+        List<AccountSummaryDto> rows = readJdbc.query(
+            "SELECT * FROM account_summary_view WHERE account_id = ?",
+            this::mapRow, accountId);
+        if (rows.isEmpty()) {
+            throw new AccountNotFoundException(accountId);
+        }
+        return rows.get(0);
     }
 
     public List<AccountSummaryDto> getAccountsForUser(UUID userId) {
-        return readRepository.findByUserId(userId)
-            .stream()
-            .map(this::toDto)
-            .toList();
+        return readJdbc.query(
+            "SELECT * FROM account_summary_view WHERE owner_user_id = ?",
+            this::mapRow, userId);
     }
 }
 ```
 
 ## The Projection Updater
 
-The projection updater consumes outbox events and applies them to the read model. It runs asynchronously — typically polled every 50–200 ms — and must be idempotent.
+The projection updater consumes outbox events and applies them to the read model. It runs asynchronously — typically polled every 50–200 ms. Because the outbox and the summary view live in the **same** database, applying an event and marking it published commit in one transaction: a crash rolls back both, so no event is skipped or applied twice.
 
 ```java
 @Component
@@ -183,21 +194,26 @@ public class AccountProjectionUpdater {
 
     private final OutboxRepository         outboxRepository;
     private final AccountSummaryRepository summaryRepository;
-    private final JdbcTemplate             writeJdbc; // connected to write-side DB
+    private final TransactionTemplate      tx;            // write-side transaction manager
     private final ObjectMapper             objectMapper;
 
     @Scheduled(fixedDelay = 100) // poll every 100 ms
-    @Transactional
     public void pollAndProject() {
-        List<OutboxEvent> events = outboxRepository.claimUnpublished(50);
-        for (OutboxEvent event : events) {
-            try {
-                applyToReadModel(event);
-                outboxRepository.markPublished(event.getId());
-            } catch (Exception ex) {
-                log.error("Failed to project event {}", event.getId(), ex);
-                outboxRepository.markFailed(event.getId(), ex.getMessage());
-            }
+        try {
+            tx.executeWithoutResult(status -> {
+                // FOR UPDATE SKIP LOCKED, ordered by id — locks last until commit
+                List<OutboxEvent> events = outboxRepository.claimUnpublished(50);
+                for (OutboxEvent event : events) {
+                    applyToReadModel(event);
+                    outboxRepository.markPublished(event.getId()); // same transaction
+                }
+            });
+        } catch (Exception ex) {
+            // The whole batch rolled back. A failed statement aborts a PostgreSQL
+            // transaction, so we cannot "skip" one bad event and continue inside
+            // it. The batch is retried on the next poll; an event that keeps
+            // failing must be moved to a quarantine table by a separate job.
+            log.error("Projection batch failed; will retry", ex);
         }
     }
 
@@ -206,7 +222,7 @@ public class AccountProjectionUpdater {
             case "AccountDebited"  -> applyDebit(event);
             case "AccountCredited" -> applyCredit(event);
             case "AccountFrozen"   -> applyFreeze(event);
-            default -> log.warn("Unknown event type: {}", event.getEventType());
+            default -> throw new IllegalStateException("Unknown event type: " + event.getEventType());
         }
     }
 
@@ -215,7 +231,7 @@ public class AccountProjectionUpdater {
         summaryRepository.applyDebit(
             cmd.accountId(),
             cmd.amount(),
-            Instant.now()
+            event.getCreatedAt()   // when it happened — not when we projected it
         );
     }
 }
@@ -233,7 +249,7 @@ public interface AccountSummaryRepository extends JpaRepository<AccountSummaryVi
             v.lastTransactionAt    = :transactedAt,
             v.lastTransactionAmount = :amount,
             v.monthlyDebitTotal    = v.monthlyDebitTotal + :amount,
-            v.updatedAt            = now()
+            v.updatedAt            = CURRENT_TIMESTAMP
          WHERE v.accountId = :accountId
         """)
     void applyDebit(
@@ -245,7 +261,7 @@ public interface AccountSummaryRepository extends JpaRepository<AccountSummaryVi
 ```
 
 > [!NOTE]
-> The projection updater runs against the **write** database — it reads from the outbox table and writes to the summary view, both of which live on the write side. The read replica receives these changes via PostgreSQL streaming replication, typically within 10–100 ms. This is the propagation path that creates the eventual consistency window.
+> The projection updater runs against the **write** database — it reads from the outbox table and writes to the summary view, both of which live on the write side. The read replica receives these changes via PostgreSQL streaming replication, typically within 10–100 ms. This is the propagation path that creates the eventual consistency window. (Here the outbox feeds only this projector. If the same outbox also feeds a Kafka relay, give each consumer its own "published" marker.)
 
 ## Separate DataSource Configuration
 
@@ -293,22 +309,24 @@ public class DataSourceConfig {
 
 ```yaml
 # application.yml
+# DataSourceBuilder creates a HikariDataSource and binds these properties
+# DIRECTLY to it — so the key is jdbc-url (not url), and pool settings sit at
+# this level (not under "hikari:").
 spring:
   datasource:
     write:
-      url: jdbc:postgresql://payments-primary.internal:5432/payments
+      jdbc-url: jdbc:postgresql://payments-primary.internal:5432/payments
       username: ${DB_WRITE_USER}
       password: ${DB_WRITE_PASSWORD}
-      hikari:
-        maximum-pool-size: 20
-        connection-timeout: 3000
+      maximum-pool-size: 20
+      connection-timeout: 3000
     read:
-      url: jdbc:postgresql://payments-replica.internal:5432/payments
+      jdbc-url: jdbc:postgresql://payments-replica.internal:5432/payments
       username: ${DB_READ_USER}
       password: ${DB_READ_PASSWORD}
-      hikari:
-        maximum-pool-size: 50       # read replica serves more concurrent queries
-        connection-timeout: 1000
+      maximum-pool-size: 50       # read replica serves more concurrent queries
+      connection-timeout: 1000
+      read-only: true
 ```
 
 > [!WARNING]
@@ -320,7 +338,7 @@ The read model is milliseconds behind the write model. For most queries this is 
 
 Three strategies address this:
 
-**1. Route immediate reads to the write store.** For a short window after a write (typically 500 ms), route balance queries for that account to the write database. After that window, the replica is consistent and normal routing resumes.
+**1. Route immediate reads to the write store.** For a short window after a write (typically 500 ms), route balance queries for that account to the write database. After that window, the replica has usually caught up and normal routing resumes. (The cache below is per application instance; behind a load balancer the next read may land on another instance, so use sticky routing or a shared store — or prefer strategy 2.)
 
 ```java
 @Service
@@ -435,7 +453,7 @@ First, return the computed balance in the command response body — the handler 
 
 **Q2: The projection updater processes outbox events every 100 ms. During a database failover, the updater fails for 45 seconds. When the primary recovers, 450 outbox events have accumulated. What must be true about the updater for the read model to become fully consistent after recovery, and how do you verify this in a test?**
 
-The updater must be **idempotent** — applying the same event twice must produce the same result as applying it once — and **at-least-once** — it must not skip any events if the outbox poll fails partway through. The `WHERE last_event_seq < :seq` or equivalent guard achieves idempotency. The outbox's `claimUnpublished` method with `markPublished` after success ensures at-least-once delivery. To verify: in an integration test, insert 100 synthetic outbox events with known amounts, start the updater, kill it after 30 events, restart it, then assert via `Awaitility` that all 100 events are reflected in the read model and that the final balance equals the sum of all 100 event amounts (not 130).
+The updater must never skip an event and never apply one twice. In this design both follow from one fact: the read-model update and `markPublished` commit in the **same** transaction on the same database, so a crash or failover rolls back both, and the next poll simply picks the events up again. (If the read model lived in a different database, that guarantee would be gone; you would then need an idempotency guard such as a per-account `last_event_seq = seq - 1` check.) To verify: in an integration test, insert 100 synthetic outbox events with known amounts, start the updater, kill it after 30 events, restart it, then assert via `Awaitility` that all 100 events are reflected in the read model and that the final balance equals the sum of all 100 event amounts (not 130).
 
 ## Practical Challenge
 
@@ -495,10 +513,22 @@ A digital wallet provider is rebuilding its transaction history feature. Current
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Implement WalletCommandHandler.handle(TransferCommand) where TransferCommand carries sender_id, recipient_id, amount, and idempotency_key. The handler must debit the sender and credit the recipient in a single transaction using canonical lock ordering (sort the two UUIDs before calling findByIdForUpdate). Both balance changes and two outbox events (WalletDebited, WalletCredited) must be committed atomically. Add an idempotency guard using idempotencyRepository.exists(key) before touching any wallet."},
-    {"id": "2", "description": "Design wallet_transaction_history_view with all columns needed to serve 'return the last 50 transactions for wallet X with running balance' without joining any other table. Required columns: wallet_id, transaction_id (unique), direction (DEBIT/CREDIT), amount, running_balance_after, counterparty_wallet_id, reference, created_at, event_sequence. Write the SELECT statement the query handler executes, ordered by created_at DESC with LIMIT 50."},
-    {"id": "3", "description": "Implement WalletHistoryProjectionUpdater that consumes WalletDebited and WalletCredited outbox events and maintains wallet_transaction_history_view. Use INSERT ... ON CONFLICT (transaction_id) DO NOTHING to make the updater idempotent — if the same event is processed twice, the history table must not contain a duplicate row. Write a test that processes the same event twice and asserts exactly one row exists with COUNT(id) = 1."},
-    {"id": "4", "description": "Write a Spring integration test that submits a TransferCommand and verifies three properties: (a) the write database reflects correct balances immediately after the command returns; (b) wallet_transaction_history_view reflects the transaction within 1 second using Awaitility with 50 ms poll interval; (c) every JDBC connection used by AccountQueryHandler targets the read replica — verified by executing SELECT pg_is_in_recovery() on the query handler's DataSource and asserting it returns true."}
+    {
+      "id": "1",
+      "description": "Implement WalletCommandHandler.handle(TransferCommand) where TransferCommand carries sender_id, recipient_id, amount, and idempotency_key. The handler must debit the sender and credit the recipient in a single transaction using canonical lock ordering (sort the two UUIDs before calling findByIdForUpdate). Both balance changes and two outbox events (WalletDebited, WalletCredited) must be committed atomically. Add a claim-first idempotency guard (INSERT ... ON CONFLICT DO NOTHING on the idempotency key, in the same transaction) before touching any wallet."
+    },
+    {
+      "id": "2",
+      "description": "Design wallet_transaction_history_view with all columns needed to serve 'return the last 50 transactions for wallet X with running balance' without joining any other table. Required columns: wallet_id, transaction_id (unique), direction (DEBIT/CREDIT), amount, running_balance_after, counterparty_wallet_id, reference, created_at, event_sequence. Write the SELECT statement the query handler executes, ordered by created_at DESC with LIMIT 50."
+    },
+    {
+      "id": "3",
+      "description": "Implement WalletHistoryProjectionUpdater that consumes WalletDebited and WalletCredited outbox events and maintains wallet_transaction_history_view. Use INSERT ... ON CONFLICT (transaction_id) DO NOTHING to make the updater idempotent — if the same event is processed twice, the history table must not contain a duplicate row. Write a test that processes the same event twice and asserts exactly one row exists with COUNT(id) = 1."
+    },
+    {
+      "id": "4",
+      "description": "Write a Spring integration test that submits a TransferCommand and verifies three properties: (a) the write database reflects correct balances immediately after the command returns; (b) wallet_transaction_history_view reflects the transaction within 1 second using Awaitility with 50 ms poll interval; (c) every JDBC connection used by AccountQueryHandler targets the read replica — verified by executing SELECT pg_is_in_recovery() on the query handler's DataSource and asserting it returns true."
+    }
   ]
 }
 -->

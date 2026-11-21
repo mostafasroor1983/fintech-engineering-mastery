@@ -179,11 +179,12 @@ The customer's balance decreases (liability reduces via debit). The bank records
 
 A minimal but correct double-entry ledger requires two tables:
 
-```java17
+```sql
 /*
  * accounts — chart of accounts
  * Each row represents one account in the general ledger.
- * Balance is NEVER stored here — always computed from journal_entries.
+ * The source of truth for balances is journal_entries (any cached balance
+ * must be updated in the same transaction and reconciled — see later lessons).
  */
 CREATE TABLE accounts (
     id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -210,7 +211,9 @@ CREATE TABLE journal_entries (
     amount          BIGINT      NOT NULL CHECK (amount > 0),  -- minor units (pence, cents)
     currency        CHAR(3)     NOT NULL,
     description     VARCHAR(255),
-    reference       VARCHAR(100),          -- idempotency key / external ref
+    reference       VARCHAR(100),          -- external ref (shared by all lines of a transaction;
+                                           -- uniqueness is enforced on a separate
+                                           -- idempotency / transactions table)
     posted_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_by      VARCHAR(50) NOT NULL   -- service or user that posted
 );
@@ -221,48 +224,55 @@ CREATE INDEX idx_journal_reference ON journal_entries(reference);
 ```
 
 > [!WARNING]
-> Never add a `balance` column to the `accounts` table that is updated transactionally. This creates a dual-write problem: you must keep the running balance in sync with the journal entries. Any discrepancy makes the ledger untrustworthy. Balance is a derived value — always compute it from the journal.
+> Never make a stored `balance` column the source of truth, and never update it separately from the journal. That creates two records of the same fact that can drift apart, and then nobody can say which is right. Balance is a derived value: the journal is the truth. (High-volume ledgers often *cache* a balance on the account row for speed and for locking — that is fine only if it is updated in the **same** transaction as the journal entries and regularly reconciled against them. Later lessons in this track cover this.)
 
 ### Balance Calculation SQL
 
-```java17
--- Balance of a single account
--- Convention: DEBIT entries are positive, CREDIT entries are negative for ASSET accounts
--- For LIABILITY/EQUITY accounts, the normal balance is credit — so invert the sign
+```sql
+-- Balance of a single account, in its NORMAL direction:
+--   ASSET / EXPENSE accounts:            DEBIT − CREDIT
+--   LIABILITY / EQUITY / REVENUE:        CREDIT − DEBIT
+-- (a customer deposit account is a LIABILITY, so its balance is credits − debits)
 SELECT
     a.id,
     a.name,
     a.type,
-    SUM(
+    COALESCE(SUM(
         CASE
             WHEN je.entry_type = 'DEBIT'  THEN  je.amount
             WHEN je.entry_type = 'CREDIT' THEN -je.amount
         END
-    ) AS balance_minor_units
+    ), 0)
+    * CASE WHEN a.type IN ('ASSET','EXPENSE') THEN 1 ELSE -1 END
+        AS balance_minor_units
 FROM accounts a
 LEFT JOIN journal_entries je ON je.account_id = a.id
 WHERE a.id = :accountId
 GROUP BY a.id, a.name, a.type;
 
--- Balance as of a specific point in time (for historical reporting)
-SELECT SUM(
+-- Balance as of a specific point in time (for historical reporting),
+-- here for a LIABILITY account (credits − debits)
+SELECT COALESCE(SUM(
     CASE
-        WHEN entry_type = 'DEBIT'  THEN  amount
-        WHEN entry_type = 'CREDIT' THEN -amount
+        WHEN entry_type = 'CREDIT' THEN  amount
+        WHEN entry_type = 'DEBIT'  THEN -amount
     END
-) AS balance_minor_units
+), 0) AS balance_minor_units
 FROM journal_entries
 WHERE account_id = :accountId
   AND posted_at <= :asOf;
 
--- Trial balance — verify debits = credits across ALL accounts
+-- Trial balance — verify debits = credits, PER CURRENCY
+-- (adding GBP to EUR would be meaningless)
 SELECT
+    currency,
     SUM(CASE WHEN entry_type = 'DEBIT'  THEN amount ELSE 0 END) AS total_debits,
     SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE 0 END) AS total_credits,
     SUM(CASE WHEN entry_type = 'DEBIT'  THEN amount ELSE 0 END) -
     SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE 0 END) AS imbalance
-FROM journal_entries;
--- imbalance MUST always be 0 — if not, a journal entry was posted incorrectly
+FROM journal_entries
+GROUP BY currency;
+-- imbalance MUST always be 0 for every currency — if not, an entry was posted incorrectly
 ```
 
 ## Java Implementation — LedgerService
@@ -287,6 +297,12 @@ public class LedgerService {
                               String reference) {
 
         validateAccounts(sourceAccountId, destinationAccountId, currency);
+
+        // Lock the source account row FIRST (SELECT ... FOR UPDATE). Without it,
+        // two concurrent transfers can both read the same balance, both pass the
+        // check and both insert a debit — an overdraft (lessons 2 and 4 of this
+        // track explore this race). With two accounts, lock in a fixed order.
+        accountRepo.lockForUpdate(sourceAccountId);
         validateBalance(sourceAccountId, amountMinorUnits, currency);
 
         // Debit source account (reduces its balance)
@@ -324,6 +340,8 @@ public class LedgerService {
         assertJournalBalances(transactionId);
     }
 
+    // Balance in the account's NORMAL direction (credits − debits for a
+    // customer deposit account, which is a LIABILITY)
     public long getBalance(UUID accountId, String currency) {
         return journalRepo.calculateBalance(accountId, currency);
     }
@@ -352,42 +370,53 @@ public class LedgerService {
 @Transactional
 public class LedgerService {
 
-    // Sealed posting command hierarchy
+    // Sealed posting command hierarchy — the records are nested INSIDE the
+    // interface, so `permits PostingCommand.Transfer` refers to real types
     public sealed interface PostingCommand
         permits PostingCommand.Transfer,
                 PostingCommand.Fee,
-                PostingCommand.Reversal {}
+                PostingCommand.Reversal {
 
-    public record Transfer(
-        UUID transactionId,
-        UUID sourceAccountId,
-        UUID destinationAccountId,
-        long amountMinorUnits,
-        String currency,
-        String description,
-        String reference
-    ) implements PostingCommand {}
+        record Transfer(
+            UUID transactionId,
+            UUID sourceAccountId,
+            UUID destinationAccountId,
+            long amountMinorUnits,
+            String currency,
+            String description,
+            String reference
+        ) implements PostingCommand {}
 
-    public record Fee(
-        UUID transactionId,
-        UUID customerAccountId,
-        UUID revenueAccountId,
-        long feeMinorUnits,
-        String currency,
-        String reference
-    ) implements PostingCommand {}
+        record Fee(
+            UUID transactionId,
+            UUID customerAccountId,
+            UUID revenueAccountId,
+            long feeMinorUnits,
+            String currency,
+            String reference
+        ) implements PostingCommand {}
+
+        record Reversal(
+            UUID originalTransactionId,
+            String reason
+        ) implements PostingCommand {}
+    }
 
     private final JournalEntryRepository journalRepo;
+    private final AccountRepository      accountRepo;
+    private final Clock                  clock;
 
     public void post(PostingCommand command) {
+        // Exhaustive: the compiler knows every permitted subtype
         switch (command) {
-            case Transfer t  -> executeTransfer(t);
-            case Fee f       -> executeFee(f);
-            case Reversal r  -> executeReversal(r);
+            case PostingCommand.Transfer t -> executeTransfer(t);
+            case PostingCommand.Fee f      -> executeFee(f);
+            case PostingCommand.Reversal r -> executeReversal(r);
         }
     }
 
-    private void executeTransfer(Transfer t) {
+    private void executeTransfer(PostingCommand.Transfer t) {
+        accountRepo.lockForUpdate(t.sourceAccountId());    // serialise the balance check
         validateBalance(t.sourceAccountId(), t.amountMinorUnits(), t.currency());
 
         var entries = List.of(
@@ -405,7 +434,7 @@ public class LedgerService {
                                      long amount, String currency, String ref) {
         return new JournalEntry(
             UUID.randomUUID(), txId, accountId, type,
-            amount, currency, ref, Instant.now(), "payment-service"
+            amount, currency, ref, clock.instant(), "payment-service"
         );
     }
 }
@@ -421,7 +450,8 @@ sequenceDiagram
 
     PS->>LS: postTransfer(txId, src, dst, £500)
     LS->>DB: BEGIN TRANSACTION
-    LS->>DB: SELECT balance FROM journal WHERE account=src
+    LS->>DB: SELECT ... FROM accounts WHERE id=src FOR UPDATE
+    LS->>DB: SELECT SUM(credits) - SUM(debits) FROM journal WHERE account=src
     DB-->>LS: balance = £1,200
     LS->>DB: INSERT journal_entry (DEBIT, src, £500)
     LS->>DB: INSERT journal_entry (CREDIT, dst, £500)
@@ -440,7 +470,7 @@ A correctly designed financial ledger **never deletes or updates journal entries
 |---|---|
 | **Full audit trail** | Every balance change is traceable to a specific journal entry |
 | **Point-in-time queries** | Balance on any date can be computed by filtering `posted_at` |
-| **Tamper evidence** | No `UPDATE`/`DELETE` means alterations are detectable |
+| **Tamper resistance** | Revoking `UPDATE`/`DELETE` makes silent edits hard; hash-chaining entries makes any alteration detectable |
 | **Compensation via reversal** | Mistakes are corrected by posting a reversing entry, not editing the original |
 | **Regulatory compliance** | Auditors can trace every transaction; no "black holes" in history |
 
@@ -450,7 +480,16 @@ A correctly designed financial ledger **never deletes or updates journal entries
 ```java17
 // Reversal — not update/delete
 public void reversePosting(UUID originalTransactionId, String reason) {
+    // Idempotent: a transaction can be reversed only once. A unique constraint
+    // on reversal_of (or on the "REV-" reference in the transactions table)
+    // stops a retried request from reversing it twice.
+    if (journalRepo.existsReversalOf(originalTransactionId)) {
+        return;
+    }
     List<JournalEntry> originals = journalRepo.findByTransactionId(originalTransactionId);
+    if (originals.isEmpty()) {
+        throw new TransactionNotFoundException(originalTransactionId);
+    }
 
     UUID reversalTxId = UUID.randomUUID();
 
@@ -465,12 +504,15 @@ public void reversePosting(UUID originalTransactionId, String reason) {
             .currency(original.getCurrency())
             .description("REVERSAL: " + reason)
             .reference("REV-" + originalTransactionId)
-            .postedAt(Instant.now())
+            .postedAt(clock.instant())
             .createdBy("reconciliation-service")
             .build())
         .toList();
 
     journalRepo.saveAll(reversals);
+    // Note: reversing a transfer DEBITS the receiver. If the receiver has
+    // already spent the money, the reversal can make that balance negative —
+    // decide by policy whether to allow it, hold it, or recover the funds.
 }
 ```
 
@@ -484,8 +526,8 @@ A production-grade ledger must enforce these invariants on every transaction:
 | Amount > 0 (no zero or negative entries) | DB `CHECK (amount > 0)` |
 | Account exists and is active | Validation before posting |
 | Currency matches account currency | Validation before posting |
-| Source account has sufficient balance | Balance check before posting |
-| All entries share the same `transaction_id` | Application-level grouping |
+| Source account has sufficient balance | Balance check before posting, with the account row locked |
+| All entries share the same `transaction_id` | Application-level grouping (optionally a deferred constraint trigger that checks each transaction balances at commit) |
 | No entry is updated or deleted | No `UPDATE`/`DELETE` grants on table |
 
 ---
@@ -517,7 +559,7 @@ A production-grade ledger must enforce these invariants on every transaction:
   },
   {
     "id": "kc-del-03",
-    "question": "Why should the balance of an account NEVER be stored as a column that is updated with each transaction?",
+    "question": "Why should an account's balance NEVER be a stored column that is the source of truth and is updated separately from the journal?",
     "options": [
       "Databases cannot perform UPDATE and INSERT in the same transaction",
       "It creates a dual-write problem: the stored balance may diverge from the journal history, destroying audit integrity",
@@ -525,7 +567,7 @@ A production-grade ledger must enforce these invariants on every transaction:
       "Running totals are only accurate with SERIALIZABLE isolation"
     ],
     "correct": 1,
-    "explanation": "If you store a running balance AND append journal entries, you have two sources of truth. Any bug, crash between writes, or concurrent update can cause them to diverge. The balance column would say £800 while the journal entries sum to £750. Which is correct? You cannot know. Balance must be a derived value computed on demand from the immutable journal."
+    "explanation": "If you keep a running balance AND append journal entries as two independent writes, you have two sources of truth. Any bug, crash between writes, or concurrent update can make them diverge: the balance column says £800 while the entries sum to £750 — which is right? The journal must be the truth and the balance derived from it. If a balance is cached for performance, it must be updated in the same transaction as the entries and reconciled against them."
   },
   {
     "id": "kc-del-04",
@@ -537,7 +579,7 @@ A production-grade ledger must enforce these invariants on every transaction:
       "Post a correcting entry for the difference of £100"
     ],
     "correct": 2,
-    "explanation": "Financial ledgers are append-only. The wrong entry is part of the audit trail — it proves the error occurred. The correct remediation is: post a full reversal (swap DR/CR on the original entry for £150), then post the correct entry for £250. Both the error and its correction are visible in the trail. Regulators and auditors expect this. Never UPDATE or DELETE journal entries."
+    "explanation": "Financial ledgers are append-only: the wrong entry stays in the audit trail as proof of what happened. The standard remediation is a full reversal (swap DR/CR on the original £150 entry) followed by the correct £250 entry, so every entry is self-explanatory. Posting only the £100 difference is also seen in practice, but it leaves an odd-looking amount whose meaning depends on the original. Never UPDATE or DELETE journal entries."
   }
 ] -->
 
@@ -554,7 +596,7 @@ A production-grade ledger must enforce these invariants on every transaction:
     },
     {
       "id": "pc-del-02",
-      "description": "Write the SQL to compute the current GBP balance of account ID 'acc-123' using the journal_entries table, with DEBIT as positive and CREDIT as negative."
+      "description": "Write the SQL to compute the current GBP balance of account ID 'acc-123' (a customer deposit account, i.e. a LIABILITY) using the journal_entries table, in its normal direction (credits minus debits)."
     },
     {
       "id": "pc-del-03",

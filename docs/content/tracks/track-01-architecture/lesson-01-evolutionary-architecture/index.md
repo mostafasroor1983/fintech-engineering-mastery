@@ -28,7 +28,7 @@ The three dimensions of change that principal engineers must manage:
 | Dimension | Examples | Risk if ignored |
 |---|---|---|
 | **Technical** | Language versions, frameworks, protocols | Security vulnerabilities, performance cliffs |
-| **Domain** | Business rules, product features, compliance | Accidental coupling, stiff-join problems |
+| **Domain** | Business rules, product features, compliance | Accidental coupling, changes that ripple across services |
 | **Operational** | Deployment targets, cloud providers, SRE tooling | Vendor lock-in, migration risk |
 
 ---
@@ -78,6 +78,7 @@ void paymentModule_mustNotDependOnFraudModule() {
 
 ```java
 // Performance budget: P99 payment submission must stay under 200ms
+// (GatlingRunner is a small in-house wrapper around the load-test tool)
 @Test
 void paymentSubmission_p99Latency_mustBeUnder200ms() throws Exception {
     GatlingRunner runner = GatlingRunner.forSimulation(PaymentSubmissionSimulation.class)
@@ -97,16 +98,16 @@ void paymentSubmission_p99Latency_mustBeUnder200ms() throws Exception {
 ```java
 // Schema compatibility: new Avro schema must be backward compatible
 @Test
-void paymentEvent_newSchemaVersion_mustBeBackwardCompatible() {
-    SchemaRegistryClient client = new MockSchemaRegistryClient();
-    AvroSchemaCompatibility checker = new AvroSchemaCompatibility();
-    
-    Schema currentSchema = loadSchema("payment-event-v2.avsc");
-    Schema proposedSchema = loadSchema("payment-event-v3.avsc");
-    
-    assertThat(checker.isBackwardCompatible(currentSchema, proposedSchema))
+void paymentEvent_newSchemaVersion_mustBeBackwardCompatible() throws IOException {
+    Schema current  = new Schema.Parser().parse(new File("schemas/payment-event-v2.avsc"));
+    Schema proposed = new Schema.Parser().parse(new File("schemas/payment-event-v3.avsc"));
+
+    // Backward compatible = consumers on the NEW schema can read data written with the OLD one
+    var result = SchemaCompatibility.checkReaderWriterCompatibility(proposed, current);
+
+    assertThat(result.getType())
         .as("Schema backward compatibility")
-        .isTrue();
+        .isEqualTo(SchemaCompatibility.SchemaCompatibilityType.COMPATIBLE);
 }
 ```
 
@@ -133,7 +134,7 @@ graph TD
     style D2b fill:#991b1b,color:#fff
 ```
 
-The four quadrants come from Ward Cunningham and Martin Fowler. As a principal engineer, your job is to prevent the reckless quadrants and consciously manage the prudent ones.
+Ward Cunningham coined the debt metaphor; Martin Fowler described these four quadrants. As a principal engineer, your job is to prevent the reckless quadrants and consciously manage the prudent ones.
 
 ### Measuring Architectural Coupling
 
@@ -141,22 +142,23 @@ The four quadrants come from Ward Cunningham and Martin Fowler. As a principal e
 
 **Efferent coupling (Ce)** — how many components this component depends *on*. High Ce = fragile, many reasons to change.
 
-**Instability (I)** = Ce / (Ca + Ce). Components with high instability (I → 1) should be abstract; components with low instability (I → 0) should be stable.
+**Instability (I)** = Ce / (Ca + Ce). I → 0 means many components depend on this one and it depends on little: it is *stable*, hard to change, and should therefore be *abstract* (interfaces, core domain rules) so it can be extended without being edited. I → 1 means it depends on many others and nothing depends on it: a concrete detail (adapter, controller) that is cheap to change. Dependencies should point towards stability (Robert C. Martin's Stable Dependencies and Stable Abstractions principles).
 
 ```java
-// ArchUnit: measure instability of core domain packages
+// ArchUnit: measure the instability of the core ledger module
 @Test
-void corePaymentDomain_mustBeStable() {
-    JavaClasses classes = new ClassFileImporter()
-        .importPackages("com.bank");
+void coreLedgerModule_mustStayStable() {
+    JavaClasses classes = new ClassFileImporter().importPackages("com.bank");
+    Set<JavaPackage> modules = classes.getPackage("com.bank").getSubpackages();
 
-    // Packages in the core domain should have many dependants (low Ce)
-    // and few dependencies themselves
-    SlicesRuleDefinition.slices()
-        .matching("com.bank.(*)..")
-        .should().notDependOnEachOther()
-        .ignoringPackages("com.bank.shared..")
-        .check(classes);
+    ComponentDependencyMetrics metrics = ArchitectureMetrics.componentDependencyMetrics(
+        MetricsComponents.fromPackages(modules));
+
+    // I = Ce / (Ca + Ce): the ledger should be depended on (high Ca),
+    // not depend on other modules (low Ce)
+    assertThat(metrics.getInstability("com.bank.ledger"))
+        .as("Instability of com.bank.ledger")
+        .isLessThan(0.3);
 }
 ```
 
@@ -184,27 +186,33 @@ An ADR answers four questions:
 4. **Status** — Is this current, superseded, or deprecated?
 
 ```markdown
-# ADR-0023: Use Optimistic Locking for Account Balance Updates
+# ADR-0023: Keep Pessimistic Locking for Balances; Optimistic Locking for Low-Contention Records
 
 **Status:** Accepted (2024-11-15)
 **Authors:** Principal Engineer, Lead Engineer — Payments
 
 ## Context
-Account balance updates currently use SELECT FOR UPDATE (pessimistic locking).
-Under our projected Q1 load (50k TPS), this creates lock contention on 
-high-velocity accounts (salary day, bill payment windows).
+Balance updates use SELECT FOR UPDATE. A proposal suggested switching every
+entity to @Version optimistic locking to remove lock waits. A load test at the
+projected salary-day peak showed some accounts receiving hundreds of updates
+per second: with optimistic locking about a third of attempts conflicted and
+retried, adding database load exactly at peak (illustrative figures).
+Account settings and limits, in contrast, conflict in under 0.1% of updates.
 
 ## Decision
-Use @Version-based optimistic locking with a bounded retry policy (max 3 
-attempts with 10ms exponential backoff). Revert to pessimistic locking only
-for multi-account operations where deadlock ordering cannot be guaranteed.
+- Balances: keep SELECT FOR UPDATE, lock accounts in id order, keep the
+  transaction short, and set lock_timeout = 2s.
+- Account settings and limits: @Version optimistic locking with at most
+  3 retries and jittered backoff.
 
 ## Consequences
-**Gains:** Eliminates lock contention on read-heavy workloads. Scales 
-horizontally without inter-node locking.
-**Trade-offs:** Application-level retry logic required. Starvation possible
-for high-contention accounts during peak windows (mitigated by backoff jitter).
-**Fitness function added:** ConcurrentBalanceUpdateTest validates retry behaviour.
+**Gains:** Predictable throughput on hot accounts (no retry storms); no row
+locks held for records that almost never conflict.
+**Trade-offs:** Lock waits on the very hottest accounts (split them into
+sub-accounts if this becomes a problem); two locking styles to document.
+**Fitness functions added:** ConcurrentBalanceUpdateTest (200 concurrent debits:
+no overdraft, no deadlock) and an ArchUnit rule that balance updates go
+through LedgerRepository.lockForUpdate().
 ```
 
 ---
@@ -253,12 +261,13 @@ sequenceDiagram
     Proxy-->>Client: Response
 ```
 
-Each phase is a fitness function gate. You do not advance to the next phase until the current one passes defined acceptance criteria — error rate parity, latency parity, reconciliation match.
+In a payment system, the shadow copy must run in a dry-run mode: it computes its answer but must never move money, call the card network or send a message. Each phase is a fitness function gate. You do not advance to the next phase until the current one passes defined acceptance criteria — error rate parity, latency parity, reconciliation match.
 
 ### Fitness Functions for Migration Safety
 
 ```java
 // Reconciliation fitness function: new service must match legacy output
+// (ShadowTestHarness is an in-house test utility, shown for illustration)
 @Test
 void shadowMode_newPaymentService_mustMatchLegacyForAllRequests() {
     ShadowTestHarness harness = ShadowTestHarness.builder()
@@ -318,7 +327,7 @@ Before approving any significant architectural change to a financial system:
         "The module has low coupling and is safe to evolve freely"
       ],
       "correct": 2,
-      "explanation": "I = 0.85 means Ce >> Ca — the module depends on many others but few depend on it. This is a highly unstable (fragile) module that changes whenever its dependencies do. High-instability components should be abstract or at the edges of the system."
+      "explanation": "I = 0.85 means Ce >> Ca — the module depends on many others but few depend on it. This is a highly unstable module that tends to change whenever its dependencies do. That is fine for concrete details at the edges of the system (adapters, controllers), but a warning sign for a core domain module, which should be stable and abstract."
     },
     {
       "id": "q3",

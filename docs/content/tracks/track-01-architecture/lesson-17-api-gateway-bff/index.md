@@ -26,7 +26,7 @@ references:
   - "Phil Calçado, 'Pattern: Backends For Frontends', soundcloud.com/backstage, 2015"
 ---
 
-A mobile banking app team at a European neobank was making 11 separate HTTP calls on the home screen load — accounts, recent transactions, credit limits, rewards balance, exchange rates, notifications, spending insights, card status, pending payments, upcoming direct debits, and product offers. On a 4G connection, the sequential calls took 3.2 seconds. With a Backend-for-Frontend that composed all 11 responses into a single call, load time dropped to 380 milliseconds. The BFF also reduced the mobile team's deployment coupling: instead of coordinating releases with 11 backend teams, they owned their BFF and could iterate independently. This lesson covers how to build both the API gateway and BFF layers correctly.
+Consider a mobile banking app team at a European neobank (a composite example) that was making 11 separate HTTP calls on the home screen load — accounts, recent transactions, credit limits, rewards balance, exchange rates, notifications, spending insights, card status, pending payments, upcoming direct debits, and product offers. On a 4G connection, the sequential calls took 3.2 seconds. With a Backend-for-Frontend that composed all 11 responses into a single call, load time dropped to 380 milliseconds. The BFF also reduced the mobile team's deployment coupling: instead of coordinating releases with 11 backend teams, they owned their BFF and could iterate independently. This lesson covers how to build both the API gateway and BFF layers correctly.
 
 ## Learning Objectives
 
@@ -41,7 +41,7 @@ A mobile banking app team at a European neobank was making 11 separate HTTP call
 
 ## Business Context
 
-In 2022, a UK challenger bank's partner API gateway had no circuit breaker between its gateway and its KYC verification service. When the KYC provider experienced elevated latency (responses slowing from 200ms to 8 seconds), the gateway accumulated thousands of queued requests waiting for KYC responses. The connection thread pool exhausted within 90 seconds. Because the gateway was shared across all APIs — not just KYC — this brought down the entire API surface for 14 minutes, including payment APIs that had no dependency on KYC at all. The fix required adding circuit breakers per downstream service at the gateway layer, ensuring failures in one upstream cannot exhaust shared gateway resources.
+Consider a UK challenger bank (a composite example) whose partner API gateway has no circuit breaker between the gateway and its KYC verification service. When the KYC provider's latency rises from 200ms to 8 seconds, the gateway accumulates thousands of in-flight requests waiting for KYC responses, and its shared connection pool and memory are exhausted within 90 seconds. Because the gateway was shared across all APIs — not just KYC — this brought down the entire API surface for 14 minutes, including payment APIs that had no dependency on KYC at all. The fix required adding circuit breakers per downstream service at the gateway layer, ensuring failures in one upstream cannot exhaust shared gateway resources.
 
 ## API Gateway Responsibilities
 
@@ -65,6 +65,9 @@ An API gateway is not just a reverse proxy. Its responsibilities cluster into fi
 ```java
 @Configuration
 public class GatewayRouteConfig {
+
+    private static final Pattern UUID_PATTERN =
+        Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
 
     @Bean
     public RouteLocator paymentGatewayRoutes(RouteLocatorBuilder builder,
@@ -95,7 +98,8 @@ public class GatewayRouteConfig {
                         .setFallbackUri("forward:/fallback/account")))
                 .uri("lb://account-service"))
 
-            // Mobile BFF — no auth at gateway, BFF handles token exchange
+            // Mobile BFF — the gateway validates the token; the BFF reads the user
+            // from that token (never from a client-supplied header)
             .route("mobile-bff", r -> r
                 .path("/mobile/v1/**")
                 .and()
@@ -113,13 +117,14 @@ public class GatewayRouteConfig {
         return (exchange, chain) -> {
             String correlationId = exchange.getRequest().getHeaders()
                 .getFirst("X-Correlation-ID");
-            if (correlationId == null) {
+            // Accept a client value only if it is a UUID (prevents log injection)
+            if (correlationId == null || !UUID_PATTERN.matcher(correlationId).matches()) {
                 correlationId = UUID.randomUUID().toString();
             }
-            final String finalCorrelationId = correlationId;
+            final String id = correlationId;
+            exchange.getResponse().getHeaders().set("X-Correlation-ID", id);
             ServerWebExchange mutatedExchange = exchange.mutate()
-                .request(r -> r.header("X-Correlation-ID", finalCorrelationId))
-                .response(r -> r.getHeaders().add("X-Correlation-ID", finalCorrelationId))
+                .request(r -> r.headers(h -> h.set("X-Correlation-ID", id)))
                 .build();
             return chain.filter(mutatedExchange);
         };
@@ -129,7 +134,7 @@ public class GatewayRouteConfig {
 
 ## BFF Architecture — One BFF per Client Type
 
-The original BFF pattern (Phil Calçado, SoundCloud, 2015) mandates a separate BFF per client type. A single "BFF" serving mobile, web, and partner clients is an aggregation service, not a BFF — it cannot be optimised for any client's needs without compromising others.
+The BFF pattern (popularised in 2015 by Phil Calçado from his work at SoundCloud, and by Sam Newman) recommends a separate BFF per client type. A single "BFF" serving mobile, web, and partner clients is an aggregation service, not a BFF — it cannot be optimised for any client's needs without compromising others.
 
 ```mermaid
 graph TD
@@ -181,10 +186,14 @@ public class MobileHomeScreenBff {
 
     @GetMapping
     public Mono<MobileHomeResponse> homeScreen(
-            @RequestHeader("X-User-ID") String userId,
+            @AuthenticationPrincipal Jwt jwt,   // validated token — not a client header
             @RequestHeader("X-Correlation-ID") String correlationId) {
 
-        // Fan out all calls in parallel — total latency = max(individual latencies)
+        String userId = jwt.getSubject();
+
+        // Fan out all calls in parallel — total latency = max(individual latencies).
+        // For finer degradation, give each call its own timeout and fallback so one
+        // slow service does not blank the whole screen.
         return Mono.zip(
             accountClient.getSummary(userId, correlationId),
             paymentClient.getRecentTransactions(userId, 5, correlationId),
@@ -221,8 +230,9 @@ Each upstream service needs its own circuit breaker. A shared breaker means one 
 @Configuration
 public class GatewayCircuitBreakerConfig {
 
+    // Spring Cloud Gateway is reactive, so it uses the REACTIVE factory
     @Bean
-    public Customizer<Resilience4JCircuitBreakerFactory> paymentServiceCb() {
+    public Customizer<ReactiveResilience4JCircuitBreakerFactory> paymentServiceCb() {
         return factory -> factory.configure(builder -> builder
             .circuitBreakerConfig(CircuitBreakerConfig.custom()
                 .failureRateThreshold(50)           // Open after 50% failures
@@ -242,7 +252,8 @@ public class GatewayCircuitBreakerConfig {
     @RequestMapping("/fallback")
     public static class GatewayFallbackController {
 
-        @GetMapping("/payment")
+        // @RequestMapping, not @GetMapping: a forwarded POST keeps its method
+        @RequestMapping("/payment")
         public ResponseEntity<Map<String, String>> paymentFallback(
                 @RequestHeader("X-Correlation-ID") String correlationId) {
             return ResponseEntity.status(503)
@@ -257,6 +268,9 @@ public class GatewayCircuitBreakerConfig {
     }
 }
 ```
+
+> [!IMPORTANT]
+> A 503 from the breaker — or a gateway timeout — does **not** mean the payment failed: the request may have reached the payment service before the gateway gave up. Clients must retry with the same `Idempotency-Key` (or check the payment status) instead of submitting a new payment.
 
 ## API Versioning at the Gateway Layer
 
@@ -284,8 +298,8 @@ public RouteLocator versionedRoutes(RouteLocatorBuilder builder) {
         .route("payment-v0-sunset", r -> r
             .path("/api/v0/payments/**")
             .filters(f -> f
-                .addResponseHeader("Sunset", "Sat, 01 Mar 2026 00:00:00 GMT")
-                .addResponseHeader("Deprecation", "true")
+                .addResponseHeader("Sunset", "Mon, 01 Mar 2027 00:00:00 GMT")   // RFC 8594
+                .addResponseHeader("Deprecation", "@1767225600")                // RFC 9745: since 2026-01-01
                 .rewritePath("/api/v0/(?<segment>.*)", "/${segment}"))
             .uri("lb://payment-service-v0"))
 
@@ -328,12 +342,12 @@ For internal BFFs where the client team and BFF team are the same, BFF is typica
       "text": "During a production incident, the KYC service becomes slow (8-second response times). The gateway has no circuit breaker. What failure mode do you expect?",
       "options": [
         "Only KYC-dependent endpoints slow down — other endpoints are unaffected",
-        "The gateway accumulates queued threads waiting for KYC responses, eventually exhausting the shared thread pool and causing all gateway routes to fail",
+        "The gateway accumulates in-flight requests waiting for KYC responses, exhausting shared gateway resources (connection pool, memory, worker threads) so that all routes start failing",
         "The gateway automatically times out slow requests after 30 seconds and returns errors only to KYC callers",
         "Kubernetes restarts the KYC pods, resolving the issue within 60 seconds"
       ],
       "correct": 1,
-      "explanation": "Without a circuit breaker, threads accumulate waiting for KYC responses. Because the gateway's thread pool is shared across all routes, KYC threads crowd out payment, account, and all other API threads. This is a cascade failure via resource exhaustion — a circuit breaker per upstream service prevents this by failing fast once the KYC service is detected as degraded, freeing threads for unrelated routes."
+      "explanation": "Without a circuit breaker, requests to the slow KYC service pile up. Because the gateway's connection pool, memory and worker capacity are shared across all routes, the KYC backlog crowds out payment, account and every other API. This is a cascade failure via resource exhaustion — a circuit breaker (with a time limit) per upstream service prevents it by failing fast once KYC is degraded, keeping resources free for unrelated routes."
     }
   ]
 }
@@ -341,25 +355,25 @@ For internal BFFs where the client team and BFF team are the same, BFF is typica
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "API Gateway and Backend-for-Frontend Patterns \u2014 Production Implementation",
+  "title": "API Gateway and Backend-for-Frontend Patterns — Production Implementation",
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
     {
       "id": "1",
-      "description": "Design the full Spring Cloud Gateway route configuration for all three client types. Include authentication filter (JWT validation), per-client rate limiting, circuit breakers per downstream service,"
+      "description": "Design the full Spring Cloud Gateway route configuration for all three client types (mobile, web, partner). Include JWT validation, per-client rate limiting, a circuit breaker per downstream service, correlation-ID propagation, and the rule that user identity is taken from the validated token, never from a client header."
     },
     {
       "id": "2",
-      "description": "Implement the `MobileHomeScreenBff` with reactive fan-out to at least four downstream services. Include timeout handling with a degraded response, mobile-specific payload transformation (mask sensitiv"
+      "description": "Implement the `MobileHomeScreenBff` with reactive fan-out to at least four downstream services. Include timeout handling with a degraded response (per call, so one slow service does not blank the screen), mobile-specific payload transformation (mask sensitive data such as account numbers), and tests for the degraded path."
     },
     {
       "id": "3",
-      "description": "Your payment service has an SLA of 200ms p99. Design the circuit breaker configuration: what failure rate threshold, sliding window size, and open-state duration is appropriate? Justify each value. Wh"
+      "description": "Your payment service has an SLA of 200ms p99. Design the circuit breaker configuration — failure-rate threshold, sliding window size and open-state duration — and justify each value. What does the client see when the breaker is open, and how must it retry a payment safely?"
     },
     {
       "id": "4",
-      "description": "You need to sunset the v0 payment API in 90 days. Design and implement the full lifecycle: add deprecation headers, build a migration guide endpoint that returns the v1 equivalent for any v0 request,"
+      "description": "You need to sunset the v0 payment API in 90 days. Design and implement the full lifecycle: Deprecation and Sunset headers, a migration-guide endpoint that returns the v1 equivalent of a v0 request, monitoring of the remaining v0 traffic per client, and the final switch-off."
     }
   ]
 }

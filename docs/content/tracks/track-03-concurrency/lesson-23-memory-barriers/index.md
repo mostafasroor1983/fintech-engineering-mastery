@@ -11,6 +11,8 @@ tags: [memory-barriers, instruction-reordering, acquire-release, JMM-internals]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 Memory barriers are the hardware mechanism underlying every high-level Java concurrency primitive. `volatile`, `synchronized`, and `VarHandle` all ultimately emit memory barrier instructions. Principal Engineers who understand barriers can reason about JMM guarantees without memorising rules — they can derive correct behaviour from first principles, design lock-free data structures, and interpret disassembly output from profilers.
 
 ## Learning Objectives
@@ -75,20 +77,21 @@ A memory barrier (fence) prevents specific categories of reordering across the b
 
 ### Why StoreLoad is the Most Expensive
 
-`StoreLoad` requires draining the store buffer — flushing all queued writes to the cache hierarchy — before any subsequent load. On x86, this is a `mfence` instruction with ~100 cycle cost. The other three barriers are largely free on x86 (TSO architecture provides most ordering for free), but are significant on ARM (weakly ordered).
+`StoreLoad` requires draining the store buffer — making all queued writes visible — before any subsequent load. On x86 HotSpot emits a lock-prefixed instruction (`lock addl $0,(rsp)`) or uses `xchg`, costing tens of cycles or more. The other three barriers are free on x86 (TSO already provides that ordering), but need real instructions on ARM (weakly ordered).
 
 ```
-x86 barrier costs (approximate):
+x86 (approximate, varies by CPU):
   LoadLoad:   free (x86 TSO provides this automatically)
   LoadStore:  free
-  StoreStore: free (SFENCE: ~10 cycles if needed at all)
-  StoreLoad:  ~100 cycles (MFENCE or LOCK XCHG)
+  StoreStore: free (TSO keeps ordinary stores in order)
+  StoreLoad:  tens of cycles or more (lock-prefixed instruction or MFENCE)
 
-ARM barrier costs:
-  LoadLoad:   ISH DSB: ~20-40 cycles
-  StoreStore: ISH DSB: ~20-40 cycles
-  StoreLoad:  ISH DSB: ~20-40 cycles
-  Full fence: ISH DSB + ISB: ~40-80 cycles
+ARMv8 (AArch64):
+  Acquire load:   LDAR  — a load with acquire ordering built in
+  Release store:  STLR  — a store with release ordering built in
+  Full fence:     DMB ISH (data memory barrier, inner shareable)
+  Java volatile read  → LDAR;  Java volatile write → STLR
+  (LDAR/STLR are cheaper than a separate full DMB fence)
 ```
 
 ## Java Operations and Their Barriers
@@ -108,18 +111,18 @@ On x86, a `volatile` read compiles to a plain memory load (no fence instruction)
 
 ### volatile Write
 
-A `volatile` write emits `StoreStore` before and `StoreLoad` after the write:
+A `volatile` write emits `StoreStore` + `LoadStore` before and `StoreLoad` after the write:
 
 ```
   store a  (normal)   ┐
   store b  (normal)   │ cannot be moved below the volatile write
-  ──────────────────── StoreStore barrier
+  ──────────────────── StoreStore + LoadStore barrier
   store x  (volatile)
   ──────────────────── StoreLoad barrier
   load  y  (normal)   │ cannot be moved above the volatile write
 ```
 
-On x86, a `volatile` write compiles to a `LOCK XCHG` or `MOV` + `MFENCE` to ensure the `StoreLoad` fence.
+On x86, HotSpot compiles a `volatile` write to a `MOV` followed by a lock-prefixed instruction (`lock addl $0,(rsp)`) — or an `XCHG` — to get the `StoreLoad` fence.
 
 This is why **`volatile` writes are more expensive than `volatile` reads** — the `StoreLoad` barrier is the most expensive barrier type.
 
@@ -130,7 +133,7 @@ monitorenter:
   ──────────────────── acquire barrier (LoadLoad + LoadStore)
   ... critical section ...
 monitorexit:
-  ──────────────────── release barrier (StoreStore + StoreLoad)
+  ──────────────────── release barrier (LoadStore + StoreStore)
 ```
 
 Acquiring a lock = acquire barrier: all reads and writes in the critical section are not moved before the lock acquisition.
@@ -181,19 +184,24 @@ public class PriceFeed {
         }
     }
 
-    // Producer: publish with release semantics (StoreStore + no subsequent reorder)
+    // Producer: publish with release semantics
+    // (earlier loads and stores cannot move below this store)
+    // NOTE: each field is ordered separately — a reader can still see the new
+    // bid with the old ask. For a consistent pair, publish one immutable
+    // snapshot object instead (see the Practical Challenge)
     public void updatePrices(long bid, long ask) {
-        BID.setRelease(this, bid);  // StoreStore before this store
-        ASK.setRelease(this, ask);  // StoreStore before this store
+        BID.setRelease(this, bid);  // LoadStore + StoreStore before this store
+        ASK.setRelease(this, ask);  // LoadStore + StoreStore before this store
     }
 
-    // Consumer: read with acquire semantics (LoadLoad + no prior reorder)
+    // Consumer: read with acquire semantics
+    // (later loads and stores cannot move above this load)
     public long getBid() {
-        return (long) BID.getAcquire(this);  // LoadLoad after this load
+        return (long) BID.getAcquire(this);  // LoadLoad + LoadStore after this load
     }
 
     public long getAsk() {
-        return (long) ASK.getAcquire(this);  // LoadLoad after this load
+        return (long) ASK.getAcquire(this);  // LoadLoad + LoadStore after this load
     }
 
     // For CAS operations on price — full volatile semantics
@@ -207,12 +215,12 @@ public class PriceFeed {
 
 | Mode | Barrier | Java Equivalent | Cost |
 |------|---------|----------------|------|
-| `get()` | None | Plain read | Cheapest |
-| `getOpaque()` | Atomicity only | - | Low |
-| `getAcquire()` | Acquire (LoadLoad + LoadStore) | `volatile` read on acquire | Medium |
+| `get()` | None (`long`/`double` not even guaranteed atomic) | Plain read | Cheapest |
+| `getOpaque()` | Atomic + coherent for this variable; no ordering with others | - | Low |
+| `getAcquire()` | Acquire (LoadLoad + LoadStore after) | - | Low (free on x86) |
 | `set()` | None | Plain write | Cheapest |
-| `setOpaque()` | Atomicity only | - | Low |
-| `setRelease()` | Release (StoreStore) | - | Medium |
+| `setOpaque()` | Atomic + coherent for this variable; no ordering with others | - | Low |
+| `setRelease()` | Release (LoadStore + StoreStore before) | `lazySet()` on Atomic classes | Low (free on x86) |
 | `getVolatile()` / `setVolatile()` | Full (all four) | `volatile` r/w | Most expensive |
 | `compareAndSet()` | Full | `AtomicXxx.compareAndSet()` | Expensive |
 
@@ -246,6 +254,7 @@ public class SpscRingBuffer<T> {
     }
 
     public SpscRingBuffer(int capacity) {
+        if (capacity < 2) throw new IllegalArgumentException("capacity must be >= 2");
         int size = Integer.highestOneBit(capacity - 1) << 1;  // next power of 2
         buffer   = new Object[size];
         mask     = size - 1;
@@ -280,12 +289,12 @@ public class SpscRingBuffer<T> {
 ```
 
 **Barrier analysis:**
-- Producer writes item with `setRelease` → StoreStore: item data is visible before index advance
-- Producer advances `writeIndex` with `setRelease` → StoreStore: index advance is visible after item
-- Consumer reads `writeIndex` with `getAcquire` → LoadLoad: index read is ordered before item read
-- Consumer reads item with `getAcquire` → LoadLoad: item data fully loaded before proceeding
+- Producer advances `writeIndex` with `setRelease` → the item write before it (and the item object's own fields) cannot move below the index write
+- Consumer reads `writeIndex` with `getAcquire` → the item read after it cannot move above the index read; it sees everything the producer wrote before the release
+- The same pairing in reverse (`setRelease(readIndex)` / `getAcquire(readIndex)`) tells the producer a slot is free, so it never overwrites an item the consumer is still reading
+- The `setRelease`/`getAcquire` on the buffer element itself is extra safety; the index pair alone already orders the element access
 
-No `StoreLoad` fence needed — the acquire-release pairing between producer's `setRelease(writeIndex)` and consumer's `getAcquire(writeIndex)` creates the synchronisation edge. This is typically 2–5× faster than using `volatile` (which emits a full `StoreLoad` fence) for the write path on x86.
+No `StoreLoad` fence needed — the acquire-release pairing between producer's `setRelease(writeIndex)` and consumer's `getAcquire(writeIndex)` creates the synchronisation edge. On x86 this removes the lock-prefixed instruction from every write, which is often several times faster than a `volatile` write path (measure on your hardware).
 
 > [!WARNING]
 > SPSC ring buffers are correct **only** with exactly one producer thread and one consumer thread. If you add a second producer or consumer, the barrier analysis breaks and you need a full CAS-based implementation (e.g., `Disruptor`'s multi-producer ring buffer).
@@ -296,16 +305,16 @@ No `StoreLoad` fence needed — the acquire-release pairing between producer's `
 x86 (Total Store Order):
   - Most reorderings are forbidden by hardware
   - Only StoreLoad reorder is allowed
-  - volatile reads: free (no fence instruction needed)
-  - volatile writes: expensive (LOCK XCHG or MFENCE)
-  - Bugs from missing barriers rarely surface on x86
+  - volatile reads: plain MOV (no fence instruction)
+  - volatile writes: expensive (lock-prefixed instruction or XCHG)
+  - Bugs from missing barriers rarely surface on x86 (but the JIT can still reorder)
 
 ARM (Weakly Ordered):
   - Most reorderings are permitted by hardware
-  - All four barrier types needed to prevent reordering
-  - volatile reads: cost ISH DSB fence
-  - volatile writes: cost ISH DSB fence
-  - Bugs from missing barriers surface reliably on ARM
+  - Ordering must be requested explicitly
+  - volatile reads: LDAR (load-acquire)
+  - volatile writes: STLR (store-release)
+  - Bugs from missing barriers surface much more often on ARM
 ```
 
 This is why code that "works" without proper barriers on x86 development machines can fail on ARM production instances (AWS Graviton, Apple M-series). The JMM is designed to be conservative — if you follow JMM rules, your code is correct on all architectures. Never rely on x86's stronger ordering.
@@ -328,7 +337,7 @@ Can a reader thread observe the new `price` but the old `timestamp`?
 
 **Q2:** `VarHandle.setRelease()` is cheaper than `setVolatile()`. When is it safe to use `setRelease()` instead of `setVolatile()`?
 
-**A:** `setRelease()` is safe when you only need the following guarantee: everything written before this store will be visible to any thread that reads this location with `getAcquire()` or stronger. You do NOT need the subsequent `StoreLoad` fence (which is the expensive part of `setVolatile()`). It is safe for producer→consumer data handoff (SPSC ring buffer, publish an item then advance a cursor) but not safe if you need a reader to observe the store before it has performed its own subsequent loads.
+**A:** `setRelease()` is safe when you only need this guarantee: everything written before this store will be visible to any thread that reads this location with `getAcquire()` or stronger. You do NOT get the following `StoreLoad` fence (the expensive part of `setVolatile()`). That is fine for producer→consumer handoff (SPSC ring buffer: publish an item, then advance a cursor). It is NOT enough when the **writing thread's own later loads** must not move before this store — the classic case is Dekker-style mutual exclusion: "set my flag, then read your flag". With only release/acquire, both threads can read the other's old flag value and both enter.
 
 ## Practical Challenge
 
@@ -355,7 +364,7 @@ Provide the implementation with explicit commentary on what barrier each `VarHan
         "They have the same cost on x86 because TSO provides all ordering automatically"
       ],
       "correct": 1,
-      "explanation": "On x86 (TSO architecture), LoadLoad and LoadStore ordering is provided for free by the hardware. Volatile reads compile to a plain MOV instruction with no fence. Volatile writes, however, require a StoreLoad fence (LOCK XCHG or MFENCE) to drain the store buffer — this is the most expensive fence type at ~100 cycles. This asymmetry means reads are nearly free while writes are expensive."
+      "explanation": "On x86 (TSO), LoadLoad and LoadStore ordering is provided by the hardware, so a volatile read compiles to a plain MOV with no fence. A volatile write needs a StoreLoad fence — HotSpot uses a lock-prefixed instruction (or XCHG) — which drains the store buffer and is the most expensive kind of fence. So reads are nearly free while writes cost noticeably more."
     },
     {
       "text": "In a single-producer single-consumer ring buffer, the producer uses VarHandle.setRelease() to advance the write index, and the consumer uses VarHandle.getAcquire() to read it. Why is this pair sufficient for correctness without a full StoreLoad fence?",
@@ -366,7 +375,7 @@ Provide the implementation with explicit commentary on what barrier each `VarHan
         "getAcquire automatically reads from main memory, bypassing all caches"
       ],
       "correct": 1,
-      "explanation": "The acquire-release pair establishes a happens-before edge: everything written by the producer before the setRelease is visible to the consumer after the getAcquire. The StoreLoad fence (which setVolatile would add) would only be needed if the producer needed to immediately see subsequent loads. For the SPSC handoff pattern, setRelease/getAcquire is both correct and significantly cheaper than setVolatile."
+      "explanation": "The acquire-release pair establishes a happens-before edge: everything written by the producer before the setRelease is visible to the consumer after the getAcquire. The StoreLoad fence that setVolatile adds is only needed when a thread's own later loads must not move before its store (Dekker-style 'set my flag, then read yours'). The SPSC handoff does not need that, so setRelease/getAcquire is both correct and cheaper than setVolatile — on ARM as well as on x86."
     },
     {
       "text": "Code using no synchronisation 'works' on x86 development machines for months but fails on AWS Graviton (ARM) in production. What is the root cause?",
@@ -377,7 +386,7 @@ Provide the implementation with explicit commentary on what barrier each `VarHan
         "ARM CPUs have smaller caches, causing more cache misses that expose race conditions"
       ],
       "correct": 1,
-      "explanation": "x86 uses Total Store Order (TSO), which provides most memory ordering guarantees automatically, masking many JMM violations. ARM is weakly ordered and allows all four types of reordering unless explicit barrier instructions are used. Code with data races may appear to work on x86 (since the hardware enforces stronger ordering than the JMM requires) but correctly fails on ARM. The JMM is the contract — code must be correct to the JMM, not to x86 hardware."
+      "explanation": "x86 uses Total Store Order (TSO), which provides most memory ordering automatically and so hides many JMM violations. ARM is weakly ordered: loads and stores may be reordered unless the code asks for ordering (LDAR/STLR, DMB). Code with data races may appear to work on x86 but fail on ARM. The JMM is the contract — code must be correct according to the JMM, not to x86 hardware."
     }
   ]
 }

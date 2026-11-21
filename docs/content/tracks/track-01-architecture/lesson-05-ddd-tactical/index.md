@@ -50,7 +50,7 @@ Strategic DDD defines where your domain boundaries are; tactical DDD defines wha
 
 ## Business Context
 
-Zephyr Bank is a UK neo-bank with 1.4 million active accounts. In Q4 2025, a production incident caused 847 accounts to go below zero — negative balance — during a concurrent payment processing burst. The root cause: balance validation was performed in the `PaymentService` class, not inside the `Account` entity. When three concurrent payment requests hit the same account simultaneously, all three threads read the same balance, all three passed the validation check, and all three debited the account. The aggregate model the team should have implemented — with invariant enforcement inside the `Account` aggregate and optimistic locking — would have prevented this race condition entirely. The incident cost £340,000 in remediation, customer compensation, and FCA reporting overhead.
+Zephyr Bank is a UK neo-bank with 1.4 million active accounts. In Q4 2025, a production incident caused 847 accounts to go below zero — negative balance — during a concurrent payment processing burst. The root cause: balance validation was performed in the `PaymentService` class, not inside the `Account` entity. When three concurrent payment requests hit the same account simultaneously, all three threads read the same balance, all three passed the validation check, and all three debited the account. The aggregate model the team should have implemented would have prevented it: the invariant checked inside the `Account` aggregate, and the aggregate loaded with a row lock (or saved with a version check) so that concurrent debits of the same account are serialised. The invariant alone is not enough — without the lock or version check, three threads can still pass it on the same stale balance. The incident cost £340,000 in remediation, customer compensation, and FCA reporting overhead.
 
 ## Entity vs Value Object vs Aggregate
 
@@ -68,7 +68,7 @@ The three fundamental building blocks of a DDD domain model have precise definit
 | **Mutability** | Mutable (state changes over lifetime) | Immutable (new object on change) | Internally mutable; externally controlled |
 | **Equality** | ID equality | Attribute equality (all fields) | Root identity equality |
 | **Lifecycle** | Has a lifecycle (created, modified, deleted) | No lifecycle; created when needed | Root controls lifecycle of all members |
-| **Fintech examples** | Account, PaymentOrder, Merchant | Money, Currency, IBAN, AccountNumber | Account + Balance + Transactions |
+| **Fintech examples** | Account, PaymentOrder, Merchant | Money, Currency, IBAN, AccountNumber | Account (root) + Balance + OverdraftLimit — not its whole transaction history |
 
 ## The Money Value Object
 
@@ -224,10 +224,10 @@ public class Account {
     public void debit(Money amount, String reference) {
         assertActive();
         assertPositive(amount);
-        // INVARIANT: balance must not go below negative overdraft limit
+        // INVARIANT: balance must never go below -overdraftLimit
         Money projectedBalance = this.balance.subtract(amount);
-        if (projectedBalance.isNegative() &&
-            projectedBalance.isGreaterThan(overdraftLimit.multiply(BigDecimal.ONE.negate()).subtract(Money.zero(balance.currency())))) {
+        Money floor = Money.zero(balance.currency()).subtract(overdraftLimit);
+        if (floor.isGreaterThan(projectedBalance)) {
             throw new InsufficientFundsException(
                 "Debit of %s would breach overdraft limit. Balance: %s, Limit: %s"
                     .formatted(amount, balance, overdraftLimit)
@@ -288,7 +288,7 @@ public class Account {
 ```
 
 > [!IMPORTANT]
-> The `domainEvents` list inside the aggregate is populated by every state-changing operation and drained by the repository or application service after save. This pattern — sometimes called the "domain events collection" pattern — ensures that events are only published after the aggregate has been successfully persisted, preventing the classic "event published but save failed" inconsistency.
+> The `domainEvents` list inside the aggregate is populated by every state-changing operation and drained by the application service after save. This "domain events collection" pattern keeps the aggregate free of messaging code and makes events part of the state change. It does **not** by itself guarantee that events are published only after the data is committed: with JPA, `save()` usually reaches the database at commit, and a plain `@EventListener` runs inside the same transaction. Use `@TransactionalEventListener(phase = AFTER_COMMIT)` for side effects outside the database, and the Transactional Outbox for events other services must receive.
 
 ## Sealed Interfaces for Domain State
 
@@ -344,7 +344,7 @@ public interface AccountRepository {
     // Load the full aggregate by its identity
     Optional<Account> findById(AccountId accountId);
 
-    // Load with optimistic lock version for concurrent modification protection
+    // Load for modification: concurrent debits of the same account must be serialised
     Optional<Account> findByIdForUpdate(AccountId accountId);
 
     // Persist the entire aggregate (insert or update)
@@ -378,8 +378,10 @@ public class JpaAccountRepository implements AccountRepository {
     }
 
     @Override
-    @Lock(LockModeType.OPTIMISTIC_FORCE_INCREMENT)
     public Optional<Account> findByIdForUpdate(AccountId accountId) {
+        // findByIdWithLock is a Spring Data method annotated with
+        // @Lock(LockModeType.PESSIMISTIC_WRITE) -> SELECT ... FOR UPDATE.
+        // (@Lock has no effect on a hand-written class like this one.)
         return jpaRepository.findByIdWithLock(accountId.value())
             .map(mapper::toDomain);
     }
@@ -407,7 +409,7 @@ public class JpaAccountRepository implements AccountRepository {
 ```
 
 > [!NOTE]
-> The domain layer imports `AccountRepository` (the interface). The infrastructure layer imports `AccountRepository` and provides `JpaAccountRepository` (the implementation). This is dependency inversion: the domain defines the contract, the infrastructure fulfils it. No Spring annotation (`@Repository`, `@Transactional`) or JPA import ever appears in the domain layer.
+> The domain layer imports `AccountRepository` (the interface). The infrastructure layer imports `AccountRepository` and provides `JpaAccountRepository` (the implementation). This is dependency inversion: the domain defines the contract, the infrastructure fulfils it. No Spring annotation (`@Repository`, `@Transactional`) or JPA import ever appears in the domain layer. If you use optimistic locking instead of a row lock, the mapper must carry the entity's `@Version` value into the aggregate and back on save — otherwise the version check never fires.
 
 ## Domain Events
 
@@ -476,6 +478,8 @@ public class AccountApplicationService {
 
 ```java
 // application/handler/AccountDebitedEventHandler.java
+// @EventListener runs synchronously in the same transaction: the ledger entry and
+// the balance change commit or roll back together (both live in the same database).
 @Component
 public class AccountDebitedEventHandler {
 
@@ -582,17 +586,17 @@ The rich model is not just cleaner — it is safer. The rule "a frozen account c
 
 **Q:** A team argues that the `Money` value object is unnecessary overhead — they can use `BigDecimal` directly in the `Account` aggregate and validate currency in the service layer. Identify two specific ways that this design can produce incorrect financial calculations or violations in a production system.
 
-**A:** First, `BigDecimal` alone has no currency context, so there is nothing preventing code from adding GBP and USD amounts together — the result is a number that is meaningless as a monetary value but will pass any type check. With a `Money` type that carries its `Currency` and validates in `add()`, the error is a `CurrencyMismatchException` thrown at the point of the illegal operation rather than a silent data corruption. Second, `BigDecimal` scale is not automatically normalised to currency conventions — a rounding operation on a GBP amount using `RoundingMode.HALF_UP` might produce `10.005` where the currency only supports two decimal places. Without the `Money` constructor enforcing `setScale(currency.getDefaultFractionDigits(), ...)`, rounding decisions are made inconsistently across the codebase, and financial reconciliation will find discrepancies. Both defects are silent: they do not throw exceptions, they do not fail tests unless specifically written for this case, and they produce financial errors that only surface during reconciliation or audit.
+**A:** First, `BigDecimal` alone has no currency context, so there is nothing preventing code from adding GBP and USD amounts together — the result is a number that is meaningless as a monetary value but will pass any type check. With a `Money` type that carries its `Currency` and validates in `add()`, the error is a `CurrencyMismatchException` thrown at the point of the illegal operation rather than a silent data corruption. Second, `BigDecimal` scale is not automatically normalised to currency conventions — a multiplication for interest or FX can produce `10.005` on a GBP amount, and nothing forces it back to the two decimal places the currency supports. Without the `Money` constructor enforcing `setScale(currency.getDefaultFractionDigits(), ...)`, rounding decisions are made inconsistently across the codebase, and financial reconciliation will find discrepancies. Both defects are silent: they do not throw exceptions, they do not fail tests unless specifically written for this case, and they produce financial errors that only surface during reconciliation or audit.
 
 **Q:** The `AccountApplicationService.debitAccount()` method saves the aggregate and then publishes domain events. What production failure can occur if this order is reversed (events published before save), and how does the `drainDomainEvents()` pattern mitigate the risk even with the correct order?
 
-**A:** If events are published before the aggregate is saved, a downstream service (e.g., the Ledger Service) may receive and process the `AccountDebitedEvent` — writing a ledger entry and confirming the debit to the customer — while the `Account` aggregate itself fails to save due to a database error. The account balance in the database is unchanged, but the ledger records a debit and the customer has been notified. This is a phantom debit: money appears to leave the account but the account balance does not change, creating an inconsistency that is expensive to detect and reverse. The `drainDomainEvents()` pattern mitigates residual risk even with the correct order by ensuring events are removed from the aggregate's list at the moment of publication — if the application restarts after save but before event publication, a reconciliation or outbox process can replay the events by re-loading the aggregate, but only events not yet drained will be replayed, preventing double-publication. For full consistency guarantees, the Transactional Outbox pattern (writing events to a database table in the same transaction as the aggregate save) should be layered on top of this pattern.
+**A:** If events are published before the aggregate is saved, a downstream service (e.g., the Ledger Service) may receive and process the `AccountDebitedEvent` — writing a ledger entry and confirming the debit to the customer — while the `Account` aggregate itself fails to save due to a database error. The account balance in the database is unchanged, but the ledger records a debit and the customer has been notified. This is a phantom debit: money appears to leave the account but the account balance does not change, creating an inconsistency that is expensive to detect and reverse. `drainDomainEvents()` only prevents the same in-memory events from being published twice (for example if the aggregate is saved twice in one unit of work). It does not protect against crashes: the events live only in memory, so if the process dies after the commit but before publishing, they are lost — and reloading the aggregate does not bring them back. Even the "correct" order has a gap, because a synchronous listener runs before the commit, and the commit can still fail. For real guarantees, write the events to an outbox table in the same transaction as the aggregate and publish them from there (Transactional Outbox), or use `@TransactionalEventListener(phase = AFTER_COMMIT)` for work that may be lost and retried.
 
 ## Practical Challenge
 
 1. **Implement the `Payment` aggregate.** Design and implement a `Payment` aggregate for a card payment processing system. The aggregate must enforce these invariants: (a) a payment can only be captured if it is in `Authorised` state, (b) a payment cannot be voided after capture, (c) the captured amount cannot exceed the authorised amount, and (d) a refund cannot exceed the total captured amount. Use Java sealed interfaces for `PaymentState`. The aggregate must raise `PaymentAuthorisedEvent`, `PaymentCapturedEvent`, and `PaymentRefundedEvent` domain events. Write unit tests (JUnit 5, no Spring context) that verify each invariant by attempting the illegal transition and asserting the expected exception.
 
-2. **Implement the `Money` value object extensions.** Extend the `Money` record from this lesson to support: (a) a `percentage(BigDecimal rate)` method that calculates a percentage of the amount (e.g., `Money.of("100.00", "GBP").percentage(new BigDecimal("0.025"))` returns `Money(2.50, GBP)`), (b) a `distribute(int parts)` method that splits a Money value into N equal parts, handling remainder cents by adding them to the last part (e.g., `Money.of("10.00", "GBP").distribute(3)` returns `[3.34, 3.33, 3.33]`), and (c) a `compareTo(Money other)` method. Write tests demonstrating that the distribute method handles the penny-rounding case correctly.
+2. **Implement the `Money` value object extensions.** Extend the `Money` record from this lesson to support: (a) a `percentage(BigDecimal rate)` method that calculates a percentage of the amount (e.g., `Money.of("100.00", "GBP").percentage(new BigDecimal("0.025"))` returns `Money(2.50, GBP)`), (b) a `distribute(int parts)` method that splits a Money value into N equal parts, handling remainder pennies by adding one to each of the first parts (e.g., `Money.of("10.00", "GBP").distribute(3)` returns `[3.34, 3.33, 3.33]`, which still sums to exactly 10.00), and (c) a `compareTo(Money other)` method. Write tests demonstrating that the distribute method handles the penny-rounding case correctly.
 
 3. **Write a `PaymentRepository` interface and JPA adapter.** Write the domain-layer `PaymentRepository` interface for the `Payment` aggregate from task 1 with methods `findById`, `findByIdForUpdate`, `save`, and `findByMerchantIdAndStatus`. Then write a `JpaPaymentRepository` adapter in the infrastructure layer. The JPA entity (`PaymentJpaEntity`) must store `PaymentState` as a discriminator-based hierarchy (using `@Inheritance(strategy = InheritanceType.SINGLE_TABLE)`). Write a `PaymentMapper` that correctly translates between the JPA entity and the domain aggregate, including the state sealed interface.
 
@@ -645,7 +649,7 @@ The rich model is not just cleaner — it is safer. The rule "a frozen account c
   "estimatedMinutes": 60,
   "tasks": [
     {"id": "1", "description": "Design and implement a Payment aggregate for a card payment processing system. Enforce these invariants: (a) a payment can only be captured if in Authorised state, (b) a payment cannot be voided after capture, (c) the captured amount cannot exceed the authorised amount, and (d) a refund cannot exceed the total captured amount. Use Java sealed interfaces for PaymentState. The aggregate must raise PaymentAuthorisedEvent, PaymentCapturedEvent, and PaymentRefundedEvent. Write JUnit 5 unit tests (no Spring context) verifying each invariant by attempting the illegal transition and asserting the expected exception."},
-    {"id": "2", "description": "Extend the Money record from this lesson to support: (a) a percentage(BigDecimal rate) method returning the calculated percentage of the amount, (b) a distribute(int parts) method splitting a Money value into N equal parts with remainder cents added to the last part, and (c) a compareTo(Money other) method. Write tests demonstrating that distribute(3) on Money.of('10.00', 'GBP') produces [3.34, 3.33, 3.33] and that the penny-rounding is handled correctly."},
+    {"id": "2", "description": "Extend the Money record from this lesson to support: (a) a percentage(BigDecimal rate) method returning the calculated percentage of the amount, (b) a distribute(int parts) method splitting a Money value into N parts, adding one remainder penny to each of the first parts so the total is preserved, and (c) a compareTo(Money other) method. Write tests demonstrating that distribute(3) on Money.of('10.00', 'GBP') produces [3.34, 3.33, 3.33] and that the penny-rounding is handled correctly."},
     {"id": "3", "description": "Write the domain-layer PaymentRepository interface for the Payment aggregate with methods findById, findByIdForUpdate, save, and findByMerchantIdAndStatus. Then write a JpaPaymentRepository adapter in the infrastructure layer. The JPA entity must store PaymentState using @Inheritance(strategy = InheritanceType.SINGLE_TABLE). Write a PaymentMapper that correctly translates between the JPA entity and the domain aggregate, including the sealed interface state."},
     {"id": "4", "description": "Refactor an anemic InvoiceService that contains 120 lines of if-else logic operating on an Invoice data class. Identify the aggregates, value objects, and domain events that belong in a rich domain model. Write the Invoice aggregate with at least three command methods, one value object (InvoiceFee), and two domain events. The aggregate must enforce at least two of the validation checks currently scattered in the service class."}
   ]

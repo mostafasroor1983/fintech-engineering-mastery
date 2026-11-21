@@ -129,7 +129,7 @@ public void debit(Money amount) {
 
 ### synchronized and Virtual Threads (Java 21)
 
-`synchronized` blocks **pin** virtual threads to their carrier thread for the duration of the block. If the virtual thread performs a blocking operation (I/O, `sleep`, another lock acquisition) while pinned, it blocks the entire carrier thread, negating the benefit of virtual threads.
+On Java 21–23, `synchronized` blocks **pin** virtual threads to their carrier thread for the duration of the block. If the virtual thread performs a blocking operation (I/O, `sleep`, another lock acquisition) while pinned, it blocks the entire carrier thread, negating the benefit of virtual threads. JDK 24 (JEP 491) removed this limitation for `synchronized`; pinning remains only in rarer cases such as native frames.
 
 ```java21
 // PROBLEM: synchronized pins virtual thread to carrier thread
@@ -152,7 +152,7 @@ public AccountBalance getBalance(String accountId) {
 ```
 
 > [!IMPORTANT]
-> When migrating to virtual threads in Java 21, audit all `synchronized` blocks. Any `synchronized` block that may block (I/O, sleep, another lock) must be converted to `ReentrantLock` to avoid carrier thread pinning.
+> When migrating to virtual threads on Java 21–23, audit all `synchronized` blocks. Any `synchronized` block that may block (I/O, sleep, another lock) should be converted to `ReentrantLock` to avoid carrier thread pinning — or upgrade to JDK 24+, where this is no longer needed. Run with `-Djdk.tracePinnedThreads=full` (JDK 21–23) or watch the `jdk.VirtualThreadPinned` JFR event to find pinning.
 
 ## ReentrantLock
 
@@ -292,8 +292,8 @@ public class ExchangeRateCache {
     private final Lock          readLock   = rwLock.readLock();
     private final Lock          writeLock  = rwLock.writeLock();
 
-    // Immutable snapshot — replaced atomically on each update
-    private volatile Map<CurrencyPair, ExchangeRate> rates = Map.of();
+    // A MUTABLE map, updated in place — this is what needs the lock
+    private final Map<CurrencyPair, ExchangeRate> rates = new HashMap<>();
 
     // Called by 400 payment threads — concurrent reads allowed
     public ExchangeRate getRate(CurrencyPair pair) {
@@ -311,7 +311,7 @@ public class ExchangeRateCache {
     public void updateRates(Map<CurrencyPair, ExchangeRate> newRates) {
         writeLock.lock();
         try {
-            rates = Map.copyOf(newRates); // Replace the entire map atomically
+            rates.putAll(newRates); // readers are blocked, so none sees a half-update
         } finally {
             writeLock.unlock();
         }
@@ -328,7 +328,7 @@ public class ExchangeRateCache {
     private final ReentrantReadWriteLock rwLock   = new ReentrantReadWriteLock();
     private final Lock                   readLock  = rwLock.readLock();
     private final Lock                   writeLock = rwLock.writeLock();
-    private volatile Map<CurrencyPair, ExchangeRate> rates = Map.of();
+    private final Map<CurrencyPair, ExchangeRate> rates = new HashMap<>();
 
     public ExchangeRate getRate(CurrencyPair pair) {
         readLock.lock();
@@ -343,7 +343,7 @@ public class ExchangeRateCache {
     public void updateRates(Map<CurrencyPair, ExchangeRate> newRates) {
         writeLock.lock();
         try {
-            rates = Map.copyOf(newRates);
+            rates.putAll(newRates);
         } finally {
             writeLock.unlock();
         }
@@ -351,12 +351,15 @@ public class ExchangeRateCache {
 }
 ```
 
+> [!TIP]
+> If the whole map is replaced on each update, you do not need a lock at all: keep an immutable snapshot behind a `volatile` reference (`rates = Map.copyOf(newRates)`) — reads are then a single volatile read. A read-write lock earns its place when the shared structure is changed in place.
+
 ### ReadWriteLock Pitfalls
 
 | Pitfall | Description | Fix |
 |---|---|---|
 | Write starvation | Readers continuously acquire lock; writer never gets access | Use `ReentrantReadWriteLock(true)` for fair mode |
-| Lock downgrade | Acquiring write lock then read lock without releasing write lock is not supported | Downgrade: hold write, acquire read, release write |
+| Lock downgrade | Supported, and useful to keep reading what you just wrote | Hold write, acquire read, then release write |
 | Lock upgrade | Cannot upgrade from read to write lock — will deadlock | Release read, acquire write separately |
 | Performance with write contention | Under heavy write load, readers block as often as with `synchronized` | Switch to `StampedLock` or CopyOnWrite pattern |
 
@@ -421,10 +424,10 @@ public class FxRateStore {
 
 ```java21
 // Java 21 — StampedLock pattern is identical
-// StampedLock IS NOT virtual-thread friendly — it uses internal park/unpark
-// that can pin virtual threads in some JVM implementations
-// For virtual thread workloads, prefer ReentrantReadWriteLock over StampedLock
-// (This is a critical Java 21 migration consideration)
+// StampedLock parks waiting threads with LockSupport.park, so a waiting
+// virtual thread unmounts from its carrier like with other j.u.c locks.
+// Its real caveats are unchanged: it is NOT reentrant and has no Conditions.
+// (volatile on the fields is optional: validate() includes the needed fence)
 public class FxRateStore {
 
     private final StampedLock lock = new StampedLock();
@@ -467,8 +470,8 @@ public class FxRateStore {
 > [!WARNING]
 > **`StampedLock` is not reentrant.** Attempting to acquire a `StampedLock` from a thread that already holds it deadlocks immediately. Always ensure the lock is not held before acquiring it. This is the most common `StampedLock` mistake.
 
-> [!WARNING]
-> **`StampedLock` and virtual threads (Java 21):** `StampedLock` may pin virtual threads depending on the JVM implementation. Prefer `ReentrantReadWriteLock` for read-heavy workloads on virtual-thread-based servers (Tomcat with virtual threads, Spring Boot 3.2+).
+> [!NOTE]
+> **`StampedLock` and virtual threads:** waiting threads park through `LockSupport`, so a virtual thread waiting for a `StampedLock` unmounts from its carrier — it does not pin. Choose between `StampedLock` and `ReentrantReadWriteLock` on reentrancy, `Condition` support, and measured read throughput, not on virtual threads.
 
 ### StampedLock vs ReadWriteLock Performance
 
@@ -479,7 +482,7 @@ public class FxRateStore {
 | Write-heavy | ✓ Acceptable | ✓ Similar |
 | Reentrant locking | ✓ Supported | ✗ Deadlock |
 | `Condition` variables | ✓ Supported | ✗ Not supported |
-| Virtual thread safety | ✓ Safe | ⚠ Check JVM version |
+| Virtual threads | ✓ Waiting threads unmount | ✓ Waiting threads unmount |
 
 ## Condition Variables
 
@@ -660,7 +663,9 @@ public class TransferService {
                     from.getLock().unlock();
                 }
             }
-            // Could not acquire both locks — back off briefly and retry
+            // Could not acquire both locks — back off for a RANDOM time and retry
+            // (a fixed delay can make two threads retry in lockstep: livelock).
+            // In production, cap the number of attempts and then fail.
             Thread.sleep(ThreadLocalRandom.current().nextLong(1, 10));
         }
     }
@@ -696,7 +701,7 @@ flowchart TD
     E -->|Yes| F[ReentrantLock]
     E -->|No| G[synchronized]
     D -->|Optimistic reads and<br/>non-reentrant OK?| H[StampedLock]
-    D -->|Need reentrancy or<br/>virtual threads?| I[ReentrantReadWriteLock]
+    D -->|Need reentrancy or<br/>Condition?| I[ReentrantReadWriteLock]
     
     style B fill:#166534,color:#ffffff
     style F fill:#1e40af,color:#ffffff
@@ -710,17 +715,16 @@ flowchart TD
 | Simple mutual exclusion, legacy code | `synchronized` |
 | Need `tryLock`, timed acquire, or interruptible acquire | `ReentrantLock` |
 | Read-heavy shared state (config, rates) | `ReentrantReadWriteLock` |
-| Maximum read throughput, non-reentrant OK | `StampedLock` (platform threads) |
-| Read-heavy + virtual threads | `ReentrantReadWriteLock` |
+| Maximum read throughput, non-reentrant OK | `StampedLock` |
 | Producer-consumer coordination | `ReentrantLock` + `Condition` |
-| Virtual thread workloads, any locking | Avoid `synchronized`, prefer `ReentrantLock` |
+| Virtual thread workloads on Java 21–23 | Avoid blocking inside `synchronized`, prefer `ReentrantLock` |
 
 ---
 
 <!-- KNOWLEDGE-CHECK [
   {
     "id": "kc-sync-01",
-    "question": "A virtual thread holds a `synchronized` lock and makes a blocking database call inside the synchronized block. What happens to the carrier thread?",
+    "question": "On Java 21, a virtual thread holds a `synchronized` lock and makes a blocking database call inside the synchronized block. What happens to the carrier thread?",
     "options": [
       "The carrier thread parks and becomes available for other virtual threads",
       "The carrier thread is pinned and cannot run other virtual threads until the database call returns",
@@ -728,7 +732,7 @@ flowchart TD
       "The virtual thread terminates and retries the operation"
     ],
     "correct": 1,
-    "explanation": "synchronized blocks pin virtual threads to their carrier thread. When the pinned virtual thread blocks on I/O, the carrier thread blocks too — defeating the purpose of virtual threads. This is called carrier thread pinning. The fix is to replace synchronized with ReentrantLock, which causes virtual threads to park (yielding the carrier) rather than pinning it."
+    "explanation": "On Java 21–23, synchronized blocks pin virtual threads to their carrier thread. When the pinned virtual thread blocks on I/O, the carrier thread blocks too — defeating the purpose of virtual threads. The fix there is to replace synchronized with ReentrantLock, which lets the virtual thread park and free the carrier. JDK 24 (JEP 491) removed this limitation for synchronized."
   },
   {
     "id": "kc-sync-02",
@@ -785,7 +789,7 @@ flowchart TD
     },
     {
       "id": "pc-sync-03",
-      "description": "Convert the `FxRateCache` from task 2 to use `StampedLock` with optimistic reads. Add the validate-and-fallback pattern. Add a comment explaining why StampedLock should NOT be used if the service migrates to virtual threads."
+      "description": "Convert the `FxRateCache` from task 2 to use `StampedLock` with optimistic reads. Add the validate-and-fallback pattern, and a comment explaining StampedLock's main risk: it is not reentrant, so re-acquiring it on the same thread deadlocks."
     },
     {
       "id": "pc-sync-04",
@@ -793,7 +797,7 @@ flowchart TD
     },
     {
       "id": "pc-sync-05",
-      "description": "A `BatchPaymentProcessor` uses `synchronized` blocks inside loops. The service is migrating to Java 21 virtual threads. Identify which synchronized blocks contain blocking I/O calls and replace them with `ReentrantLock`."
+      "description": "A `BatchPaymentProcessor` uses `synchronized` blocks inside loops and is migrating to Java 21 virtual threads. Identify which synchronized blocks contain blocking I/O calls and replace them with `ReentrantLock` (or explain why upgrading to JDK 24+ removes the need)."
     }
   ]
 } -->

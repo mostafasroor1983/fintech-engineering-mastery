@@ -11,6 +11,8 @@ tags: [thread-pool-exhaustion, bulkhead, executor-isolation, back-pressure]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 Thread pool exhaustion is one of the most common causes of payment system outages. It is deceptively simple: a shared executor fills up, callers queue indefinitely, latency spikes, and the entire service stops responding — all without a single exception being thrown. Understanding how pools exhaust, detecting it early, and designing bulkhead boundaries separating critical paths from non-critical work is a core Principal Engineer competency.
 
 ## Learning Objectives
@@ -25,7 +27,7 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-A European payment processor ran a single shared executor with 200 threads across all operations: payment authorisations, fraud checks, settlement batches, and report generation. One evening, settlement batch jobs ran long due to a database query regression. Within minutes all 200 threads were occupied on batch work. Payment authorisations began queuing in the executor's unbounded `LinkedBlockingQueue`. Latency spiked from 50 ms to 45 seconds. By the time on-call was paged, thousands of transactions had timed out at the client. Revenue impact: €2.3 million. Root cause: no pool isolation, no queue depth monitoring, unbounded queue masking the problem.
+*Composite example (based on common industry failure patterns, not a specific company):* a payment processor ran a single shared executor with 200 threads across all operations: payment authorisations, fraud checks, settlement batches, and report generation. One evening, settlement batch jobs ran long due to a database query regression. Within minutes all 200 threads were occupied on batch work. Payment authorisations began queuing in the executor's unbounded `LinkedBlockingQueue`. Latency spiked from 50 ms to 45 seconds. By the time on-call was paged, thousands of transactions had timed out at the client. The business impact ran into millions in lost and reversed payments. Root cause: no pool isolation, no queue depth monitoring, unbounded queue masking the problem.
 
 ## How Thread Pool Exhaustion Happens
 
@@ -74,7 +76,8 @@ new ThreadPoolExecutor(
     200, 200,
     0L, TimeUnit.MILLISECONDS,
     new ArrayBlockingQueue<>(500),     // bounded: triggers rejection at 500
-    new CallerRunsPolicy()             // or custom rejection handler
+    new ThreadPoolExecutor.AbortPolicy() // or a custom handler (below);
+                                         // CallerRunsPolicy only for non-request work
 );
 ```
 
@@ -90,9 +93,9 @@ The bulkhead pattern (from naval architecture — watertight compartments) isola
 │                                                             │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────┐  │
 │  │  payment-exec    │  │   fraud-exec     │  │batch-exec│  │
-│  │  core:50 max:50  │  │  core:30 max:30  │  │core:5    │  │
-│  │  queue:100       │  │  queue:200       │  │max:5     │  │
-│  │                  │  │                  │  │queue:10  │  │
+│  │  core:50 max:50  │  │  core:30 max:50  │  │core:5    │  │
+│  │  queue:100       │  │  queue:500       │  │max:10    │  │
+│  │                  │  │                  │  │queue:50  │  │
 │  │  PAYMENT AUTH    │  │  FRAUD CHECKS    │  │BATCH JOBS│  │
 │  │  SETTLEMENT      │  │  SANCTIONS       │  │REPORTS   │  │
 │  └──────────────────┘  └──────────────────┘  └──────────┘  │
@@ -130,6 +133,8 @@ public class ExecutorBulkheadConfig {
         exec.setMaxPoolSize(50);
         exec.setQueueCapacity(500);
         exec.setThreadNamePrefix("fraud-");
+        // The caller is a payment thread: when full, the payment thread runs the
+        // check itself — slower, but a fraud check is never skipped
         exec.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
         exec.initialize();
         return exec;
@@ -143,7 +148,9 @@ public class ExecutorBulkheadConfig {
         exec.setMaxPoolSize(10);
         exec.setQueueCapacity(50);
         exec.setThreadNamePrefix("batch-");
-        exec.setRejectedExecutionHandler(new ThreadPoolExecutor.DiscardOldestPolicy());
+        // Never silently drop batch work: a dropped settlement or report job is
+        // a missed obligation. CallerRunsPolicy slows the batch scheduler instead
+        exec.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
         exec.initialize();
         return exec;
     }
@@ -152,7 +159,7 @@ public class ExecutorBulkheadConfig {
 
 ### Critical Path Rejection Handler
 
-For payment operations, `DiscardPolicy` or `AbortPolicy` are both wrong — silent data loss vs uncaught exception. Use a handler that logs, increments metrics, and surfaces a meaningful exception:
+For payment operations, `DiscardPolicy` is wrong — silent data loss. Plain `AbortPolicy` is safe but throws a generic exception with no log or metric. Use a handler that logs, increments metrics, and surfaces a meaningful, typed exception:
 
 ```java
 public class PaymentRejectionHandler implements RejectedExecutionHandler {
@@ -210,10 +217,13 @@ public class ExecutorHealthIndicator implements HealthIndicator {
         double utilPct  = poolSize == 0 ? 0 : (double) active / maxPool * 100;
         double queuePct = queueCap == 0 ? 0 : (double) queueSize / queueCap * 100;
 
+        // Put this indicator in the READINESS group only: DOWN then stops new
+        // traffic to this instance. In the liveness group it would make
+        // Kubernetes restart busy pods — and overload the remaining ones
         Health.Builder builder = utilPct > 90 || queuePct > 80
             ? Health.down()
             : utilPct > 70 || queuePct > 50
-                ? Health.unknown()   // "degraded" via DOWN or custom status
+                ? Health.status("DEGRADED")   // custom status — still reported as healthy
                 : Health.up();
 
         return builder
@@ -231,7 +241,7 @@ public class ExecutorHealthIndicator implements HealthIndicator {
 
 ### Micrometer Executor Metrics
 
-Spring Boot auto-registers executor metrics if you name the bean. Expose them to Prometheus/Grafana:
+Spring Boot auto-instruments `ThreadPoolTaskExecutor` beans (tagged with the bean name) when Micrometer is on the classpath. Bind them manually only for executors Boot does not manage, and expose them to Prometheus/Grafana:
 
 ```java
 @Bean(name = "paymentExecutor")
@@ -243,13 +253,13 @@ public ThreadPoolTaskExecutor paymentExecutor(MeterRegistry registry) {
     exec.setThreadNamePrefix("payment-");
     exec.initialize();
 
-    // Register Micrometer bindings manually if needed
-    ExecutorServiceMetrics.monitor(
-        registry,
+    // Manual binding (only if the executor is not auto-instrumented,
+    // otherwise the meters are registered twice)
+    new ExecutorServiceMetrics(
         exec.getThreadPoolExecutor(),
         "payment-executor",
         List.of(Tag.of("pool", "payment"))
-    );
+    ).bindTo(registry);
 
     return exec;
 }
@@ -258,8 +268,8 @@ public ThreadPoolTaskExecutor paymentExecutor(MeterRegistry registry) {
 Key metrics to alert on:
 | Metric | Alert Threshold |
 |--------|----------------|
-| `executor.pool.size` / `executor.pool.max` | > 90% |
-| `executor.queued` / `executor.queue.remaining` | > 70% |
+| `executor.active` / `executor.pool.max` | > 90% |
+| `executor.queued` / (`executor.queued` + `executor.queue.remaining`) | > 70% |
 | `executor.rejected.total` rate | Any non-zero |
 | `executor.completed.total` rate drop | > 50% drop vs baseline |
 
@@ -278,6 +288,9 @@ public class PaymentController {
     @Qualifier("paymentExecutor")
     private ThreadPoolTaskExecutor paymentExecutor;
 
+    @Autowired
+    private PaymentService paymentService;
+
     @PostMapping("/authorise")
     public CompletableFuture<AuthorisationResponse> authorise(
             @RequestBody AuthorisationRequest request) {
@@ -289,32 +302,33 @@ public class PaymentController {
 
         if (remaining == 0 || (double) queueSize / (queueSize + remaining) > 0.9) {
             // Proactive 503 before hitting rejection handler
-            throw new ResponseStatusException(
-                HttpStatus.SERVICE_UNAVAILABLE,
-                "Payment service temporarily overloaded. Retry after 2 seconds."
-            );
+            throw new PaymentExecutorExhaustedException(
+                "Payment service temporarily overloaded");
         }
 
+        // Submit to the underlying ThreadPoolExecutor: ThreadPoolTaskExecutor.execute()
+        // would wrap our handler's exception in Spring's TaskRejectedException
         return CompletableFuture.supplyAsync(
             () -> paymentService.authorise(request),
-            paymentExecutor
+            tpe
         );
     }
 
     @ExceptionHandler(PaymentExecutorExhaustedException.class)
-    @ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
-    public ErrorResponse handleExhaustion(PaymentExecutorExhaustedException ex) {
-        return ErrorResponse.of("EXECUTOR_EXHAUSTED", ex.getMessage());
+    public ResponseEntity<ErrorResponse> handleExhaustion(PaymentExecutorExhaustedException ex) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+            .header(HttpHeaders.RETRY_AFTER, "2")       // tell clients when to retry
+            .body(ErrorResponse.of("EXECUTOR_EXHAUSTED", ex.getMessage()));
     }
 }
 ```
 
 ### Virtual Threads as the Exhaustion Cure (Java 21)
 
-For I/O-bound payment workloads, virtual threads eliminate pool exhaustion entirely — blocking I/O unmounts the carrier thread rather than occupying it:
+For I/O-bound payment workloads, virtual threads remove **thread** exhaustion — blocking I/O unmounts the carrier thread rather than occupying it. The limit moves to the scarce downstream resources (database connections, partner rate limits), so bound those with the connection pool size or a `Semaphore`:
 
 ```java
-// Java 21: no pool exhaustion for I/O-bound work
+// Java 21: no THREAD exhaustion for I/O-bound work
 @Bean(name = "paymentExecutor")
 public Executor paymentExecutor() {
     // Thread-per-task with virtual threads — scales to millions
@@ -332,12 +346,12 @@ public Executor paymentExecutor() {
 | Payment auth | Small (< 2× pool) | Fast rejection, preserve SLA |
 | Fraud check | Medium (5–10× pool) | Tolerate burst; fraud latency less critical |
 | Batch/reports | Large or unbounded | Background work, no latency SLA |
-| CPU-bound | Zero (SynchronousQueue) | No queuing — reject immediately |
+| CPU-bound | Small, with `CallerRunsPolicy` | Natural throttling of the producer |
 
-For payment auth with a 50 ms SLA and 50 threads:
-- Target throughput: 50 threads / 0.05 s = 1,000 req/s
-- Acceptable queue drain time: 200 ms (4× SLA)
-- Maximum queue: 1,000 × 0.2 = 200 tasks — set `queueCapacity=200`
+For payment auth where each task takes 50 ms, with 50 threads and a 250 ms latency budget:
+- Pool throughput: 50 threads / 0.05 s = 1,000 req/s
+- Acceptable time waiting in the queue: 250 ms − 50 ms = 200 ms
+- Maximum queue: 1,000 req/s × 0.2 s = 200 tasks — set `queueCapacity=200`
 
 ## Knowledge Check
 
@@ -356,7 +370,7 @@ Your payment service uses a shared `ThreadPoolExecutor` with 100 threads and an 
 **Task:** Implement a bulkhead architecture with the following requirements:
 
 1. **Payment executor:** 60 threads, queue capacity 150, custom rejection that increments a Micrometer counter and throws `PaymentExecutorExhaustedException`
-2. **Batch executor:** 15 threads, queue capacity 30, `DiscardOldestPolicy`
+2. **Batch executor:** 15 threads, queue capacity 30, `CallerRunsPolicy` (batch work must never be silently dropped)
 3. **Health endpoint** at `/actuator/health` that reports `DOWN` when payment executor thread utilisation > 85% or queue fill > 75%
 4. **Controller** that returns HTTP 503 with `Retry-After: 2` header when the rejection handler fires
 
@@ -391,7 +405,7 @@ Verify by writing a stress test that submits 500 concurrent payment tasks and 20
       "text": "Which metric combination should trigger an alert indicating imminent thread pool exhaustion in a payment executor?",
       "options": [
         "executor.completed.total rate increasing steadily",
-        "executor.pool.size / executor.pool.max > 90% AND executor.queued / executor.queue.remaining > 70%",
+        "executor.active / executor.pool.max > 90% AND executor.queued / (executor.queued + executor.queue.remaining) > 70%",
         "executor.rejected.total equals zero",
         "executor.active.count equals executor.core.size"
       ],
@@ -408,10 +422,22 @@ Verify by writing a stress test that submits 500 concurrent payment tasks and 20
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
-    {"id": "1", "description": "Implement a three-pool bulkhead configuration using ThreadPoolTaskExecutor beans: a payment executor (60 threads, queue 150, custom PaymentRejectionHandler that increments a Micrometer counter and throws PaymentExecutorExhaustedException), a fraud executor (30 threads, queue 500, CallerRunsPolicy), and a batch executor (10 threads, queue 50, DiscardOldestPolicy)."},
-    {"id": "2", "description": "Implement the custom PaymentRejectionHandler that logs pool state (active/max threads, queue size/capacity), increments a 'payment.executor.rejected' Micrometer counter, and throws a typed PaymentExecutorExhaustedException with a descriptive message including current pool metrics."},
-    {"id": "3", "description": "Implement an ExecutorHealthIndicator (implementing HealthIndicator) that reports DOWN when payment executor thread utilisation exceeds 85% or queue fill exceeds 75%, and reports UP otherwise. Expose the health check at /actuator/health with detailed metrics including activeThreads, utilisation percentage, queueSize, and queueFill percentage."},
-    {"id": "4", "description": "Implement a PaymentController with a /api/payments/authorise endpoint that proactively checks queue fill before submitting (returning HTTP 503 with Retry-After: 2 header when queue fill > 90%), and an exception handler that maps PaymentExecutorExhaustedException to HTTP 503. Write a concurrent stress test using 500 payment tasks and 200 batch tasks simultaneously, asserting that at least 400 payment tasks complete successfully and none are silently dropped."}
+    {
+      "id": "1",
+      "description": "Implement a three-pool bulkhead configuration using ThreadPoolTaskExecutor beans: a payment executor (60 threads, queue 150, custom PaymentRejectionHandler that increments a Micrometer counter and throws PaymentExecutorExhaustedException), a fraud executor (30 threads, queue 500, CallerRunsPolicy), and a batch executor (10 threads, queue 50, CallerRunsPolicy — batch work must never be silently dropped)."
+    },
+    {
+      "id": "2",
+      "description": "Implement the custom PaymentRejectionHandler that logs pool state (active/max threads, queue size/capacity), increments a 'payment.executor.rejected' Micrometer counter, and throws a typed PaymentExecutorExhaustedException with a descriptive message including current pool metrics."
+    },
+    {
+      "id": "3",
+      "description": "Implement an ExecutorHealthIndicator (implementing HealthIndicator) that reports DOWN when payment executor thread utilisation exceeds 85% or queue fill exceeds 75%, and UP otherwise. Add it to the readiness health group only (not liveness), with details including activeThreads, utilisation percentage, queueSize, and queueFill percentage."
+    },
+    {
+      "id": "4",
+      "description": "Implement a PaymentController with a /api/payments/authorise endpoint that proactively checks queue fill before submitting (returning HTTP 503 with Retry-After: 2 header when queue fill > 90%), and an exception handler that maps PaymentExecutorExhaustedException to HTTP 503. Write a concurrent stress test using 500 payment tasks and 200 batch tasks simultaneously, asserting that at least 400 payment tasks complete successfully and none are silently dropped."
+    }
   ]
 }
 -->

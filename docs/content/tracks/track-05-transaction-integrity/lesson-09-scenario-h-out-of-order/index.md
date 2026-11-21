@@ -11,12 +11,14 @@ tags: [event-ordering, out-of-order, sequence-numbers, event-sourcing, Kafka]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 Kafka guarantees strict ordering within a single partition for a single consumer group. That guarantee is narrower than most engineers assume. A partition rebalance, a consumer lag spike, or a multi-partition topic with account events spread across partitions is enough for a `CreditReversed` event to arrive before the `CreditApplied` it reverses — and an account balance to be corrupted in a way that neither the application nor the database will detect, because the SQL executed correctly. This lesson traces the exact conditions that break event ordering, then implements three defensive strategies: a sequence-number gap buffer, partition-per-entity routing, and an event-sourcing replay model that treats ordering violations as a first-class concern.
 
 ## Learning Objectives
 
-- Explain the conditions under which Kafka's within-partition ordering guarantee breaks down: multi-partition topics, consumer group rebalances, and concurrent processing of the same partition.
-- Implement a gap-buffer consumer using `ConcurrentHashMap<String, PriorityQueue<AccountEvent>>` that buffers out-of-order events and drains them once the missing sequence arrives.
+- Explain the conditions under which per-entity ordering breaks down: an entity's events spread over several partitions, redelivery after rebalances, and handing records from one partition to several threads.
+- Implement a gap-buffer consumer that buffers out-of-order events durably and applies them once the missing sequence arrives.
 - Handle the gap-timeout case with a `ScheduledExecutorService` that alerts and applies available events when a gap exceeds 5 seconds.
 - Route all events for an entity to a single Kafka partition using the entity ID as the message key, and articulate the parallelism trade-off.
 - Design an event-sourcing approach where balance is derived by replaying events in sequence, eliminating in-place balance updates entirely.
@@ -24,13 +26,13 @@ Kafka guarantees strict ordering within a single partition for a single consumer
 
 ## Business Context
 
-Accord Bank, a digital retail bank with 890,000 current accounts, operates an event-driven account service where all balance mutations flow through Kafka. At 09:14 on a Monday morning, a scheduled consumer group rebalance triggered by a Kubernetes rolling deployment caused 23 partitions to be reassigned. During the 400 ms rebalance window, two consumers processing adjacent partitions both held in-flight events for a subset of accounts that happened to have events on both partitions (a known issue with the previous hash-partitioning scheme). When consumption resumed, 61 accounts had their `CreditReversed` events (sequence N+1) processed before their corresponding `CreditApplied` events (sequence N).
+*Composite example:* "Accord Bank", a fictional digital retail bank with 890,000 current accounts, operates an event-driven account service where all balance mutations flow through Kafka. At 09:14 on a Monday morning, a scheduled consumer group rebalance triggered by a Kubernetes rolling deployment caused 23 partitions to be reassigned. During the 400 ms rebalance window, two consumers processing adjacent partitions both held in-flight events for a subset of accounts that happened to have events on both partitions (a known issue with the previous hash-partitioning scheme). When consumption resumed, 61 accounts had their `CreditReversed` events (sequence N+1) processed before their corresponding `CreditApplied` events (sequence N).
 
-The balance calculation applied the reversal to the pre-credit balance, producing a value £X lower than correct. For 7 accounts the corrupted balance was below zero — which triggered automated credit freeze notifications to those customers. By the time the gap filled and the `CreditApplied` events were processed (231 ms later), the freeze notifications had already been sent and the accounts had been flagged in the fraud system. Remediation required 7 manual account reviews, 7 customer apology calls, and a Vulnerable Customer Assessment for 2 of the affected accounts under FCA CONC guidelines. The engineering postmortem identified no monitoring for sequence gaps. The gap existed for 231 ms and was entirely invisible.
+The balance calculation applied the reversal to the pre-credit balance, producing a value £X lower than correct. For 7 accounts the corrupted balance was below zero — which triggered automated credit freeze notifications to those customers. By the time the gap filled and the `CreditApplied` events were processed (231 ms later), the freeze notifications had already been sent and the accounts had been flagged in the fraud system. Remediation required 7 manual account reviews, 7 customer apology calls, and extra care reviews for 2 customers identified as vulnerable. The engineering postmortem identified no monitoring for sequence gaps. The gap existed for 231 ms and was entirely invisible.
 
 ## Why Kafka Ordering Breaks
 
-Kafka guarantees that within a single partition, messages are delivered to a consumer in the order they were produced. This guarantee holds only while one consumer in the group is reading that partition. The guarantee breaks in three scenarios.
+Kafka guarantees that within a single partition, messages are delivered to a consumer in the order they were produced (with an idempotent producer, even across retries). Per-*entity* ordering still breaks in three scenarios.
 
 ```mermaid
 flowchart TD
@@ -51,12 +53,12 @@ flowchart TD
 
 **Scenario 1 — Multi-partition topic without key-based routing**: An account's events are spread across partitions. Different consumers process them at different rates.
 
-**Scenario 2 — Consumer group rebalance**: Partition P0 was assigned to Consumer A. During rebalance, P0 is reassigned to Consumer B. Consumer A may have already begun processing an event from P0 that Consumer B will also replay after the rebalance, or Consumer B starts at the last committed offset which may leave a gap.
+**Scenario 2 — Consumer group rebalance**: Partition P0 was assigned to Consumer A. During rebalance, P0 is reassigned to Consumer B, which starts from the last *committed* offset. Events that A had processed but not yet committed are delivered again — B sees *older* sequence numbers again (duplicates), and if A was still finishing work while B started, the two can overlap.
 
-**Scenario 3 — Concurrent processing within a partition**: Using `ConcurrentKafkaListenerContainerFactory` with `setConcurrency(N > 1)` for a topic without further partitioning effectively breaks ordering guarantees for that consumer group.
+**Scenario 3 — Concurrent processing within a partition**: Spring's `setConcurrency(N)` is safe on its own — each partition is still read by exactly one thread. Ordering breaks when the listener hands records to a thread pool (`@Async`, `CompletableFuture`, parallel streams) so that two records from the same partition are processed at the same time.
 
 > [!WARNING]
-> Setting `concurrency > 1` on a `@KafkaListener` processes messages from multiple partitions in parallel, which is the intended behaviour. If your topic has fewer partitions than the concurrency level, some threads will be idle. If your entity events span multiple partitions, you get out-of-order processing. The concurrency level should equal the number of partitions, and each account's events should live on exactly one partition.
+> Setting `concurrency > 1` on a `@KafkaListener` processes messages from multiple partitions in parallel, which is the intended behaviour. If your topic has fewer partitions than the concurrency level, some threads will be idle. If your entity events span multiple partitions, you get out-of-order processing. Keep concurrency at or below the number of partitions, make sure each account's events live on exactly one partition, and never process records of one partition concurrently inside the listener.
 
 ## Sequence Numbers on Events
 
@@ -83,7 +85,7 @@ The sequence number is assigned by the producer at the time of event creation an
 
 ## Fix 1 — Gap Buffer with Priority Queue
 
-The gap buffer holds events that have arrived out of order and drains them once the missing predecessor arrives. Each account gets its own `PriorityQueue` ordered by `sequenceNumber`.
+The gap buffer holds events that have arrived out of order and applies them once the missing predecessor arrives. Its state must be **durable**. An in-memory buffer has two fatal flaws: the consumer acknowledges the Kafka offset of an event it has only *buffered*, so a restart loses that event for good; and after a restart or rebalance the in-memory "next expected sequence" is gone. So the last applied sequence lives on the account row (updated in the same transaction as the balance), and early events wait in a `pending_account_events` table.
 
 ```java
 @Service
@@ -92,68 +94,63 @@ The gap buffer holds events that have arrived out of order and drains them once 
 public class SequencedEventConsumer {
 
     private final AccountBalanceService accountBalanceService;
+    private final PendingEventRepository pendingEvents;   // pending_account_events table
     private final GapMonitoringService  gapMonitoringService;
-
-    // accountId → next expected sequence number
-    private final ConcurrentHashMap<UUID, Long> expectedSequence = new ConcurrentHashMap<>();
-
-    // accountId → buffered out-of-order events, ordered by sequence number
-    private final ConcurrentHashMap<UUID, PriorityQueue<AccountEvent>> gapBuffer =
-            new ConcurrentHashMap<>();
 
     @KafkaListener(topics = "account.events", groupId = "balance-service",
                    containerFactory = "manualAckContainerFactory")
     public void onAccountEvent(AccountEvent event, Acknowledgment ack) {
-        processEvent(event);
-        ack.acknowledge();
+        accountBalanceService.processInOrder(event);   // one DB transaction (below)
+        ack.acknowledge();   // safe: the event is now either applied or durably buffered
     }
+}
 
-    private void processEvent(AccountEvent event) {
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class AccountBalanceService {
+
+    private final AccountRepository accounts;
+    private final PendingEventRepository pendingEvents;
+    private final GapMonitoringService gapMonitoringService;
+
+    @Transactional
+    public void processInOrder(AccountEvent event) {
         UUID accountId = event.accountId();
-        long expected  = expectedSequence.getOrDefault(accountId, 1L);
+        // Row lock: serialises all processing for this account
+        Account account = accounts.findByIdForUpdate(accountId).orElseThrow();
+        long expected = account.getLastAppliedSeq() + 1;
 
-        if (event.sequenceNumber() == expected) {
-            apply(event);
-            expectedSequence.put(accountId, expected + 1);
-            drainBuffer(accountId);                     // apply any buffered successors
-
-        } else if (event.sequenceNumber() > expected) {
-            // Event arrived early — buffer it
+        if (event.sequenceNumber() < expected) {
+            // Already applied (redelivery after a rebalance) — idempotent skip
+            log.info("Stale/duplicate event ignored: accountId={} seq={} expected={}",
+                    accountId, event.sequenceNumber(), expected);
+            return;
+        }
+        if (event.sequenceNumber() > expected) {
+            // Arrived early — buffer it DURABLY (unique on account_id + seq)
             log.warn("Gap detected: accountId={} expected={} received={}",
                     accountId, expected, event.sequenceNumber());
-            bufferEvent(event);
+            pendingEvents.insertIgnoringDuplicate(event);
             gapMonitoringService.recordGap(accountId, expected, event.sequenceNumber());
+            return;
+        }
 
-        } else {
-            // event.sequenceNumber() < expected → already processed (duplicate)
-            log.warn("Stale/duplicate event ignored: accountId={} seq={} expected={}",
-                    accountId, event.sequenceNumber(), expected);
+        // In order: apply it, then drain any buffered successors
+        apply(account, event);
+        long next = event.sequenceNumber() + 1;
+        Optional<AccountEvent> buffered;
+        while ((buffered = pendingEvents.find(accountId, next)).isPresent()) {
+            apply(account, buffered.get());
+            pendingEvents.delete(accountId, next);
+            gapMonitoringService.clearGap(accountId, next);
+            next++;
         }
     }
 
-    private void bufferEvent(AccountEvent event) {
-        gapBuffer.computeIfAbsent(
-                event.accountId(),
-                k -> new PriorityQueue<>(Comparator.comparingLong(AccountEvent::sequenceNumber))
-        ).add(event);
-    }
-
-    private void drainBuffer(UUID accountId) {
-        PriorityQueue<AccountEvent> buffer = gapBuffer.get(accountId);
-        if (buffer == null || buffer.isEmpty()) return;
-
-        long nextExpected = expectedSequence.get(accountId);
-        while (!buffer.isEmpty() && buffer.peek().sequenceNumber() == nextExpected) {
-            AccountEvent next = buffer.poll();
-            apply(next);
-            nextExpected++;
-            expectedSequence.put(accountId, nextExpected);
-            gapMonitoringService.clearGap(accountId, next.sequenceNumber());
-        }
-    }
-
-    private void apply(AccountEvent event) {
-        accountBalanceService.applyEvent(event);
+    private void apply(Account account, AccountEvent event) {
+        account.applyEvent(event);                       // balance change
+        account.setLastAppliedSeq(event.sequenceNumber()); // same transaction
         log.debug("Applied event: accountId={} seq={} type={}",
                 event.accountId(), event.sequenceNumber(), event.type());
     }
@@ -162,7 +159,7 @@ public class SequencedEventConsumer {
 
 ## Fix 2 — Gap Timeout Handling
 
-A gap that never fills is worse than a gap that is detected quickly. A missing event (dropped by the producer, lost in a DLT) will stall the account's event stream indefinitely if there is no timeout.
+A gap that never fills is worse than a gap that is detected quickly. A missing event (dropped by the producer, lost in a DLT) will stall the account's event stream indefinitely if there is no timeout. The first step on a timeout should be to **fetch the missing event from the authoritative event store** — only if it cannot be found does the policy decision below apply.
 
 ```java
 @Component
@@ -170,12 +167,9 @@ A gap that never fills is worse than a gap that is detected quickly. A missing e
 @Slf4j
 public class GapTimeoutMonitor {
 
-    private final SequencedEventConsumer eventConsumer;
+    private final GapMonitoringService   gapMonitoringService;
     private final AlertingService        alertingService;
     private final AccountBalanceService  accountBalanceService;
-
-    // accountId → timestamp when the gap was first detected
-    private final ConcurrentHashMap<UUID, Instant> gapDetectedAt = new ConcurrentHashMap<>();
 
     private static final Duration GAP_TIMEOUT  = Duration.ofSeconds(5);
     private static final Duration CHECK_INTERVAL = Duration.ofSeconds(1);
@@ -185,8 +179,10 @@ public class GapTimeoutMonitor {
         Instant now      = Instant.now();
         Instant deadline = now.minus(GAP_TIMEOUT);
 
-        eventConsumer.getOpenGaps().forEach((accountId, expectedSeq) -> {
-            Instant detectedAt = gapDetectedAt.computeIfAbsent(accountId, k -> now);
+        // Open gaps come from the durable event_gaps table, not from memory,
+        // so they survive restarts and are visible to every instance
+        gapMonitoringService.findOpenGaps().forEach((accountId, expectedSeq) -> {
+            Instant detectedAt = gapMonitoringService.detectedAt(accountId, expectedSeq);
 
             if (detectedAt.isBefore(deadline)) {
                 log.error("Gap timeout: accountId={} missingSeq={} gapAge={}ms",
@@ -202,10 +198,9 @@ public class GapTimeoutMonitor {
 
                 // Apply buffered events that follow the gap — balance will be inaccurate
                 // but the account unblocks. Flag for manual reconciliation.
-                eventConsumer.forceApplyBuffered(accountId);
+                accountBalanceService.forceApplyBuffered(accountId);   // skips the missing seq
                 accountBalanceService.flagForReconciliation(accountId,
                         "gap-timeout: missing seq=" + expectedSeq);
-                gapDetectedAt.remove(accountId);
             }
         });
     }
@@ -217,28 +212,28 @@ public class GapTimeoutMonitor {
 
 ## Fix 3 — Kafka Partition-per-Account Routing
 
-The simplest architectural fix: ensure all events for an account always land in the same Kafka partition by using `accountId` as the message key. Kafka's default `DefaultPartitioner` uses a consistent hash of the key modulo the partition count.
+The simplest architectural fix: ensure all events for an account always land in the same Kafka partition by using `accountId` as the message key. Kafka's default partitioner hashes the key (murmur2) modulo the partition count — so changing the partition count later remaps keys to different partitions. With an idempotent producer (`max.in.flight.requests.per.connection` ≤ 5), retries do not reorder records within a partition.
 
 ```java
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class AccountEventProducer {
 
     private final KafkaTemplate<String, AccountEvent> kafkaTemplate;
 
     private static final String TOPIC = "account.events";
 
-    public void publish(AccountEvent event) {
-        // Using accountId as the key guarantees same-partition delivery
-        kafkaTemplate.send(TOPIC, event.accountId().toString(), event)
-                .whenComplete((result, ex) -> {
-                    if (ex != null) {
-                        throw new EventPublishingException("Failed to publish event", ex);
-                    }
-                    log.debug("Published: accountId={} seq={} partition={}",
-                            event.accountId(), event.sequenceNumber(),
-                            result.getRecordMetadata().partition());
-                });
+    public void publish(AccountEvent event) throws Exception {
+        // Using accountId as the key guarantees same-partition delivery.
+        // Wait for the result: throwing inside an async whenComplete callback
+        // reaches nobody. (In production, publish via the outbox — lesson 13.)
+        SendResult<String, AccountEvent> result =
+                kafkaTemplate.send(TOPIC, event.accountId().toString(), event)
+                        .get(10, TimeUnit.SECONDS);
+        log.debug("Published: accountId={} seq={} partition={}",
+                event.accountId(), event.sequenceNumber(),
+                result.getRecordMetadata().partition());
     }
 }
 ```
@@ -266,7 +261,7 @@ The trade-off is real: partition-per-account routing limits parallelism to one c
 
 ## Fix 4 — Event Sourcing: Balance as a Derived Projection
 
-In an event-sourcing model, the balance is never stored directly. It is always derived by replaying events from sequence 1. Out-of-order delivery cannot corrupt the balance because the balance is not updated in place — it is recalculated.
+In an event-sourcing model, the balance is never stored as the source of truth. It is derived by replaying the account's events in sequence order (in practice from a periodic snapshot, not from sequence 1 every time). Out-of-order delivery cannot corrupt the balance because the balance is not updated in place — it is recalculated from the ordered event store, and gaps are detected.
 
 ```java
 @Service
@@ -335,7 +330,7 @@ CREATE INDEX idx_account_events_account_seq
     ON account_events (account_id, sequence_number);
 ```
 
-The `UNIQUE (account_id, sequence_number)` constraint enforces sequence integrity at the database level. An attempt to insert a duplicate or out-of-order sequence number fails immediately.
+The `UNIQUE (account_id, sequence_number)` constraint stops **duplicates** at the database level. It does not stop gaps or out-of-order inserts — sequence 5 can be inserted before 4 — which is why `validateNoGaps` checks the replayed sequence. (If the event store is the writer, allocate sequence numbers with a per-account counter in the same transaction so gaps cannot appear.)
 
 ## Operational Monitoring — Event Gaps Table
 
@@ -382,7 +377,7 @@ Design an ordering strategy for this scenario:
 1. How do you guarantee that the EUR debit and the GBP credit are applied atomically, even if the two Kafka messages are consumed at different times? Draw a sequence diagram showing the failure scenario where only one side is applied.
 2. Extend the gap buffer implementation to support a "cross-currency hold": when `FxConversionApplied` for the EUR side is received, the EUR balance is not updated until the corresponding GBP credit is confirmed as processed (or vice versa). What data structure tracks the pending cross-currency correlation?
 3. Write the `event_gaps` monitoring query that counts unresolved gaps by age bucket: 0–1s, 1–5s, 5–30s, >30s. This query will drive a Grafana panel.
-4. A load test reveals that the in-memory `gapBuffer` grows unbounded under sustained out-of-order delivery. Propose a bounded eviction strategy that prevents OOM while preserving correctness guarantees.
+4. A load test reveals that the gap buffer grows without limit under sustained out-of-order delivery. Propose a bounded strategy (e.g. a per-account limit and a maximum gap age) that prevents unbounded growth while preserving correctness — and explain why "evict the oldest buffered event" would silently lose money movements.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -430,10 +425,22 @@ Design an ordering strategy for this scenario:
   "difficulty": "advanced",
   "estimatedMinutes": 50,
   "tasks": [
-    {"id": "1", "description": "Design a cross-currency ordering strategy for FxConversionApplied events that atomically debit EUR (seq N on account.events.eur) and credit GBP (seq M on account.events.gbp). Draw a sequence diagram showing the failure scenario where only one side is applied."},
-    {"id": "2", "description": "Extend the gap buffer to support a cross-currency hold: when FxConversionApplied for the EUR side is received, hold the EUR balance update until the corresponding GBP credit is confirmed. Define the data structure tracking the pending cross-currency correlation."},
-    {"id": "3", "description": "Write an event_gaps monitoring SQL query that counts unresolved gaps by age bucket: 0-1s, 1-5s, 5-30s, >30s. This query will drive a Grafana panel for on-call alerting."},
-    {"id": "4", "description": "Design a bounded eviction strategy for the in-memory gap buffer that prevents OOM under sustained out-of-order delivery while preserving correctness guarantees. Describe the eviction policy and what happens to evicted events."}
+    {
+      "id": "1",
+      "description": "Design a cross-currency ordering strategy for FxConversionApplied events that atomically debit EUR (seq N on account.events.eur) and credit GBP (seq M on account.events.gbp). Draw a sequence diagram showing the failure scenario where only one side is applied."
+    },
+    {
+      "id": "2",
+      "description": "Extend the gap buffer to support a cross-currency hold: when FxConversionApplied for the EUR side is received, hold the EUR balance update until the corresponding GBP credit is confirmed. Define the data structure tracking the pending cross-currency correlation."
+    },
+    {
+      "id": "3",
+      "description": "Write an event_gaps monitoring SQL query that counts unresolved gaps by age bucket: 0-1s, 1-5s, 5-30s, >30s. This query will drive a Grafana panel for on-call alerting."
+    },
+    {
+      "id": "4",
+      "description": "Design a bounded strategy for the gap buffer (e.g. a per-account limit on pending events and a maximum gap age) that prevents unbounded growth under sustained out-of-order delivery while preserving correctness. Describe what happens to events beyond the limit (e.g. stop consuming that partition and alert, rather than drop them)."
+    }
   ]
 }
 -->

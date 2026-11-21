@@ -33,7 +33,9 @@ references:
   - "Basel Committee on Banking Supervision: Sound management of risks related to money laundering and financing of terrorism (2020)"
 ---
 
-Know Your Customer (KYC) is the cornerstone obligation of financial crime compliance. Every regulated financial institution must be able to answer a deceptively simple question before opening an account: who is this person, are they who they claim to be, what risk do they pose, and is their intended use of the product consistent with legitimate activity? Getting that answer wrong in either direction costs real money — HSBC paid $1.9 billion in a 2012 US Department of Justice settlement for systematic KYC failures, and ING Bank N.V. paid €775 million in 2018 after Dutch prosecutors found 100,000 customer files were never updated for periods exceeding five years. Getting it wrong in the other direction — rejecting legitimate customers through excessive friction — cost UK challenger banks an estimated 35% application abandonment rate in 2023 according to Callsign research. As a senior engineer building onboarding systems, you sit at the intersection of regulatory obligation and commercial imperative.
+## Overview
+
+Know Your Customer (KYC) is the cornerstone obligation of financial crime compliance. Every regulated financial institution must be able to answer a deceptively simple question before opening an account: who is this person, are they who they claim to be, what risk do they pose, and is their intended use of the product consistent with legitimate activity? Getting that answer wrong in either direction costs real money — HSBC paid $1.9 billion in a 2012 US Department of Justice settlement for systematic KYC failures, and ING Bank N.V. paid €775 million in 2018 after Dutch prosecutors found serious, structural failures in its customer due diligence and transaction monitoring. Getting it wrong in the other direction — rejecting or losing legitimate customers through excessive friction — is costly too: digital onboarding journeys commonly lose a large share of applicants at the identity-verification step. As a senior engineer building onboarding systems, you sit at the intersection of regulatory obligation and commercial imperative.
 
 ## Learning Objectives
 
@@ -48,23 +50,23 @@ Know Your Customer (KYC) is the cornerstone obligation of financial crime compli
 
 ## Business Context
 
-In March 2022, Santander UK was fined £107.7 million by the Financial Conduct Authority for anti-money laundering failures affecting 560,000 business customers over a five-year period. The root cause was not a failure to collect data — customer documents were gathered — but a failure of the systems that processed and maintained that data. Automated onboarding workflows could not handle the edge cases that make up the long tail of real customer populations: dual nationality, name transliteration from Arabic or Chinese scripts, shell company ownership chains that reached 14 layers deep, and customers whose risk profile changed significantly after the initial risk rating was locked. The engineering team had built a monolithic onboarding service that wrote a final `risk_tier` value to the customer record and never revisited it. Regulators described this as a "broken" approach to ongoing due diligence. The fine calculation was roughly £192 per affected customer — a number that becomes brutally instructive when you realise that building a proper periodic review system would have cost a fraction of that.
+In December 2022, the Financial Conduct Authority fined Santander UK £107.7 million for anti-money laundering failures in its business banking division between 2012 and 2017, affecting around 560,000 business customers. The FCA found that the bank did not properly verify information customers gave at onboarding (such as expected turnover), did not effectively monitor whether accounts were used as declared, and did not act quickly enough when risks were identified. Data was collected — the failure was in how it was checked, maintained and acted upon. *The engineering pattern behind failures like this (a composite, not a description of Santander's systems):* an onboarding service writes a final `risk_tier` to the customer record and never revisits it; edge cases — dual nationality, transliterated names, long ownership chains, customers whose behaviour changes after onboarding — fall through. The fine works out at roughly £192 per affected customer, far more than a proper ongoing due diligence system would have cost.
 
 ## Regulatory Framework: FATF and EU AML Directives
 
-The Financial Action Task Force (FATF) is the inter-governmental body that sets the global standard for anti-money laundering (AML) and counter-terrorist financing (CTF). Its 40 Recommendations, first issued in 1990 and substantially revised in 2012, define the risk-based approach that all national AML regimes must implement. Recommendation 10 defines Customer Due Diligence. Recommendation 12 defines Enhanced Due Diligence for Politically Exposed Persons. Recommendation 15, added in the 2023 revision, explicitly addresses virtual assets and obligated parties must apply CDD to crypto-asset service providers.
+The Financial Action Task Force (FATF) is the inter-governmental body that sets the global standard for anti-money laundering (AML) and counter-terrorist financing (CTF). Its 40 Recommendations, first issued in 1990 and substantially revised in 2012, define the risk-based approach that all national AML regimes must implement. Recommendation 10 defines Customer Due Diligence. Recommendation 12 defines Enhanced Due Diligence for Politically Exposed Persons. Recommendation 15 (new technologies) was extended in 2018–2019 to cover virtual assets: virtual asset service providers must be regulated and apply CDD, including the "travel rule" for transfers.
 
 The EU has transposed FATF obligations through successive AML Directives. Each directive tightened requirements that have direct architectural implications.
 
 | Directive | Year | Key Engineering Impact |
 |-----------|------|------------------------|
 | 4AMLD | 2017 | Risk-based approach made mandatory; UBO register introduced |
-| 5AMLD | 2020 | Virtual currency platforms brought in scope; UBO registers made public |
-| 6AMLD | 2021 | 22 predicate offences harmonised; criminal liability extended to legal persons; 4-year minimum custodial sentence |
-| AML Package 2024 | 2027 (target) | Single EU AML Authority (AMLA) with direct supervisory powers; €10,000 cash payment limit |
+| 5AMLD | 2020 | Virtual currency platforms brought in scope; UBO registers opened to the public (general public access was struck down by the EU Court of Justice in 2022; access now requires a legitimate interest) |
+| 6AMLD | 2021 | 22 predicate offences harmonised; criminal liability extended to legal persons; maximum prison term of at least 4 years for money laundering |
+| AML Package 2024 | AMLR applies from July 2027 | Directly applicable AML Regulation; EU AML Authority (AMLA); €10,000 cash payment limit |
 
 > [!IMPORTANT]
-> The 2024 EU AML Package creates a new supranational regulator (AMLA) with direct supervisory powers over the highest-risk institutions. Data-sharing architectures must be designed today to accommodate regulatory data requests that bypass national FIUs. This is not a future concern — AMLA begins operations in 2025 with full supervisory scope by 2027.
+> The 2024 EU AML Package creates a new EU-level supervisor, AMLA (based in Frankfurt), which began operating in 2025 and will directly supervise a selected group of the highest-risk cross-border institutions from 2028. The AML Regulation replaces many national rules with one directly applicable rulebook from July 2027. Design customer data and audit trails now so they can answer supervisory requests in a consistent, EU-wide format.
 
 ## CDD, EDD, and SDD Tiers
 
@@ -77,7 +79,7 @@ The risk-based approach requires that the intensity of due diligence be proporti
 **Simplified Due Diligence (SDD)** may apply where risk is demonstrably low: regulated financial institutions, listed companies on recognised exchanges, government bodies. SDD permits reduced verification frequency and documentation depth, but it is not an exemption from CDD — it is a calibrated reduction.
 
 > [!NOTE]
-> SDD is a risk-proportionate reduction, not a free pass. Under 5AMLD Article 15, firms must still document the rationale for applying SDD and monitor the relationship for signals that would escalate it to Standard or Enhanced CDD. A customer who qualifies for SDD at onboarding may require EDD within 90 days if transaction behaviour is inconsistent with the stated purpose.
+> SDD is a risk-proportionate reduction, not a free pass. Under 4AMLD Article 15 (and UK MLR 2017 regulation 37), firms must document why SDD applies and keep monitoring the relationship for signals that should escalate it to standard CDD or EDD. A customer who qualified for SDD at onboarding may need EDD soon afterwards if their behaviour does not match the stated purpose.
 
 ## Onboarding Pipeline Architecture
 
@@ -110,7 +112,7 @@ sequenceDiagram
     API-->>Customer: 201 Created
 ```
 
-The saga orchestrator must handle the failure modes at each step. If document verification fails after identity verification has succeeded, the compensating transaction cancels the identity verification reservation and marks the application as `PENDING_MANUAL_REVIEW` rather than `REJECTED` — a critical distinction because the customer may simply have submitted a low-quality photograph.
+The saga orchestrator must handle the failure modes at each step. If document verification is inconclusive after identity verification has succeeded (blurry image, low liveness score), the application goes to `PENDING_MANUAL_REVIEW` rather than `REJECTED` — a critical distinction because the customer may simply have submitted a low-quality photograph. Only a document confirmed as forged is rejected (and referred to the fraud team). Each step's result is saved in its own short transaction, so the saga can resume after a crash; the orchestrator must never hold one database transaction open across slow external calls.
 
 ```java
 // KycOrchestrationService.java
@@ -126,7 +128,11 @@ public class KycOrchestrationService {
     private final CoreBankingClient coreBankingClient;
     private final ApplicationEventPublisher eventPublisher;
 
-    @Transactional
+    // NOT @Transactional: one DB transaction held open across several slow
+    // HTTP calls would pin a connection for seconds, and a rollback at step 5
+    // would erase the saved progress while the external effects remain.
+    // updateStatus/persist* each commit in their own short transaction
+    // (TransactionTemplate), so the saga can resume from its last state.
     public KycResult orchestrate(KycApplication application) {
         log.info("Starting KYC orchestration for applicationId={}", application.getId());
         updateStatus(application, KycStatus.IDENTITY_VERIFICATION_IN_PROGRESS);
@@ -150,25 +156,41 @@ public class KycOrchestrationService {
         try {
             docResult = docClient.verify(DocumentVerificationRequest.from(application));
         } catch (DocumentVerificationException e) {
-            // compensate: nothing to undo for IDV in this model
+            // Provider error is not the customer's fault: retry later
             return failApplication(application, KycFailureReason.DOC_PROVIDER_ERROR, e);
         }
 
-        if (!docResult.authentic() || docResult.livenessScore() < 0.90) {
+        if (docResult.forgeryDetected()) {
+            // Confirmed forgery: reject and refer to the fraud team
             return rejectApplication(application, KycFailureReason.DOCUMENT_NOT_AUTHENTIC);
+        }
+        if (!docResult.authentic() || docResult.livenessScore() < 0.90) {
+            // Inconclusive (blurry photo, poor lighting): a human decides
+            return requireManualReview(application, "Document check inconclusive");
         }
 
         updateStatus(application, KycStatus.SANCTIONS_SCREENING_IN_PROGRESS);
 
         // Step 3: Sanctions and PEP Screening
-        ScreeningResult screeningResult = sanctionsClient.screen(ScreeningRequest.from(application));
+        ScreeningResult screeningResult;
+        try {
+            screeningResult = sanctionsClient.screen(ScreeningRequest.from(application));
+        } catch (ScreeningException e) {
+            // Never treat "screening unavailable" as "no hit"
+            return failApplication(application, KycFailureReason.SCREENING_PROVIDER_ERROR, e);
+        }
 
-        if (screeningResult.hasBlockingHit()) {
+        if (screeningResult.hasConfirmedSanctionsMatch()) {
             return blockApplication(application, screeningResult);
+        }
+        if (screeningResult.hasPotentialSanctionsMatch()) {
+            // Fuzzy match: hold for a sanctions analyst — do not auto-block
+            return holdForSanctionsReview(application, screeningResult);
         }
 
         boolean requiresEdd = screeningResult.pepStatus() != PepStatus.CLEAR
                 || isHighRiskJurisdiction(application.getNationality())
+                || isHighRiskJurisdiction(application.getCountryOfResidence())
                 || application.getProductType().requiresEdd();
 
         updateStatus(application, KycStatus.RISK_RATING_IN_PROGRESS);
@@ -176,7 +198,7 @@ public class KycOrchestrationService {
         // Step 4: Risk Rating
         RiskRatingInput ratingInput = RiskRatingInput.builder()
                 .customerId(application.getCustomerId())
-                .jurisdiction(application.getNationality())
+                .jurisdiction(application.getCountryOfResidence())
                 .occupation(application.getOccupation())
                 .productType(application.getProductType())
                 .pepStatus(screeningResult.pepStatus())
@@ -187,18 +209,25 @@ public class KycOrchestrationService {
         CustomerRiskRating riskRating = riskEngine.calculate(ratingInput);
         persistRiskRating(riskRating);
 
-        if (riskRating.band() == RiskBand.HIGH && !riskRating.seniorManagerApproved()) {
+        // EDD (PEPs, high-risk countries) and HIGH / VERY_HIGH bands need
+        // senior-management approval before the relationship starts
+        boolean needsApproval = requiresEdd
+                || riskRating.band() == RiskBand.HIGH
+                || riskRating.band() == RiskBand.VERY_HIGH;
+        if (needsApproval && !riskRating.seniorManagerApproved()) {
             return awaitSeniorApproval(application, riskRating);
         }
 
         updateStatus(application, KycStatus.ACCOUNT_OPENING_IN_PROGRESS);
 
-        // Step 5: Account Opening
+        // Step 5: Account Opening — idempotent by applicationId, so a retry
+        // after a timeout returns the same account instead of opening a second
         AccountCreationResult accountResult = coreBankingClient.openAccount(
                 AccountCreationRequest.builder()
+                        .idempotencyKey(application.getId().toString())
                         .customerId(application.getCustomerId())
                         .riskRatingId(riskRating.id())
-                        .cddTier(requiresEdd ? CddTier.ENHANCED : CddTier.STANDARD)
+                        .cddTier(riskRating.cddTier())
                         .build()
         );
 
@@ -210,9 +239,10 @@ public class KycOrchestrationService {
 
     private KycResult blockApplication(KycApplication application, ScreeningResult result) {
         application.setStatus(KycStatus.BLOCKED);
-        application.setBlockedReason("SANCTIONS_HIT: " + result.highestMatchScore());
+        application.setBlockedReason("SANCTIONS_MATCH: " + result.highestMatchScore());
         applicationRepo.save(application);
-        // OFAC reporting obligation — do NOT notify customer of the reason
+        // Sanctions team handles any reporting duty (rules differ by country);
+        // the customer gets a neutral decline — NEVER the reason
         eventPublisher.publishEvent(new SanctionsBlockEvent(application.getId(), result));
         return KycResult.blocked();
     }
@@ -220,7 +250,7 @@ public class KycOrchestrationService {
 ```
 
 > [!WARNING]
-> When an application is blocked due to a sanctions hit, you must NOT inform the customer that the reason is a sanctions match. This is "tipping off" and is a criminal offence under the Proceeds of Crime Act 2002 (UK) and equivalent legislation in most jurisdictions. The application should be declined with a neutral message. All communication about the block must go through your compliance team and legal counsel.
+> When an application is blocked or held because of a sanctions match or a suspicion, do NOT tell the customer the reason. Where a suspicion has been reported, telling them can be "tipping off" — a criminal offence under the Proceeds of Crime Act 2002 (UK) and equivalent laws in most jurisdictions — and in any case it helps sanctioned persons evade controls. The application should be declined with a neutral message. All communication about the block must go through your compliance team and legal counsel.
 
 ## Customer Risk Rating Schema and Service
 
@@ -275,7 +305,7 @@ CREATE UNIQUE INDEX idx_crr_customer_active
     WHERE superseded_at IS NULL;
 ```
 
-The risk scoring model weights four primary factors. Scores are summed and mapped to a band. The model must be version-controlled: changing the weights is a material change that must be documented and approved by the MLRO (Money Laundering Reporting Officer).
+The risk scoring model weights four primary factors into a weighted average, then applies **floors**: some facts (for example, being a PEP) put a customer into a high band no matter what the average says. A PEP must never be averaged down to "standard" by a low product score. The model must be version-controlled: changing the weights is a material change that must be documented and approved by the MLRO (Money Laundering Reporting Officer).
 
 ```java
 // RiskRatingEngine.java
@@ -283,6 +313,7 @@ The risk scoring model weights four primary factors. Scores are summed and mappe
 public class RiskRatingEngine {
 
     // Weights must be approved by MLRO — do not change without change management sign-off
+    // (they sum to 100, so the weighted average stays on a 0–100 scale)
     private static final int JURISDICTION_WEIGHT    = 35;
     private static final int OCCUPATION_WEIGHT      = 25;
     private static final int PRODUCT_WEIGHT         = 20;
@@ -296,36 +327,49 @@ public class RiskRatingEngine {
         "UK",                 5
     );
 
+    private final Clock clock;
+
+    public RiskRatingEngine(Clock clock) { this.clock = clock; }
+
     public CustomerRiskRating calculate(RiskRatingInput input) {
         int jurisdictionScore = resolveJurisdictionScore(input.jurisdiction());
         int occupationScore   = resolveOccupationScore(input.occupation());
         int productScore      = resolveProductScore(input.productType());
-        int pepScore          = input.pepStatus() == PepStatus.CLEAR ? 0 : 40;
+        int behaviourScore    = input.behaviourScore();      // 0–100, 0 at onboarding
 
-        // Composite score: weighted average across factors (0–100 scale each)
-        double raw = (jurisdictionScore * JURISDICTION_WEIGHT
+        // Weighted average across factors (each on a 0–100 scale)
+        int weighted = Math.round((jurisdictionScore * JURISDICTION_WEIGHT
                     + occupationScore   * OCCUPATION_WEIGHT
                     + productScore      * PRODUCT_WEIGHT
-                    + pepScore          * 10)   // PEP is an additive modifier
-                   / 100.0;
+                    + behaviourScore    * BEHAVIOUR_WEIGHT) / 100f);
 
-        int finalScore = Math.min(100, (int) Math.round(raw) + input.behaviourAdjustment());
-        RiskBand band  = scoreToBand(finalScore);
+        RiskBand band = scoreToBand(weighted);
 
-        Date nextReview = calculateNextReview(band);
+        // Floors: facts that override the average
+        int pepScore = 0;
+        if (input.pepStatus() != PepStatus.CLEAR) {
+            pepScore = 100;
+            band = RiskBand.max(band, RiskBand.HIGH);          // PEP → at least HIGH
+        }
+        if (jurisdictionScore == 100) {
+            band = RiskBand.max(band, RiskBand.HIGH);          // FATF high-risk → EDD
+        }
 
         return CustomerRiskRating.builder()
                 .customerId(input.customerId())
-                .riskScore(finalScore)
+                .riskScore(weighted)
                 .riskBand(band)
-                .cddTier(band == RiskBand.LOW ? CddTier.SIMPLIFIED
-                        : band == RiskBand.HIGH || band == RiskBand.VERY_HIGH ? CddTier.ENHANCED
+                // SDD only for documented low-risk categories (regulated firm,
+                // listed company, public body) — a low score alone is not enough
+                .cddTier(band == RiskBand.HIGH || band == RiskBand.VERY_HIGH ? CddTier.ENHANCED
+                        : band == RiskBand.LOW && input.sddEligible() ? CddTier.SIMPLIFIED
                         : CddTier.STANDARD)
                 .jurisdictionScore(jurisdictionScore)
                 .occupationScore(occupationScore)
                 .productScore(productScore)
+                .behaviourScore(behaviourScore)
                 .pepScore(pepScore)
-                .nextReviewDue(nextReview)
+                .nextReviewDue(calculateNextReview(band))
                 .build();
     }
 
@@ -336,12 +380,13 @@ public class RiskRatingEngine {
         return RiskBand.VERY_HIGH;
     }
 
-    private Date calculateNextReview(RiskBand band) {
+    private LocalDate calculateNextReview(RiskBand band) {
+        LocalDate today = LocalDate.now(clock);
         return switch (band) {
-            case LOW       -> LocalDate.now().plusYears(3);
-            case STANDARD  -> LocalDate.now().plusYears(1);
-            case HIGH      -> LocalDate.now().plusMonths(6);
-            case VERY_HIGH -> LocalDate.now().plusMonths(3);
+            case LOW       -> today.plusYears(3);
+            case STANDARD  -> today.plusYears(1);
+            case HIGH      -> today.plusMonths(6);
+            case VERY_HIGH -> today.plusMonths(3);
         };
     }
 }
@@ -349,7 +394,7 @@ public class RiskRatingEngine {
 
 ## UBO Resolution for Corporate Customers
 
-The EU's 4AMLD introduced mandatory Ultimate Beneficial Owner (UBO) registers, requiring firms to identify every natural person who owns or controls more than 25% of a corporate customer. In practice, ownership structures involve multiple layers of holding companies, trusts, and partnerships, and the 25% threshold must be applied by aggregating direct and indirect holdings.
+The EU's 4AMLD introduced mandatory Ultimate Beneficial Owner (UBO) registers, requiring firms to identify every natural person who ultimately owns or controls a corporate customer — through more than 25% of the shares or voting rights, or through control by other means. If nobody qualifies, the firm records the senior managing official instead, and documents why. In practice, ownership structures involve multiple layers of holding companies, trusts, and partnerships, and the 25% threshold must be applied by aggregating direct and indirect holdings.
 
 ```java
 // UboResolutionService.java
@@ -357,7 +402,7 @@ The EU's 4AMLD introduced mandatory Ultimate Beneficial Owner (UBO) registers, r
 public class UboResolutionService {
 
     private static final BigDecimal UBO_THRESHOLD = new BigDecimal("0.25");
-    private static final int MAX_RESOLUTION_DEPTH = 15; // regulatory limit per FCA guidance
+    private static final int MAX_RESOLUTION_DEPTH = 15; // internal safety limit — deeper chains go to manual review
 
     public List<UboRecord> resolveUbos(String legalEntityId) {
         Map<String, BigDecimal> effectiveOwnership = new HashMap<>();
@@ -365,7 +410,7 @@ public class UboResolutionService {
 
         return effectiveOwnership.entrySet().stream()
                 .filter(e -> e.getKey().startsWith("PERSON:"))  // only natural persons
-                .filter(e -> e.getValue().compareTo(UBO_THRESHOLD) >= 0)
+                .filter(e -> e.getValue().compareTo(UBO_THRESHOLD) > 0)   // MORE than 25%
                 .map(e -> buildUboRecord(e.getKey(), e.getValue()))
                 .toList();
     }
@@ -379,7 +424,9 @@ public class UboResolutionService {
                 + " at entity " + entityId + ". Manual review required.");
         }
         if (visited.contains(entityId)) {
-            // Circular ownership — flag for manual review
+            // Circular ownership on this path — flag for manual review.
+            // (visited is copied per branch, so the same holding company reached
+            //  through two different paths — a "diamond" — is NOT a cycle)
             throw new CircularOwnershipException(entityId);
         }
 
@@ -406,7 +453,7 @@ public class UboResolutionService {
 ```
 
 > [!NOTE]
-> The 25% threshold is a regulatory floor, not a ceiling. Many institutions apply a 10% threshold for high-risk customers or for customers in sectors prone to beneficial ownership abuse (gambling, real estate, money services). Your UBO_THRESHOLD constant should be configurable per customer segment, not hardcoded as a global value.
+> The 25% threshold is the regulatory standard, and firms may go lower. Shareholdings are also not the whole story: a person can control a company through voting agreements, board appointment rights or a trust without owning 25%, and those people are UBOs too. Many institutions apply a 10% threshold for high-risk customers or for customers in sectors prone to beneficial ownership abuse (gambling, real estate, money services). Your UBO_THRESHOLD constant should be configurable per customer segment, not hardcoded as a global value.
 
 ## Periodic Review and Data Retention
 
@@ -419,9 +466,8 @@ Ongoing due diligence is not optional. FATF Recommendation 10(d) requires firms 
 public class PeriodicReviewScheduler {
 
     @Scheduled(cron = "0 0 6 * * MON-FRI")  // 06:00 every business day
-    @Transactional
     public void triggerDueReviews() {
-        LocalDate reviewCutoff = LocalDate.now().plusDays(14); // 14-day lead time
+        LocalDate reviewCutoff = LocalDate.now(clock).plusDays(14); // 14-day lead time
         List<CustomerRiskRating> dueRatings =
                 ratingRepo.findCurrentRatingsDueBy(reviewCutoff);
 
@@ -429,6 +475,12 @@ public class PeriodicReviewScheduler {
                 dueRatings.size(), reviewCutoff);
 
         dueRatings.forEach(rating -> {
+            // The job runs every day and a rating stays "due" for 14 days:
+            // without this check it would create 10 duplicate tasks per customer.
+            // (Backed by a unique index on (rating_id, review_type) for open tasks.)
+            if (reviewWorkflowService.hasOpenTask(rating.getId(), ReviewType.PERIODIC)) {
+                return;
+            }
             reviewWorkflowService.createReviewTask(
                     ReviewTaskRequest.builder()
                             .customerId(rating.getCustomerId())
@@ -443,7 +495,7 @@ public class PeriodicReviewScheduler {
 }
 ```
 
-**The GDPR Right-to-Erasure Conflict.** Under GDPR Article 17, data subjects have the right to erasure. Under AML regulations (e.g., 4AMLD Article 40, UK MLR 2017 Regulation 40), firms must retain customer due diligence records for a minimum of five years after the business relationship ends, and up to ten years where there are grounds for suspicion. These two obligations are in direct conflict.
+**The GDPR Right-to-Erasure Conflict.** Under GDPR Article 17, data subjects have the right to erasure. Under AML regulations (e.g., 4AMLD Article 40, UK MLR 2017 Regulation 40), firms must retain customer due diligence records for five years after the business relationship ends; EU member states may allow or require a further period, up to ten years in total, for example where records are needed for investigations or proceedings. These two obligations are in direct conflict.
 
 The resolution is well-established in legal guidance but rarely implemented correctly in systems:
 
@@ -459,7 +511,7 @@ A: The system should implement event-triggered review in addition to time-based 
 
 **Q2: Your `UboResolutionService` throws a `CircularOwnershipException`. What does this represent in the real world, and what should your system do next?**
 
-A: Circular ownership (Company A owns Company B, which owns Company A) is a red flag associated with deliberate obfuscation of beneficial ownership. Legitimate corporate structures do not contain ownership cycles. The correct response is to: (1) prevent the application from proceeding automatically; (2) route it to a specialist analyst for manual investigation; (3) consider filing a Suspicious Activity Report (SAR) with the relevant Financial Intelligence Unit (FIU) if the circular structure appears deliberate; and (4) document the full investigation in the customer's compliance file regardless of the outcome.
+A: Circular ownership (Company A owns Company B, which owns Company A) is a red flag often associated with deliberate obfuscation of beneficial ownership. It is rare in legitimate structures (some groups do have cross-shareholdings), and it makes the real owner hard to identify — so it can never be resolved automatically. The correct response is to: (1) prevent the application from proceeding automatically; (2) route it to a specialist analyst for manual investigation; (3) consider filing a Suspicious Activity Report (SAR) with the relevant Financial Intelligence Unit (FIU) if the circular structure appears deliberate; and (4) document the full investigation in the customer's compliance file regardless of the outcome.
 
 ## Practical Challenge
 
@@ -469,7 +521,7 @@ A: Circular ownership (Company A owns Company B, which owns Company A) is a red 
 
 3. **Build the GDPR pseudonymisation handler.** Write a `GdprErasureService` that accepts a `customerId`, verifies whether the AML retention period has expired (using `account_closed_at + 5 years`), and either: (a) performs pseudonymisation if still within the retention window — replacing name, national ID number, and address with deterministic pseudonyms derived from a secret key — or (b) performs hard deletion if the retention period has elapsed. The pseudonymisation must be reversible by compliance officers with the correct key.
 
-4. **Write a Testcontainers integration test** that runs the full `KycOrchestrationService.orchestrate()` flow against a real PostgreSQL instance. Mock the external IDV, document, and sanctions clients with WireMock. Verify that: a PEP customer routes to `CddTier.ENHANCED`; a sanctions-hit customer results in `KycStatus.BLOCKED` and publishes a `SanctionsBlockEvent`; and a failed document verification results in `KycStatus.PENDING_MANUAL_REVIEW` rather than `REJECTED`.
+4. **Write a Testcontainers integration test** that runs the full `KycOrchestrationService.orchestrate()` flow against a real PostgreSQL instance. Mock the external IDV, document, and sanctions clients with WireMock. Verify that: a PEP customer routes to `CddTier.ENHANCED`; a confirmed sanctions match results in `KycStatus.BLOCKED` and publishes a `SanctionsBlockEvent`; and an inconclusive document verification results in `KycStatus.PENDING_MANUAL_REVIEW` rather than `REJECTED`.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -494,18 +546,18 @@ A: Circular ownership (Company A owns Company B, which owns Company A) is a red 
         "An ownership structure requiring manual verification of foreign entities"
       ],
       "correct": 2,
-      "explanation": "Circular ownership (Company A owns Company B, which owns Company A) is a red flag for deliberate obfuscation of beneficial ownership. Legitimate corporate structures do not contain ownership cycles. The correct response is to prevent automatic processing, route to specialist analyst, consider filing a SAR, and document the investigation."
+      "explanation": "Circular ownership (Company A owns Company B, which owns Company A) is a red flag often associated with deliberate obfuscation of beneficial ownership. It is rare in legitimate structures and makes the real owner hard to identify. The correct response is to stop automatic processing, route to a specialist analyst, consider filing a SAR if it looks deliberate, and document the investigation."
     },
     {
       "text": "What is the conflict between GDPR right-to-erasure and AML record retention requirements?",
       "options": [
         "There is no conflict — GDPR exempts financial data from erasure requirements",
-        "GDPR requires immediate deletion on request, but AML regulations require customer records to be kept for 5 years after account closure",
+        "GDPR gives a right to erasure, but AML regulations require customer records to be kept for 5 years after the relationship ends",
         "AML regulations require deletion after 2 years, which conflicts with GDPR's 7-year minimum",
         "GDPR and AML both require 5-year retention with no conflict"
       ],
       "correct": 1,
-      "explanation": "GDPR's right-to-erasure is in direct tension with AML regulations that require customer records to be kept for 5 years after account closure (and potentially longer if proceedings are ongoing). The technical solution is pseudonymisation during the AML retention window — replacing PII with deterministic pseudonyms — and hard deletion only after the retention period has elapsed."
+      "explanation": "GDPR's right to erasure is in tension with AML rules that require customer records to be kept for 5 years after the relationship ends (longer in some cases). GDPR Article 17(3)(b) exempts data needed for a legal obligation, so the solution is restricted, pseudonymised retention during the AML window and hard deletion only after it ends."
     }
   ]
 }
@@ -531,7 +583,7 @@ A: Circular ownership (Company A owns Company B, which owns Company A) is a red 
     },
     {
       "id": "4",
-      "description": "Write a Testcontainers integration test running the full `KycOrchestrationService.orchestrate()` flow against real PostgreSQL. Mock IDV, document, and sanctions clients with WireMock. Verify: PEP customer routes to `CddTier.ENHANCED`; sanctions-hit customer results in `KycStatus.BLOCKED` and publishes `SanctionsBlockEvent`; failed document verification results in `KycStatus.PENDING_MANUAL_REVIEW` rather than `REJECTED`."
+      "description": "Write a Testcontainers integration test running the full `KycOrchestrationService.orchestrate()` flow against real PostgreSQL. Mock IDV, document, and sanctions clients with WireMock. Verify: PEP customer routes to `CddTier.ENHANCED`; a confirmed sanctions match results in `KycStatus.BLOCKED` and publishes `SanctionsBlockEvent`; an inconclusive document verification results in `KycStatus.PENDING_MANUAL_REVIEW` rather than `REJECTED`."
     }
   ]
 }

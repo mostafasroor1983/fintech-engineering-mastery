@@ -32,7 +32,9 @@ The classic conditions for a concurrency bug to surface:
 
 In development, your service handles ten requests per minute. The bug never fires. In production, it handles ten thousand requests per minute, and suddenly two threads read the same account balance at the same time, both decide the balance is sufficient, both debit it, and a customer ends up with a negative balance — or worse, a fraudster exploits the window to withdraw twice.
 
-### Real Fintech Incidents Caused by Thread-Safety Failures
+### Typical Fintech Incidents Caused by Thread-Safety Failures
+
+*Composite examples, based on common industry failure patterns — not specific companies.*
 
 **Balance corruption:** A payment gateway maintained a per-user balance cache in a `HashMap`. Two threads simultaneously called `updateBalance()` on the same user key. HashMap's internal resize operation is not thread-safe; during resize, the internal linked-list structure can form an infinite loop, causing CPU pinning and a service freeze. Even before resize, a lost update can silently zero out a balance increment.
 
@@ -182,15 +184,31 @@ public class FeeScheduleCache {
 @Component
 public class FeeScheduleCache {
 
-    private final ConcurrentMap<String, BigDecimal> feeSchedule = new ConcurrentHashMap<>();
+    // Cache FUTURES, not values: putIfAbsent is atomic, and the slow database
+    // call runs OUTSIDE the map. (Calling the DB inside computeIfAbsent would
+    // hold a map bin lock during I/O and block other keys in that bin.)
+    private final ConcurrentMap<String, CompletableFuture<BigDecimal>> feeSchedule =
+        new ConcurrentHashMap<>();
 
     public BigDecimal getFee(String productCode) {
-        // computeIfAbsent is atomic: the check and the put happen as one operation
-        return feeSchedule.computeIfAbsent(productCode, this::loadFeeFromDatabase);
+        CompletableFuture<BigDecimal> fresh = new CompletableFuture<>();
+        CompletableFuture<BigDecimal> existing = feeSchedule.putIfAbsent(productCode, fresh);
+        if (existing != null) {
+            return existing.join();          // another thread is loading / has loaded it
+        }
+        try {
+            // We won the race: load exactly once per productCode
+            BigDecimal fee = loadFeeFromDatabase(productCode);
+            fresh.complete(fee);
+            return fee;
+        } catch (RuntimeException e) {
+            feeSchedule.remove(productCode, fresh);   // allow a retry later
+            fresh.completeExceptionally(e);
+            throw e;
+        }
     }
 
     private BigDecimal loadFeeFromDatabase(String productCode) {
-        // DB call — only executed once per productCode even under concurrent access
         return feeRepository.findFeeByProductCode(productCode);
     }
 }
@@ -310,8 +328,9 @@ public class PaymentGatewayClient {
 **BEST — Initialization-on-demand holder idiom (preferred):**
 
 ```java
-// The class loader guarantees that the static initializer of a nested class
-// runs exactly once, under a lock, the first time the class is accessed.
+// The JVM guarantees that the static initializer of a nested class runs
+// exactly once, under the class initialization lock, the first time the
+// class is used.
 // This is simpler, safer, and performs as well as double-checked locking.
 public class PaymentGatewayClient {
 
@@ -372,6 +391,7 @@ public class PendingPaymentRegistry {
     }
 
     // Option 1: unmodifiable view — prevents writes but still a live view
+    // (callers must still synchronize on the list while iterating it)
     public List<Payment> getPendingPayments() {
         return Collections.unmodifiableList(pendingPayments);
     }
@@ -445,7 +465,7 @@ public class PaymentEventHandler {
 - [ ] **Identify all non-final instance fields.** Each is a candidate for a thread-safety problem if the class is used as a shared singleton.
 - [ ] **For each mutable field, check for atomic visibility.** Does every write happen-before every subsequent read? If not, `volatile` or synchronization is required.
 - [ ] **For numeric counters, use AtomicInteger / AtomicLong.** Never use `++` or `+= N` on a plain `int` or `long` in a shared class.
-- [ ] **For reference fields that are replaced atomically, use AtomicReference.** Plain reference assignment is not atomic on 32-bit JVMs and is not guaranteed visible without `volatile`.
+- [ ] **For reference fields that are swapped, use `volatile` or `AtomicReference`.** A reference write is always atomic (only non-volatile `long`/`double` writes may be split), but without `volatile` other threads may not see it — and conditional swaps need CAS.
 - [ ] **Replace HashMap/HashSet/ArrayList in singletons with thread-safe alternatives.** Use `ConcurrentHashMap`, `CopyOnWriteArrayList`, or synchronize explicitly.
 - [ ] **Identify all compound operations (check-then-act, read-modify-write, iterate-and-modify).** Each must be executed as a single atomic operation or under a lock.
 - [ ] **Audit all lazy initialization.** Use `volatile` double-checked locking or the holder idiom; never use plain double-checked locking.
@@ -453,7 +473,7 @@ public class PaymentEventHandler {
 - [ ] **Check all constructors for `this` escape.** If `this` must be published before the constructor completes, use a factory method instead.
 - [ ] **Check for `synchronized` on wrong object.** `synchronized (this)` is correct only if callers also synchronize on the same instance; `synchronized` on a local variable is always a bug.
 - [ ] **Annotate the class with `@ThreadSafe`, `@NotThreadSafe`, or `@Immutable`.** Make the thread-safety contract explicit in the Javadoc.
-- [ ] **Verify that `@GuardedBy` annotations are present on every field that requires a lock.** SpotBugs enforces these at static-analysis time.
+- [ ] **Verify that `@GuardedBy` annotations are present on every field that requires a lock.** Error Prone's `GuardedBy` check enforces them at compile time; SpotBugs flags inconsistent synchronization.
 
 ---
 
@@ -635,17 +655,27 @@ public class PaymentLimitService {
 @Service
 public class PaymentLimitService {
 
+    // NOTE: a JVM lock protects ONE instance only. With several instances,
+    // the remaining limit must be checked-and-reserved atomically in a shared
+    // store (database conditional UPDATE or a Redis script — see Level 3)
     private final Map<String, BigDecimal> limitCache = new HashMap<>();
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
 
     public boolean canProcessAndReserve(String userId, BigDecimal amount) {
+        // Load OUTSIDE the lock — never hold a lock during a database call
+        BigDecimal loaded = limitCache.containsKey(userId) ? null : loadLimitFromDb(userId);
+
         lock.writeLock().lock(); // Exclusive lock: no other thread can read or write
         try {
-            BigDecimal currentLimit = limitCache.computeIfAbsent(userId, this::loadLimitFromDb);
+            BigDecimal currentLimit = limitCache.get(userId);
+            if (currentLimit == null) {
+                currentLimit = (loaded != null) ? loaded : loadLimitFromDb(userId);
+                limitCache.put(userId, currentLimit);
+            }
             if (amount.compareTo(currentLimit) > 0) {
                 return false;
             }
-            // Update the limit atomically within the same lock
+            // Check and reserve happen under the same lock: no race window
             limitCache.put(userId, currentLimit.subtract(amount));
             return true;
         } finally {
@@ -653,10 +683,11 @@ public class PaymentLimitService {
         }
     }
 
+    /** Remaining limit if cached, otherwise null (the caller loads it). */
     public BigDecimal getCurrentLimit(String userId) {
         lock.readLock().lock(); // Shared lock: multiple readers allowed concurrently
         try {
-            return limitCache.getOrDefault(userId, loadLimitFromDb(userId));
+            return limitCache.get(userId);
         } finally {
             lock.readLock().unlock();
         }
@@ -826,6 +857,8 @@ public class FundsTransferService {
 }
 ```
 
+**SAFE (simplest) — one conditional UPDATE:** `UPDATE accounts SET balance = balance - :amount WHERE id = :id AND balance >= :amount` — 0 rows updated means insufficient funds. The check and the change are one atomic statement.
+
 **SAFE — SELECT FOR UPDATE (pessimistic locking):**
 
 ```java
@@ -864,8 +897,8 @@ public interface AccountRepository extends JpaRepository<Account, String> {
 // Optimistic locking is better for low-contention scenarios.
 // @Version adds a version column. Hibernate automatically appends
 // WHERE version = :expectedVersion to every UPDATE.
-// If the version has changed (concurrent modification detected), Hibernate
-// throws OptimisticLockException, which the caller should retry or handle.
+// If the version has changed, the commit fails with Spring's
+// ObjectOptimisticLockingFailureException.
 @Entity
 public class Account {
 
@@ -878,11 +911,25 @@ public class Account {
     private Long version; // Hibernate manages this automatically
 }
 
+// The RETRY must sit OUTSIDE the transaction: the conflict is detected at
+// commit, and each attempt needs a fresh transaction that reloads the row.
+// So put @Retryable on a different bean that calls the @Transactional one.
+@Service
+public class FundsTransferFacade {
+
+    private final FundsTransferService service;
+
+    @Retryable(retryFor = ObjectOptimisticLockingFailureException.class,
+               maxAttempts = 3, backoff = @Backoff(delay = 20, multiplier = 2))
+    public void debit(String accountId, BigDecimal amount) {
+        service.debit(accountId, amount);   // new transaction per attempt
+    }
+}
+
 @Service
 public class FundsTransferService {
 
     @Transactional
-    @Retryable(value = OptimisticLockException.class, maxAttempts = 3)
     public void debit(String accountId, BigDecimal amount) {
         Account account = accountRepository.findById(accountId)
             .orElseThrow(AccountNotFoundException::new);
@@ -891,10 +938,9 @@ public class FundsTransferService {
             throw new InsufficientFundsException();
         }
         account.setBalance(account.getBalance().subtract(amount));
-        accountRepository.save(account);
-        // Hibernate: UPDATE accounts SET balance=?, version=version+1
-        //            WHERE id=? AND version=?
-        // If version mismatch: throws OptimisticLockException → @Retryable retries
+        // Hibernate at commit: UPDATE accounts SET balance=?, version=version+1
+        //                      WHERE id=? AND version=?
+        // 0 rows updated → ObjectOptimisticLockingFailureException → facade retries
     }
 }
 ```
@@ -930,41 +976,40 @@ public class DailySpendingLimitService {
 }
 ```
 
-**SAFE — Distributed lock with Redisson:**
+**SAFE — one atomic check-and-add on the Redis server:**
+
+Redis runs a Lua script as a single atomic step, so the check and the increment cannot interleave with another instance. Amounts are stored in integer minor units (cents), so `INCRBY` works. (A distributed lock around separate GET and SET would also work, but adds lock-expiry risks and an extra round-trip.)
 
 ```java
 @Service
 public class DailySpendingLimitService {
 
-    private final RedissonClient redisson;
-    private final RedisTemplate<String, BigDecimal> redis;
+    private final StringRedisTemplate redis;
 
-    public boolean approveTransaction(String userId, BigDecimal amount) {
-        // RLock provides a distributed mutual exclusion lock backed by Redis.
-        // Only one JVM instance can hold the lock for a given key at any time.
-        RLock lock = redisson.getLock("daily_spend_lock:" + userId);
-        try {
-            // Wait up to 5 seconds to acquire, hold for up to 10 seconds
-            if (!lock.tryLock(5, 10, TimeUnit.SECONDS)) {
-                throw new LockAcquisitionException("Could not acquire spending lock for " + userId);
-            }
-            BigDecimal dailySpend = redis.opsForValue().get("daily_spend:" + userId);
-            BigDecimal limit = BigDecimal.valueOf(5000);
-            if (dailySpend == null) dailySpend = BigDecimal.ZERO;
+    // Returns the new total, or -1 if the limit would be exceeded
+    private static final RedisScript<Long> CHECK_AND_ADD = RedisScript.of("""
+        local spent  = tonumber(redis.call('GET', KEYS[1]) or '0')
+        local amount = tonumber(ARGV[1])
+        local limit  = tonumber(ARGV[2])
+        if spent + amount > limit then
+            return -1
+        end
+        local total = redis.call('INCRBY', KEYS[1], amount)
+        if redis.call('TTL', KEYS[1]) < 0 then
+            redis.call('EXPIRE', KEYS[1], ARGV[3])   -- reset after the day ends
+        end
+        return total
+        """, Long.class);
 
-            if (dailySpend.add(amount).compareTo(limit) > 0) {
-                return false; // Safe: no other instance can check/modify concurrently
-            }
-            redis.opsForValue().set("daily_spend:" + userId, dailySpend.add(amount));
-            return true;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new LockInterruptedException(e);
-        } finally {
-            if (lock.isHeldByCurrentThread()) {
-                lock.unlock();
-            }
-        }
+    public boolean approveTransaction(String userId, long amountCents) {
+        Long result = redis.execute(CHECK_AND_ADD,
+            List.of("daily_spend:" + userId),
+            String.valueOf(amountCents),
+            String.valueOf(500_000L),          // limit: 5,000.00 in cents
+            String.valueOf(secondsUntilMidnight()));
+        return result != null && result >= 0;
+        // If the payment later FAILS, release the amount (DECRBY) — the
+        // reservation must not stay counted against the limit
     }
 }
 ```
@@ -979,11 +1024,13 @@ Kafka guarantees ordered delivery within a partition. If you process messages fr
 // UNSAFE: a custom ExecutorService dispatches messages from the same partition
 // to multiple threads. Two messages for account "ACC-123" may be processed
 // concurrently, with the second message's debit applied before the first's credit.
-@KafkaListener(topics = "payment-events")
+// (It also commits offsets for messages that are still being processed.)
+@Component
 public class PaymentEventConsumer {
 
     private final ExecutorService executor = Executors.newFixedThreadPool(10);
 
+    @KafkaListener(topics = "payment-events")
     public void onMessage(ConsumerRecord<String, PaymentEvent> record) {
         // UNSAFE: message for key "ACC-123" can be on this thread while another
         // "ACC-123" message is on a different thread in the pool
@@ -999,14 +1046,15 @@ public class PaymentEventConsumer {
 // All messages for a given account key are routed to the same partition
 // (by key hash), so they are always processed sequentially.
 // No external synchronization needed for per-account state.
-@KafkaListener(
-    topics = "payment-events",
-    concurrency = "3" // 3 threads, each assigned its own partitions
-)
+@Component
 public class PaymentEventConsumer {
 
     private final PaymentEventProcessor processor;
 
+    @KafkaListener(
+        topics = "payment-events",
+        concurrency = "3" // 3 threads, each assigned its own partitions
+    )
     public void onMessage(ConsumerRecord<String, PaymentEvent> record) {
         // This method is called sequentially within a partition.
         // Events for the same account key (routed to the same partition) are ordered.
@@ -1057,6 +1105,10 @@ public class SettlementService {
         try {
             List<Payment> unsettled = paymentRepository.findUnsettled();
             for (Payment p : unsettled) {
+                // Defence in depth: a distributed lock can be lost (network
+                // partition, long GC pause). Make each settlement idempotent by
+                // claiming the row: UPDATE payments SET status='SETTLING'
+                // WHERE id=? AND status='UNSETTLED' — skip it if 0 rows
                 settle(p);
             }
         } finally {
@@ -1116,14 +1168,14 @@ public class CheckoutController {
 
 ### Application-Level Audit Checklist
 
-- [ ] **Identify every read-then-conditional-write sequence that spans two SQL statements.** Each must be protected by `SELECT FOR UPDATE` (pessimistic) or `@Version` (optimistic).
-- [ ] **Audit every distributed cache read-then-act sequence.** Stale reads across multiple application instances require a distributed lock (Redisson) or an idempotency key mechanism.
+- [ ] **Identify every read-then-conditional-write sequence that spans two SQL statements.** Each must become one conditional `UPDATE`, or be protected by `SELECT FOR UPDATE` (pessimistic) or `@Version` (optimistic).
+- [ ] **Audit every distributed cache read-then-act sequence.** Across multiple instances, use an atomic server-side operation (Lua script, `INCRBY`), a distributed lock, or an idempotency key mechanism.
 - [ ] **Verify Kafka consumer concurrency settings.** Confirm that messages for the same entity key are routed to the same partition (consistent hashing by key) and processed by one thread per partition.
 - [ ] **Audit all `@Scheduled` jobs.** In a multi-instance deployment, every job must acquire a distributed lock before executing or be deployed only to a dedicated scheduler node.
 - [ ] **Review all uses of `HttpSession`.** Sessions should store only immutable identifiers (IDs), never mutable business objects.
 - [ ] **Identify every write-after-read pattern that spans a network call.** Any read from a service, followed by a write to a different service, based on the read result, is a potential TOCTOU race.
 - [ ] **Audit idempotency key handling.** Duplicate message delivery (Kafka at-least-once, HTTP retry) must be handled with idempotency keys stored in the database with a unique constraint.
-- [ ] **Review event sourcing / outbox patterns.** The transactional outbox pattern must write the event and the state change in the same database transaction; never write to a message broker directly from application code.
+- [ ] **Review event sourcing / outbox patterns.** The transactional outbox pattern must write the event and the state change in the same database transaction. Never update the database and publish to the broker as two separate steps of one business operation (the dual-write problem) — let a relay publish from the outbox.
 - [ ] **Audit all long-running transactions.** Transactions held open for the duration of an HTTP request increase the TOCTOU window and the probability of deadlock.
 - [ ] **Verify that optimistic lock retry logic has a bounded retry count and exponential backoff.** Unbounded retries under high contention can amplify the problem rather than resolving it.
 
@@ -1137,7 +1189,7 @@ A thread-safety audit is most effective when structured in phases, moving from a
 
 **SpotBugs with `@GuardedBy`:**
 
-SpotBugs enforces the `@GuardedBy` annotation from the `com.google.code.findbugs:jsr305` or `net.jcip:jcip-annotations` library. Annotate every field that requires a lock:
+Annotate every field that requires a lock with `@GuardedBy` (from `net.jcip:jcip-annotations` or Error Prone's annotations). **Error Prone**'s `GuardedBy` check enforces it at compile time; **SpotBugs** detects inconsistent synchronization (`IS2_INCONSISTENT_SYNC`) — a field accessed sometimes with and sometimes without the lock:
 
 ```java
 import net.jcip.annotations.GuardedBy;
@@ -1159,14 +1211,15 @@ public class PaymentLedger {
 }
 ```
 
-SpotBugs will flag any access to `balance` that is not inside a `synchronized (lock)` block.
+Error Prone will reject any access to `balance` that is not inside a `synchronized (lock)` block.
 
 **SonarQube rules to enable:**
 
-- `java:S2259` — Null pointer dereference (can indicate lost update race)
-- `java:S2886` — Non-thread-safe field in a thread-safe class
-- `java:S3077` — Non-serializable field in serializable class (also catches volatile misuse)
-- `findbugs:IS2_INCONSISTENT_SYNC` — Field accessed both with and without synchronization
+- `java:S2886` — Getters and setters should be synchronized in pairs
+- `java:S3077` — Non-primitive fields should not be `volatile` (volatile does not make the object's contents thread-safe)
+- `java:S2445` — Blocks should be synchronized on `private final` fields
+- `java:S2222` — Locks should be released on all paths
+- SpotBugs `IS2_INCONSISTENT_SYNC` (via the SpotBugs plugin) — field accessed both with and without synchronization
 
 **Maven plugin configuration:**
 
@@ -1217,34 +1270,37 @@ psql -d testdb -c "SELECT payment_id, COUNT(*) FROM settled_payments GROUP BY pa
 [jcstress](https://github.com/openjdk/jcstress) is the OpenJDK harness for writing and running concurrency stress tests at the JVM level. It is particularly useful for testing custom synchronization mechanisms, `AtomicReference` CAS loops, and visibility guarantees.
 
 ```java
+// Initial balance 50; two actors each try to debit 50 with a CAS loop.
+// r1/r2 = 1 if that actor's debit succeeded, 0 if it was refused.
 @JCStressTest
-@Outcome(id = "0, 1", expect = ACCEPTABLE, desc = "Thread 2 saw Thread 1's write")
-@Outcome(id = "0, 0", expect = ACCEPTABLE, desc = "Thread 2 ran before Thread 1 wrote")
-@Outcome(id = "1, 0", expect = FORBIDDEN,  desc = "Impossible: balance went negative")
+@Outcome(id = "1, 0", expect = ACCEPTABLE, desc = "Actor 1 debited, actor 2 refused")
+@Outcome(id = "0, 1", expect = ACCEPTABLE, desc = "Actor 2 debited, actor 1 refused")
+@Outcome(id = "1, 1", expect = FORBIDDEN,  desc = "Both debited — balance went negative")
+@Outcome(id = "0, 0", expect = FORBIDDEN,  desc = "Both refused — a debit was lost")
 @State
 public class BalanceCasTest {
 
     final AtomicReference<BigDecimal> balance =
-        new AtomicReference<>(BigDecimal.valueOf(100));
+        new AtomicReference<>(BigDecimal.valueOf(50));
 
-    @Actor
-    public void actor1(II_Result r) {
+    private int tryDebit(BigDecimal amount) {
         BigDecimal cur, upd;
         do {
             cur = balance.get();
-            upd = cur.subtract(BigDecimal.valueOf(50));
+            upd = cur.subtract(amount);
+            if (upd.signum() < 0) return 0;          // refuse: insufficient funds
         } while (!balance.compareAndSet(cur, upd));
-        r.r1 = balance.get().intValue() >= 0 ? 1 : 0;
+        return 1;
+    }
+
+    @Actor
+    public void actor1(II_Result r) {
+        r.r1 = tryDebit(BigDecimal.valueOf(50));
     }
 
     @Actor
     public void actor2(II_Result r) {
-        BigDecimal cur, upd;
-        do {
-            cur = balance.get();
-            upd = cur.subtract(BigDecimal.valueOf(50));
-        } while (!balance.compareAndSet(cur, upd));
-        r.r2 = balance.get().intValue() >= 0 ? 1 : 0;
+        r.r2 = tryDebit(BigDecimal.valueOf(50));
     }
 }
 ```
@@ -1410,11 +1466,11 @@ public synchronized void processWhenFunded(BigDecimal required) throws Interrupt
       "options": [
         "Yes. @Transactional with READ_COMMITTED and a ReentrantLock guarantee atomicity across all instances.",
         "Yes. READ_COMMITTED isolation prevents dirty reads, so no double-debit is possible.",
-        "No. A ReentrantLock is JVM-local; it does not coordinate across separate application instances. A SELECT FOR UPDATE or distributed lock is required.",
+        "No. A ReentrantLock is JVM-local; it does not coordinate across separate application instances. A conditional UPDATE, SELECT FOR UPDATE, @Version, or a distributed lock is required.",
         "No. @Transactional must use SERIALIZABLE isolation to prevent this race; READ_COMMITTED is insufficient."
       ],
       "correct": 2,
-      "explanation": "A ReentrantLock lives in the JVM heap of one process. In a multi-instance deployment, each instance has its own lock object; acquiring the lock in one JVM has no effect on other JVMs. To prevent concurrent modification of the same database row across instances, the correct approaches are: (1) SELECT FOR UPDATE to acquire a database row-level lock within the transaction, (2) optimistic locking with @Version, or (3) a distributed lock (e.g., Redisson) backed by Redis. READ_COMMITTED isolation alone does not prevent the TOCTOU race described."
+      "explanation": "A ReentrantLock lives in the JVM heap of one process. In a multi-instance deployment, each instance has its own lock object; acquiring it in one JVM has no effect on the others. To prevent concurrent modification of the same row across instances, use: (1) a single conditional UPDATE (WHERE balance >= :amount), (2) SELECT FOR UPDATE to take a row lock within the transaction, (3) optimistic locking with @Version, or (4) a distributed lock. READ_COMMITTED isolation alone does not prevent this TOCTOU race."
     },
     {
       "text": "A developer uses the following double-checked locking pattern to lazily initialize a shared payment client: 'private static PaymentClient instance; ... if (instance == null) { synchronized(...) { if (instance == null) { instance = new PaymentClient(); } } }'. What is the precise defect in this code?",
@@ -1425,7 +1481,7 @@ public synchronized void processWhenFunded(BigDecimal required) throws Interrupt
         "Double-checked locking is inherently broken in Java regardless of volatile and must be replaced with synchronized getInstance()."
       ],
       "correct": 1,
-      "explanation": "Without volatile, the Java Memory Model permits the JVM to reorder the instructions that initialize PaymentClient's fields relative to the assignment to 'instance'. A thread reading 'instance' in the outer check can observe a non-null reference to an object whose constructor has not yet completed — meaning its fields may hold null or zero values. Adding 'volatile' to the declaration of 'instance' establishes a happens-before relationship: the write to 'instance' (and all prior writes inside the constructor) will always be visible before any subsequent read of 'instance'. Alternatively, the initialization-on-demand holder idiom avoids volatile entirely by relying on the class loader's thread-safety guarantee."
+      "explanation": "Without volatile, the Java Memory Model permits the writes that initialize PaymentClient's fields to be reordered with the assignment to 'instance'. A thread reading 'instance' in the outer check can see a non-null reference to an object whose constructor writes are not yet visible — so non-final fields may hold null or zero. Declaring 'instance' volatile establishes happens-before: the constructor's writes are visible to any thread that reads the non-null reference. Alternatively, the initialization-on-demand holder idiom avoids volatile by relying on the JVM's class initialization lock."
     }
   ]
 }
@@ -1443,7 +1499,7 @@ public synchronized void processWhenFunded(BigDecimal required) throws Interrupt
     },
     {
       "id": "task-02",
-      "description": "Implement a thread-safe PaymentLimitService that must: (1) cache per-user daily spending limits loaded from a database, (2) atomically check whether a new transaction would exceed the limit and, if not, reserve the amount, (3) support concurrent cache invalidation when limits are reconfigured. Write the implementation using ReadWriteLock, then write a second implementation using ConcurrentHashMap.compute(). Write a jcstress test that verifies no limit is exceeded under 10 concurrent actors all attempting to reserve amounts that sum to more than the limit."
+      "description": "Implement a thread-safe PaymentLimitService that must: (1) cache per-user daily spending limits loaded from a database (load outside any lock or compute function), (2) atomically check whether a new transaction would exceed the limit and, if not, reserve the amount, (3) support concurrent cache invalidation when limits are reconfigured. Write the implementation using ReadWriteLock, then a second one using ConcurrentHashMap.compute() (with only fast, in-memory work inside compute). Write a jcstress test that verifies no limit is exceeded under concurrent actors all attempting to reserve amounts that sum to more than the limit. Finally, explain why both versions are only correct within one JVM."
     },
     {
       "id": "task-03",

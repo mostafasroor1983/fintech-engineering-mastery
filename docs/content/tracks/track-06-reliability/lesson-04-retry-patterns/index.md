@@ -31,6 +31,9 @@ Retries are a double-edged sword in financial systems. Done correctly, they mask
 | Idempotent 5xx | `500` on GET | Server-side transient error |
 | Kafka unavailable | `TimeoutException` | Broker temporarily unreachable |
 
+> [!WARNING]
+> A **read timeout** (or a 502/504) on a non-idempotent call such as a payment POST is an *unknown outcome*: the payment may have gone through. Retry it only with the **same idempotency key**, so the processor can recognise the duplicate — or query the payment's status first. A *connect* timeout is different: the request never left, so retrying is safe.
+
 ### Non-Retriable Errors
 
 | Condition | HTTP / Code | Why NOT Retriable |
@@ -42,7 +45,9 @@ Retries are a double-edged sword in financial systems. Done correctly, they mask
 | Account frozen | `403` | Compliance hold |
 
 ```java
-// Classify errors before blindly retrying
+// Classify errors before blindly retrying.
+// Assumes every payment call carries an idempotency key — that is what makes
+// retrying an unknown outcome (read timeout, 502/504) safe.
 public class PaymentRetryClassifier {
 
     public boolean isRetriable(Throwable throwable) {
@@ -52,30 +57,27 @@ public class PaymentRetryClassifier {
             if (status >= 400 && status < 500 && status != 429) {
                 return false;
             }
-            // 503 Service Unavailable - retriable
             // 500 Internal Server Error - only if we know it's idempotent
             if (status == 500) {
                 return isIdempotentOperation(feignException);
             }
-            return status == 503 || status == 502 || status == 429;
+            // 502/503/504 and 429 - retriable (with the idempotency key)
+            return status == 502 || status == 503 || status == 504 || status == 429;
         }
-        if (throwable instanceof SocketTimeoutException
-            || throwable instanceof ConnectTimeoutException) {
-            return true;
+        if (throwable instanceof ConnectTimeoutException) {
+            return true;    // request never sent
         }
-        // Business exceptions are never retriable
-        if (throwable instanceof InsufficientFundsException
-            || throwable instanceof AccountFrozenException
-            || throwable instanceof DuplicateTransactionException) {
-            return false;
+        if (throwable instanceof SocketTimeoutException) {
+            return true;    // unknown outcome: safe ONLY with the idempotency key
         }
+        // Business exceptions and anything unknown are never retried
         return false;
     }
 
     private boolean isIdempotentOperation(FeignException e) {
         // Check if the original request method was idempotent
         // GET, HEAD, PUT, DELETE are idempotent; POST is not by default
-        String method = extractRequestMethod(e);
+        String method = e.request().httpMethod().name();
         return "GET".equals(method) || "PUT".equals(method) || "DELETE".equals(method);
     }
 }
@@ -104,9 +106,9 @@ public class RetryConfiguration {
     @Bean
     public RetryConfig paymentRetryConfig() {
         return RetryConfig.custom()
-            .maxAttempts(4)
-            // Exponential backoff: 500ms, 1s, 2s, 4s
-            .waitDuration(Duration.ofMillis(500))
+            .maxAttempts(4)   // 1 call + 3 retries
+            // Exponential backoff between attempts: 500ms, 1s, 2s
+            // (do not ALSO set waitDuration — use one way of setting the interval)
             .intervalFunction(IntervalFunction.ofExponentialBackoff(
                 Duration.ofMillis(500),  // initial interval
                 2.0                       // multiplier
@@ -124,7 +126,11 @@ public class RetryConfiguration {
 
     @Bean
     public RetryRegistry retryRegistry(RetryConfig paymentRetryConfig) {
-        return RetryRegistry.of(Map.of("payment", paymentRetryConfig));
+        // Registered as the DEFAULT config, so retryRegistry.retry("payment")
+        // uses it. (RetryRegistry.of(Map.of("payment", cfg)) only registers a
+        // named CONFIG; retry("payment") would still use the built-in default
+        // unless you call retry("payment", "payment").)
+        return RetryRegistry.of(paymentRetryConfig);
     }
 }
 ```
@@ -231,7 +237,11 @@ public class DecorrelatedJitterInterval implements IntervalFunction {
 
     @Override
     public long apply(int attempt) {
-        long prev = previousDelay.get();
+        // Attempt 1 starts a NEW retry sequence — reset, or the delay carries
+        // over from an unrelated earlier call on the same thread.
+        // (Thread-local state also assumes all attempts run on one thread —
+        //  not true for async retries; keep the state per operation there.)
+        long prev = (attempt <= 1) ? baseMs : previousDelay.get();
         long next = Math.min(maxMs, ThreadLocalRandom.current().nextLong(baseMs, prev * 3));
         previousDelay.set(next);
         return next;
@@ -243,14 +253,42 @@ public class DecorrelatedJitterInterval implements IntervalFunction {
 
 ```java
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class PaymentGatewayService {
 
-    private final RetryRegistry retryRegistry;
-    private final CircuitBreakerRegistry circuitBreakerRegistry;
+    private final Retry retry;
+    private final CircuitBreaker cb;
     private final PaymentGatewayClient gatewayClient;
-    private final MeterRegistry meterRegistry;
+    private final PaymentDeadLetterHandler deadLetterHandler;
+
+    public PaymentGatewayService(RetryRegistry retryRegistry,
+                                 CircuitBreakerRegistry circuitBreakerRegistry,
+                                 PaymentGatewayClient gatewayClient,
+                                 PaymentDeadLetterHandler deadLetterHandler,
+                                 MeterRegistry meterRegistry) {
+        this.retry = retryRegistry.retry("payment");
+        this.cb = circuitBreakerRegistry.circuitBreaker("payment-gateway");
+        this.gatewayClient = gatewayClient;
+        this.deadLetterHandler = deadLetterHandler;
+
+        // Register listeners ONCE. Registering them inside submitPayment()
+        // would add a new listener on every call — a memory leak and
+        // duplicated logs. Per-request context comes from the MDC.
+        retry.getEventPublisher()
+            .onRetry(event -> {
+                log.warn("Payment retry attempt={} idempotencyKey={} cause={}",
+                    event.getNumberOfRetryAttempts(),
+                    MDC.get("idempotencyKey"),
+                    event.getLastThrowable().getClass().getSimpleName());
+                meterRegistry.counter("payment.retry",
+                    "attempt", String.valueOf(event.getNumberOfRetryAttempts())
+                ).increment();
+            })
+            .onError(event -> log.error("Payment exhausted all retries for key={}",
+                MDC.get("idempotencyKey"), event.getLastThrowable()))
+            .onSuccess(event -> log.info("Payment succeeded after {} retries key={}",
+                event.getNumberOfRetryAttempts(), MDC.get("idempotencyKey")));
+    }
 
     /**
      * Submit payment with retry + circuit breaker integration.
@@ -258,53 +296,30 @@ public class PaymentGatewayService {
      * This means: attempt → check CB → call → on failure → backoff → check CB again.
      */
     public PaymentResponse submitPayment(PaymentRequest request) {
-        Retry retry = retryRegistry.retry("payment");
-        CircuitBreaker cb = circuitBreakerRegistry.circuitBreaker("payment-gateway");
-
-        // Instrument retry events for observability
-        retry.getEventPublisher()
-            .onRetry(event -> {
-                log.warn("Payment retry attempt={} for idempotencyKey={} cause={}",
-                    event.getNumberOfRetryAttempts(),
-                    request.getIdempotencyKey(),
-                    event.getLastThrowable().getMessage());
-                meterRegistry.counter("payment.retry",
-                    "attempt", String.valueOf(event.getNumberOfRetryAttempts()),
-                    "gateway", request.getGateway()
-                ).increment();
-            })
-            .onError(event -> log.error("Payment exhausted all retries for key={}",
-                request.getIdempotencyKey(), event.getLastThrowable()))
-            .onSuccess(event -> {
-                if (event.getNumberOfRetryAttempts() > 0) {
-                    log.info("Payment succeeded after {} retries key={}",
-                        event.getNumberOfRetryAttempts(), request.getIdempotencyKey());
-                }
-            });
-
         Supplier<PaymentResponse> decoratedCall = Retry.decorateSupplier(
             retry,
             CircuitBreaker.decorateSupplier(cb,
-                () -> gatewayClient.submit(request)
+                () -> gatewayClient.submit(request)   // carries the idempotency key
             )
         );
 
+        MDC.put("idempotencyKey", request.getIdempotencyKey());
         try {
             return decoratedCall.get();
         } catch (CallNotPermittedException e) {
             throw new PaymentGatewayUnavailableException(
                 "Circuit breaker open for gateway: " + request.getGateway(), e);
-        } catch (MaxRetriesExceededException e) {
-            sendToDeadLetterQueue(request, e);
+        } catch (RuntimeException e) {
+            // When retries on EXCEPTIONS are exhausted, Resilience4j rethrows
+            // the last exception itself. (MaxRetriesExceededException is only
+            // thrown when retries on a RESULT predicate run out.)
+            deadLetterHandler.handleExhaustedRetries(request, e,
+                retry.getRetryConfig().getMaxAttempts());
             throw new PaymentGatewayTemporarilyUnavailableException(
-                "Max retries exceeded for key: " + request.getIdempotencyKey(), e);
+                "Retries exhausted for key: " + request.getIdempotencyKey(), e);
+        } finally {
+            MDC.remove("idempotencyKey");
         }
-    }
-
-    private void sendToDeadLetterQueue(PaymentRequest request, Exception cause) {
-        log.error("Sending payment to DLQ after retry exhaustion key={}",
-            request.getIdempotencyKey());
-        // DLQ implementation in Section 7
     }
 }
 ```
@@ -329,7 +344,9 @@ public class IdempotencyKeyStrategy {
      * This key is preserved across retries of the same logical payment.
      */
     public String generateKey(PaymentRequest request) {
-        // Use a combination of business identifiers, NOT UUID (UUID changes on retry)
+        // Derived from the business transaction. (A random UUID is also fine
+        // IF it is generated once when the payment is created and stored —
+        // what must never happen is a NEW key per attempt.)
         String composite = String.join(":",
             request.getAccountId(),
             request.getBeneficiaryAccountId(),
@@ -375,7 +392,10 @@ public class IdempotentPaymentService {
             // Cache successful response for deduplication window (24h)
             keyStore.storeSuccess(idempotencyKey, response, Duration.ofHours(24));
             return response;
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
+            // Releasing the marker is safe because a later attempt sends the
+            // SAME key: the processor — the real arbiter — recognises a payment
+            // that did go through before the failure. Redis is only a fast path.
             keyStore.clearInFlight(idempotencyKey);
             throw e;
         }
@@ -387,6 +407,7 @@ public class IdempotentPaymentService {
 public class RedisIdempotencyKeyStore implements IdempotencyKeyStore {
 
     private final RedisTemplate<String, PaymentResponse> redisTemplate;
+    private final StringRedisTemplate markerTemplate;   // for the in-flight marker
     private static final String PREFIX = "idempotency:";
     private static final String INFLIGHT_PREFIX = "idempotency:inflight:";
 
@@ -398,20 +419,21 @@ public class RedisIdempotencyKeyStore implements IdempotencyKeyStore {
 
     @Override
     public boolean setInFlight(String key, Duration ttl) {
-        Boolean result = redisTemplate.opsForValue()
-            .setIfAbsent(INFLIGHT_PREFIX + key, null, ttl);
+        // Redis cannot store a null value — use a small marker string
+        Boolean result = markerTemplate.opsForValue()
+            .setIfAbsent(INFLIGHT_PREFIX + key, "1", ttl);
         return Boolean.TRUE.equals(result);
     }
 
     @Override
     public void storeSuccess(String key, PaymentResponse response, Duration ttl) {
         redisTemplate.opsForValue().set(PREFIX + key, response, ttl);
-        redisTemplate.delete(INFLIGHT_PREFIX + key);
+        markerTemplate.delete(INFLIGHT_PREFIX + key);
     }
 
     @Override
     public void clearInFlight(String key) {
-        redisTemplate.delete(INFLIGHT_PREFIX + key);
+        markerTemplate.delete(INFLIGHT_PREFIX + key);
     }
 }
 ```
@@ -436,8 +458,10 @@ public class FxRateService {
      * FX rate queries are idempotent GET operations — safe to retry unconditionally.
      */
     @Retryable(
-        retryFor = {RestClientException.class, ResourceAccessException.class},
-        noRetryFor = {UnauthorizedException.class},
+        // I/O errors and 5xx only. (RestClientException would also match
+        // HttpClientErrorException — 4xx such as 401 — which must not be retried.)
+        retryFor = {ResourceAccessException.class, HttpServerErrorException.class},
+        noRetryFor = {HttpClientErrorException.class},
         maxAttempts = 4,
         backoff = @Backoff(
             delay = 200,
@@ -455,6 +479,8 @@ public class FxRateService {
     public ExchangeRate recoverFxRate(RestClientException ex,
                                        String fromCurrency,
                                        String toCurrency) {
+        // A cached rate is acceptable for an INDICATIVE quote shown to a user;
+        // an executable FX conversion must never silently use a stale rate.
         log.warn("FX rate fetch failed after retries, using cached rate {}/{}",
             fromCurrency, toCurrency);
         return cachedRateRepository.findLatest(fromCurrency, toCurrency)
@@ -506,8 +532,8 @@ public class PaymentDeadLetterHandler {
                 }
             });
 
-        // Alert on-call team for high-value transactions
-        if (request.getAmountCents().compareTo(BigDecimal.valueOf(100_000_00)) > 0) {
+        // Alert on-call team for high-value transactions (over 100,000.00)
+        if (request.getAmountCents() > 10_000_000L) {
             alertingService.page(PagerDutyAlert.builder()
                 .severity(Severity.P2)
                 .summary("High-value payment failed after all retries")
@@ -532,7 +558,9 @@ public class PaymentDeadLetterHandler {
             dlqEntry.getAttemptCount(),
             (System.currentTimeMillis() - receivedAt) / 1000);
 
-        // Store in ops dashboard for manual triage
+        // Store in ops dashboard for manual triage. If the last failure was a
+        // timeout, the payment's state is UNKNOWN: reprocessing must first ask
+        // the processor for the payment (by idempotency key), never resend blindly.
         dlqRepository.save(dlqEntry);
     }
 }
@@ -556,8 +584,9 @@ public class RetryWithCircuitBreakerConfig {
      *    (no actual network call, no waiting)
      * 4. Retry treats CNPE as non-retriable (fail fast)
      *
-     * Do NOT reverse: CircuitBreaker(Retry(call)) would retry
-     * before the CB sees the failure, inflating CB failure counts.
+     * Do NOT reverse: CircuitBreaker(Retry(call)) hides individual failures
+     * from the CB (it only sees the final outcome of a whole retry sequence),
+     * and the retries keep hitting a dependency the CB should already have cut off.
      */
     @Bean
     public Retry paymentRetry(RetryRegistry retryRegistry) {
@@ -597,33 +626,35 @@ In a microservice chain (A → B → C), if each service retries 3 times, a sing
  * and we should stop retrying to avoid amplification.
  */
 @Component
+@Slf4j
 public class RetryBudget {
 
     private final AtomicLong totalCalls = new AtomicLong(0);
     private final AtomicLong retryCalls = new AtomicLong(0);
     private static final double MAX_RETRY_RATIO = 0.10; // 10%
 
-    public boolean tryAcquire() {
+    /** Call for EVERY attempt (first attempts and retries). */
+    public void recordCall() {
         totalCalls.incrementAndGet();
+    }
+
+    /** Call before a RETRY; returns false when the budget is spent. */
+    public boolean tryAcquireRetry() {
         long total = totalCalls.get();
         long retries = retryCalls.get();
 
-        // Allow first retries freely (need minimum sample size)
-        if (total < 100) return true;
-
-        double currentRatio = (double) retries / total;
-        if (currentRatio >= MAX_RETRY_RATIO) {
-            log.warn("Retry budget exhausted: retryRatio={:.2f}% limit={}%",
-                currentRatio * 100, MAX_RETRY_RATIO * 100);
+        // Allow retries freely until we have a minimum sample size
+        if (total >= 100 && (double) retries / total >= MAX_RETRY_RATIO) {
+            log.warn("Retry budget exhausted: retryRatio={}% limit={}%",
+                String.format("%.2f", 100.0 * retries / total), MAX_RETRY_RATIO * 100);
             return false;
         }
-
         retryCalls.incrementAndGet();
         return true;
     }
 
+    @Scheduled(fixedRate = 60_000)   // a fresh window every minute
     public void reset() {
-        // Reset counters periodically (e.g., every minute)
         totalCalls.set(0);
         retryCalls.set(0);
     }
@@ -640,10 +671,11 @@ public class RetryMetricsPublisher {
     private final MeterRegistry meterRegistry;
 
     public void registerRetryMetrics(Retry retry, String service) {
-        // Built-in Resilience4j metrics
-        TaggedRetryMetrics.ofRetryRegistry(
-            RetryRegistry.of(retry.getRetryConfig())
-        ).bindTo(meterRegistry);
+        // Built-in Resilience4j metrics: with resilience4j-micrometer, the
+        // Spring Boot starter binds TaggedRetryMetrics for the RetryRegistry
+        // automatically. If you build the registry yourself, bind THAT registry
+        // once: TaggedRetryMetrics.ofRetryRegistry(retryRegistry).bindTo(meterRegistry)
+        // (binding a brand-new RetryRegistry would publish nothing).
 
         // Custom metrics for financial monitoring
         retry.getEventPublisher()
@@ -687,7 +719,7 @@ resilience4j:
         retry-exceptions:
           - java.io.IOException
           - java.net.SocketTimeoutException
-          - feign.FeignException.ServiceUnavailable
+          - feign.FeignException$ServiceUnavailable   # nested class: use $
         ignore-exceptions:
           - com.fintech.payments.exception.InsufficientFundsException
           - com.fintech.payments.exception.DuplicateTransactionException
@@ -697,6 +729,9 @@ resilience4j:
         enable-exponential-backoff: true
         exponential-backoff-multiplier: 2.5
         exponential-max-wait-duration: 60s
+        # exponential backoff + randomisation = jitter
+        enable-randomized-wait: true
+        randomized-wait-factor: 0.5
       fx-rate:
         max-attempts: 5
         wait-duration: 100ms
@@ -728,26 +763,31 @@ resilience4j:
 **Respect Retry-After headers.** When payment processors return `429 Too Many Requests` with a `Retry-After: 5` header, honor that value instead of your computed backoff. Ignoring it causes further rate limiting.
 
 ```java
-@Component
-public class RetryAfterRespectingIntervalFunction implements IntervalFunction {
-
-    private final ThreadLocal<Long> retryAfterMs = new ThreadLocal<>();
-
-    public void setRetryAfter(long milliseconds) {
-        retryAfterMs.set(milliseconds);
-    }
+// Resilience4j passes the last result or exception to an IntervalBiFunction,
+// so the Retry-After value can be read straight from the 429 response.
+public class RetryAfterAwareInterval implements IntervalBiFunction<Object> {
 
     @Override
-    public long apply(int attempt) {
-        Long explicit = retryAfterMs.get();
-        if (explicit != null) {
-            retryAfterMs.remove();
-            return explicit;
+    public Long apply(Integer attempt, Either<Throwable, Object> outcome) {
+        if (outcome.isLeft()
+                && outcome.getLeft() instanceof FeignException fe
+                && fe.status() == 429) {
+            Optional<Long> retryAfterMs = fe.responseHeaders()
+                .getOrDefault("Retry-After", List.of()).stream()
+                .findFirst()
+                .filter(v -> v.chars().allMatch(Character::isDigit)) // seconds form;
+                .map(v -> Long.parseLong(v) * 1000);                 // an HTTP-date form also exists
+            if (retryAfterMs.isPresent()) {
+                return Math.min(retryAfterMs.get(), 60_000L);        // cap what we accept
+            }
         }
-        // Fall back to exponential backoff
-        return Math.min(500L * (long) Math.pow(2, attempt - 1), 30_000L);
+        // Fall back to exponential backoff with full jitter
+        long cap = Math.min(500L << (attempt - 1), 30_000L);
+        return ThreadLocalRandom.current().nextLong(0, cap + 1);
     }
 }
+
+// RetryConfig.custom().intervalBiFunction(new RetryAfterAwareInterval()) ...
 ```
 
 ---
@@ -783,10 +823,22 @@ public class RetryAfterRespectingIntervalFunction implements IntervalFunction {
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Implement a PaymentRetryClassifier that correctly identifies retriable vs non-retriable exceptions, handling 429 with Retry-After header respect, and ensure non-idempotent POST calls are only retried with a valid idempotency key."},
-    {"id": "2", "description": "Configure Resilience4j with full-jitter exponential backoff (base 500ms, multiplier 2, cap 30s, max 4 attempts) and integrate it with a CircuitBreaker using Retry(CircuitBreaker(call)) ordering."},
-    {"id": "3", "description": "Build a Redis-backed IdempotencyKeyStore that prevents concurrent duplicate submissions using setIfAbsent, stores successful responses for 24h deduplication, and clears in-flight markers on failure."},
-    {"id": "4", "description": "Implement a PaymentDeadLetterHandler that publishes exhausted payments to a Kafka DLQ topic, triggers PagerDuty alerts for transactions over $100,000, and exposes a retry budget gauge in Prometheus."}
+    {
+      "id": "1",
+      "description": "Implement a PaymentRetryClassifier that correctly identifies retriable vs non-retriable exceptions, handling 429 with Retry-After header respect, and ensure non-idempotent POST calls are only retried with a valid idempotency key."
+    },
+    {
+      "id": "2",
+      "description": "Configure Resilience4j with full-jitter exponential backoff (base 500ms, multiplier 2, cap 30s, max 4 attempts) and integrate it with a CircuitBreaker using Retry(CircuitBreaker(call)) ordering."
+    },
+    {
+      "id": "3",
+      "description": "Build a Redis-backed IdempotencyKeyStore that prevents concurrent duplicate submissions using setIfAbsent with a small marker value (Redis cannot store null), stores successful responses for 24h deduplication, and clears in-flight markers on failure — explaining why that is safe only because the processor deduplicates by the same idempotency key."
+    },
+    {
+      "id": "4",
+      "description": "Implement a PaymentDeadLetterHandler that publishes exhausted payments to a Kafka DLQ topic, triggers PagerDuty alerts for transactions over $100,000, and exposes a retry budget gauge in Prometheus."
+    }
   ]
 }
 -->

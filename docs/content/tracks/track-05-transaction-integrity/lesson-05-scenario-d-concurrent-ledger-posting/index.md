@@ -48,22 +48,24 @@ references:
   - "Spring Data JPA — DataIntegrityViolationException Javadoc"
 ---
 
+## Overview
+
 Settlement systems are unforgiving environments. A ledger entry that posts twice, a debit without a matching credit, or a batch total that disagrees with its constituent rows are not edge cases to be handled gracefully — they are regulatory violations, audit failures, and in some jurisdictions, reportable incidents. This lesson follows a settlement engine that broke the double-entry invariant under concurrent load, dissects why higher isolation levels alone could not save it, and builds the idempotency, write-skew protection, and partitioning strategy that together make the system correct at scale. By the end you will understand not just what went wrong, but why each fix is necessary and what class of bugs each one prevents.
 
 ## Learning Objectives
 
 - Explain why a retry storm combined with non-idempotent inserts breaks the double-entry invariant even when each individual posting is internally balanced.
 - Demonstrate that `SERIALIZABLE` isolation does not prevent duplicate-row insertion and articulate why idempotency at the application/schema level is the correct fix.
-- Implement idempotent ledger entry insertion using a `UNIQUE` constraint and handle `DataIntegrityViolationException` with correct semantics (success, not error).
+- Implement idempotent ledger entry insertion using a `UNIQUE` constraint and `INSERT ... ON CONFLICT DO NOTHING`, treating an already-posted entry as success, not error.
 - Identify write skew in a batch-limit scenario and apply a pessimistic lock on the batch header row to eliminate it.
 - Design a PostgreSQL range-partitioned ledger table that reduces lock contention without sacrificing query correctness.
-- Enforce per-account posting order through a `UNIQUE(account_id, sequence_number)` constraint and a gap-free sequence generation strategy.
+- Enforce per-account posting order through a `UNIQUE(account_id, sequence_number)` constraint and a gap-free per-account counter.
 
 ## Business Context
 
-ClearPath Securities, a mid-size clearing house processing equity and bond trades for 47 member firms, runs an end-of-day settlement batch that posts between 800 000 and 1.4 million ledger entries per night. The batch is parallelised across 16 worker threads to meet a 90-minute settlement window mandated by the exchange's rules.
+*Composite example:* "ClearPath Securities", a fictional mid-size clearing house processing equity and bond trades for 47 member firms, runs an end-of-day settlement batch that posts between 800 000 and 1.4 million ledger entries per night. The batch is parallelised across 16 worker threads to meet a 90-minute settlement window mandated by the exchange's rules.
 
-During a quarter-end settlement with elevated volume (1.38 million entries), the reconciliation job that runs immediately after the batch reported a discrepancy: total DEBIT entries summed to €2 184 300 more than total CREDIT entries. The batch showed all 1.38 million postings as successful. The discrepancy corresponded exactly to 2 184 individual transactions being posted twice — once by the original thread, once by the retry triggered by a downstream timeout that the original had already recovered from silently.
+During a quarter-end settlement with elevated volume (1.38 million entries), the reconciliation job that runs immediately after the batch reported a discrepancy: the settled value in the ledger was €2 184 300 higher than the value in the exchange's trade file. The batch showed all 1.38 million postings as successful. The discrepancy corresponded exactly to 2 184 individual transactions being posted twice — once by the original thread, once by the retry triggered by a downstream timeout that the original had already recovered from silently.
 
 The exchange's risk team placed ClearPath on a 30-day enhanced monitoring regime. The firm's CTO committed to a root-cause report and remediation plan within five business days. The engineering team had 72 hours to implement, test, and deploy the fix without taking the system offline.
 
@@ -74,7 +76,7 @@ The settlement batch processes each transaction by calling `LedgerPostingService
 ```java
 // In the batch orchestrator
 @Retryable(
-    value = {TransientDataAccessException.class, CannotAcquireLockException.class},
+    retryFor = {TransientDataAccessException.class, CannotAcquireLockException.class},
     maxAttempts = 3,
     backoff = @Backoff(delay = 500, multiplier = 2)
 )
@@ -258,6 +260,8 @@ public record LedgerPostingRequest(
 
 ### Idempotent Service
 
+The service claims both entries with `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`. Do not rely on `save()` plus catching `DataIntegrityViolationException` inside the transaction: with JPA the INSERT usually runs at flush/commit (after your `try` block), and in PostgreSQL a failed statement aborts the whole transaction.
+
 ```java
 @Service
 @RequiredArgsConstructor
@@ -272,35 +276,30 @@ public class IdempotentLedgerPostingService {
         LedgerEntry debit = mapper.toDebitEntry(request);
         LedgerEntry credit = mapper.toCreditEntry(request);
 
-        try {
-            ledgerEntryRepository.saveAll(List.of(debit, credit));
-            log.debug("Posted transaction {}: DEBIT {} CREDIT {}",
-                    request.transactionId(),
-                    request.debitAccountId(),
-                    request.creditAccountId());
-            return PostingResult.posted(request.transactionId());
+        // Native multi-row insert:
+        //   INSERT INTO ledger_entries (...) VALUES (...debit...), (...credit...)
+        //   ON CONFLICT (idempotency_key) DO NOTHING
+        // Returns how many rows were actually inserted. No exception on a
+        // duplicate, so the transaction stays healthy.
+        int inserted = ledgerEntryRepository.insertIgnoringDuplicates(List.of(debit, credit));
 
-        } catch (DataIntegrityViolationException e) {
-            if (isDuplicateKeyViolation(e)) {
-                // The unique constraint fired — this is a retry of an already-posted transaction.
-                // Return success: the caller's intent (post this transaction) is already fulfilled.
+        return switch (inserted) {
+            case 2 -> {
+                log.debug("Posted transaction {}: DEBIT {} CREDIT {}",
+                        request.transactionId(), request.debitAccountId(), request.creditAccountId());
+                yield PostingResult.posted(request.transactionId());
+            }
+            case 0 -> {
+                // Both keys already exist: a retry of an already-posted transaction.
+                // Success — the caller's intent (post this transaction) is fulfilled.
                 log.info("Idempotent: transaction {} already posted, returning success",
                         request.transactionId());
-                return PostingResult.alreadyPosted(request.transactionId());
+                yield PostingResult.alreadyPosted(request.transactionId());
             }
-            // A different integrity violation (e.g. foreign key) — rethrow
-            throw e;
-        }
-    }
-
-    private boolean isDuplicateKeyViolation(DataIntegrityViolationException e) {
-        Throwable cause = e.getCause();
-        if (cause instanceof org.hibernate.exception.ConstraintViolationException cve) {
-            String constraintName = cve.getConstraintName();
-            return constraintName != null &&
-                   constraintName.contains("uq_ledger_idempotency_key");
-        }
-        return false;
+            // Exactly one leg exists: should be impossible (both legs are always
+            // inserted in one transaction) — the ledger is inconsistent. Roll back.
+            default -> throw new LedgerInconsistencyException(request.transactionId());
+        };
     }
 }
 ```
@@ -326,7 +325,7 @@ public sealed interface PostingResult {
 ```
 
 > [!IMPORTANT]
-> `DataIntegrityViolationException` on a duplicate key means the transaction was already posted. The correct response is **success** — not an error. The caller asked for transaction X to be posted; transaction X is posted. Returning an error here would cause the batch orchestrator to mark the transaction as failed and potentially trigger a manual remediation workflow for a transaction that is actually fine.
+> A conflict on the idempotency key means the transaction was already posted. The correct response is **success** — not an error. The caller asked for transaction X to be posted; transaction X is posted. Returning an error here would cause the batch orchestrator to mark the transaction as failed and potentially trigger a manual remediation workflow for a transaction that is actually fine.
 
 ### Mapper
 
@@ -393,23 +392,16 @@ The write skew scenario:
 
 ```mermaid
 sequenceDiagram
-    participant T1 as Thread 1 (post €40M entry)
+    participant T1 as Thread 1 (post €2M entry)
     participant DB as Database
-    participant T2 as Thread 2 (post €15M entry)
+    participant T2 as Thread 2 (post €2M entry)
 
-    Note over DB: Batch current total = €38M
+    Note over DB: Batch current total = €47M
 
     T1->>DB: SELECT SUM(amount) FROM ledger_entries WHERE batch_id=X AND entry_type=DEBIT
-    Note over DB: Returns €38M
+    Note over DB: Returns €47M
     T2->>DB: SELECT SUM(amount) FROM ledger_entries WHERE batch_id=X AND entry_type=DEBIT
-    Note over DB: Returns €38M
-
-    T1->>T1: 38M + 40M = 78M > 50M ✗ — BLOCKED? No: 40M...
-    Note over T1: Wait — 38 + 40 = 78 > 50 ✗<br/>T1 would be rejected.<br/>Let's use a realistic example:
-
-    Note over T1,T2: Reset: Batch total = €47M
-    T1->>DB: SELECT SUM → €47M
-    T2->>DB: SELECT SUM → €47M
+    Note over DB: Returns €47M
 
     T1->>T1: 47M + 2M = 49M ≤ 50M ✓ — passes
     T2->>T2: 47M + 2M = 49M ≤ 50M ✓ — passes
@@ -493,10 +485,10 @@ public class BatchLedgerPostingService {
 
 At 1.4 million entries per night and years of retention, the `ledger_entries` table grows to hundreds of millions of rows. A single table becomes a bottleneck in two ways:
 
-1. **Lock contention**: even row-level locks on a heavily-written table compete for page-level shared locks and index-maintenance locks.
+1. **Write hot spots and maintenance**: concurrent inserts all land on the same "right-hand" pages of large indexes, and vacuuming and index maintenance on a huge table get slower and slower.
 2. **Query performance**: reconciliation queries that scan entries for a given date must traverse an ever-growing index.
 
-PostgreSQL declarative partitioning by `posted_date` addresses both:
+PostgreSQL declarative partitioning by date addresses both. Partition by the **settlement date carried in the request** (deterministic), not by `now()` at insert time: a retry that runs after midnight must land in the same partition as the original attempt.
 
 ```sql
 -- Parent (partitioned) table
@@ -532,7 +524,7 @@ CREATE UNIQUE INDEX uq_ledger_account_sequence_20240115
 ```
 
 > [!WARNING]
-> The unique constraint `uq_ledger_idempotency_key` must be defined *on each partition*, not on the parent table. PostgreSQL does not enforce unique constraints across partition boundaries for range-partitioned tables. If the idempotency key uniqueness must be global (spanning multiple days), you need a separate lookup table or a range-partitioned unique index via an extension like `pg_partman` combined with explicit cross-partition checks. For settlement systems where each transaction belongs to exactly one settlement date, per-partition uniqueness is sufficient and correct.
+> On a partitioned table, PostgreSQL only allows a unique constraint that **includes the partition key** (e.g. `UNIQUE (idempotency_key, posted_at)`), and per-partition unique indexes only guarantee uniqueness *within* each partition. Neither guarantees that an idempotency key is unique across days. Per-partition uniqueness is safe only if the partition key is deterministic for the operation (the settlement date from the request — never `now()` at retry time). If you need global uniqueness, claim the key in a separate, non-partitioned `ledger_idempotency_keys` table (with a plain UNIQUE constraint) in the same transaction as the insert.
 
 ### Partition Management in Java
 
@@ -587,7 +579,7 @@ public class PartitionMaintenanceJob {
 
 By partitioning on `posted_at`:
 
-- Concurrent postings for the same settlement date all go to the same partition, but the partition is smaller and has fewer index pages to lock.
+- Concurrent postings for the same settlement date all go to the same partition, but its indexes are small and stay in memory, and vacuum works on a small table.
 - Reconciliation queries for a specific date use partition pruning — PostgreSQL queries only the relevant partition, ignoring all others.
 - Old partitions can be detached and archived to cold storage without affecting the live partition.
 - Autovacuum runs per-partition, spreading the I/O cost.
@@ -598,12 +590,25 @@ Ledger entries must be applied in order per account for accurate running-balance
 
 ```sql
 -- The constraint is already in the schema above.
--- Here is how to generate gap-free sequence numbers safely.
+-- How to generate GAP-FREE per-account sequence numbers safely:
 
--- Option 1: PostgreSQL sequence per account (expensive at scale)
--- Option 2: Advisory lock + MAX(sequence_number) + 1
+-- Not a PostgreSQL SEQUENCE: sequences are not transactional — a rolled-back
+-- transaction still consumes its value, so sequences leave gaps.
+-- Not MAX(sequence_number) + 1 without a lock: two transactions can read the
+-- same MAX and collide.
 
--- Option 3 (recommended): Application-managed sequence with optimistic retry
+-- Recommended: a per-account counter row, incremented in the SAME transaction
+-- as the ledger insert. The UPDATE locks the counter row (serialising postings
+-- for that account), and a rollback also undoes the increment — no gaps.
+CREATE TABLE account_sequences (
+    account_id UUID   PRIMARY KEY REFERENCES accounts(id),
+    last_seq   BIGINT NOT NULL DEFAULT 0
+);
+
+UPDATE account_sequences
+SET    last_seq = last_seq + 1
+WHERE  account_id = :accountId
+RETURNING last_seq;
 ```
 
 ```java
@@ -611,27 +616,26 @@ Ledger entries must be applied in order per account for accurate running-balance
 @RequiredArgsConstructor
 public class SequenceNumberService {
 
-    private final LedgerEntryRepository ledgerEntryRepository;
+    private final JdbcTemplate jdbc;
 
     /**
      * Allocates the next sequence number for an account.
-     * Uses an optimistic loop — retries on unique constraint violation.
-     * In practice, contention on a single account's sequence is low because
-     * settlement entries for one account are typically processed by one thread.
+     * MUST be called inside the same transaction that inserts the ledger entry:
+     * the counter row stays locked until commit, and a rollback returns the
+     * number — so the sequence has no gaps.
      */
+    @Transactional(propagation = Propagation.MANDATORY)
     public long nextSequenceNumber(UUID accountId) {
-        int maxAttempts = 5;
-        for (int attempt = 0; attempt < maxAttempts; attempt++) {
-            Long maxSeq = ledgerEntryRepository
-                    .findMaxSequenceNumber(accountId);
-            long nextSeq = (maxSeq == null ? 0L : maxSeq) + 1;
-            // Optimistically return the candidate; the UNIQUE constraint
-            // at the database will reject it if another thread used it first.
-            // The caller's transaction will catch the ConstraintViolationException
-            // and retry here.
-            return nextSeq;
+        Long next = jdbc.queryForObject("""
+                UPDATE account_sequences
+                SET    last_seq = last_seq + 1
+                WHERE  account_id = ?
+                RETURNING last_seq
+                """, Long.class, accountId);
+        if (next == null) {
+            throw new SequenceAllocationException(accountId);
         }
-        throw new SequenceAllocationException(accountId, maxAttempts);
+        return next;
     }
 }
 ```
@@ -643,6 +647,7 @@ public interface LedgerEntryRepository extends JpaRepository<LedgerEntry, UUID> 
     @Query("SELECT MAX(e.sequenceNumber) FROM LedgerEntry e WHERE e.accountId = :accountId")
     Long findMaxSequenceNumber(@Param("accountId") UUID accountId);
 
+    // Customer (liability) convention: credits increase the balance
     @Query("""
             SELECT SUM(CASE WHEN e.entryType = 'DEBIT'  THEN -e.amount
                             WHEN e.entryType = 'CREDIT' THEN  e.amount
@@ -665,7 +670,7 @@ public interface LedgerEntryRepository extends JpaRepository<LedgerEntry, UUID> 
 ```
 
 > [!NOTE]
-> For accounts with very high posting rates (e.g. a central counterparty account that receives one entry per member firm per batch), the `MAX(sequence_number) + 1` approach creates contention. In these cases, pre-allocate a block of sequence numbers from a dedicated `account_sequences` table using `SELECT ... FOR UPDATE SKIP LOCKED` and distribute them to posting threads before the batch starts.
+> For accounts with very high posting rates (e.g. a central counterparty account that receives one entry per member firm per batch), the per-account counter row becomes a serialisation point. Options: post those entries from a single thread per account (often the batch's natural design), or give up strict gap-freeness for that account and pre-allocate blocks of numbers — but then a crashed worker leaves gaps, so the gap check below must know which accounts use block allocation.
 
 ### Verifying Sequence Continuity
 
@@ -713,16 +718,16 @@ public class LedgerReconciliationService {
         String sql = """
                 SELECT
                     batch_id,
+                    currency,
                     SUM(CASE WHEN entry_type = 'DEBIT'  THEN amount ELSE 0 END) AS total_debit,
                     SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE 0 END) AS total_credit
                 FROM ledger_entries
                 WHERE posted_at >= CURRENT_DATE - INTERVAL '1 day'
                   AND posted_at <  CURRENT_DATE
-                GROUP BY batch_id
-                HAVING ABS(
-                    SUM(CASE WHEN entry_type = 'DEBIT'  THEN amount ELSE 0 END) -
-                    SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE 0 END)
-                ) > 0.001
+                GROUP BY batch_id, currency      -- never net EUR against USD
+                -- NUMERIC sums are EXACT: any difference at all is a real error
+                HAVING SUM(CASE WHEN entry_type = 'DEBIT'  THEN amount ELSE 0 END) <>
+                       SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE 0 END)
                 """;
 
         List<Map<String, Object>> imbalances = jdbc.queryForList(sql);
@@ -782,11 +787,11 @@ public class LedgerReconciliationService {
 
 **Q1: The settlement batch is retried on `TransientDataAccessException`. After the fix (unique constraint on `idempotency_key`), the second attempt hits the constraint and throws `DataIntegrityViolationException`. The exception propagates up to the `@Retryable` annotation. Should `DataIntegrityViolationException` be in the retryable exception list? Why or why not?**
 
-A: No. `DataIntegrityViolationException` on the idempotency key means the transaction is already posted — it is a *permanent* condition, not a transient one. Retrying would hit the constraint again and again until `maxAttempts` is exhausted, then propagate the exception as a failure. The correct behaviour is to catch `DataIntegrityViolationException` inside the posting service, determine whether it is a duplicate-key violation on the idempotency key, and if so return `PostingResult.alreadyPosted()` — a success. The `@Retryable` annotation never sees the exception at all. `DataIntegrityViolationException` for *other* constraints (e.g. a foreign key to an account that does not exist) is also not retryable — it represents a data error that retrying will not fix. As a rule, only retry on exceptions that represent resource unavailability (network timeouts, lock acquisition failures, deadlocks), not on exceptions that represent logical errors.
+A: No. A duplicate on the idempotency key means the transaction is already posted — a *permanent* condition, not a transient one. Retrying would hit the constraint again and again until `maxAttempts` is exhausted, then report a failure for a transaction that is fine. The correct behaviour is to handle the duplicate inside the posting service and return `PostingResult.alreadyPosted()` — a success. With `INSERT ... ON CONFLICT DO NOTHING` there is no exception at all; you simply see that 0 rows were inserted. The `@Retryable` annotation never sees anything to retry. `DataIntegrityViolationException` for *other* constraints (e.g. a foreign key to an account that does not exist) is also not retryable — it represents a data error that retrying will not fix. As a rule, only retry on exceptions that represent resource unavailability (network timeouts, lock acquisition failures, deadlocks), not on exceptions that represent logical errors.
 
 **Q2: Why does the batch-limit write skew fix require locking the batch header row rather than simply upgrading to `SERIALIZABLE` isolation?**
 
-A: `SERIALIZABLE` would work for this specific case — it detects the write skew and aborts one of the two concurrent transactions. However, there are three reasons to prefer the explicit pessimistic lock. First, `SERIALIZABLE` on a high-throughput settlement batch causes frequent serialisation failures that must be retried — the abort rate under load can be 10–30 %, significantly increasing total work. Second, the explicit lock on the batch header makes the serialisation point visible in the code — a reviewer can see exactly where concurrent access is controlled, rather than relying on the database to silently abort one transaction. Third, the batch header lock also ensures that the `total_debit` running total on the header row is accurate, which the reconciliation service can read without re-summing all entries — a significant performance benefit for large batches. `SERIALIZABLE` isolation provides no such denormalised summary.
+A: `SERIALIZABLE` would work for this specific case — it detects the write skew and aborts one of the two concurrent transactions. However, there are three reasons to prefer the explicit pessimistic lock. First, `SERIALIZABLE` on a high-throughput settlement batch causes serialisation failures that must be retried — under heavy contention on the same batch the abort rate can be high, significantly increasing total work. Second, the explicit lock on the batch header makes the serialisation point visible in the code — a reviewer can see exactly where concurrent access is controlled, rather than relying on the database to silently abort one transaction. Third, the batch header lock also ensures that the `total_debit` running total on the header row is accurate, which the reconciliation service can read without re-summing all entries — a significant performance benefit for large batches. `SERIALIZABLE` isolation provides no such denormalised summary.
 
 ## Practical Challenge
 
@@ -861,7 +866,7 @@ Consider: the migration must run without downtime. How do you handle rows in `le
 **Task 3 — Reconciliation Alert Threshold**
 
 The reconciliation service fires a critical alert when any imbalance is detected. Extend it to:
-1. Tolerate a rounding tolerance of €0.001 (already in the SQL — confirm you understand why).
+1. Keep the exact comparison (`<>`, no tolerance) in the SQL — confirm you understand why: `NUMERIC` arithmetic is exact, so any tolerance would only hide real errors.
 2. Add a **severity level** to the alert: imbalances under €100 are WARNING, over €100 are CRITICAL.
 3. Publish the alert as a CloudEvents 1.0 JSON envelope to a Kafka topic `ledger.reconciliation.alerts`, with:
    - `type`: `com.clearpath.ledger.reconciliation.imbalance`
@@ -881,7 +886,7 @@ The reconciliation service fires a critical alert when any imbalance is detected
         "No — the entire batch should be cancelled and an alert raised"
       ],
       "correct": 1,
-      "explanation": "DataIntegrityViolationException on the idempotency key is a permanent condition, not a transient one. The transaction is already posted. The service should catch it, verify it is a duplicate-key violation on the idempotency key column, and return PostingResult.alreadyPosted() — a success. Only retry on exceptions representing resource unavailability, not logical errors."
+      "explanation": "A duplicate on the idempotency key is a permanent condition, not a transient one: the transaction is already posted. The service should handle it (ideally with INSERT ... ON CONFLICT DO NOTHING, which raises no exception) and return PostingResult.alreadyPosted() — a success. Only retry on exceptions representing resource unavailability, not logical errors."
     },
     {
       "text": "Why does the batch-limit write skew fix require locking the batch header row rather than simply upgrading to SERIALIZABLE isolation?",
@@ -892,12 +897,12 @@ The reconciliation service fires a critical alert when any imbalance is detected
         "Locking the batch header row is required by ISO 20022 settlement standards"
       ],
       "correct": 1,
-      "explanation": "SERIALIZABLE would work but causes frequent serialisation failures (10-30% abort rate) under high load. The explicit pessimistic lock on the batch header makes the serialisation point visible to reviewers, reduces retry overhead, and also maintains a denormalised total_debit running total on the header row that the reconciliation service can read efficiently."
+      "explanation": "SERIALIZABLE would work but can cause many serialisation failures under heavy contention on the same batch. The explicit pessimistic lock on the batch header makes the serialisation point visible to reviewers, reduces retry overhead, and also maintains a denormalised total_debit running total on the header row that the reconciliation service can read efficiently."
     },
     {
       "text": "The per-account sequence_number has a UNIQUE(account_id, sequence_number) constraint. A reconciliation query finds a gap: account ACC-1 has entries with sequence 1, 2, 4, 5 — sequence 3 is missing. What does this indicate?",
       "options": [
-        "The sequence_number allocation uses MAX+1 which skips numbers under concurrent load",
+        "The sequence numbers come from a PostgreSQL SEQUENCE, which is expected to skip values",
         "A ledger entry was deleted or never inserted, which is a potential data integrity violation since ledgers are append-only",
         "The partition for that posting date was detached before the entry was committed",
         "Sequence 3 was reserved by the idempotency key table but is still in PROCESSING state"

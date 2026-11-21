@@ -11,8 +11,13 @@ EM.Lab = (function () {
   /* ----------------------------------------------------------
      State
   ---------------------------------------------------------- */
-  var _scenarios  = null;   // Loaded from decision-lab.json
-  var _loadPromise = null;  // Singleton fetch promise
+  var _scenarios  = null;   // Loaded from decision-lab.json (current language)
+  var _loadPromises = {};   // One fetch per language
+  var _trackTitleCache = {}; // lang:trackId -> { lessonId: title }
+  var _fallback = {};        // lang -> true when English data is shown in another UI language
+
+  /* English content inside the Arabic UI must keep left-to-right order */
+  function _cdir() { return _fallback[EM.I18n.lang()] ? ' dir="ltr"' : ''; }
 
   /* ----------------------------------------------------------
      Scoring Tiers
@@ -31,9 +36,9 @@ EM.Lab = (function () {
 
   function _tierLabel(tier) {
     switch (tier) {
-      case 'principal': return 'Principal Engineer';
-      case 'senior':    return 'Senior Engineer';
-      default:          return 'Needs Development';
+      case 'principal': return EM.t('lab.tierPrincipal');
+      case 'senior':    return EM.t('lab.tierSenior');
+      default:          return EM.t('lab.tierDeveloping');
     }
   }
 
@@ -49,17 +54,47 @@ EM.Lab = (function () {
      Data Loading
   ---------------------------------------------------------- */
   function _loadScenarios() {
-    if (_loadPromise) return _loadPromise;
-    _loadPromise = fetch('data/decision-lab.json')
-      .then(function (r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
-      })
-      .then(function (data) {
-        _scenarios = data.scenarios || [];
-        return _scenarios;
+    var lang = EM.I18n.lang();
+    if (!_loadPromises[lang]) {
+      _loadPromises[lang] = EM.I18n.fetchJSON('data/decision-lab.json')
+        .then(function (res) { _fallback[lang] = res.fallback; return res.body.scenarios || []; })
+        .catch(function (err) { delete _loadPromises[lang]; throw err; });
+    }
+    return _loadPromises[lang].then(function (list) {
+      _scenarios = list;
+      return list;
+    });
+  }
+
+  /* Resolve related lesson ids (e.g. "track-05-lesson-02") to titles + routes */
+  function _loadRelatedLessons(ids) {
+    ids = ids || [];
+    var lang = EM.I18n.lang();
+    var trackIds = [];
+    ids.forEach(function (id) {
+      var tid = id.split('-lesson-')[0];
+      if (trackIds.indexOf(tid) === -1) trackIds.push(tid);
+    });
+    return Promise.all(trackIds.map(function (tid) {
+      var key = lang + ':' + tid;
+      if (_trackTitleCache[key]) return _trackTitleCache[key];
+      var appTrack = (EM.App.tracks || []).filter(function (t) { return t.id === tid; })[0];
+      if (!appTrack) return Promise.resolve({});
+      _trackTitleCache[key] = EM.I18n.fetchJSON('content/tracks/' + tid + '-' + appTrack.slug + '/_track.json')
+        .then(function (res) {
+          var map = {};
+          (res.body.lessons || []).forEach(function (l) { map[l.id] = l.title; });
+          return map;
+        })
+        .catch(function () { return {}; });
+      return _trackTitleCache[key];
+    })).then(function (maps) {
+      var all = {};
+      maps.forEach(function (m) { Object.keys(m).forEach(function (k) { all[k] = m[k]; }); });
+      return ids.filter(function (id) { return all[id]; }).map(function (id) {
+        return { id: id, track: id.split('-lesson-')[0], title: all[id] };
       });
-    return _loadPromise;
+    });
   }
 
   function _findScenario(scenarioId) {
@@ -110,6 +145,11 @@ EM.Lab = (function () {
       .replace(/"/g, '&quot;');
   }
 
+  /* Escape text and turn `backticked` fragments into isolated LTR code spans */
+  function _rt(s) {
+    return _esc(s).replace(/`([^`]+)`/g, '<code class="lab-code" dir="ltr">$1</code>');
+  }
+
   /* ----------------------------------------------------------
      Render: Index Page
   ---------------------------------------------------------- */
@@ -124,30 +164,40 @@ EM.Lab = (function () {
       }).join('');
 
       var headerStats =
-        '<div style="display:flex;gap:var(--sp-5);margin-top:var(--sp-5)">' +
-          _statPill(scenarios.length + ' scenarios') +
-          _statPill(totalCompleted + ' completed') +
-          _statPill('Principal difficulty') +
+        '<div class="lab-stats">' +
+          _statPill(EM.t('lab.statScenarios', { n: scenarios.length })) +
+          _statPill(EM.t('lab.statCompleted', { n: totalCompleted })) +
+          _statPill(EM.t('lab.statDifficulty')) +
+        '</div>';
+
+      var howItWorks =
+        '<div class="lab-how">' +
+          '<div class="lab-how-title">' + EM.t('lab.howTitle') + '</div>' +
+          '<ol class="lab-how-list">' +
+            '<li>' + EM.esc(EM.t('lab.how1')) + '</li>' +
+            '<li>' + EM.esc(EM.t('lab.how2')) + '</li>' +
+            '<li>' + EM.esc(EM.t('lab.how3')) + '</li>' +
+          '</ol>' +
         '</div>';
 
       return '<div class="page">' +
         '<div class="page-header lab-index-header">' +
-          '<div class="lab-icon-wrap">' + EM.Icons.lab + '</div>' +
-          '<h1 class="page-title" style="margin-top:var(--sp-3)">Decision Lab</h1>' +
-          '<p class="page-subtitle" style="max-width:640px">' +
-            'Real-world engineering scenarios drawn from production incidents in banking and FinTech. ' +
-            'Each scenario presents a system under stress — analyse the constraints, choose your approach, ' +
-            'and defend it. Scored against a Principal Engineer rubric.' +
-          '</p>' +
+          '<div class="lab-title-row">' +
+            '<div class="lab-icon-wrap">' + EM.Icons.lab + '</div>' +
+            '<h1 class="page-title">' + EM.t('lab.title') + '</h1>' +
+          '</div>' +
+          '<p class="page-subtitle lab-subtitle">' + EM.esc(EM.t('lab.subtitle')) + '</p>' +
           headerStats +
         '</div>' +
+        (_fallback[EM.I18n.lang()] ? EM.I18n.fallbackNote() : '') +
+        howItWorks +
         '<div class="lab-scenarios-grid">' + cards + '</div>' +
       '</div>';
     });
   }
 
   function _statPill(label) {
-    return '<span class="tag-chip" style="font-size:var(--text-xs)">' + _esc(label) + '</span>';
+    return '<span class="lab-stat-pill">' + _esc(label) + '</span>';
   }
 
   function _renderScenarioCard(scenario, state) {
@@ -178,7 +228,7 @@ EM.Lab = (function () {
 
     // Tags
     var tags = (scenario.tags || []).slice(0, 3).map(function (t) {
-      return '<span class="tag-chip" style="font-size:11px">' + _esc(t) + '</span>';
+      return '<span class="tag-chip" dir="ltr">' + _esc(t) + '</span>';
     }).join('');
 
     // Status row
@@ -187,19 +237,19 @@ EM.Lab = (function () {
       statusText = _tierLabel(tier);
       statusCls  = 'status-completed';
     } else if (started) {
-      statusText = 'In Progress — Stage ' + (answeredCount + 1) + ' of ' + scenario.stages.length;
+      statusText = EM.t('lab.inProgress', { n: Math.min(answeredCount + 1, scenario.stages.length), total: scenario.stages.length });
       statusCls  = 'status-in-progress';
     } else {
-      statusText = 'Not Started · ' + scenario.estimatedMinutes + ' min';
+      statusText = EM.t('lab.notStarted', { n: scenario.estimatedMinutes });
       statusCls  = 'status-not-started';
     }
 
     return '<button class="scenario-card" onclick="EM.Router.navigate(\'/decision-lab/' + scenario.id + '\')">' +
       '<div class="scenario-card-top">' +
-        '<div style="flex:1">' +
-          '<div class="scenario-num">SCENARIO ' + num + '</div>' +
-          '<div class="scenario-card-title">' + _esc(scenario.title) + '</div>' +
-          '<div class="scenario-card-subtitle">' + _esc(scenario.subtitle) + '</div>' +
+        '<div class="scenario-card-main">' +
+          '<div class="scenario-num">' + EM.t('lab.scenario', { n: num }) + '</div>' +
+          '<div class="scenario-card-title"' + _cdir() + '>' + _esc(scenario.title) + '</div>' +
+          '<div class="scenario-card-subtitle"' + _cdir() + '>' + _esc(scenario.subtitle) + '</div>' +
         '</div>' +
         rightSide +
       '</div>' +
@@ -219,9 +269,9 @@ EM.Lab = (function () {
       var scenario = _findScenario(scenarioId);
       if (!scenario) {
         return '<div class="page"><div class="page-header">' +
-          '<h1 class="page-title">Scenario Not Found</h1>' +
-          '<p class="page-subtitle">Scenario ID: ' + _esc(scenarioId) + '</p>' +
-          '<button class="btn btn-secondary" onclick="EM.Router.navigate(\'/decision-lab\')">&larr; Decision Lab</button>' +
+          '<h1 class="page-title">' + EM.t('lab.notFound') + '</h1>' +
+          '<p class="page-subtitle">' + _esc(EM.t('lab.scenarioId', { id: scenarioId })) + '</p>' +
+          '<button class="btn btn-secondary" onclick="EM.Router.navigate(\'/decision-lab\')">' + _esc(EM.t('lab.back')) + '</button>' +
         '</div></div>';
       }
 
@@ -232,7 +282,7 @@ EM.Lab = (function () {
       // Breadcrumb
       var breadcrumb =
         '<div class="scenario-breadcrumb">' +
-          '<button onclick="EM.Router.navigate(\'/decision-lab\')">' + EM.Icons.arrow + ' Decision Lab</button>' +
+          '<button onclick="EM.Router.navigate(\'/decision-lab\')">' + _esc(EM.t('lab.title')) + '</button>' +
           '<span class="scenario-breadcrumb-sep">/</span>' +
           '<span>' + _esc(scenario.title) + '</span>' +
         '</div>';
@@ -244,10 +294,14 @@ EM.Lab = (function () {
       if (stateStr === 'IDLE') {
         bodyHtml = _renderStartPanel(scenario) + contextHtml;
       } else if (completed) {
-        bodyHtml = _renderStageProgress(scenario, state) +
-                   contextHtml +
-                   _renderCompletedStages(scenario, state) +
-                   _renderDebrief(scenario, state);
+        return _loadRelatedLessons(scenario.relatedLessons).then(function (related) {
+          return '<div class="scenario-page">' + breadcrumb +
+            _renderStageProgress(scenario, state) +
+            contextHtml +
+            _renderCompletedStages(scenario, state) +
+            _renderDebrief(scenario, state, related) +
+          '</div>';
+        });
       } else {
         var stageIdx = _currentStageIndex(scenario, state);
         bodyHtml = _renderStageProgress(scenario, state) +
@@ -266,11 +320,11 @@ EM.Lab = (function () {
     }).join('');
 
     return '<div class="scenario-context">' +
-      '<div class="scenario-context-label">Scenario Context</div>' +
-      '<div class="scenario-context-text">' + _esc(scenario.context) + '</div>' +
+      '<div class="scenario-context-label">' + EM.t('lab.context') + '</div>' +
+      '<div class="scenario-context-text"' + _cdir() + '>' + _rt(scenario.context) + '</div>' +
       (constraints
         ? '<div class="scenario-constraints">' +
-            '<div class="scenario-constraints-label">System Constraints</div>' +
+            '<div class="scenario-constraints-label">' + EM.t('lab.constraints') + '</div>' +
             '<div class="constraints-list">' + constraints + '</div>' +
           '</div>'
         : '') +
@@ -283,28 +337,27 @@ EM.Lab = (function () {
 
     return '<div class="scenario-start-panel">' +
       '<div class="scenario-num" style="justify-content:center;display:flex;margin-bottom:var(--sp-3)">' +
-        'SCENARIO ' + num +
+        EM.t('lab.scenario', { n: num }) +
       '</div>' +
-      '<div class="scenario-start-title">' + _esc(scenario.title) + '</div>' +
+      '<div class="scenario-start-title"' + _cdir() + '>' + _esc(scenario.title) + '</div>' +
       '<div class="scenario-start-subtitle">' +
-        _esc(scenario.subtitle) + ' — ' +
-        'You will face ' + scenario.stages.length + ' decision stages. ' +
-        'Read the context carefully. Each stage is scored; maximum ' + maxSc + ' points.' +
+        '<strong>' + _esc(scenario.subtitle) + '</strong><br>' +
+        _esc(EM.t('lab.startIntro', { n: scenario.stages.length, max: maxSc })) +
       '</div>' +
       '<div class="scenario-start-meta">' +
         '<div class="scenario-start-meta-item">' +
-          EM.Icons.clock + '<span>' + scenario.estimatedMinutes + ' min</span>' +
+          EM.Icons.clock + '<span>' + EM.t('lab.metaMin', { n: scenario.estimatedMinutes }) + '</span>' +
         '</div>' +
         '<div class="scenario-start-meta-item">' +
-          EM.Icons.build + '<span>' + scenario.stages.length + ' stages</span>' +
+          EM.Icons.build + '<span>' + EM.t('lab.metaStages', { n: scenario.stages.length }) + '</span>' +
         '</div>' +
         '<div class="scenario-start-meta-item">' +
-          EM.Icons.check + '<span>' + maxSc + ' pts max</span>' +
+          EM.Icons.check + '<span>' + EM.t('lab.metaPts', { n: maxSc }) + '</span>' +
         '</div>' +
       '</div>' +
       '<button class="btn btn-primary" ' +
         'onclick="EM.Lab._startScenario(\'' + scenario.id + '\')">' +
-        'Begin Scenario' +
+        EM.t('lab.begin') +
       '</button>' +
     '</div>';
   }
@@ -328,7 +381,7 @@ EM.Lab = (function () {
         '<div class="stage-step-bubble ' + bubbleCls + '">' +
           (isDone ? EM.Icons.check : (idx + 1)) +
         '</div>' +
-        '<span class="stage-step-label ' + labelCls + '">Stage ' + (idx + 1) + '</span>' +
+        '<span class="stage-step-label ' + labelCls + '">' + EM.t('lab.stage', { n: idx + 1 }) + '</span>' +
         connector +
       '</div>';
     }).join('');
@@ -339,8 +392,8 @@ EM.Lab = (function () {
     return '<div class="stage-progress">' +
       '<div class="stage-progress-steps">' + steps + '</div>' +
       (answeredCount > 0 || completed
-        ? '<div style="font-family:var(--font-mono);font-size:var(--text-sm);color:var(--text-muted);flex-shrink:0">' +
-            '<strong style="color:var(--text-primary)">' + totalSc + '</strong>/' + maxSc + ' pts' +
+        ? '<div class="stage-progress-score">' +
+            EM.t('lab.pts', { a: '<strong>' + totalSc + '</strong>', b: maxSc }) +
           '</div>'
         : '') +
     '</div>';
@@ -358,12 +411,12 @@ EM.Lab = (function () {
       var chosen     = stage.options.find(function (o) { return o.id === chosenId; });
       var isCorrect  = chosenId === stage.correctOptionId;
 
-      return '<div class="stage-panel" style="opacity:0.85">' +
+      return '<div class="stage-panel stage-panel-done">' +
         '<div class="stage-label">' +
-          'Stage ' + (idx + 1) + ' &mdash; Completed' +
-          '<span class="stage-label-score">' + earned + '/' + stage.maxScore + ' pts</span>' +
+          '<span>' + EM.t('lab.stageDone', { n: idx + 1 }) + '</span>' +
+          '<span class="stage-label-score">' + EM.t('lab.pts', { a: earned, b: stage.maxScore }) + '</span>' +
         '</div>' +
-        '<div class="stage-question">' + _esc(stage.question) + '</div>' +
+        '<div class="stage-question"' + _cdir() + '>' + _rt(stage.question) + '</div>' +
         _renderRevealedOptions(stage, chosenId, true) +
         _renderStageScoreDisplay(earned, stage.maxScore) +
       '</div>';
@@ -384,19 +437,19 @@ EM.Lab = (function () {
 
       return '<div class="stage-panel" id="active-stage-panel">' +
         '<div class="stage-label">' +
-          'Stage ' + (stageIdx + 1) + ' of ' + scenario.stages.length +
-          '<span class="stage-label-score">' + stage.maxScore + ' pts available</span>' +
+          '<span>' + EM.t('lab.stageOf', { n: stageIdx + 1, total: scenario.stages.length }) + '</span>' +
+          '<span class="stage-label-score">' + EM.t('lab.ptsAvailable', { n: stage.maxScore }) + '</span>' +
         '</div>' +
-        '<div class="stage-question">' + _esc(stage.question) + '</div>' +
+        '<div class="stage-question"' + _cdir() + '>' + _rt(stage.question) + '</div>' +
         _renderRevealedOptions(stage, chosenId, true) +
         _renderStageScoreDisplay(earned, stage.maxScore) +
         '<div class="stage-next-btn visible">' +
           (isLast
             ? '<button class="btn btn-primary" onclick="EM.Lab._completeScenario(\'' + scenario.id + '\')">' +
-                'View Full Debrief &amp; Score' +
+                _esc(EM.t('lab.viewDebrief')) +
               '</button>'
             : '<button class="btn btn-primary" onclick="EM.Lab._advanceStage(\'' + scenario.id + '\', ' + (stageIdx + 1) + ')">' +
-                'Next Stage &rarr;' +
+                _esc(EM.t('lab.next')) +
               '</button>') +
         '</div>' +
       '</div>';
@@ -408,16 +461,16 @@ EM.Lab = (function () {
         'id="opt-' + _esc(opt.id) + '" ' +
         'onclick="EM.Lab._selectOption(\'' + _esc(scenario.id) + '\', \'' + _esc(stage.id) + '\', \'' + _esc(opt.id) + '\')">' +
         '<span class="option-label">' + _esc(opt.label) + '</span>' +
-        '<span>' + _esc(opt.text) + '</span>' +
+        '<div class="option-body"' + _cdir() + '><span class="option-text">' + _rt(opt.text) + '</span></div>' +
       '</button>';
     }).join('');
 
     return '<div class="stage-panel" id="active-stage-panel">' +
       '<div class="stage-label">' +
-        'Stage ' + (stageIdx + 1) + ' of ' + scenario.stages.length +
-        '<span class="stage-label-score">' + stage.maxScore + ' pts available</span>' +
+        '<span>' + EM.t('lab.stageOf', { n: stageIdx + 1, total: scenario.stages.length }) + '</span>' +
+        '<span class="stage-label-score">' + EM.t('lab.ptsAvailable', { n: stage.maxScore }) + '</span>' +
       '</div>' +
-      '<div class="stage-question">' + _esc(stage.question) + '</div>' +
+      '<div class="stage-question"' + _cdir() + '>' + _rt(stage.question) + '</div>' +
       '<div class="options-grid" id="options-grid-' + _esc(stage.id) + '">' + optionsHtml + '</div>' +
       '<div id="stage-score-' + _esc(stage.id) + '" class="stage-score-display"></div>' +
       '<div id="stage-rationale-' + _esc(stage.id) + '" class="stage-rationale"></div>' +
@@ -437,12 +490,12 @@ EM.Lab = (function () {
         else                             cls = 'neutral-reveal';
 
         var feedbackHtml = (isChosen || isCorrect) && showFeedback
-          ? '<div class="option-feedback visible">' + _esc(opt.feedback) + '</div>'
+          ? '<div class="option-feedback visible">' + _rt(opt.feedback) + '</div>'
           : '';
 
         return '<button class="option-card ' + cls + '" disabled>' +
           '<span class="option-label">' + _esc(opt.label) + '</span>' +
-          '<div><span>' + _esc(opt.text) + '</span>' + feedbackHtml + '</div>' +
+          '<div class="option-body"' + _cdir() + '><span class="option-text">' + _rt(opt.text) + '</span>' + feedbackHtml + '</div>' +
         '</button>';
       }).join('') +
     '</div>';
@@ -451,18 +504,18 @@ EM.Lab = (function () {
   function _renderStageScoreDisplay(earned, max) {
     var pct  = max > 0 ? Math.round((earned / max) * 100) : 0;
     var tier = pct >= 90 ? 'full' : (pct >= 60 ? 'partial' : 'low');
-    var label = pct === 100 ? 'Perfect' : (pct >= 60 ? 'Partial credit' : 'Incorrect');
+    var label = pct === 100 ? EM.t('lab.perfect') : (earned > 0 ? EM.t('lab.partial') : EM.t('lab.incorrect'));
 
     return '<div class="stage-score-display visible">' +
-      '<div>' +
+      '<div class="stage-score-num">' +
         '<div class="stage-score-points">' + earned + '</div>' +
-        '<div class="stage-score-of">/ ' + max + ' pts</div>' +
+        '<div class="stage-score-of">' + EM.t('lab.ofPts', { n: max }) + '</div>' +
       '</div>' +
       '<div class="stage-score-tier tier-' + tier + '">' + label + '</div>' +
     '</div>';
   }
 
-  function _renderDebrief(scenario, state) {
+  function _renderDebrief(scenario, state, related) {
     var maxSc   = _maxScore(scenario);
     var totalSc = _totalScore(scenario, state);
     var tier    = _scoreTier(totalSc, maxSc);
@@ -478,75 +531,83 @@ EM.Lab = (function () {
 
       var chosenRow = chosen
         ? '<div class="debrief-answer-row ' + (isCorrect ? 'debrief-chosen-correct' : 'debrief-chosen-wrong') + '">' +
-            '<span class="debrief-answer-label">Your answer:</span>' +
-            '<span class="debrief-answer-text">' + _esc(chosen.label) + '. ' + _esc(chosen.text) + '</span>' +
+            '<span class="debrief-answer-label">' + EM.t('lab.yourAnswer') + '</span>' +
+            '<span class="debrief-answer-text"' + _cdir() + '><span class="debrief-opt-label">' + _esc(chosen.label) + '</span>' + _rt(chosen.text) + '</span>' +
           '</div>'
         : '';
 
       var bestRow = !isCorrect && best
         ? '<div class="debrief-answer-row debrief-best-answer">' +
-            '<span class="debrief-answer-label">Best answer:</span>' +
-            '<span class="debrief-answer-text">' + _esc(best.label) + '. ' + _esc(best.text) + '</span>' +
+            '<span class="debrief-answer-label">' + EM.t('lab.bestAnswer') + '</span>' +
+            '<span class="debrief-answer-text"' + _cdir() + '><span class="debrief-opt-label">' + _esc(best.label) + '</span>' + _rt(best.text) + '</span>' +
           '</div>'
         : '';
 
       return '<div class="debrief-stage">' +
         '<div class="debrief-stage-header">' +
-          '<div class="debrief-stage-num">Stage ' + (idx + 1) + '</div>' +
+          '<div class="debrief-stage-num">' + EM.t('lab.stage', { n: idx + 1 }) + '</div>' +
           '<div class="debrief-stage-score ' + (isCorrect ? 'score-principal' : (earned > 0 ? 'score-senior' : 'score-developing')) + '">' +
-            earned + '/' + stage.maxScore + ' pts' +
+            EM.t('lab.pts', { a: earned, b: stage.maxScore }) +
           '</div>' +
         '</div>' +
-        '<div class="debrief-stage-question">' + _esc(stage.question) + '</div>' +
+        '<div class="debrief-stage-question"' + _cdir() + '>' + _rt(stage.question) + '</div>' +
         chosenRow +
         bestRow +
         (stage.principalRationale
           ? '<div class="debrief-rationale">' +
-              '<strong style="color:var(--accent)">Principal perspective: </strong>' +
-              _esc(stage.principalRationale) +
+              '<strong style="color:var(--accent)">' + EM.t('lab.principalPersp') + '</strong>' +
+              '<span' + _cdir() + '>' + _rt(stage.principalRationale) + '</span>' +
             '</div>'
           : '') +
       '</div>';
     }).join('');
 
     var takeaways = (scenario.debrief.keyTakeaways || []).map(function (t) {
-      return '<li>' + _esc(t) + '</li>';
+      return '<li' + _cdir() + '>' + _rt(t) + '</li>';
     }).join('');
 
     var reading = (scenario.debrief.furtherReading || []).map(function (r) {
-      return '<li>' + _esc(r) + '</li>';
+      return '<li dir="auto">' + _esc(r) + '</li>';
+    }).join('');
+
+    var relatedHtml = (related || []).map(function (l) {
+      return '<li><a href="#/tracks/' + _esc(l.track) + '/lessons/' + _esc(l.id) + '">' +
+        '<span class="debrief-related-num" dir="ltr">' + _esc(l.track.replace('track-', 'T')) + '</span>' +
+        '<span>' + _esc(l.title) + '</span></a></li>';
     }).join('');
 
     return '<div class="debrief-panel">' +
       '<div class="debrief-header">' +
         '<div>' +
-          '<div style="font-family:var(--font-mono);font-size:11px;font-weight:700;' +
-            'letter-spacing:0.08em;color:var(--text-muted);text-transform:uppercase;margin-bottom:var(--sp-2)">' +
-            'Principal Engineer Debrief' +
+          '<div class="debrief-kicker">' +
+            EM.t('lab.debrief') +
           '</div>' +
-          '<div class="debrief-title">' + _esc(scenario.title) + '</div>' +
+          '<div class="debrief-title"' + _cdir() + '>' + _esc(scenario.title) + '</div>' +
         '</div>' +
         '<div class="final-score-display">' +
           '<div class="final-score-value ' + _tierCssClass(tier) + '">' + totalSc + '</div>' +
-          '<div class="final-score-100">/ ' + maxSc + '</div>' +
+          '<div class="final-score-100">' + EM.t('lab.ofPts', { n: maxSc }) + '</div>' +
           '<div class="final-score-tier ' + _tierCssClass(tier) + '">' + _tierLabel(tier) + '</div>' +
         '</div>' +
       '</div>' +
       '<div class="debrief-body">' +
-        '<div class="debrief-summary">' + _esc(scenario.debrief.summary) + '</div>' +
+        '<div class="debrief-summary"' + _cdir() + '>' + _rt(scenario.debrief.summary) + '</div>' +
         '<div class="debrief-stages">' + stageBreakdowns + '</div>' +
         (takeaways
-          ? '<div class="debrief-takeaways"><h4>Key Takeaways</h4><ul>' + takeaways + '</ul></div>'
+          ? '<div class="debrief-takeaways"><h4>' + EM.t('lab.takeaways') + '</h4><ul>' + takeaways + '</ul></div>'
           : '') +
         (reading
-          ? '<div class="debrief-reading"><h4>Further Reading</h4><ul>' + reading + '</ul></div>'
+          ? '<div class="debrief-reading"><h4>' + EM.t('lab.reading') + '</h4><ul>' + reading + '</ul></div>'
+          : '') +
+        (relatedHtml
+          ? '<div class="debrief-related"><h4>' + EM.t('lab.related') + '</h4><ul>' + relatedHtml + '</ul></div>'
           : '') +
         '<div class="debrief-actions">' +
           '<button class="btn btn-secondary" onclick="EM.Lab._resetScenario(\'' + scenario.id + '\')">' +
-            'Retry Scenario' +
+            EM.t('lab.retry') +
           '</button>' +
           '<button class="btn btn-ghost" onclick="EM.Router.navigate(\'/decision-lab\')">' +
-            '&larr; All Scenarios' +
+            _esc(EM.t('lab.all')) +
           '</button>' +
         '</div>' +
       '</div>' +
@@ -633,8 +694,10 @@ EM.Lab = (function () {
       if (isChosen || isCorrect) {
         var feedbackDiv = document.createElement('div');
         feedbackDiv.className = 'option-feedback visible';
-        feedbackDiv.textContent = opt.feedback;
-        btn.querySelector('span:last-child').appendChild(feedbackDiv);
+        if (_cdir()) feedbackDiv.setAttribute('dir', 'ltr');
+        feedbackDiv.innerHTML = _rt(opt.feedback);
+        var body = btn.querySelector('.option-body') || btn;
+        body.appendChild(feedbackDiv);
       }
     });
 
@@ -643,8 +706,8 @@ EM.Lab = (function () {
     if (rationaleDiv && stage.principalRationale) {
       rationaleDiv.className = 'stage-rationale visible';
       rationaleDiv.innerHTML =
-        '<div class="stage-rationale-label">Principal Engineer Perspective</div>' +
-        _esc(stage.principalRationale);
+        '<div class="stage-rationale-label">' + EM.t('lab.perspective') + '</div>' +
+        '<div' + _cdir() + '>' + _rt(stage.principalRationale) + '</div>';
     }
   }
 
@@ -665,12 +728,12 @@ EM.Lab = (function () {
     if (isLast) {
       nextDiv.innerHTML =
         '<button class="btn btn-primary" onclick="EM.Lab._completeScenario(\'' + scenarioId + '\')">' +
-          'View Full Debrief &amp; Score' +
+          _esc(EM.t('lab.viewDebrief')) +
         '</button>';
     } else {
       nextDiv.innerHTML =
         '<button class="btn btn-primary" onclick="EM.Lab._advanceStage(\'' + scenarioId + '\', ' + (stageIdx + 1) + ')">' +
-          'Next Stage &rarr;' +
+          _esc(EM.t('lab.next')) +
         '</button>';
     }
   }

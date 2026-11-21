@@ -11,6 +11,8 @@ tags: [safe-publication, final-fields, constructor-safety, JMM]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 An object is "safely published" when every thread that can see the reference to it also sees the fully initialised state of its fields. Without safe publication, another thread can observe the object in a partially constructed state — with fields holding default zero/null values even though the constructor has "completed". This is one of the most subtle and dangerous aspects of the Java Memory Model.
 
 ## Learning Objectives
@@ -97,6 +99,8 @@ public class PaymentEventPublisher {
 }
 ```
 
+Moving `register(this)` to the last line of the constructor does **not** fix it: the `final` field guarantee only holds for threads that get the reference after the constructor has finished.
+
 **Fix:** Register the listener after construction:
 
 ```java
@@ -121,7 +125,7 @@ public class PaymentEventPublisher {
 
 ### 1. Static Initialiser
 
-The JVM guarantees static initialisers complete before any thread can access the class. The class loader holds a lock during static initialisation:
+The JVM guarantees static initialisers complete before any thread can use the class. The JVM holds a per-class **initialisation lock** while the static initialiser runs (JLS §12.4.2):
 
 ```java
 public class FeeScheduleCache {
@@ -158,7 +162,7 @@ public final class PaymentRoute {
 ```
 
 > [!IMPORTANT]
-> The `final` field guarantee applies to the **reference** stored in the field, not to the object the reference points to. `private final List<String> codes` guarantees the `List` reference is visible, but the list's contents are only thread-safe if the list itself is immutable (use `List.copyOf()` or `Collections.unmodifiableList()`).
+> The `final` field guarantee covers the reference **and** everything reachable through it **as it was when the constructor finished** — so a list filled in the constructor is seen with its contents. It does **not** cover changes made later: if anyone modifies a `final` `ArrayList` after construction, readers have no visibility guarantee (and `ArrayList` is not thread-safe anyway). So store immutable copies: `List.copyOf()` is safest. (`Collections.unmodifiableList()` is only a read-only view — whoever still holds the original list can change it.)
 
 ### 3. `volatile` Field
 
@@ -281,7 +285,10 @@ public class PaymentGatewayClient {
 }
 ```
 
-**Why it works:** `Holder.INSTANCE` is a static final field. The JVM initialises `Holder` the first time `getInstance()` is called, using the class-loading lock to ensure exactly-once execution. Static field writes in the initialiser are always safely published to all threads.
+**Why it works:** `Holder.INSTANCE` is a static final field. The JVM initialises `Holder` the first time `getInstance()` is called, using the class initialisation lock to ensure exactly-once execution. Static field writes in the initialiser are always safely published to all threads.
+
+> [!WARNING]
+> If the constructor throws, the JVM marks `Holder` as **failed**: the first caller gets `ExceptionInInitializerError` and every later call gets `NoClassDefFoundError` — there is no retry until the JVM restarts. For initialisation that can fail (network, database), use a `volatile` field with double-checked locking, which can retry on the next call.
 
 ## Safe Publication in Practice: Immutable Configuration
 
@@ -363,7 +370,7 @@ public class PaymentConfigService {
 
 **Q2:** You remove the `volatile` modifier from the double-checked locking instance field. The code runs correctly on your development machine for months. Why might this code still be dangerous in production?
 
-**A:** The broken double-checked locking bug is timing-sensitive and JVM/hardware dependent. Some JVMs and CPUs perform fewer reorderings than the JMM permits, making the bug rare in practice on strongly-ordered x86. It manifests more reliably on weakly-ordered architectures (ARM, some older SPARC). Production hardware, JVM version changes, or increased load changing JIT behaviour can expose the bug at any time. Never rely on hardware ordering stronger than what the JMM guarantees.
+**A:** The broken double-checked locking bug is timing-sensitive and JVM/hardware dependent. x86 CPUs do not reorder stores with other stores, which makes the bug rare there — but the JIT compiler may still reorder the writes on any CPU. It shows up more often on weakly-ordered architectures such as ARM (for example AWS Graviton or Apple Silicon servers). Moving to new hardware, a new JVM version, or a load pattern that changes JIT decisions can expose the bug at any time. Never rely on ordering stronger than what the JMM guarantees.
 
 ## Practical Challenge
 
@@ -392,7 +399,7 @@ A payment service needs a `FraudRuleEngine` that:
         "Yes, but only if the HashMap is wrapped with Collections.synchronizedMap()"
       ],
       "correct": 1,
-      "explanation": "The JMM freeze guarantee covers all writes that happen during the constructor before the final field freeze. Since the HashMap was populated during the constructor and the reference is a final field, all contents written during construction are visible. However, if the HashMap is later modified post-construction, those modifications are NOT covered by the freeze guarantee."
+      "explanation": "The JMM final-field guarantee covers the reference and everything reachable through it as it was at the end of the constructor. Since the HashMap was filled in the constructor and is held in a final field, all its contents written during construction are visible to any thread that gets the object reference after construction. Modifications made to the HashMap after construction are NOT covered — and HashMap is not safe for concurrent modification — so prefer an immutable copy such as Map.copyOf()."
     },
     {
       "text": "What is the 'this escape' anti-pattern and why is it dangerous?",

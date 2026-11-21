@@ -11,7 +11,9 @@ tags: [decision-framework, trade-offs, correctness-vs-performance, staff-enginee
 java-versions: [17, 21]
 ---
 
-Across the twenty-three lessons of Track 6 you have built a toolkit: optimistic locks, pessimistic locks, outbox patterns, sagas, idempotent consumers, event sourcing, audit trails, compensating transactions, and reconciliation jobs. The hardest part of principal engineering is not implementing any one of these — it is choosing the right one for the situation in front of you, articulating the trade-offs to your team, and committing to a design that will hold under production conditions you have not yet seen. This capstone lesson synthesises Track 6 into a decision framework you can apply immediately.
+## Overview
+
+Across the twenty-three lessons of Track 5 you have built a toolkit: optimistic locks, pessimistic locks, outbox patterns, sagas, idempotent consumers, event sourcing, audit trails, compensating transactions, and reconciliation jobs. The hardest part of principal engineering is not implementing any one of these — it is choosing the right one for the situation in front of you, articulating the trade-offs to your team, and committing to a design that will hold under production conditions you have not yet seen. This capstone lesson synthesises Track 5 into a decision framework you can apply immediately.
 
 ## Learning Objectives
 
@@ -25,7 +27,7 @@ Across the twenty-three lessons of Track 6 you have built a toolkit: optimistic 
 
 ## Business Context
 
-In 2024, a tier-1 UK bank's payments team shipped a new real-time standing-order engine. Under load testing it passed all correctness checks. On the first real payroll Friday, with 400,000 concurrent standing orders firing between 06:00 and 08:00, the system deadlocked. Two services — the balance deduction service and the beneficiary credit service — both used `SELECT FOR UPDATE` and acquired locks in opposite order depending on which side initiated the transfer. Within four minutes, 90% of transactions were waiting for locks held by other waiting transactions. The service was unavailable for 47 minutes.
+*Composite example:* a large UK bank's payments team ships a new real-time standing-order engine. Under load testing it passed all correctness checks. On the first real payroll Friday, with 400,000 concurrent standing orders firing between 06:00 and 08:00, the system deadlocked. Two services — the balance deduction service and the beneficiary credit service — both used `SELECT FOR UPDATE` and acquired locks in opposite order depending on which side initiated the transfer. Within four minutes, 90% of transactions were waiting for locks held by other waiting transactions. The service was unavailable for 47 minutes.
 
 The engineering post-mortem identified the root cause as a design decision made without a framework: the team had applied `SELECT FOR UPDATE` everywhere because "it's the safe option." Pessimistic locking is safe for a single service. Across two services acquiring locks in an uncoordinated order, it is a deadlock machine. The correct design for cross-service financial mutations is a saga with compensation — not distributed two-phase locking.
 
@@ -35,7 +37,7 @@ That 47-minute outage is what this framework is designed to prevent.
 
 Every financial system lives on a spectrum between two poles:
 
-**Strong consistency (SERIALIZABLE isolation + FOR UPDATE):** The database guarantees that every transaction sees a view of the data consistent with a serial execution order. No anomalies — no dirty reads, no non-repeatable reads, no phantom reads. The price is that conflicting transactions must wait for one another. Under high concurrency this means queuing, and queuing means latency. At extreme load it means deadlocks.
+**Strong consistency (SERIALIZABLE isolation + FOR UPDATE):** The database guarantees that every transaction sees a view of the data consistent with a serial execution order. No anomalies — no dirty reads, no non-repeatable reads, no phantom reads. The price is that conflicting transactions must wait for one another. Under high concurrency this means queuing, and queuing means latency. At extreme load it means deadlocks and serialization failures that must be retried.
 
 **Eventual consistency (saga + idempotency + at-least-once delivery):** Each service performs its own ACID transaction. Cross-service consistency is achieved by eventually executing all steps in a saga and compensating if any step fails. No cross-service locking, no distributed wait queues. The price is complexity: every step must be idempotent, every failure must have a compensation, and the system is transiently inconsistent between saga steps.
 
@@ -59,13 +61,16 @@ flowchart TD
 
     F --> J{Is the saga step\ncalled at-least-once?}
     J -->|Yes| K[Idempotent consumer\nLesson 12 required]
-    J -->|No| L[Exactly-once delivery\nKafka transactions or\noutbox dedup]
+    J -->|No — rare, verify it| L[Still add dedup:\nKafka transactions cover\nKafka writes only]
 
     G --> M{Does the operation\nneed a compensation path?}
     H --> M
     M -->|Yes| N[Define compensating\ntransaction now\nLesson 23]
     M -->|No| O[Document why\ncompensation is not needed]
 ```
+
+> [!TIP]
+> For a change to a single balance row, the first choice is often neither kind of lock: a conditional atomic update — `UPDATE accounts SET balance = balance - :amt WHERE id = :id AND balance >= :amt` — is correct under `READ COMMITTED`, needs no retry loop and holds the row lock only for the statement (lesson 16).
 
 The most important branch is the cross-service split at node D. If the mutation crosses a service boundary, pessimistic locking is structurally incompatible with the design — you cannot hold a database lock across an HTTP call or a Kafka message. The correct instrument is always a saga.
 
@@ -82,7 +87,7 @@ flowchart TD
     C --> E{Can duplicate events\narrive?}
     D --> E
     E -->|Yes — at-least-once\ndelivery| F[Idempotent consumer\nprocessed_events table\nLesson 12]
-    E -->|No — exactly-once\nguaranteed| G[No dedup needed\nbut add monitoring\nfor unexpected duplicates]
+    E -->|"No — 'exactly-once'\nclaimed"| G[Dedup anyway:\nend-to-end exactly-once\nacross DB + Kafka does not exist]
 
     F --> H{Are sequence gaps\npossible?}
     G --> H
@@ -96,7 +101,7 @@ flowchart TD
 
 ## The Correctness Hierarchy
 
-Not all correctness guarantees are equal. The hierarchy below ranks five levels from strongest to most relaxed. Descend only as far as your business requirements demand — each level down adds complexity that must be earned by a genuine performance or availability requirement.
+Not all correctness guarantees are equal. The hierarchy below orders five levels. L1–L3 all give the same strong correctness inside **one** database — they differ in how they handle contention. The real step down in guarantees is from L3 to L4 (cross-service, transiently inconsistent) and L5. Descend only as far as your business requirements demand — each step down adds complexity that must be earned by a genuine performance or availability requirement.
 
 ```mermaid
 flowchart TD
@@ -120,7 +125,7 @@ flowchart TD
 **Descending the hierarchy is a deliberate trade-off, not a shortcut.** When you move from L1 to L4, you are trading the database's ACID guarantee for a distributed saga you must design, implement, monitor, and compensate. That is a valid trade-off for cross-service payments. It is not a valid trade-off for a simple single-service balance update where L1 is fully sufficient.
 
 > [!IMPORTANT]
-> Never use L5 (at-least-once + idempotent consumer) for balance mutations. The eventual consistency window — however short — means that a customer's balance may be temporarily wrong. For read-only projections, audit fans, and notification pipelines, L5 is excellent. For anything that changes a financial balance, the minimum is L4 with compensation defined.
+> Never use L5 (at-least-once + idempotent consumer, no ordering) on its own for balance mutations. Without ordering, gap handling and defined compensations, an event that arrives out of order or fails leaves a balance wrong with nothing in place to repair it. For read-only projections, audit fans, and notification pipelines, L5 is excellent. For anything that changes a financial balance, the minimum is L4: the owning service applies the change in its own ACID transaction, and compensation is defined.
 
 ## Anti-Patterns Table
 
@@ -140,7 +145,7 @@ The common thread across all four anti-patterns is the same: an engineer applied
 
 ## The Principal Engineer Checklist
 
-Before any financial data mutation goes to production, verify the following five properties. Each item on the checklist corresponds to a lesson in Track 6.
+Before any financial data mutation goes to production, verify the following five properties. Each item on the checklist corresponds to a lesson in Track 5.
 
 **Idempotency** — Can this operation be safely retried? Is there a unique constraint, a `processed_events` table, or a database-level idempotency key that prevents double-posting? (Lessons 3, 12)
 
@@ -210,7 +215,7 @@ standing orders in real-time within 10 seconds of trigger time. Expected volume:
 Saga + Outbox (Correctness Level 4).
 Rationale: standing order execution touches two service boundaries (Balance Service,
 Beneficiary Notification Service). Single-service pessimistic locking cannot span
-service boundaries without introducing deadlock risk (see 2024 incident post-mortem).
+service boundaries without introducing deadlock risk (see the incident post-mortem).
 
 ### Idempotency mechanism
 Each saga step carries a deterministic idempotency key:
@@ -226,7 +231,8 @@ Compensation is idempotent (UNIQUE reversal_reference).
 ### Audit trail
 Every saga step transition is written to saga_execution_log (append-only).
 Balance deductions write to ledger_entries (append-only).
-Both tables are retained for 7 years per FCA record-keeping requirements.
+Both tables are retained for 7 years per our record-keeping policy
+(regulatory minimum plus margin; confirmed with Compliance).
 
 ### Monitoring
 Alerts:
@@ -246,7 +252,7 @@ Business has accepted this window; it is disclosed in the product terms.
 
 ## Alternatives considered
 L3 (pessimistic lock across services): rejected — deadlock risk demonstrated
-in load test (see 2024 incident).
+in load test (see the incident post-mortem).
 L1 (single distributed transaction / 2PC): rejected — couples availability of
 Balance DB and Notification DB; not acceptable per our HA requirements.
 
@@ -284,7 +290,7 @@ To illustrate the framework in action, consider a new feature: **same-day salary
 
 **Output: FIDR written, design reviewed, feature greenlit.**
 
-The whole walk-through takes under 10 minutes once the framework is internalised. That is the return on the investment you made across the twenty-four lessons of Track 6.
+The whole walk-through takes under 10 minutes once the framework is internalised. That is the return on the investment you made across the twenty-four lessons of Track 5.
 
 ## Implementing the Saga State Machine
 
@@ -324,6 +330,9 @@ public enum SagaState {
     FAILED
 }
 
+// NOT @Transactional: no transaction may stay open across the remote calls.
+// Every sagaExecutionRepository.save() commits on its own (Spring Data's save
+// is transactional), so each checkpoint is durable before the next call.
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -335,12 +344,20 @@ public class PaymentSagaOrchestrator {
     private final NotificationOutboxService notificationOutboxService;
     private final ReversalService reversalService;
 
-    @Transactional
     public SagaExecution startOrResume(String sagaType, String businessKey, SagaPayload payload) {
         // Resume if already started (idempotent at the saga level)
-        return sagaExecutionRepository.findBySagaTypeAndBusinessKey(sagaType, businessKey)
-            .map(this::resume)
-            .orElseGet(() -> start(sagaType, businessKey, payload));
+        Optional<SagaExecution> existing =
+            sagaExecutionRepository.findBySagaTypeAndBusinessKey(sagaType, businessKey);
+        if (existing.isPresent()) {
+            return resume(existing.get());
+        }
+        try {
+            return start(sagaType, businessKey, payload);
+        } catch (DataIntegrityViolationException raced) {
+            // A concurrent call inserted the same (saga_type, business_key) first
+            return resume(sagaExecutionRepository
+                .findBySagaTypeAndBusinessKey(sagaType, businessKey).orElseThrow());
+        }
     }
 
     private SagaExecution start(String sagaType, String businessKey, SagaPayload payload) {
@@ -351,7 +368,7 @@ public class PaymentSagaOrchestrator {
             .payload(payload)
             .build();
         // Persist INITIATED state before any service call
-        execution = sagaExecutionRepository.save(execution);
+        execution = sagaExecutionRepository.saveAndFlush(execution);
         return advance(execution);
     }
 
@@ -370,7 +387,7 @@ public class PaymentSagaOrchestrator {
 
     private SagaExecution advance(SagaExecution execution) {
         try {
-            // Step 1: reserve balance
+            // Step 1: reserve balance — the idempotency key makes a retry safe
             BalanceReservationResult reservation = balanceService.reserve(
                 execution.getPayload().accountId(),
                 execution.getPayload().amount(),
@@ -380,7 +397,11 @@ public class PaymentSagaOrchestrator {
             execution = transitionTo(execution, SagaState.STEP_1_BALANCE_RESERVED);
             return advanceFromStep1(execution);
         } catch (Exception ex) {
-            return failSaga(execution, "Step 1 (balance reserve) failed: " + ex.getMessage());
+            // A timeout is an UNKNOWN outcome: the reservation may exist. Release
+            // it by its idempotency key — a no-op if it was never created.
+            execution.setLastError("Step 1 (balance reserve) failed: " + ex.getMessage());
+            execution = transitionTo(execution, SagaState.COMPENSATING_STEP_1);
+            return compensateStep1(execution);
         }
     }
 
@@ -396,8 +417,10 @@ public class PaymentSagaOrchestrator {
             execution = transitionTo(execution, SagaState.STEP_2_LEDGER_POSTED);
             return advanceFromStep2(execution);
         } catch (Exception ex) {
-            execution = transitionTo(execution, SagaState.COMPENSATING_STEP_1);
-            return compensateStep1(execution);
+            // The posting may have happened before the failure (e.g. a timeout):
+            // compensate step 2 too — it reverses the entry only if it exists
+            execution = transitionTo(execution, SagaState.COMPENSATING_STEP_2);
+            return compensateStep2(execution);
         }
     }
 
@@ -407,19 +430,19 @@ public class PaymentSagaOrchestrator {
             notificationOutboxService.enqueue(execution.getPayload().toNotificationEvent());
             return transitionTo(execution, SagaState.COMPLETED);
         } catch (Exception ex) {
-            // Notification failure does not warrant compensation of the financial steps.
-            // Log and alert; the outbox relay will retry.
+            // Notification failure does not warrant compensation of the financial
+            // steps. Log, alert, and record a pending notification for a retry job.
             log.error("Notification outbox enqueue failed for saga {}: {}",
                 execution.getBusinessKey(), ex.getMessage());
+            notificationOutboxService.recordPendingRetry(execution.getId());
             return transitionTo(execution, SagaState.COMPLETED);
         }
     }
 
-    // Each transition is persisted in its own @Transactional call so a crash
+    // Each transition is its own committed write (repository save), so a crash
     // after the write but before the next service call leaves the saga in a
     // known, resumable state.
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public SagaExecution transitionTo(SagaExecution execution, SagaState newState) {
+    private SagaExecution transitionTo(SagaExecution execution, SagaState newState) {
         execution.setState(newState);
         execution.setUpdatedAt(Instant.now());
         if (newState == SagaState.COMPLETED || newState == SagaState.COMPENSATED
@@ -429,33 +452,33 @@ public class PaymentSagaOrchestrator {
         return sagaExecutionRepository.save(execution);
     }
 
+    // If a compensation throws, the saga simply stays in its COMPENSATING_*
+    // state; the recovery job (stuck-saga scan) calls startOrResume() again.
     private SagaExecution compensateStep2(SagaExecution execution) {
-        reversalService.reverseTransaction(ReversalRequest.builder()
-            .originalTransactionId(execution.getPayload().ledgerEntryId())
-            .initiatedBy("SAGA_COMPENSATION:" + execution.getBusinessKey())
-            .valueDate(LocalDate.now())
-            .build());
-        execution = transitionTo(execution, SagaState.COMPENSATING_STEP_1);
-        return compensateStep1(execution);
+        ledgerService.findByIdempotencyKey(execution.getBusinessKey() + ":LEDGER")
+            .ifPresent(entry -> reversalService.reverseTransaction(ReversalRequest.builder()
+                .originalEntryId(entry.getId())
+                .initiatedBy("SAGA_COMPENSATION:" + execution.getBusinessKey())
+                .valueDate(LocalDate.now())
+                .build()));
+        SagaExecution next = transitionTo(execution, SagaState.COMPENSATING_STEP_1);
+        return compensateStep1(next);
     }
 
     private SagaExecution compensateStep1(SagaExecution execution) {
-        balanceService.releaseReservation(
-            execution.getPayload().reservationId(),
+        // Release by the reservation's idempotency key — works even if we never
+        // received the reservation id, and is a no-op if nothing was reserved
+        balanceService.releaseReservationByKey(
+            execution.getBusinessKey() + ":RESERVE",
             execution.getBusinessKey() + ":RELEASE"
         );
         return transitionTo(execution, SagaState.COMPENSATED);
-    }
-
-    private SagaExecution failSaga(SagaExecution execution, String reason) {
-        execution.setLastError(reason);
-        return transitionTo(execution, SagaState.FAILED);
     }
 }
 ```
 
 > [!WARNING]
-> The `transitionTo` method uses `Propagation.REQUIRES_NEW` to persist each state transition in its own independent transaction. This is deliberate: if the outer saga transaction rolls back (e.g., because a service call throws), the state transition must still be committed so that the saga can be resumed from the correct checkpoint on the next attempt. Without `REQUIRES_NEW`, a rollback of the outer transaction would also roll back the state transition, leaving the saga in its previous state and causing the failed step to be retried — which may produce a duplicate side effect if the step was partially executed.
+> The orchestrator deliberately has **no** surrounding `@Transactional`. Each state transition must be committed on its own, before the next remote call, so that the saga can be resumed from the correct checkpoint after a crash. One big transaction would also hold a database connection across every remote call (the "one big transaction" anti-pattern). A common mistake is to try to fix this with `@Transactional(propagation = REQUIRES_NEW)` on a `transitionTo` method called through `this` — Spring's proxy never sees a self-invocation, so the annotation is silently ignored. If you need a transaction around a checkpoint, put that method in a separate bean.
 
 ## Monitoring Financial Integrity at Scale
 
@@ -480,14 +503,19 @@ public void onDuplicateDetected(IdempotencyKeyCollisionEvent event) {
 **Reconciliation discrepancy count:** The nightly reconciliation job is the last line of defence. Its output — the number of transactions that do not match the external source of truth — should be zero. Instrument it as a gauge metric. Any non-zero reading should page on-call immediately.
 
 ```java
-@Scheduled(cron = "0 30 3 * * *")  // 03:30 UTC nightly
+// Registered ONCE: a gauge keeps only a weak reference to the object it reads,
+// and re-registering the same name just returns the first gauge
+private final AtomicInteger discrepancyCount = meterRegistry.gauge(
+    "financial.reconciliation.discrepancy_count", new AtomicInteger(0));
+
+@Scheduled(cron = "0 30 3 * * *", zone = "UTC")  // 03:30 UTC nightly
 public void runReconciliation() {
-    ReconciliationResult result = reconciliationEngine.reconcile(LocalDate.now().minusDays(1));
+    ReconciliationResult result = reconciliationEngine.reconcile(
+        LocalDate.now(ZoneOffset.UTC).minusDays(1));
 
     // This gauge is read by the alerting system.
     // Any value > 0 triggers a P1 alert.
-    meterRegistry.gauge("financial.reconciliation.discrepancy_count",
-        result.discrepancyCount());
+    discrepancyCount.set(result.discrepancyCount());
 
     if (result.discrepancyCount() > 0) {
         alertingService.raiseP1(
@@ -500,13 +528,13 @@ public void runReconciliation() {
 ```
 
 > [!NOTE]
-> Reconciliation discrepancies are not always caused by bugs in the system under review. Common false positives include: timing differences (a transaction posted at 23:59:59 that the external system records on the next day), currency conversion rounding (sub-cent differences in multi-currency accounts), and feed delivery delays from the external system. Build a discrepancy classifier into your reconciliation job that distinguishes these known categories from genuine errors, so that the on-call engineer receives a pre-triage alert rather than raw data.
+> Reconciliation discrepancies are not always caused by bugs in the system under review. Common false positives include: timing differences (a transaction posted at 23:59:59 that the external system records on the next day), currency conversion differences (the two sides converted at different rates or with different rounding rules — find and fix the rule, never auto-accept the difference), and feed delivery delays from the external system. Build a discrepancy classifier into your reconciliation job that distinguishes these known categories from genuine errors, so that the on-call engineer receives a pre-triage alert rather than raw data.
 
 ## Knowledge Check
 
 **Q1: A team is building a new FX conversion feature. The conversion touches the customer's GBP account (debit), creates a EUR balance (credit), and publishes an FX rate snapshot to a reporting service. The team proposes wrapping all three operations in a single `@Transactional` method. What is wrong with this design and what should it be changed to?**
 
-A: There are two problems. First, the Kafka publish inside a `@Transactional` method creates a dual-write problem: if the database transaction commits but the Kafka publish fails (or vice versa), the two systems are permanently inconsistent. The correct pattern is Transactional Outbox (Lesson 13): the Kafka message is written as a row in an `outbox` table inside the same database transaction. A separate relay process reads from the outbox and publishes to Kafka, guaranteeing that publish happens if and only if the transaction committed. Second, publishing to a reporting service is a fire-and-forget, non-financial operation that belongs at L5 (at-least-once + idempotent consumer) — it should not be coupled to the correctness of the FX conversion, which belongs at L4. Mixing L4 (saga for the GBP/EUR balance update) and L5 (reporting fan-out) in a single transaction inflates the blast radius: a reporting publish failure would roll back a valid FX conversion.
+A: There are two problems. First, the Kafka publish inside a `@Transactional` method creates a dual-write problem: if the database transaction commits but the Kafka publish fails (or vice versa), the two systems are permanently inconsistent. The correct pattern is Transactional Outbox (Lesson 13): the Kafka message is written as a row in an `outbox` table inside the same database transaction. A separate relay process reads from the outbox and publishes to Kafka, guaranteeing that publish happens if and only if the transaction committed. Second, publishing to a reporting service is a fire-and-forget, non-financial operation that belongs at L5 (at-least-once + idempotent consumer) — it must not be coupled to the correctness of the FX conversion. If the GBP and EUR accounts live in the same ledger database, the debit and the credit belong together in **one** local ACID transaction (L1), with the reporting event written as an outbox row in that same transaction. Only if the two balances live in different services is a saga (L4) needed. Either way, a reporting publish failure must never roll back a valid FX conversion.
 
 **Q2: A principal engineer is reviewing a pull request for a new batch payment processor. The code uses `@Version` on the `Account` entity with a single retry. The batch processes 50,000 payments against 5,000 accounts. What question should the principal engineer ask in the review and what change should they require before approving?**
 
@@ -526,7 +554,7 @@ The existing implementation uses a single `@Transactional` method that makes all
 
 **Task:**
 
-1. Identify every violation of the correctness hierarchy, the anti-patterns table, and the Principal Engineer checklist in the existing design. Write your findings as review comments, referencing the specific lesson from Track 6 for each finding.
+1. Identify every violation of the correctness hierarchy, the anti-patterns table, and the Principal Engineer checklist in the existing design. Write your findings as review comments, referencing the specific lesson from Track 5 for each finding.
 
 2. Redesign the BNPL flow as a saga with an outbox. Define the saga steps, the idempotency key for each step, and the compensation action for each step. Present this as a Mermaid sequence diagram.
 
@@ -544,12 +572,12 @@ The existing implementation uses a single `@Transactional` method that makes all
       "text": "A team is building an FX conversion feature that debits a GBP account, credits a EUR account, and publishes an FX rate snapshot to a reporting service — all inside a single @Transactional method with a kafkaTemplate.send() call. What are the two specific problems with this design?",
       "options": [
         "The transaction is too long and will cause connection pool exhaustion; the reporting publish should be on a separate thread",
-        "The Kafka publish inside @Transactional creates a dual-write problem (DB commits but Kafka publish can fail or vice versa, leaving systems permanently inconsistent) AND publishing to a reporting service inside a financial transaction mixes L4 and L5 — a reporting publish failure should not roll back a valid FX conversion",
+        "The Kafka publish inside @Transactional creates a dual-write problem (DB commits but Kafka publish can fail or vice versa, leaving systems permanently inconsistent) AND it couples a non-financial reporting publish (L5) to the financial conversion — a reporting publish failure should not roll back a valid FX conversion",
         "The GBP and EUR accounts require two separate transactions since they are different currencies",
         "kafkaTemplate.send() is not thread-safe and should be called outside @Transactional"
       ],
       "correct": 1,
-      "explanation": "Two distinct problems: (1) Dual-write hazard — kafkaTemplate.send() is not part of the JPA transaction. If the DB commits but Kafka is unavailable, the event is lost permanently. The fix is Transactional Outbox: write the Kafka message as an outbox row in the same DB transaction. (2) Mixing correctness levels — the GBP/EUR balance update requires L4 (saga with compensation) while the reporting fan-out belongs at L5 (at-least-once, idempotent consumer). Coupling them means a reporting failure rolls back a valid financial transaction, which is incorrect."
+      "explanation": "Two distinct problems: (1) Dual-write hazard — kafkaTemplate.send() is not part of the JPA transaction. If the DB commits but Kafka is unavailable, the event is lost permanently. The fix is Transactional Outbox: write the Kafka message as an outbox row in the same DB transaction. (2) Mixing correctness levels — the reporting fan-out belongs at L5 (at-least-once, idempotent consumer) and must not be able to roll back the conversion. If both accounts live in the same ledger database, the GBP debit and EUR credit belong in one local ACID transaction (L1) plus an outbox row; only balances in different services need a saga (L4)."
     },
     {
       "text": "A principal engineer is reviewing a batch payment processor that uses @Version with one retry for 50,000 payments across 5,000 accounts. What is the critical question to ask in the code review, and what change is required before approval?",
@@ -583,9 +611,9 @@ The existing implementation uses a single `@Transactional` method that makes all
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Review the existing BNPL implementation (single @Transactional spanning four HTTP service calls and one kafkaTemplate.send()). Write review comments identifying every violation: (a) which anti-pattern each issue matches from the Anti-Patterns Table, (b) which correctness hierarchy level is violated and what level is required, (c) which item on the Principal Engineer checklist is not satisfied, referencing the specific Track 6 lesson for each finding."},
+    {"id": "1", "description": "Review the existing BNPL implementation (single @Transactional spanning four HTTP service calls and one kafkaTemplate.send()). Write review comments identifying every violation: (a) which anti-pattern each issue matches from the Anti-Patterns Table, (b) which correctness hierarchy level is violated and what level is required, (c) which item on the Principal Engineer checklist is not satisfied, referencing the specific Track 5 lesson for each finding."},
     {"id": "2", "description": "Redesign the BNPL flow as a saga with an outbox. Define the five saga steps (merchant reservation, credit line opening, first instalment debit, ledger credit, notification), the idempotency key format for each step (e.g., '{bnplPurchaseId}:{stepName}'), and the compensation action for each step. Present as a Mermaid sequenceDiagram showing both the happy path and the compensation path when the ledger credit step fails."},
-    {"id": "3", "description": "Write BnplSagaOrchestrator as a Spring @Service with enum BnplSagaState (INITIATED, MERCHANT_RESERVED, CREDIT_OPENED, LEDGER_POSTED, COMPLETED, COMPENSATING, COMPENSATED, FAILED). Each state transition must be persisted to bnpl_saga_executions via transitionTo() using Propagation.REQUIRES_NEW before the next step executes. Implement startOrResume() that finds an existing saga by business_key and resumes from the last persisted state rather than re-executing completed steps."},
+    {"id": "3", "description": "Write BnplSagaOrchestrator as a Spring @Service with enum BnplSagaState (INITIATED, MERCHANT_RESERVED, CREDIT_OPENED, LEDGER_POSTED, COMPLETED, COMPENSATING, COMPENSATED, FAILED). Each state transition must be persisted to bnpl_saga_executions via transitionTo() and committed on its own before the next step executes — with no @Transactional wrapping the remote calls (remember that REQUIRES_NEW on a method called through this is ignored). Implement startOrResume() that finds an existing saga by business_key and resumes from the last persisted state rather than re-executing completed steps."},
     {"id": "4", "description": "Complete a Financial Integrity Decision Record (FIDR) for the redesigned BNPL flow with all seven sections: Service/Feature, Date/Authors, Context, Decision (concurrency strategy, idempotency mechanism, compensation, audit trail, monitoring), Trade-offs accepted, Alternatives considered with reasons for rejection, and Reviewed-by checkboxes. The FIDR must reference the correctness level selected (L4), the monitoring alert thresholds, and the reconciliation job that will verify correctness nightly."}
   ]
 }

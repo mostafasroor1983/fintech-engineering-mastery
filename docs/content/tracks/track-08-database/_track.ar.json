@@ -1,0 +1,414 @@
+{
+  "id": "track-08",
+  "sequence": 8,
+  "title": "بنية قواعد البيانات والبيانات",
+  "shortTitle": "قواعد البيانات",
+  "slug": "database",
+  "color": "#06b6d4",
+  "colorMuted": "rgba(6, 182, 212, 0.15)",
+  "description": "خصائص ACID، وMVCC، ومستويات عزل المعاملات، وأقفال الصفوف، والقفل المتفائل والمتشائم، ومكونات PostgreSQL الداخلية، وتصميم قواعد البيانات المالية.",
+  "difficulty": "advanced",
+  "estimatedHours": 33,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-08-lesson-01",
+      "sequence": 1,
+      "title": "خصائص ACID — الذرية والاتساق والعزل والديمومة",
+      "slug": "acid-properties",
+      "path": "content/tracks/track-08-database/lesson-01-acid-properties/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "ACID",
+        "atomicity",
+        "consistency",
+        "isolation",
+        "durability"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-08-lesson-02",
+      "sequence": 2,
+      "title": "مستويات عزل المعاملات — شذوذ القراءة وعلاجه",
+      "slug": "isolation-levels",
+      "path": "content/tracks/track-08-database/lesson-02-isolation-levels/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "isolation-levels",
+        "dirty-read",
+        "phantom",
+        "serializable",
+        "read-committed"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-08-lesson-03",
+      "sequence": 3,
+      "title": "MVCC — التحكم في التزامن متعدد الإصدارات بالتفصيل",
+      "slug": "mvcc",
+      "path": "content/tracks/track-08-database/lesson-03-mvcc/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "MVCC",
+        "versioning",
+        "snapshot-isolation",
+        "vacuum",
+        "bloat"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-08-lesson-04",
+      "sequence": 4,
+      "title": "الأقفال في PostgreSQL — أقفال الصفوف والصفحات والأقفال الاستشارية",
+      "slug": "postgresql-locking",
+      "path": "content/tracks/track-08-database/lesson-04-postgresql-locking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "PostgreSQL",
+        "locking",
+        "row-lock",
+        "advisory-lock",
+        "deadlock"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-08-lesson-05",
+      "sequence": 5,
+      "title": "استراتيجيات الفهرسة — B-Tree وGIN وGiST وBRIN",
+      "slug": "index-strategies",
+      "path": "content/tracks/track-08-database/lesson-05-index-strategies/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "index",
+        "B-tree",
+        "GIN",
+        "BRIN",
+        "covering-index"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-08-lesson-06",
+      "sequence": 6,
+      "title": "تقسيم الجداول — بالنطاق والتجزئة للبيانات المالية",
+      "slug": "table-partitioning",
+      "path": "content/tracks/track-08-database/lesson-06-partitioning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "partitioning",
+        "range-partition",
+        "hash-partition",
+        "pruning",
+        "archival"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-07",
+      "sequence": 7,
+      "title": "تجزئة قواعد البيانات (Sharding) — استراتيجيات التوسع الأفقي",
+      "slug": "sharding",
+      "path": "content/tracks/track-08-database/lesson-07-sharding/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "sharding",
+        "horizontal-scaling",
+        "shard-key",
+        "re-sharding",
+        "Vitess"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-08-lesson-08",
+      "sequence": 8,
+      "title": "النسخ المقروءة — توجيه الاستعلامات وإدارة التأخر",
+      "slug": "read-replicas",
+      "path": "content/tracks/track-08-database/lesson-08-read-replicas/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "read-replica",
+        "replication-lag",
+        "query-routing",
+        "consistency",
+        "CQRS"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-09",
+      "sequence": 9,
+      "title": "تطور المخطط — الترحيل بدون توقف",
+      "slug": "schema-evolution",
+      "path": "content/tracks/track-08-database/lesson-09-schema-evolution/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "schema-evolution",
+        "Flyway",
+        "Liquibase",
+        "online-migration",
+        "backward-compatible"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-08-lesson-10",
+      "sequence": 10,
+      "title": "تجميع الاتصالات — ضبط PgBouncer وHikariCP",
+      "slug": "connection-pooling",
+      "path": "content/tracks/track-08-database/lesson-10-connection-pooling/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "connection-pool",
+        "PgBouncer",
+        "HikariCP",
+        "max-pool-size",
+        "transaction-mode"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-11",
+      "sequence": 11,
+      "title": "WAL وCDC — التقاط تغييرات البيانات باستخدام Debezium",
+      "slug": "wal-cdc",
+      "path": "content/tracks/track-08-database/lesson-11-wal-cdc/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "WAL",
+        "CDC",
+        "Debezium",
+        "logical-replication",
+        "streaming"
+      ],
+      "tier": "supporting"
+    },
+    {
+      "id": "track-08-lesson-12",
+      "sequence": 12,
+      "title": "JSONB والبيانات شبه المنظمة في PostgreSQL",
+      "slug": "jsonb-semi-structured",
+      "path": "content/tracks/track-08-database/lesson-12-jsonb/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "JSONB",
+        "semi-structured",
+        "index",
+        "GIN",
+        "document-store"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-13",
+      "sequence": 13,
+      "title": "بيانات السلاسل الزمنية — TimescaleDB والجداول الفائقة",
+      "slug": "time-series-data",
+      "path": "content/tracks/track-08-database/lesson-13-time-series/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "time-series",
+        "TimescaleDB",
+        "hypertable",
+        "compression",
+        "continuous-aggregate"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-14",
+      "sequence": 14,
+      "title": "جداول التدقيق — الجداول الزمنية وتتبّع السجل التاريخي",
+      "slug": "audit-tables",
+      "path": "content/tracks/track-08-database/lesson-14-audit-tables/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "audit",
+        "temporal-table",
+        "history",
+        "bitemporal",
+        "trigger"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-15",
+      "sequence": 15,
+      "title": "اختبار قواعد البيانات — الاختبار القائم على الخصائص واختبار التكامل",
+      "slug": "database-testing",
+      "path": "content/tracks/track-08-database/lesson-15-database-testing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "database-testing",
+        "Testcontainers",
+        "property-based",
+        "integration-testing",
+        "migration-testing"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-16",
+      "sequence": 16,
+      "title": "تحليل خطط الاستعلام — EXPLAIN وANALYZE والتصوير",
+      "slug": "query-plan-analysis",
+      "path": "content/tracks/track-08-database/lesson-16-query-plan/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "EXPLAIN",
+        "ANALYZE",
+        "query-plan",
+        "cost-model",
+        "visualisation"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-17",
+      "sequence": 17,
+      "title": "PostgreSQL الموزعة — Citus والاستعلامات الموزعة",
+      "slug": "distributed-postgresql",
+      "path": "content/tracks/track-08-database/lesson-17-distributed-postgresql/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "Citus",
+        "distributed",
+        "co-location",
+        "cross-shard",
+        "PostgreSQL"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-18",
+      "sequence": 18,
+      "title": "أرشفة البيانات — التخزين البارد وإدارة البيانات متعددة المستويات",
+      "slug": "data-archival",
+      "path": "content/tracks/track-08-database/lesson-18-data-archival/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "archival",
+        "cold-storage",
+        "data-lifecycle",
+        "tiering",
+        "S3"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-19",
+      "sequence": 19,
+      "title": "النسخ الاحتياطي والاستعادة — الاستعادة لنقطة زمنية في القطاع المالي",
+      "slug": "backup-recovery",
+      "path": "content/tracks/track-08-database/lesson-19-backup-recovery/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "backup",
+        "PITR",
+        "pg_basebackup",
+        "WAL-archiving",
+        "recovery"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-20",
+      "sequence": 20,
+      "title": "قياس أداء قواعد البيانات — pgbench وأحمال العمل المخصصة",
+      "slug": "db-benchmarking",
+      "path": "content/tracks/track-08-database/lesson-20-db-benchmarking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "pgbench",
+        "benchmarking",
+        "TPS",
+        "workload-simulation",
+        "latency"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-21",
+      "sequence": 21,
+      "title": "NewSQL — بنية CockroachDB وGoogle Spanner",
+      "slug": "newsql",
+      "path": "content/tracks/track-08-database/lesson-21-newsql/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "NewSQL",
+        "CockroachDB",
+        "Spanner",
+        "serializable",
+        "geo-partitioning"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-08-lesson-22",
+      "sequence": 22,
+      "title": "إطار المهندس الرئيسي لقرارات قواعد البيانات",
+      "slug": "database-decision-framework",
+      "path": "content/tracks/track-08-database/lesson-22-database-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "database",
+        "trade-offs",
+        "staff-engineer",
+        "selection"
+      ],
+      "tier": "optional"
+    }
+  ],
+  "mainPathMinutes": 670,
+  "optionalLessonCount": 14
+}

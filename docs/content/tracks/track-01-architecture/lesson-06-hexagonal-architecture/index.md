@@ -52,7 +52,7 @@ The hexagonal architecture pattern, introduced by Alistair Cockburn in 2005, sol
 
 ## Business Context
 
-Clearstream Financial's payment processing team maintains a monolithic Spring Boot application where JPA `@Entity` classes are used directly in REST controllers, `@Transactional` service methods call external HTTP APIs inline, and the fraud detection vendor is hardwired into the payment processing logic via a `@Autowired` service. When the fraud vendor suffered a 90-minute outage in March 2026, every payment authorisation failed because there was no circuit breaker or fallback — the vendor call and the payment logic were the same method. Replacing the vendor requires changes in 23 files across 11 packages. A hexagonal architecture would have isolated the fraud vendor behind an outbound port interface, making vendor replacement a single-adapter change and enabling a fallback implementation to be swapped in without touching the payment processing logic.
+Consider a payment processing team (a composite example) that maintains a monolithic Spring Boot application where JPA `@Entity` classes are used directly in REST controllers, `@Transactional` service methods call external HTTP APIs inline, and the fraud detection vendor is hardwired into the payment processing logic via a `@Autowired` service. When the fraud vendor has a 90-minute outage, every payment authorisation fails because there was no circuit breaker or fallback — the vendor call and the payment logic were the same method. Replacing the vendor requires changes in 23 files across 11 packages. A hexagonal architecture would have isolated the fraud vendor behind an outbound port interface, making vendor replacement a single-adapter change and enabling a fallback implementation to be swapped in without touching the payment processing logic.
 
 ## Hexagonal Architecture Layers
 
@@ -108,7 +108,7 @@ graph TD
 
 **Domain Layer** — Contains the domain model (aggregates, value objects, domain events, domain exceptions). Zero dependencies on frameworks, libraries, or infrastructure. This layer could run in a standard Java SE main method.
 
-**Application Layer** — Contains application services that orchestrate use cases by calling domain logic and outbound ports. May depend on the domain layer and on port interfaces. No infrastructure imports. Spring annotations like `@Transactional` are acceptable here but must be the only Spring dependency.
+**Application Layer** — Contains application services that orchestrate use cases by calling domain logic and outbound ports. May depend on the domain layer and on port interfaces. No infrastructure imports. Spring's `@Service` and `@Transactional` are acceptable here, but they should be the only Spring dependencies.
 
 **Adapter Layer** — Contains the driving adapters (REST controllers, gRPC handlers, Kafka consumers, CLI runners) and driven adapters (JPA repositories, Kafka producers, HTTP clients to external services). Adapters import and implement port interfaces. Adapters may depend on Spring, JPA, Kafka, Feign, and any other framework.
 
@@ -181,9 +181,13 @@ public class PaymentApplicationService implements PaymentUseCase {
 
     @Override
     public PaymentId authorisePayment(AuthorisePaymentCommand command) {
-        // Idempotency check — application-level concern
-        paymentRepository.findByIdempotencyKey(command.idempotencyKey())
-            .ifPresent(existing -> { throw new DuplicatePaymentException(command.idempotencyKey()); });
+        // Idempotency — a retry with the same key gets the same answer, not an error.
+        // (Two concurrent first attempts both see "not found"; the UNIQUE constraint on
+        // idempotency_key makes the second insert fail, and the caller retries into this branch.)
+        Optional<Payment> existing = paymentRepository.findByIdempotencyKey(command.idempotencyKey());
+        if (existing.isPresent()) {
+            return existing.get().id();
+        }
 
         // Load merchant via outbound port
         Merchant merchant = merchantRepository.findById(command.merchantId())
@@ -248,6 +252,9 @@ public class PaymentApplicationService implements PaymentUseCase {
 }
 ```
 
+> [!NOTE]
+> To keep the example short, the fraud check runs inside the class-level `@Transactional`, so a slow fraud vendor holds a database connection. In production, call slow remote ports *before* opening the transaction (for example with a `TransactionTemplate` around only the save), as capstone 3 does.
+
 ## Outbound Ports
 
 Outbound (driven) ports define what the application core needs from the outside world. They are interfaces in the application layer, implemented by adapters in the infrastructure layer.
@@ -297,8 +304,9 @@ public class JpaPaymentRepository implements PaymentRepository {
     }
 
     @Override
-    @Lock(LockModeType.PESSIMISTIC_WRITE)
     public Optional<Payment> findByIdForUpdate(PaymentId paymentId) {
+        // findWithLockById is declared on the Spring Data interface with
+        // @Lock(LockModeType.PESSIMISTIC_WRITE); @Lock does nothing on this class.
         return springDataRepository.findWithLockById(paymentId.value())
             .map(mapper::toDomain);
     }
@@ -381,13 +389,17 @@ public class KafkaPaymentEventAdapter implements PaymentEventPublisher {
         kafkaTemplate.send(PAYMENT_EVENTS_TOPIC, message.paymentId(), message)
             .whenComplete((result, ex) -> {
                 if (ex != null) {
-                    // Log and potentially write to outbox for retry
-                    throw new EventPublishingException("Failed to publish event: " + event, ex);
+                    // Runs on a Kafka I/O thread after this method returned:
+                    // throwing here would reach nobody. Log and count it instead.
+                    log.error("Failed to publish {}", event, ex);
                 }
             });
     }
 }
 ```
+
+> [!WARNING]
+> This adapter shows the port mechanics, not a production-safe publisher. Sending to Kafka inside the database transaction is a dual write: the send can succeed and the transaction roll back, or the transaction commit and the send fail. A production `PaymentEventPublisher` adapter should insert the event into an outbox table in the same transaction and let a relay publish it (Transactional Outbox, Track 05). Because the application service only sees the port, switching to the outbox adapter needs no change in the core.
 
 ## Driving Adapter: REST Controller
 
@@ -573,7 +585,7 @@ class HexagonalArchitectureTest {
 
 **Q:** A team is debating whether to put the `@Transactional` annotation on the `PaymentApplicationService` or on the `JpaPaymentRepository` adapter. Where does it belong in a hexagonal architecture and why?
 
-**A:** The `@Transactional` annotation belongs on the `PaymentApplicationService` (the application layer), not on the JPA adapter. The transaction boundary is a business concern: a payment authorisation use case is a single atomic operation that must either succeed completely or roll back completely — that is a business invariant, not a persistence detail. The application service is the appropriate place to declare that the entire operation runs in a single transaction because it has the full context of the use case. If the transaction annotation is on the JPA adapter, then each individual database call runs in its own transaction, meaning a failure during event publishing after a successful save would leave the database in a committed state without the corresponding events having been published — a business consistency violation. Additionally, placing `@Transactional` on the adapter creates an invisible dependency between the adapter and the application service's transactional requirements; changing the transaction behaviour requires changing the adapter, which is an infrastructure class, rather than the application class where the business requirement lives. The practical implication is that `@Transactional` from `org.springframework.transaction.annotation` is acceptable as the single Spring import in the application service layer.
+**A:** The `@Transactional` annotation belongs on the `PaymentApplicationService` (the application layer), not on the JPA adapter. The transaction boundary is a business concern: a payment authorisation use case is a single atomic operation that must either succeed completely or roll back completely — that is a business invariant, not a persistence detail. The application service is the appropriate place to declare that the entire operation runs in a single transaction because it has the full context of the use case. If the transaction annotation is on the JPA adapter, then each individual repository call commits on its own: when a use case writes two things (for example the payment row and its outbox event row, or a payment and the merchant's daily limit), a failure between them leaves half of the operation committed — a business consistency violation. Additionally, placing `@Transactional` on the adapter creates an invisible dependency between the adapter and the application service's transactional requirements; changing the transaction behaviour requires changing the adapter, which is an infrastructure class, rather than the application class where the business requirement lives. The practical implication is that `@Transactional` from `org.springframework.transaction.annotation` is acceptable as the single Spring import in the application service layer.
 
 ## Practical Challenge
 
@@ -581,7 +593,7 @@ class HexagonalArchitectureTest {
 
 2. **Enforce the dependency rule with ArchUnit.** Write a complete `HexagonalArchitectureTest` class using ArchUnit 1.3.x that enforces: (a) no domain class imports from `org.springframework`, JPA, or Kafka packages, (b) no application class imports from adapter packages, (c) all outbound port implementations in `adapter.out` implement an interface from `application.port.out`, and (d) all classes in `adapter.in.web` annotated with `@RestController` depend on an interface from `application.port.in`, not directly on `application.service`. Run the tests against the package structure defined in this lesson.
 
-3. **Write a testing pyramid for the payment use case.** For the `authorisePayment` use case, write three levels of test: (a) a pure unit test (`PaymentApplicationServiceTest`) using Mockito that tests the fraud-rejection business rule without any Spring context, (b) a slice test (`@WebMvcTest` for the controller) that verifies the REST contract — correct HTTP status codes, request deserialization, and response serialisation — by mocking the `PaymentUseCase` port, and (c) a persistence adapter test (`@DataJpaTest` for `JpaPaymentRepository`) that verifies save and findById round-trip correctly with an H2 in-memory database. Each test class must start and complete in under 500ms individually.
+3. **Write a testing pyramid for the payment use case.** For the `authorisePayment` use case, write three levels of test: (a) a pure unit test (`PaymentApplicationServiceTest`) using Mockito that tests the fraud-rejection business rule without any Spring context, (b) a slice test (`@WebMvcTest` for the controller) that verifies the REST contract — correct HTTP status codes, request deserialization, and response serialisation — by mocking the `PaymentUseCase` port, and (c) a persistence adapter test (`@DataJpaTest` for `JpaPaymentRepository`) that verifies save and findById round-trip correctly against PostgreSQL in Testcontainers (H2 hides PostgreSQL-specific behaviour such as locking and constraint errors). The unit and slice tests should each run in well under a second; the persistence test may take longer because it starts a real database.
 
 4. **Migrate a layered architecture to hexagonal.** You are given a traditional three-layer Spring Boot application (`controller → service → repository`) for a loan origination feature. The `LoanService` class directly autowires `LoanRepository` (a Spring Data JPA interface), `CreditBureauClient` (a `@Component` wrapping RestTemplate calls), and `LoanEventPublisher` (a `@Component` wrapping KafkaTemplate). Redesign the package structure following the hexagonal pattern, identify the inbound port, the three outbound ports, write the interface definitions for each port, and describe (without implementing in full) what each adapter class would contain. Identify which of the existing test classes would need to be rewritten and which could be retained with minor modifications.
 
@@ -608,7 +620,7 @@ class HexagonalArchitectureTest {
         "On neither; transactions should be managed by a separate TransactionManager bean injected into the application service."
       ],
       "correct": 2,
-      "explanation": "@Transactional belongs on the application service because the transaction boundary is a business requirement: the entire use case must succeed or fail atomically. If placed on the JPA adapter, each individual database call runs in its own transaction, breaking the atomicity of the use case and enabling partial writes — a business consistency violation."
+      "explanation": "@Transactional belongs on the application service because the transaction boundary is a business requirement: the entire use case must succeed or fail atomically. If placed on the JPA adapter, each repository call commits on its own, so a use case that writes several things can leave a partial result committed — a business consistency violation."
     },
     {
       "text": "Which of the following correctly describes the dependency rule in hexagonal architecture?",
@@ -633,7 +645,7 @@ class HexagonalArchitectureTest {
   "tasks": [
     {"id": "1", "description": "Implement a FraudCheckPort interface and two adapter implementations: (a) AcmeFraudAdapter that calls a hypothetical external fraud API at POST https://api.acmefraud.com/v2/score using Spring RestClient, and (b) NoOpFraudAdapter that always returns FraudAssessment.lowRisk(0.01). Wire both as Spring beans — NoOpFraudAdapter as @Primary for the test profile, AcmeFraudAdapter with @ConditionalOnProperty(name='fraud.provider', havingValue='acme'). Write a unit test for AcmeFraudAdapter using MockRestServiceServer verifying the request structure and high-risk response mapping."},
     {"id": "2", "description": "Write a complete HexagonalArchitectureTest class using ArchUnit 1.3.x that enforces: (a) no domain class imports from org.springframework, JPA, or Kafka packages, (b) no application class imports from adapter packages, (c) all outbound port implementations in adapter.out implement an interface from application.port.out, and (d) all @RestController classes in adapter.in.web depend on an interface from application.port.in rather than directly on application.service classes."},
-    {"id": "3", "description": "Write a testing pyramid for the authorisePayment use case at three levels: (a) a pure unit test using Mockito testing the fraud-rejection business rule without any Spring context, (b) a @WebMvcTest slice test for the PaymentController verifying correct HTTP status codes and request deserialization by mocking the PaymentUseCase port, and (c) a @DataJpaTest for JpaPaymentRepository verifying save and findById round-trip with H2. Each test class must start and complete in under 500ms individually."},
+    {"id": "3", "description": "Write a testing pyramid for the authorisePayment use case at three levels: (a) a pure unit test using Mockito testing the fraud-rejection business rule without any Spring context, (b) a @WebMvcTest slice test for the PaymentController verifying correct HTTP status codes and request deserialization by mocking the PaymentUseCase port, and (c) a @DataJpaTest for JpaPaymentRepository verifying save and findById round-trip against PostgreSQL in Testcontainers. The unit and slice tests should each run in well under a second."},
     {"id": "4", "description": "Migrate a traditional three-layer LoanService (which directly autowires LoanRepository, CreditBureauClient, and LoanEventPublisher) to hexagonal architecture. Redesign the package structure, identify the inbound port and three outbound ports, write the interface definitions for each port, and describe what each adapter class would contain. Identify which existing test classes must be rewritten and which can be retained with minor modifications."}
   ]
 }

@@ -101,7 +101,7 @@ CompletableFuture<Money> amount = CompletableFuture.completedFuture(Money.of(100
 
 // 3. Run async computation
 CompletableFuture<FraudScore> fraudCheck = CompletableFuture.supplyAsync(
-    () -> fraudService.check(payment),    // Runs on ForkJoinPool.commonPool() — AVOID
+    () -> fraudService.check(payment),    // Without the 2nd argument: commonPool — AVOID
     fraudExecutor                          // Always supply a named, bounded executor
 );
 ```
@@ -111,7 +111,7 @@ CompletableFuture<FraudScore> fraudCheck = CompletableFuture.supplyAsync(
 
 ## Transformation: thenApply
 
-`thenApply` transforms the result of a stage synchronously in the **same thread** that completed the previous stage. Use it for fast, non-blocking transformations.
+`thenApply` transforms the result of a stage synchronously, usually in the **same thread** that completed the previous stage — or in the calling thread, if the previous stage had already completed when `thenApply` was called. Use it for fast, non-blocking transformations.
 
 ```java17
 CompletableFuture<PaymentResponse> pipeline = CompletableFuture
@@ -228,11 +228,14 @@ sequenceDiagram
 ```java17
 CompletableFuture<FraudScore> withFallback = CompletableFuture
     .supplyAsync(() -> fraudService.check(payment), fraudExecutor)
-    // If fraud service throws, return a default score (fail-open or fail-closed)
+    // If fraud service throws, return a fallback score.
+    // Fail-open vs fail-closed is a RISK decision, not a coding one: many
+    // banks fail closed, or allow only small amounts and send the rest to
+    // manual review. Record every fallback decision.
     .exceptionally(ex -> {
         log.warn("Fraud service unavailable: {}", ex.getMessage());
         metricsService.increment("fraud.service.error");
-        return FraudScore.defaultScore(); // Fail-open: allow payment with default score
+        return FraudScore.fallbackScore();
     });
 ```
 
@@ -276,6 +279,8 @@ CompletableFuture<PaymentResult> pipeline = CompletableFuture
     .thenApply(p -> validate(p))                           // SKIPPED if prev threw
     .thenCompose(v -> fraudCheck(v))                       // SKIPPED if prev threw
     .exceptionally(ex -> PaymentResult.failed(ex))         // Catches all upstream failures
+                                                           // (ex is usually a CompletionException:
+                                                           //  use ex.getCause() for the real error)
     .thenApply(r -> enrichResponse(r));                    // Runs on both success and recovered failure
 ```
 
@@ -314,8 +319,12 @@ CompletableFuture<SanctionsResult> fastest = (CompletableFuture<SanctionsResult>
         providerB.checkAsync(payment),
         providerC.checkAsync(payment)
     );
-// WARNING: anyOf cancels nothing — the other providers keep running
-// Consider cancelling the slower futures to avoid wasted work
+// WARNING 1: anyOf completes with the FIRST result — including a first
+// FAILURE. A provider that fails fast beats one that answers correctly.
+// To get the first SUCCESS, complete a shared future only on success.
+// WARNING 2: anyOf cancels nothing — the other providers keep running, and
+// calling cancel() on a CompletableFuture does NOT stop the work behind it.
+// To save resources, cancel the underlying requests (e.g. the HTTP calls).
 ```
 
 ### thenCombine — Merge Two Results
@@ -351,13 +360,20 @@ CompletableFuture<FraudScore> fraudWithDefault = CompletableFuture
 
 ```java17
 // Full pipeline with per-stage timeouts and fallbacks
+// NOTE: a timeout's clock starts when orTimeout/completeOnTimeout is CALLED.
+// Chained at the end of the pipeline, it starts at build time and also counts
+// earlier stages. To time one stage, put the timeout on that stage's own
+// future — inside thenCompose, as below. (A timeout stops the WAITING, not
+// the remote call itself.)
 public CompletableFuture<PaymentResult> processWithTimeouts(PaymentRequest request) {
     return CompletableFuture
         .supplyAsync(() -> fetchAccount(request.getAccountId()), dbExecutor)
         .orTimeout(200, TimeUnit.MILLISECONDS)
         .thenComposeAsync(account ->
-            fraudService.checkAsync(account, request), fraudExecutor)
-        .completeOnTimeout(FraudScore.defaultScore(), 300, TimeUnit.MILLISECONDS)
+            fraudService.checkAsync(account, request)
+                // fraud stage only: 300ms from when the fraud call starts
+                .completeOnTimeout(FraudScore.fallbackScore(), 300, TimeUnit.MILLISECONDS),
+            fraudExecutor)
         .thenComposeAsync(fraud -> {
             if (fraud.isBlocked()) return CompletableFuture.failedFuture(
                 new FraudBlockException(fraud.getReason()));
@@ -411,12 +427,13 @@ CompletableFuture.supplyAsync(() -> slowDbCall()); // Uses commonPool — AVOID
 // FIX: always pass an executor
 CompletableFuture.supplyAsync(() -> slowDbCall(), dbExecutor); // ✓
 
-// MISTAKE 2: Blocking inside a CompletableFuture stage
+// MISTAKE 2: Blocking inside a stage that runs on a shared or CPU pool
 CompletableFuture.supplyAsync(() -> {
-    Thread.sleep(5000); // Blocks the thread — kills throughput
+    blockingHttpCall();   // Blocks a pool thread for the whole call
     return result;
-}, executor);
-// FIX: orTimeout / async stages / virtual threads
+}, cpuExecutor);
+// FIX: run blocking calls on a dedicated, bounded I/O executor or on
+// virtual threads — never on commonPool or a CPU-sized pool
 
 // MISTAKE 3: get() without timeout — can block forever
 PaymentResult result = future.get(); // DANGEROUS — no timeout
@@ -472,7 +489,7 @@ future.exceptionally(ex -> { log.error("...", ex); return fallback; }); // ✓
       "They complete with null values"
     ],
     "correct": 1,
-    "explanation": "CompletableFuture.anyOf() completes as soon as any input future completes — but it does NOT cancel the other futures. Providers B and C continue running and consuming resources (threads, network connections). To avoid wasted work, you should explicitly cancel the other futures by calling future.cancel(true) on each one after anyOf() completes."
+    "explanation": "CompletableFuture.anyOf() completes as soon as any input future completes — but it does NOT cancel the other futures. Providers B and C keep running and consuming resources (threads, network connections). And calling cancel(true) on a CompletableFuture only marks that future as cancelled — it does not interrupt the work behind it. To save resources, cancel the underlying requests themselves (for example through the HTTP client). Note also that anyOf completes with the first result even if it is a failure."
   },
   {
     "id": "kc-cf-04",
@@ -501,11 +518,11 @@ future.exceptionally(ex -> { log.error("...", ex); return fallback; }); // ✓
     },
     {
       "id": "pc-cf-02",
-      "description": "Add per-stage timeouts: fetchAccount must complete within 100ms, fraud check within 300ms, sanctions within 300ms, settlement within 1000ms. Each timeout should produce a specific failure reason in the final PaymentResult — not a generic TimeoutException."
+      "description": "Add per-stage timeouts: fetchAccount within 100ms, fraud check within 300ms, sanctions within 300ms, settlement within 1000ms — each measured from the start of its own stage (put the timeout on that stage's future). Each timeout must produce a specific failure reason in the final PaymentResult — not a generic TimeoutException."
     },
     {
       "id": "pc-cf-03",
-      "description": "Implement a hedged fraud check using `anyOf()`: contact two fraud providers simultaneously, use the first response, and explicitly cancel the slower future to avoid resource waste. Add a 500ms overall timeout — if neither provider responds, fail the payment with FraudServiceUnavailableException."
+      "description": "Implement a hedged fraud check: contact two fraud providers simultaneously and use the first SUCCESSFUL response (anyOf alone would also accept a first failure). Cancel the slower provider's underlying HTTP request to avoid wasted work. Add a 500ms overall timeout — if neither provider responds, fail the payment with FraudServiceUnavailableException."
     },
     {
       "id": "pc-cf-04",

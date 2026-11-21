@@ -83,12 +83,12 @@ stateDiagram-v2
 
 | State | Meaning | Operational concern |
 |---|---|---|
-| `RUNNABLE` | On CPU or ready to run | Normal — but check for CPU-spinning loops |
-| `BLOCKED` | Waiting for a `synchronized` monitor | Lock contention — high count = bottleneck |
-| `WAITING` | Parked indefinitely (park, wait, join) | Expected for idle workers; unexpected = potential deadlock |
+| `RUNNABLE` | On CPU or ready to run — **also** a thread blocked in a native socket read | Check the top frame: a CPU-spinning loop, or `socketRead`/`SocketDispatcher.read` = waiting on the network |
+| `BLOCKED` | Waiting to enter a `synchronized` monitor | Lock contention — high count = bottleneck |
+| `WAITING` | Parked indefinitely (park, wait, join) — includes threads waiting for a `ReentrantLock` | Expected for idle workers; many threads parked on the same lock = contention or deadlock |
 | `TIMED_WAITING` | Parked with timeout | Expected (sleeps, scheduled tasks) |
 | `NEW` | Created but not started | Should not persist — start() not called? |
-| `TERMINATED` | Finished | Should not appear in running pool — leak? |
+| `TERMINATED` | Finished | Not shown in thread dumps — the thread no longer exists |
 
 ## Generating Thread Dumps
 
@@ -96,6 +96,8 @@ stateDiagram-v2
 // Method 1: jstack — most common for production
 // jstack <pid> > dump.txt
 // Find PID: jps -l (shows all Java processes)
+// NOTE: jstack, Thread.print, kill -3 and ThreadMXBean show PLATFORM threads
+// only. For virtual threads use jcmd Thread.dump_to_file (Method 3)
 
 // Method 2: Kill signal (Unix/Linux/macOS)
 // kill -3 <pid>   → thread dump printed to stdout/stderr of the JVM process
@@ -224,6 +226,8 @@ Java stack information for the threads listed above:
 Found 1 deadlock.
 ```
 
+Deadlocks on `ReentrantLock` are reported too: the threads show `WAITING (parking)` instead of `BLOCKED`, and the report names the `ReentrantLock$NonfairSync` objects instead of monitors.
+
 **Reading this deadlock:**
 1. `payment-processor-1` holds `AccountA` lock, wants `AccountB` lock (line 28)
 2. `payment-processor-2` holds `AccountB` lock, wants `AccountA` lock (line 28)
@@ -245,6 +249,10 @@ Found 1 deadlock.
 
 ... (payment-processor-3 through payment-processor-50: same pattern)
 
+// (Simplified. A thread waiting on a network read itself usually shows
+//  RUNNABLE in socketRead; a thread waiting for a pooled connection usually
+//  shows WAITING (parking) inside the pool's getConnection())
+
 // Diagnosis:
 // - All 50 payment threads are waiting for FraudServiceClient
 // - FraudServiceClient has a connection pool bottleneck (or the fraud service is down)
@@ -256,84 +264,81 @@ Found 1 deadlock.
 // Automated pool exhaustion detection from thread dump
 public class PoolExhaustionDetector {
 
-    public static Map<String, Long> countBlockedByLock(ThreadInfo[] threads) {
-        // Count how many threads are blocked on each lock
+    public static Map<String, Long> countWaitersByLock(ThreadInfo[] threads) {
+        // Count how many threads wait on each lock: BLOCKED = synchronized
+        // monitors; WAITING/TIMED_WAITING with lock info = ReentrantLock,
+        // semaphores and other java.util.concurrent synchronizers
         return Arrays.stream(threads)
-            .filter(t -> t.getThreadState() == Thread.State.BLOCKED)
+            .filter(t -> t.getThreadState() == Thread.State.BLOCKED
+                      || t.getThreadState() == Thread.State.WAITING
+                      || t.getThreadState() == Thread.State.TIMED_WAITING)
             .filter(t -> t.getLockInfo() != null)
             .collect(Collectors.groupingBy(
                 t -> t.getLockInfo().getClassName() + "@" + t.getLockInfo().getIdentityHashCode(),
                 Collectors.counting()
             ));
     }
-    // If any single lock has N threads blocked where N ≈ pool size → pool exhaustion on that lock
+    // If any single lock has N threads waiting where N ≈ pool size → pool exhaustion on that lock
+    // (Idle pool workers also wait — on the pool's own queue; exclude that lock)
 }
 ```
 
 ## Virtual Thread Dumps (Java 21)
 
-Java 21 introduces a richer thread dump format specifically for virtual threads:
+Java 21 adds a thread dump that includes virtual threads, grouped by **thread container** (executor or `StructuredTaskScope`). The exact JSON fields depend on the JDK version — newer JDKs add more state and lock details. A simplified example:
 
 ```java21
-// Java 21 thread dump includes virtual threads with their carrier thread
+// Java 21 thread dump includes virtual threads
 // Use: jcmd <pid> Thread.dump_to_file -format=json threads.json
 
-// Virtual thread in JSON format:
+// A parked virtual thread (simplified):
 {
+  "tid": "45",
   "name": "",
-  "tid": 45,
-  "state": "WAITING",
   "virtual": true,
-  "carrier": {
-    "name": "ForkJoinPool-1-worker-1",
-    "tid": 12
-  },
   "stack": [
-    "java.lang.VirtualThread.park(VirtualThread.java:...)",
-    "java.util.concurrent.locks.LockSupport.park(LockSupport.java:...)",
+    "java.base/java.lang.VirtualThread.park(VirtualThread.java:...)",
+    "java.base/java.util.concurrent.locks.LockSupport.park(LockSupport.java:...)",
     "com.bank.payment.AccountRepository.findById(AccountRepository.java:42)"
   ]
 }
 
-// Key fields:
-// "virtual": true  → this is a virtual thread
-// "carrier"        → which platform thread it is currently mounted on (if any)
-// "state": WAITING → parked on I/O — this is the CORRECT behaviour
+// Key points:
+// "virtual": true → this is a virtual thread
+// no "carrier"    → it is parked (unmounted) — the CORRECT behaviour for I/O waits
+// "carrier": {...} appears only for a virtual thread MOUNTED at dump time
 
-// If you see a virtual thread BLOCKED (on object monitor):
-// → It is inside a synchronized block — potential pinning issue (see Lesson 13)
+// A mounted virtual thread that stays on its carrier while blocked
+// (for example inside synchronized on Java 21–23) is pinned — see Lesson 13
 ```
 
 ```java21
-// Detecting pinned virtual threads in a thread dump
-public class PinningDetector {
+// Detecting pinned virtual threads at runtime
+// ThreadMXBean and Thread.getAllStackTraces() do NOT include virtual threads,
+// so they cannot find pinning. Use the JFR event instead (see Lesson 13):
+public class PinningDetector implements AutoCloseable {
 
-    public static List<String> findPinnedVirtualThreads() {
-        ThreadMXBean tmx = ManagementFactory.getThreadMXBean();
-        ThreadInfo[] threads = tmx.dumpAllThreads(true, true);
+    private final RecordingStream rs = new RecordingStream();
+    private final Map<String, LongAdder> pinsByFrame = new ConcurrentHashMap<>();
 
-        return Arrays.stream(threads)
-            .filter(t -> {
-                // Virtual thread pinned = BLOCKED state on object monitor
-                // (ReentrantLock WAITING is NOT pinning — virtual thread parks correctly)
-                return t.getThreadState() == Thread.State.BLOCKED
-                    && t.getLockInfo() != null
-                    && isVirtualThread(t);
-            })
-            .map(t -> t.getThreadName() + " pinned at " + 
-                      (t.getStackTrace().length > 0 ? t.getStackTrace()[0] : "unknown"))
-            .collect(Collectors.toList());
+    public PinningDetector() {
+        rs.enable("jdk.VirtualThreadPinned").withThreshold(Duration.ofMillis(5));
+        rs.onEvent("jdk.VirtualThreadPinned", e -> {
+            String top = e.getStackTrace() == null || e.getStackTrace().getFrames().isEmpty()
+                ? "unknown"
+                : e.getStackTrace().getFrames().get(0).getMethod().getName();
+            pinsByFrame.computeIfAbsent(top, k -> new LongAdder()).increment();
+        });
+        rs.startAsync();
     }
 
-    private static boolean isVirtualThread(ThreadInfo info) {
-        // In Java 21, ThreadInfo doesn't expose isVirtual() directly
-        // Use Thread.isVirtual() after finding the thread by ID
-        return Thread.getAllStackTraces().keySet().stream()
-            .filter(t -> t.threadId() == info.getThreadId())
-            .findFirst()
-            .map(Thread::isVirtual)
-            .orElse(false);
+    public Map<String, Long> snapshot() {
+        Map<String, Long> copy = new HashMap<>();
+        pinsByFrame.forEach((k, v) -> copy.put(k, v.sum()));
+        return copy;
     }
+
+    @Override public void close() { rs.close(); }
 }
 ```
 
@@ -347,7 +352,7 @@ flowchart TD
     C -->|No| E[Transient — monitor for recurrence]
     D -->|All blocking on same lock| F[Pool exhaustion or\nlock contention bottleneck]
     D -->|Circular wait| G[Deadlock — fix lock ordering]
-    D -->|Waiting for external service| H[Circuit breaker / timeout issue]
+    D -->|Waiting for external service\n(often RUNNABLE in socketRead)| H[Circuit breaker / timeout issue]
     D -->|All RUNNABLE, high CPU| I[CPU spinning — check for tight loops]
     F --> J[Add circuit breaker\nand timeout]
     G --> K[Fix lock ordering\nor use tryLock]
@@ -392,7 +397,7 @@ flowchart TD
       "No — but only if the carrier thread is also WAITING"
     ],
     "correct": 1,
-    "explanation": "WAITING is the correct state for a virtual thread blocked on I/O. When a virtual thread blocks (JDBC call, HTTP request, sleep), the JVM parks it in the heap and the carrier thread is freed. WAITING in the dump means the virtual thread is doing exactly what it should — waiting for the DB response without consuming an OS thread. This is normal and expected behaviour. BLOCKED (on object monitor) is the concerning state — that indicates synchronized-caused pinning."
+    "explanation": "WAITING is the correct state for a virtual thread blocked on I/O. When a virtual thread blocks (JDBC call, HTTP request, sleep), the JVM parks it in the heap and frees the carrier thread. WAITING in the dump means the virtual thread is doing exactly what it should — waiting for the DB response without holding an OS thread. The concerning case is a virtual thread that stays mounted on its carrier while it blocks — for example BLOCKED on a monitor or blocking inside synchronized on Java 21–23 — which is pinning."
   },
   {
     "id": "kc-td-04",
@@ -429,7 +434,7 @@ flowchart TD
     },
     {
       "id": "pc-tda-04",
-      "description": "Using Java 21, generate a thread dump in JSON format (`jcmd Thread.dump_to_file -format=json`) of a service running 1000 virtual threads. Write a script (or Java program) that: (1) counts virtual vs platform threads, (2) identifies any virtual threads in BLOCKED state (potential pinning), (3) groups virtual threads by their current stack frame top to identify what most are waiting for."
+      "description": "Using Java 21, generate a thread dump in JSON format (`jcmd <pid> Thread.dump_to_file -format=json`) of a service running 1000 virtual threads. Write a script (or Java program) that: (1) counts virtual vs platform threads, (2) lists virtual threads that were mounted on a carrier at dump time, with their top frames (candidates for pinning — confirm with the JFR event jdk.VirtualThreadPinned), (3) groups virtual threads by their top stack frame to identify what most are waiting for."
     }
   ]
 } -->

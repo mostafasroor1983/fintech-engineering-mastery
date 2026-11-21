@@ -42,12 +42,16 @@ Not all metrics make good SLIs. Good SLIs measure what users actually care about
 
 ### The Four Golden Signals Applied to Finance
 
+Google's SRE book names four golden signals: latency, traffic, errors and saturation. Applied to a financial service:
+
 | Signal | Financial Service SLI | Why It Matters |
 |---|---|---|
-| **Availability** | `successful_responses / total_responses` | Users can reach the service |
 | **Latency** | P50, P95, P99 request duration | Users experience acceptable speed |
-| **Error rate** | `5xx_responses / total_responses` | Users receive correct responses |
+| **Traffic** | Payment requests per second | Context: is a drop in errors real, or did traffic stop? |
+| **Errors** | `5xx_responses / total_responses` | Users receive correct responses |
 | **Saturation** | Queue depth, thread pool utilisation | Proxy for approaching failure |
+
+The availability SLI is derived from the errors signal: `1 - (failed_requests / total_requests)`, where "failed" means the *service* failed — not a correct business decline.
 
 ### Latency SLI Design — Percentiles Not Averages
 
@@ -61,7 +65,7 @@ P99 latency:    850ms  → 1 in 100 requests is very slow
 P99.9 latency: 3,200ms → 1 in 1,000 is unacceptable
 
 For a bank processing 10M payments/day:
-  P99.9 = 10,000 customers per day experiencing 3+ second delays
+  P99.9 = 10,000 payments per day taking 3+ seconds
 ```
 
 ### Financial System SLI Examples
@@ -70,18 +74,19 @@ For a bank processing 10M payments/day:
 # Payment authorisation service SLIs
 slis:
   - name: payment_success_rate
-    description: "Fraction of payment requests that succeed"
-    numerator: "sum(rate(payment_requests_total{status='2xx'}[5m]))"
+    description: "Fraction of payment requests the service handled correctly (business declines count as success)"
+    numerator: "sum(rate(payment_requests_total{status!~\"5..\"}[5m]))"
     denominator: "sum(rate(payment_requests_total[5m]))"
-    
+
   - name: payment_p99_latency
     description: "99th percentile end-to-end payment authorisation latency"
     query: "histogram_quantile(0.99, sum(rate(payment_duration_seconds_bucket[5m])) by (le))"
-    
+
   - name: settlement_completeness
-    description: "Fraction of initiated settlements that complete within SLA window"
-    numerator: "count(settlements{status='completed', age_seconds < 86400})"
-    denominator: "count(settlements{status IN ('completed','failed'), age_seconds >= 86400})"
+    description: "Fraction of settlements initiated more than 24h ago that completed within 24h"
+    # Not a Prometheus metric: computed from the settlement database (or exported by a job)
+    numerator: "SELECT count(*) FROM settlements WHERE initiated_at < now() - interval '24 hours' AND completed_at <= initiated_at + interval '24 hours'"
+    denominator: "SELECT count(*) FROM settlements WHERE initiated_at < now() - interval '24 hours'"
 ```
 
 ---
@@ -117,35 +122,41 @@ When the budget is depleted:
 // 6-hour window burn rate — catches degraded performance
 // 3-day window burn rate — catches slow reliability erosion
 
-// If your SLO is 99.95% and you're burning at 14x the budget rate,
-// you'll exhaust the monthly budget in ~2 days
+// burn rate 1 = spending the budget exactly over the whole window.
+// At 14.4x a 28-day budget is gone in 28 / 14.4 ≈ 2 days.
 
-double burnRate = currentErrorRate / allowedErrorRate;
-// burnRate > 14.4 → page on-call immediately (1h window)
-// burnRate > 6    → page within 1 hour (6h window)
-// burnRate > 1    → create ticket for investigation (3d window)
+double burnRate = currentErrorRate / allowedErrorRate;   // allowed = 1 - SLO
+// burnRate > 14.4 over 1h → page on-call immediately
+// burnRate > 6    over 6h → page
+// burnRate > 1    over 3d → ticket for investigation
+// (Each long window is paired with a short one — 5m, 30m, 6h — so the alert
+//  stops firing soon after the problem is fixed.)
 ```
 
-```
-// Prometheus alert: fast burn (14x for 1 hour) or slow burn (6x for 6 hours)
-// This is the Google SRE multi-window alerting approach
+```yaml
+# Prometheus alert: fast burn (14.4x over 1h, confirmed by a 5m window)
+# This is the multi-window, multi-burn-rate approach from the Google SRE Workbook
 groups:
   - name: payment_slo_alerts
     rules:
       - alert: PaymentSLOBudgetBurnRateCritical
         expr: |
           (
-            1 - (
-              sum(rate(payment_requests_total{status=~"2xx"}[1h]))
-              /
-              sum(rate(payment_requests_total[1h]))
-            )
+            sum(rate(payment_requests_total{status=~"5.."}[1h]))
+            /
+            sum(rate(payment_requests_total[1h]))
+          ) / (1 - 0.9995) > 14.4
+          and
+          (
+            sum(rate(payment_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(payment_requests_total[5m]))
           ) / (1 - 0.9995) > 14.4
         for: 2m
         labels:
           severity: page
         annotations:
-          summary: "Payment SLO: fast burn detected — budget exhaustion in <2 days"
+          summary: "Payment SLO: fast burn — at this rate the 28-day budget is gone in about 2 days"
 ```
 
 ---
@@ -153,49 +164,48 @@ groups:
 ## Implementing SLO Tracking in Spring Boot
 
 ```java
-// SLO tracker — records SLI observations and calculates budget consumption
+// SLO tracker — records SLI observations; budget maths happens in Prometheus
 @Component
 public class PaymentSloTracker {
-    
+
     private final MeterRegistry meterRegistry;
-    
-    // Prometheus counter for success/failure tracking
+
+    // ONE counter name with an outcome tag — one increment per request.
+    // (Two counters "success" and "all" under the same name would double
+    //  count when summed. Micrometer adds "_total" for Prometheus itself.)
     private final Counter successCounter;
-    private final Counter totalCounter;
+    private final Counter failureCounter;
     private final Timer latencyTimer;
-    
+
     public PaymentSloTracker(MeterRegistry meterRegistry) {
         this.meterRegistry = meterRegistry;
-        
-        this.successCounter = Counter.builder("payment.requests.total")
-            .tag("status", "success")
-            .description("Total successful payment requests")
+
+        this.successCounter = Counter.builder("payment.requests")
+            .tag("outcome", "success")
+            .description("Payment requests handled correctly")
             .register(meterRegistry);
-            
-        this.totalCounter = Counter.builder("payment.requests.total")
-            .tag("status", "all")
-            .description("Total payment requests")
+
+        this.failureCounter = Counter.builder("payment.requests")
+            .tag("outcome", "failure")
+            .description("Payment requests that failed because of the service")
             .register(meterRegistry);
-            
-        this.latencyTimer = Timer.builder("payment.duration.seconds")
+
+        // Histogram buckets (aggregatable across instances) — not client-side
+        // percentiles, which cannot be averaged across pods
+        this.latencyTimer = Timer.builder("payment.duration")   // -> payment_duration_seconds_*
             .description("Payment authorisation latency")
-            .publishPercentiles(0.5, 0.95, 0.99, 0.999)
             .publishPercentileHistogram()
             .register(meterRegistry);
     }
 
-    public <T> T track(Supplier<T> operation, Function<T, Boolean> successPredicate) {
+    public <T> T track(Supplier<T> operation, Predicate<T> successPredicate) {
         Timer.Sample sample = Timer.start(meterRegistry);
         try {
             T result = operation.get();
-            totalCounter.increment();
-            if (successPredicate.apply(result)) {
-                successCounter.increment();
-            }
+            (successPredicate.test(result) ? successCounter : failureCounter).increment();
             return result;
-        } catch (Exception e) {
-            totalCounter.increment();
-            // Exception = failure — do not increment success counter
+        } catch (RuntimeException e) {
+            failureCounter.increment();   // exception = failure
             throw e;
         } finally {
             sample.stop(latencyTimer);
@@ -208,7 +218,7 @@ public class PaymentSloTracker {
 public class PaymentService {
 
     private final PaymentSloTracker sloTracker;
-    
+
     public PaymentResult authorise(PaymentRequest request) {
         return sloTracker.track(
             () -> doAuthorise(request),
@@ -228,47 +238,57 @@ Financial systems have additional constraints beyond continuous availability. Re
 
 ```mermaid
 gantt
-    title End-of-Day Processing Window (SLO Consideration)
+    title End-of-Day Processing Window (illustrative times)
     dateFormat  HH:mm
+    axisFormat  %H:%M
     section Retail Payments
-    BACS Submission Deadline    :crit, 15:30, 30m
-    
+    Internal BACS file cut-off (sponsor bank) :crit, 15:30, 30m
+
     section Settlement
-    CHAPS Window                :active, 06:00, 480m
-    RTGS Close                  :crit, 16:00, 30m
-    
+    CHAPS operating day          :active, 06:00, 720m
+    CHAPS day closes             :crit, 18:00, 15m
+
     section Reporting
     Regulatory Report Generation :20:00, 180m
-    
+
     section Maintenance
     Planned Maintenance Window   :23:00, 60m
 ```
 
-The SLO for a BACS submission system must account for the hard deadline at 15:30. Missing it means payments are delayed by one business day — a regulatory and reputational failure. This is a **hard SLO with zero error budget for the submission function**.
+The times above are illustrative — always take cut-offs from the current scheme and sponsor-bank timetables. In this example the sponsor bank needs our BACS file by 15:30 (earlier than the scheme's own input deadline, so it can process and forward it). Missing that cut-off means payments are delayed by one business day — a regulatory and reputational failure. This is a **hard SLO with zero error budget for the submission function**.
 
 ```java
-// Hard SLO enforcement: BACS submission deadline
-// This job MUST complete before 15:30 BST on each business day
-@Scheduled(cron = "0 0 15 * * MON-FRI", zone = "Europe/London")
+// Hard SLO enforcement: BACS submission cut-off
+// This job MUST complete before 15:30 UK time on each business day.
+// Start early enough to allow a retry; 15:00 leaves only one attempt.
+@Scheduled(cron = "0 0 14 * * MON-FRI", zone = "Europe/London")
 public void submitBacsFile() {
-    Instant deadline = LocalTime.of(15, 30)
-        .atDate(LocalDate.now(ZoneId.of("Europe/London")))
-        .atZone(ZoneId.of("Europe/London"))
-        .toInstant();
-    
+    ZoneId london = ZoneId.of("Europe/London");
+    LocalDate processingDate = LocalDate.now(london);
+    Instant deadline = LocalTime.of(15, 30).atDate(processingDate).atZone(london).toInstant();
+
+    // Several instances may run this schedule: only one may submit the file.
+    // claim() = INSERT ... ON CONFLICT (processing_date) DO NOTHING
+    if (!submissionLog.claim(processingDate)) {
+        return;
+    }
+
     Instant startTime = Instant.now();
-    
     try {
-        BacsSubmission submission = bacsSubmissionService.prepareSubmission();
+        BacsSubmission submission = bacsSubmissionService.prepareSubmission(processingDate);
         bacsGateway.submit(submission, deadline); // throws if deadline cannot be met
-        
-        auditLog.record(AuditEvent.BACS_SUBMITTED, submission.getFileId(), 
+
+        auditLog.record(AuditEvent.BACS_SUBMITTED, submission.getFileId(),
             Duration.between(startTime, Instant.now()));
-            
+
     } catch (BacsDeadlineMissedException e) {
         // This is a P1 incident — wake up on-call immediately
-        alertingService.page(OnCallTier.P1, 
+        alertingService.page(OnCallTier.P1,
             "BACS submission deadline missed — manual intervention required");
+    } catch (RuntimeException e) {
+        // ANY other failure also threatens the deadline: page, don't just log
+        alertingService.page(OnCallTier.P1,
+            "BACS submission failed: " + e.getMessage() + " — deadline " + deadline);
     }
 }
 ```
@@ -281,9 +301,9 @@ Before publishing SLOs for a financial service:
 
 - [ ] **SLIs measure user-visible behaviour** — not internal metrics like CPU (measure payment success rate, not database connection pool usage)
 - [ ] **Latency SLIs use P99 or P99.9** — not average or median
-- [ ] **SLO is tighter than SLA** by at least 0.5–1 percentage point
+- [ ] **SLO is tighter than SLA** — e.g. a 99.95% SLO against a 99.9% SLA, which halves the allowed downtime
 - [ ] **Error budget policy is documented** — what happens when budget is <50%? <0%?
-- [ ] **Multi-window burn rate alerts configured** — 1h (page), 6h (ticket), 3d (trend review)
+- [ ] **Multi-window burn rate alerts configured** — 1h and 6h (page), 3d (ticket)
 - [ ] **Compliance windows identified** — EOD deadlines, settlement cut-offs have hard SLOs
 - [ ] **User journey SLOs defined** — not just individual API calls, but end-to-end flows
 - [ ] **SLO review cadence established** — monthly review to tighten or loosen based on data
@@ -313,7 +333,7 @@ Before publishing SLOs for a financial service:
         "1 hour per month — a generous budget that encourages innovation"
       ],
       "correct": 2,
-      "explanation": "Five-nines = 26.3 seconds/month. A rolling deployment of 10 pods with 3-second health check intervals can easily consume this. If your deployment takes 5 minutes to roll, you've breached the SLO before you've shipped a single feature. This is why Google SRE recommends starting with achievable SLOs and tightening based on data."
+      "explanation": "Five-nines = about 26 seconds per month. A single bad deployment, a failover or a slow health-check rollout can consume that in one go. If a faulty release takes 5 minutes to roll back, you've breached the SLO many times over. This is why the Google SRE books recommend starting with achievable SLOs and tightening them based on data — and why each extra nine must be paid for with redundancy, automation and cost."
     },
     {
       "id": "q3",
@@ -337,7 +357,7 @@ Before publishing SLOs for a financial service:
         "Single-window alerts don't work with Prometheus"
       ],
       "correct": 1,
-      "explanation": "A single error rate threshold can't distinguish a brief spike from sustained degradation. Multi-window burn rate catches: (1) fast burns (14x rate over 1h = outage, page immediately) and (2) slow burns (6x rate over 6h = degradation, page soon). This reduces alert fatigue compared to a fixed threshold while ensuring nothing is missed."
+      "explanation": "A single error rate threshold can't distinguish a brief spike from sustained degradation. Multi-window burn rate catches: (1) fast burns (14.4x rate over 1h = outage, page immediately) and (2) slow burns (6x rate over 6h = degradation, also page). Pairing each long window with a short one makes the alert stop soon after recovery. This reduces alert fatigue compared to a fixed threshold while ensuring nothing is missed."
     }
   ]
 }
@@ -345,25 +365,25 @@ Before publishing SLOs for a financial service:
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "SLOs and Error Budgets \u2014 Reliability Engineering for Finance \u2014 Production Implementation",
+  "title": "SLOs and Error Budgets — Production Implementation",
   "difficulty": "advanced",
   "estimatedMinutes": 85,
   "tasks": [
     {
       "id": "1",
-      "description": "Calculate the error budget"
+      "description": "Calculate the error budget for a payment API with a 99.95% availability SLO over a 28-day rolling window, in minutes and seconds. Then calculate how long the budget lasts at burn rates of 1x, 6x and 14.4x."
     },
     {
       "id": "2",
-      "description": "Write the SLI Prometheus queries"
+      "description": "Write the SLI Prometheus queries: the success rate (5xx responses are failures, business declines are not) and the P99 latency from histogram buckets. Explain why client-side percentiles cannot be aggregated across pods."
     },
     {
       "id": "3",
-      "description": "Define the error budget burn rate alert"
+      "description": "Define the error budget burn rate alerts: a fast-burn page (14.4x over 1h, confirmed by a 5m window), a slow-burn page (6x over 6h, confirmed by 30m) and a ticket (1x over 3 days, confirmed by 6h)."
     },
     {
       "id": "4",
-      "description": "Design the error budget policy"
+      "description": "Design the error budget policy: what the team does when the remaining budget drops below 50%, below 25% and below 0%, who can approve an exception, and how compliance deadlines (such as a BACS file cut-off) are treated as hard SLOs with zero budget."
     }
   ]
 }

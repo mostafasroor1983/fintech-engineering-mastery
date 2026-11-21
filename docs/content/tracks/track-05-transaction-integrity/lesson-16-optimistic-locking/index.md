@@ -11,6 +11,8 @@ tags: [optimistic-locking, "@Version", CAS, retry, conflict-detection]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 Optimistic locking is the high-throughput alternative to row-level locks. Instead of holding a database lock for the duration of a transaction, you read freely and then verify at write time that nobody else modified the row since you read it. In banking systems where most accounts are read far more often than they are written, optimistic locking can eliminate lock contention entirely — until it cannot, and that failure mode is the part most engineers underestimate.
 
 ## Learning Objectives
@@ -24,7 +26,7 @@ Optimistic locking is the high-throughput alternative to row-level locks. Instea
 
 ## Business Context
 
-In April 2022, a European neobank processed a marketing campaign that triggered 40,000 simultaneous balance-update requests across 8,000 accounts — roughly five concurrent writers per account on average. Their implementation used `@Version` with a single retry. Under that load the conflict rate on popular accounts reached 60%. With three retries the system issued 2.4× the intended database writes, saturating the write replica connection pool. The service degraded for 11 minutes while engineers scrambled to raise the pool limit.
+*Composite example:* a European neobank runs a marketing campaign that triggered 40,000 simultaneous balance-update requests across 8,000 accounts — roughly five concurrent writers per account on average. Their implementation used `@Version` and retried each conflict up to three times. Under that load the conflict rate on popular accounts reached 60%, and the retries pushed the system to roughly 2.4× the intended database writes, saturating the primary database's connection pool. The service degraded for 11 minutes while engineers scrambled to raise the pool limit.
 
 The root cause was not the choice of optimistic locking itself — it was deploying optimistic locking in a write-heavy burst scenario with no circuit breaker to fall back to pessimistic locking. The post-incident rule they adopted: **measure conflict rate per aggregate type in production; if P95 conflict rate exceeds 10% for any aggregate, switch that aggregate to `SELECT FOR UPDATE`.**
 
@@ -236,18 +238,21 @@ Optimistic locking looks free because it holds no locks. But every conflict wast
 
 | Scenario | TPS | Conflict Rate | Attempts | Wasted DB calls/sec |
 |---|---|---|---|---|
-| Low contention | 100 | 2% | 1.02 avg | ~2 |
-| Medium contention | 100 | 20% | 1.44 avg | ~88 |
-| High contention | 100 | 40% | 1.96 avg | ~192 |
+| Low contention | 100 | 2% | 1.02 avg | ~4 |
+| Medium contention | 100 | 20% | 1.24 avg | ~48 |
+| High contention | 100 | 40% | 1.56 avg | ~112 |
+
+(Simplified model: each attempt conflicts with the same probability p, at most 3 attempts, and every wasted attempt costs 2 round-trips — the failed `UPDATE` and the re-read.)
 
 At 20% conflict rate with 3 max retries, the expected number of DB write attempts per logical operation is:
 
 ```
-E[attempts] = 1 + 0.20 + 0.20² + ... ≈ 1.25 (for geometric series with p=0.20)
-Wasted calls = 100 TPS × (1.25 - 1.0) × 2 round-trips = 50 extra round-trips/sec
+E[attempts] = 1 + p + p²            (at most 3 attempts)
+           = 1 + 0.20 + 0.04 = 1.24
+Wasted calls = 100 TPS × (1.24 - 1.0) × 2 round-trips ≈ 48 extra round-trips/sec
 ```
 
-That is 50 extra round-trips per second that produce no business value. Beyond 10% conflict rate the marginal cost of optimistic locking typically exceeds the marginal benefit over `SELECT FOR UPDATE`.
+That is about 48 extra round-trips per second that produce no business value — and in real bursts the conflict probability rises with every retry, so the real cost is higher. A common rule of thumb: beyond about 10% conflict rate, optimistic locking usually costs more than `SELECT FOR UPDATE`. Measure it for your own workload.
 
 > [!NOTE]
 > Measure your actual conflict rate using a Micrometer counter. Instrument the `@Recover` method and the catch block in the retry wrapper. If `conflict_rate_per_minute / total_writes > 0.10` for a given aggregate type, it is time to switch to pessimistic locking for that aggregate.
@@ -265,7 +270,7 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
      * Returns 1 if the update succeeded, 0 if version mismatch or insufficient funds.
      */
     @Modifying
-    @Query("""
+    @Query(nativeQuery = true, value = """
         UPDATE accounts
            SET balance    = balance - :amount,
                version    = version + 1,
@@ -301,10 +306,13 @@ public class HighThroughputDebitService {
         int updated = accountRepository.casDebit(accountId, amount, current.version());
 
         if (updated == 0) {
-            // Could be version mismatch OR insufficient funds — distinguish if needed
-            Account account = accountRepository.findById(accountId).orElseThrow();
-            if (account.getBalance().compareTo(amount) < 0) {
-                throw new InsufficientFundsException(accountId, account.getBalance(), amount);
+            // Version mismatch, insufficient funds OR account not active — distinguish
+            AccountVersionProjection now = accountQueryRepository.findVersionById(accountId).orElseThrow();
+            if (now.status() != AccountStatus.ACTIVE) {
+                throw new AccountNotActiveException(accountId);
+            }
+            if (now.balance().compareTo(amount) < 0) {
+                throw new InsufficientFundsException(accountId, now.balance(), amount);
             }
             throw new OptimisticLockConflictException(accountId, current.version());
         }
@@ -314,10 +322,13 @@ public class HighThroughputDebitService {
 
 ```sql
 -- The projection query — avoids loading the full entity for the version check
-SELECT id, version, balance
+SELECT id, version, balance, status
   FROM accounts
  WHERE id = ?;
 ```
+
+> [!TIP]
+> For a pure debit you do not even need the version predicate: `UPDATE accounts SET balance = balance - :amount WHERE id = :id AND balance >= :amount AND status = 'ACTIVE'` is atomic on its own — the database re-checks the condition on the latest row version. Then there is no conflict to retry, only "insufficient funds". The version check is needed when the new state depends on *other* values you read earlier (for example a decision made in application code).
 
 ## Optimistic Locking for Collections — Version on Parent
 
@@ -366,6 +377,8 @@ public class PaymentBatch {
 
 When thread A adds item 5 and thread B concurrently adds item 5 to the same batch, one of their `UPDATE payment_batches SET version=? WHERE id=? AND version=?` calls returns 0 rows — conflict. The losing thread retries and re-reads the batch, now seeing the item added by the winning thread, before adding its own item with the correct sequence number.
 
+Do not rely on the ORM's collection dirty-checking alone to bump the parent version — whether a change to an inverse (`mappedBy`) collection increments it depends on the mapping. Make it explicit: load the batch with `LockModeType.OPTIMISTIC_FORCE_INCREMENT` (the version is incremented on commit even if no parent column changed), and add `UNIQUE (batch_id, sequence_number)` on the items table as a database backstop.
+
 ## Optimistic vs. Pessimistic: Decision Framework
 
 ```mermaid
@@ -383,11 +396,11 @@ flowchart TD
 
 | Dimension | Optimistic | Pessimistic |
 |---|---|---|
-| Lock held duration | Zero | Full transaction |
+| Lock held duration | None between read and write (only the UPDATE's row lock until commit) | From the locking read to commit |
 | Throughput under low contention | Excellent | Good |
 | Throughput under high contention | Poor (retries cascade) | Predictable |
 | Deadlock risk | None | Present |
-| Read scalability | Reads are always free | Reads block writers |
+| Read scalability | Reads are always free | Plain reads are free; locking reads wait for each other and for writers |
 | Complexity | Low | Medium (ordering required) |
 | Best for | Account reads, config | Transfers, payment processing |
 
@@ -399,7 +412,7 @@ A: When `ObjectOptimisticLockingFailureException` is thrown, the current transac
 
 **Q2: A team reports that their optimistic locking implementation causes intermittent data corruption: occasionally two concurrent debits both succeed and the final balance is only reduced by one amount instead of two. What is the most likely cause?**
 
-A: The version column is not being checked. The most likely causes are: (a) the `@Version` column was added to the entity but the database column was not added to the table (JPA silently skips the predicate if the column does not exist in some configurations); (b) the developer is using a native `@Query` for the debit that does not include the `AND version = ?` predicate; or (c) the entity is loaded with `EntityManager.find()` using `LockModeType.NONE` and then saved via a custom bulk update that bypasses JPA version management. In all cases the `UPDATE` statement must include `AND version = ?` to guarantee the CAS semantic.
+A: The version column is not being checked on that write path. The most likely causes are: (a) the debit goes through a JPQL or native bulk `UPDATE` (`@Modifying @Query`) — bulk updates bypass `@Version` completely, neither checking nor incrementing it unless you write it yourself; (b) that query writes an absolute value (`SET balance = :newBalance`, computed in Java from an earlier read) without an `AND version = ?` predicate; or (c) the service copies the version from a fresh read instead of the version the client originally saw, so the check always passes. In all cases the `UPDATE` statement must include `AND version = ?` to guarantee the CAS semantic.
 
 ## Practical Challenge
 
@@ -411,9 +424,9 @@ A: The version column is not being checked. The most likely causes are: (a) the 
 
 2. Write a `ConflictRateCircuitBreaker` Spring component that reads the per-tier conflict rate every 30 seconds. If the rate exceeds 10%, it flips a `boolean` flag for that tier. The `RetryingDebitService` checks this flag and routes to a `PessimisticDebitService` (using `SELECT FOR UPDATE`) instead of the optimistic path.
 
-3. Write a SQL CAS update that handles both the balance check and the version check in a single statement, returning a `result_code` of `'OK'`, `'INSUFFICIENT_FUNDS'`, or `'VERSION_CONFLICT'` using a PostgreSQL `DO` block or a PL/pgSQL function.
+3. Write a SQL CAS update that handles both the balance check and the version check in a single statement, returning a `result_code` of `'OK'`, `'INSUFFICIENT_FUNDS'`, or `'VERSION_CONFLICT'` using a PL/pgSQL function (a `DO` block cannot return a value).
 
-4. Write a JUnit 5 test that launches 50 concurrent threads all trying to debit £10 from an account with £100 balance, using `CountDownLatch` and `ExecutorService`. Assert that exactly 10 debits succeed, the rest throw `InsufficientFundsException` or `OptimisticLockExhaustedException`, and the final balance is exactly £0.00.
+4. Write a JUnit 5 test that launches 50 concurrent threads all trying to debit £10 from an account with £100 balance, using `CountDownLatch` and `ExecutorService`. Assert that no update is lost: `successes × £10 + final balance = £100`, the final balance is never negative, and every failure is `InsufficientFundsException` or `OptimisticLockExhaustedException`. (In optimistic mode some debits can exhaust their retries while money is still left, so "exactly 10" is not guaranteed there; in pessimistic mode assert exactly 10 successes and a final balance of £0.00.)
 
 > [!IMPORTANT]
 > The circuit breaker must be safe to read from multiple threads simultaneously. Use `ConcurrentHashMap` for the flag storage and avoid any synchronised blocks in the hot read path — the routing decision is made on every transaction and must add less than 1 microsecond of overhead.
@@ -436,12 +449,12 @@ A: The version column is not being checked. The most likely causes are: (a) the 
       "text": "A team reports that their @Version optimistic locking implementation causes intermittent data corruption: two concurrent debits both succeed but only one amount is reflected in the final balance. What is the most likely root cause?",
       "options": [
         "The @Retryable maxAttempts is set too low, causing some retries to be silently dropped",
-        "The version column check is not being applied — either the @Version column exists in the entity but not the DB table, the debit uses a native @Query without AND version = ?, or a bulk UPDATE bypasses JPA version management",
+        "The version check is not applied on that write path — e.g. the debit uses a JPQL/native bulk @Modifying UPDATE (which bypasses @Version entirely) that writes an absolute balance without AND version = ?",
         "The @Version field type is long instead of Long, causing null pointer exceptions that are swallowed",
         "The persistence context is shared across threads, allowing one thread to overwrite another's entity state"
       ],
       "correct": 1,
-      "explanation": "If the UPDATE does not include AND version = ? the CAS semantic is broken — both concurrent updates succeed because neither checks the version. Common causes: the @Version column was added to the entity but not the database schema (JPA may silently skip the predicate); a native @Query for the debit omits the version predicate; or a custom bulk update bypasses JPA version management entirely. The fix is to verify the generated SQL includes the version predicate on every write path."
+      "explanation": "If the UPDATE does not include AND version = ? the CAS semantic is broken — both concurrent updates succeed because neither checks the version. Common causes: the debit goes through a bulk @Modifying @Query, which bypasses JPA version management (no check, no increment); that query sets an absolute balance computed from an earlier read; or the service copies the version from a fresh read instead of the one the client saw. The fix is to verify the generated SQL includes the version predicate on every write path — or use a relative, conditional update (balance = balance - :amount WHERE balance >= :amount)."
     },
     {
       "text": "At what conflict rate does the break-even math show optimistic locking costs more than it saves, and what should you do when this threshold is crossed in production?",
@@ -452,7 +465,7 @@ A: The version column is not being checked. The most likely causes are: (a) the 
         "1% — any conflict indicates high contention requiring pessimistic locking immediately"
       ],
       "correct": 1,
-      "explanation": "Above 10% conflict rate, the marginal cost of optimistic locking (failed UPDATE + re-read + retry cycle per conflict) typically exceeds the marginal benefit over SELECT FOR UPDATE. Each conflict wastes a full DB round-trip for the failed UPDATE plus another for the re-read on retry. Measure with a Micrometer counter on the @Recover method and the catch block. If conflict_rate_per_minute / total_writes > 0.10 for a given aggregate type, switch to pessimistic locking for that aggregate."
+      "explanation": "As a rule of thumb, above about 10% conflict rate the cost of optimistic locking (failed UPDATE + re-read + retry cycle per conflict) usually exceeds the benefit over SELECT FOR UPDATE. Each conflict wastes a DB round-trip for the failed UPDATE plus another for the re-read on retry. Measure with a Micrometer counter on the @Recover method and the catch block. If conflict_rate_per_minute / total_writes > 0.10 for a given aggregate type, switch to pessimistic locking for that aggregate."
     }
   ]
 }
@@ -464,10 +477,22 @@ A: The version column is not being checked. The most likely causes are: (a) the 
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Instrument the existing @Retryable debit service to emit a Micrometer Counter named optimistic.lock.conflicts tagged with aggregate_type and account_tier (not raw account_id — use a tier enum STANDARD/PREMIUM/ENTERPRISE to prevent cardinality explosion). Also emit a Counter named optimistic.lock.attempts for every debit attempt. The conflict rate is conflicts/attempts per 30-second window."},
-    {"id": "2", "description": "Implement ConflictRateCircuitBreaker as a Spring @Component that reads the per-tier conflict rate from the Micrometer registry every 30 seconds using a @Scheduled method. If the rate exceeds 10% for a tier, set a flag in a ConcurrentHashMap<AccountTier, Boolean>. The RetryingDebitService checks this flag on every call and routes to PessimisticDebitService (SELECT FOR UPDATE) instead of the optimistic path. Use a ConcurrentHashMap — no synchronized blocks on the read path."},
-    {"id": "3", "description": "Write a SQL CAS update function in PL/pgSQL that handles both balance check and version check in a single atomic statement, returning a result_code of OK, INSUFFICIENT_FUNDS, or VERSION_CONFLICT without requiring a separate SELECT. The function signature should be: SELECT * FROM debit_account(p_account_id UUID, p_amount NUMERIC, p_expected_version BIGINT)."},
-    {"id": "4", "description": "Write a JUnit 5 test that launches 50 concurrent threads all trying to debit £10 from an account with £100 balance using CountDownLatch and ExecutorService. Assert: exactly 10 debits succeed, the rest throw InsufficientFundsException or OptimisticLockExhaustedException, and the final balance is exactly £0.00. Run the test twice — once with the circuit breaker in optimistic mode and once with it forced to pessimistic mode — and assert the same final balance in both cases."}
+    {
+      "id": "1",
+      "description": "Instrument the existing @Retryable debit service to emit a Micrometer Counter named optimistic.lock.conflicts tagged with aggregate_type and account_tier (not raw account_id — use a tier enum STANDARD/PREMIUM/ENTERPRISE to prevent cardinality explosion). Also emit a Counter named optimistic.lock.attempts for every debit attempt. The conflict rate is conflicts/attempts per 30-second window."
+    },
+    {
+      "id": "2",
+      "description": "Implement ConflictRateCircuitBreaker as a Spring @Component that reads the per-tier conflict rate from the Micrometer registry every 30 seconds using a @Scheduled method. If the rate exceeds 10% for a tier, set a flag in a ConcurrentHashMap<AccountTier, Boolean>. The RetryingDebitService checks this flag on every call and routes to PessimisticDebitService (SELECT FOR UPDATE) instead of the optimistic path. Use a ConcurrentHashMap — no synchronized blocks on the read path."
+    },
+    {
+      "id": "3",
+      "description": "Write a SQL CAS update function in PL/pgSQL that handles both balance check and version check in a single atomic statement, returning a result_code of OK, INSUFFICIENT_FUNDS, or VERSION_CONFLICT without requiring a separate SELECT. The function signature should be: SELECT * FROM debit_account(p_account_id UUID, p_amount NUMERIC, p_expected_version BIGINT)."
+    },
+    {
+      "id": "4",
+      "description": "Write a JUnit 5 test that launches 50 concurrent threads all trying to debit £10 from an account with £100 balance using CountDownLatch and ExecutorService. Assert that no update is lost: successes × £10 + final balance = £100, the balance is never negative, and every failure is InsufficientFundsException or OptimisticLockExhaustedException. Run the test twice — once with the circuit breaker in optimistic mode and once forced to pessimistic mode. In pessimistic mode also assert exactly 10 successes and a final balance of £0.00."
+    }
   ]
 }
 -->

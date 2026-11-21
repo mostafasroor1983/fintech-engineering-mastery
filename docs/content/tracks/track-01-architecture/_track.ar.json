@@ -1,0 +1,365 @@
+{
+  "id": "track-01",
+  "sequence": 1,
+  "title": "البنية المعمارية المتقدمة للبرمجيات",
+  "shortTitle": "البنية المعمارية",
+  "slug": "architecture",
+  "color": "#6366f1",
+  "colorMuted": "rgba(99, 102, 241, 0.15)",
+  "description": "البنية المعمارية التطورية، وسجلات القرارات المعمارية (ADR)، وأنماط التصميم، ونموذج C4، والتصميم الموجّه بالمجال (DDD)، وتصميم الأنظمة للمنصات المالية الكبيرة.",
+  "difficulty": "advanced",
+  "estimatedHours": 30,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-01-lesson-01",
+      "sequence": 1,
+      "title": "البنية المعمارية التطورية — دوال اللياقة والدَّين التقني",
+      "slug": "evolutionary-architecture",
+      "path": "content/tracks/track-01-architecture/lesson-01-evolutionary-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "evolutionary-architecture",
+        "fitness-functions",
+        "technical-debt",
+        "ADR"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-02",
+      "sequence": 2,
+      "title": "سجلات القرارات المعمارية — ممارسة ADR",
+      "slug": "architectural-decision-records",
+      "path": "content/tracks/track-01-architecture/lesson-02-adr-practice/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tags": [
+        "ADR",
+        "decision-records",
+        "architecture-documentation"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-03",
+      "sequence": 3,
+      "title": "نموذج C4 — توصيل البنية المعمارية",
+      "slug": "c4-model",
+      "path": "content/tracks/track-01-architecture/lesson-03-c4-model/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "C4",
+        "architecture-diagrams",
+        "context",
+        "container",
+        "component"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-04",
+      "sequence": 4,
+      "title": "التصميم الموجّه بالمجال — الأنماط الاستراتيجية",
+      "slug": "ddd-strategic",
+      "path": "content/tracks/track-01-architecture/lesson-04-ddd-strategic/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "DDD",
+        "bounded-context",
+        "ubiquitous-language",
+        "context-mapping"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-01-lesson-05",
+      "sequence": 5,
+      "title": "التصميم الموجّه بالمجال — الأنماط التكتيكية",
+      "slug": "ddd-tactical",
+      "path": "content/tracks/track-01-architecture/lesson-05-ddd-tactical/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "DDD",
+        "aggregate",
+        "entity",
+        "value-object",
+        "repository",
+        "domain-service"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-01-lesson-06",
+      "sequence": 6,
+      "title": "البنية السداسية — المنافذ والمحوّلات (Ports and Adapters)",
+      "slug": "hexagonal-architecture",
+      "path": "content/tracks/track-01-architecture/lesson-06-hexagonal-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "hexagonal",
+        "ports-and-adapters",
+        "clean-architecture",
+        "dependency-inversion"
+      ],
+      "tier": "supporting"
+    },
+    {
+      "id": "track-01-lesson-07",
+      "sequence": 7,
+      "title": "أنماط البنية القائمة على الأحداث",
+      "slug": "event-driven-architecture",
+      "path": "content/tracks/track-01-architecture/lesson-07-event-driven-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "event-driven",
+        "event-sourcing",
+        "CQRS",
+        "domain-events"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-01-lesson-08",
+      "sequence": 8,
+      "title": "CQRS — الفصل بين الأوامر والاستعلامات",
+      "slug": "cqrs-pattern",
+      "path": "content/tracks/track-01-architecture/lesson-08-cqrs-pattern/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "CQRS",
+        "command",
+        "query",
+        "read-model",
+        "write-model"
+      ],
+      "tier": "supporting"
+    },
+    {
+      "id": "track-01-lesson-09",
+      "sequence": 9,
+      "title": "تصميم الواجهات البرمجية — REST وGraphQL وgRPC في الخدمات المالية",
+      "slug": "api-design",
+      "path": "content/tracks/track-01-architecture/lesson-09-api-design/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "REST",
+        "GraphQL",
+        "gRPC",
+        "API-design",
+        "OpenAPI"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-01-lesson-10",
+      "sequence": 10,
+      "title": "الخدمات المصغّرة أم النظام الموحّد — القرار المعماري",
+      "slug": "microservices-vs-monolith",
+      "path": "content/tracks/track-01-architecture/lesson-10-microservices-vs-monolith/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "microservices",
+        "monolith",
+        "modular-monolith",
+        "strangler-fig"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-11",
+      "sequence": 11,
+      "title": "شبكة الخدمات — Istio وEnvoy في الخدمات المالية",
+      "slug": "service-mesh",
+      "path": "content/tracks/track-01-architecture/lesson-11-service-mesh/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "service-mesh",
+        "Istio",
+        "Envoy",
+        "mTLS",
+        "traffic-management"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-12",
+      "sequence": 12,
+      "title": "بنية البيانات للأنظمة المالية",
+      "slug": "data-architecture",
+      "path": "content/tracks/track-01-architecture/lesson-12-data-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "data-architecture",
+        "data-mesh",
+        "data-lake",
+        "analytical-platform"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-13",
+      "sequence": 13,
+      "title": "اختبار العقود — العقود التي يحددها المستهلك باستخدام Pact",
+      "slug": "contract-testing",
+      "path": "content/tracks/track-01-architecture/lesson-13-contract-testing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "contract-testing",
+        "Pact",
+        "consumer-driven",
+        "API-compatibility"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-14",
+      "sequence": 14,
+      "title": "تحديد المعدّل والخنق والضغط العكسي (Back Pressure)",
+      "slug": "rate-limiting",
+      "path": "content/tracks/track-01-architecture/lesson-14-rate-limiting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "rate-limiting",
+        "throttling",
+        "back-pressure",
+        "token-bucket",
+        "leaky-bucket"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-01-lesson-15",
+      "sequence": 15,
+      "title": "مفاتيح الميزات والإطلاق التدريجي في البنوك",
+      "slug": "feature-flags",
+      "path": "content/tracks/track-01-architecture/lesson-15-feature-flags/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "feature-flags",
+        "progressive-delivery",
+        "canary",
+        "LaunchDarkly"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-16",
+      "sequence": 16,
+      "title": "بنية تعدد المستأجرين في منصات التقنية المالية",
+      "slug": "multi-tenancy",
+      "path": "content/tracks/track-01-architecture/lesson-16-multi-tenancy/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "multi-tenancy",
+        "tenant-isolation",
+        "data-partitioning",
+        "SaaS"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-17",
+      "sequence": 17,
+      "title": "بوابة الواجهات البرمجية ونمط Backend-for-Frontend",
+      "slug": "api-gateway-bff",
+      "path": "content/tracks/track-01-architecture/lesson-17-api-gateway-bff/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "API-gateway",
+        "BFF",
+        "aggregation",
+        "authentication",
+        "routing"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-18",
+      "sequence": 18,
+      "title": "بنية الأمان القائمة على انعدام الثقة (Zero Trust)",
+      "slug": "zero-trust-architecture",
+      "path": "content/tracks/track-01-architecture/lesson-18-zero-trust/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "zero-trust",
+        "mTLS",
+        "identity",
+        "least-privilege"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-19",
+      "sequence": 19,
+      "title": "نمط Strangler Fig وأنماط الترحيل التدريجي",
+      "slug": "strangler-fig-migration",
+      "path": "content/tracks/track-01-architecture/lesson-19-strangler-fig/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "strangler-fig",
+        "migration",
+        "legacy-modernisation",
+        "anti-corruption-layer"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-01-lesson-20",
+      "sequence": 20,
+      "title": "إطار المهندس الرئيسي لاتخاذ القرارات المعمارية",
+      "slug": "architecture-decision-framework",
+      "path": "content/tracks/track-01-architecture/lesson-20-architecture-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "architecture-trade-offs",
+        "staff-engineer",
+        "principal-engineer"
+      ],
+      "tier": "optional"
+    }
+  ],
+  "mainPathMinutes": 595,
+  "optionalLessonCount": 13
+}

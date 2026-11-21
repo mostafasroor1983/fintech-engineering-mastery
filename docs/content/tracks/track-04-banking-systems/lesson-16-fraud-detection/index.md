@@ -35,7 +35,9 @@ references:
   - "Basel Committee: Principles for the Sound Management of Operational Risk (2011, rev. 2021)"
 ---
 
-Fraud is the single largest source of financial loss for retail banks in absolute terms. UK Finance reported £1.17 billion lost to authorised and unauthorised fraud in the UK alone in 2023, with Authorised Push Payment (APP) fraud accounting for £459.7 million — a category that barely existed a decade ago. The engineering challenge in fraud detection is fundamentally different from AML or sanctions compliance: where sanctions screening asks "is this party on a list?", fraud detection asks "does this behaviour pattern deviate from what is normal for this customer and this channel?" That question requires statistical inference, not lookup, and it must be answered within the latency budget of a payment authorisation — typically under 300 milliseconds from the perspective of the payment network, often with a 50ms internal target to leave headroom for other authorisation steps. This lesson builds the full fraud detection architecture: a pluggable rules engine for deterministic velocity and behavioural rules, an ML model scoring integration for probabilistic risk assessment, and a challenge flow that throttles fraud without blocking legitimate customers.
+## Overview
+
+Fraud is the single largest source of financial loss for retail banks in absolute terms. UK Finance reported £1.17 billion lost to authorised and unauthorised fraud in the UK alone in 2023, with Authorised Push Payment (APP) fraud accounting for £459.7 million — a category that was barely even measured a decade ago. The engineering challenge in fraud detection is fundamentally different from AML or sanctions compliance: where sanctions screening asks "is this party on a list?", fraud detection asks "does this behaviour pattern deviate from what is normal for this customer and this channel?" That question requires statistical inference, not lookup, and it must be answered within the latency budget of a payment authorisation — typically under 300 milliseconds from the perspective of the payment network, often with a 50ms internal target to leave headroom for other authorisation steps. This lesson builds the full fraud detection architecture: a pluggable rules engine for deterministic velocity and behavioural rules, an ML model scoring integration for probabilistic risk assessment, and a challenge flow that throttles fraud without blocking legitimate customers.
 
 ## Learning Objectives
 
@@ -50,7 +52,7 @@ Fraud is the single largest source of financial loss for retail banks in absolut
 
 ## Business Context
 
-In 2021, HSBC UK processed a fraudulent instruction that resulted in a £600,000 APP fraud loss. The victim was a property buyer who received an email purportedly from their solicitor instructing them to send completion funds to a new account. HSBC's fraud system scored the payment as low-risk because the customer had a good transaction history, was using a known device, and the transaction was for a residential property purchase — a category that HSBC's rules engine had been tuned to let through with minimal friction to avoid abandonment by legitimate buyers in time-sensitive conveyancing transactions. The fraud was detected only 11 days later during reconciliation. The engineering lesson is that individual signals can all be "normal" while the combination is anomalous: same device, same location, authenticated session, but first-time beneficiary, full account balance transfer, and beneficiary account opened 3 days prior. No single rule caught it; only an ML model trained on APP fraud patterns would have flagged the beneficiary account age combined with the transfer-to-zero behaviour. HSBC subsequently invested £26 million in an ML-based fraud platform upgrade between 2022 and 2024.
+*Composite example (based on common APP fraud cases, not a specific bank):* a home buyer receives an email that appears to come from their solicitor, telling them to send the completion money to a "new" account. The bank's fraud system scores the payment as low risk: the customer has a long, clean history, uses their usual device and location, and property purchases had been tuned to pass with little friction, because blocking time-critical completions annoys genuine buyers. The fraud is discovered days later, when the real solicitor asks where the money is. The engineering lesson is that every individual signal can be "normal" while the combination is anomalous: same device, same location, authenticated session — but a first-time payee, almost the whole balance moved, and a receiving account opened a few days earlier. No single rule caught it; a model (or a combined rule) looking at payee novelty, receiving-account age and transfer-to-near-zero together would have. Since October 2024, UK payment firms must reimburse most APP fraud victims (up to £85,000 per claim), so this miss is now directly the bank's loss.
 
 ## Fraud Typology in Banking
 
@@ -105,25 +107,36 @@ public interface FraudRule {
     default boolean isHardStop() { return false; }
 }
 
-// VelocityRule.java — velocity check using Redis-backed counters
+// VelocityRule.java — sliding-window velocity check in Redis
 @Component
 public class VelocityRule implements FraudRule {
 
     private static final String RULE_ID = "VELOCITY_TXN_COUNT_1H";
     private static final int THRESHOLD_COUNT = 10;
     private static final int SCORE_CONTRIBUTION = 45;
+    private static final Duration WINDOW = Duration.ofHours(1);
 
-    private final RedisTemplate<String, String> redis;
+    private final StringRedisTemplate redis;
+    private final Clock clock;
 
     @Override public String ruleId()    { return RULE_ID; }
     @Override public String ruleName()  { return "Transaction count velocity (1h)"; }
-    @Override public String version()   { return "1.2.0"; }
+    @Override public String version()   { return "1.3.0"; }
 
     @Override
     public RuleResult evaluate(FraudAssessmentContext ctx) {
-        String key = "fraud:velocity:txn_count:1h:" + ctx.customerId();
-        Long count = redis.opsForValue().increment(key);
-        redis.expire(key, Duration.ofHours(1));
+        // A sorted set of transaction ids scored by time = a true sliding window.
+        // (INCR + EXPIRE on every call would push the expiry forward forever while
+        //  activity continues, so the counter would never fall back.)
+        // ZADD by transaction id is idempotent: a retried assessment of the SAME
+        // payment is not counted twice.
+        String key = "fraud:velocity:txn:" + ctx.customerId();
+        long now = clock.millis();
+        redis.opsForZSet().add(key, ctx.transactionId(), now);
+        redis.opsForZSet().removeRangeByScore(key, 0, now - WINDOW.toMillis());
+        Long count = redis.opsForZSet().zCard(key);
+        redis.expire(key, WINDOW);          // housekeeping for idle customers
+        // (in production run these four commands as one Lua script / pipeline)
 
         if (count == null) return RuleResult.notFired(ruleId());
 
@@ -140,29 +153,33 @@ public class VelocityRule implements FraudRule {
 public class GeolocationVelocityRule implements FraudRule {
 
     private static final String RULE_ID = "IMPOSSIBLE_TRAVEL";
-    private static final double MAX_FEASIBLE_KMH = 900.0; // commercial aviation speed
-    private static final int SCORE_CONTRIBUTION = 70;
+    private static final double MAX_FEASIBLE_KMH = 900.0;  // commercial aviation speed
+    private static final double MIN_DISTANCE_KM = 300.0;   // IP geolocation is imprecise
+    private static final int SCORE_CONTRIBUTION = 40;      // VPNs cause false hits: not a hard stop
 
     @Override public String ruleId()   { return RULE_ID; }
     @Override public String ruleName() { return "Impossible travel velocity"; }
-    @Override public String version()  { return "1.0.1"; }
+    @Override public String version()  { return "1.1.0"; }
 
     @Override
     public RuleResult evaluate(FraudAssessmentContext ctx) {
-        ctx.previousTransaction().ifPresent(prev -> {
-            if (prev.ipLocation() == null || ctx.currentIpLocation() == null) return;
+        Optional<PreviousTransaction> prevOpt = ctx.previousTransaction();
+        if (prevOpt.isEmpty()) return RuleResult.notFired(ruleId());
+        PreviousTransaction prev = prevOpt.get();
+        if (prev.ipLocation() == null || ctx.currentIpLocation() == null) {
+            return RuleResult.notFired(ruleId());
+        }
 
-            double distanceKm = haversineDistance(prev.ipLocation(), ctx.currentIpLocation());
-            double hoursSincePrev = Duration.between(prev.authorisedAt(), ctx.requestedAt())
-                    .toMinutes() / 60.0;
+        double distanceKm = haversineDistance(prev.ipLocation(), ctx.currentIpLocation());
+        if (distanceKm < MIN_DISTANCE_KM) return RuleResult.notFired(ruleId());
 
-            if (hoursSincePrev > 0) {
-                double impliedSpeedKmh = distanceKm / hoursSincePrev;
-                if (impliedSpeedKmh > MAX_FEASIBLE_KMH) {
-                    // return via context — illustrative; real code would use a result accumulator
-                }
-            }
-        });
+        double hours = Duration.between(prev.authorisedAt(), ctx.requestedAt()).toSeconds() / 3600.0;
+        double impliedSpeedKmh = hours <= 0 ? Double.POSITIVE_INFINITY : distanceKm / hours;
+
+        if (impliedSpeedKmh > MAX_FEASIBLE_KMH) {
+            return RuleResult.fired(ruleId(), SCORE_CONTRIBUTION,
+                    String.format("%.0f km in %.2f h (%.0f km/h)", distanceKm, hours, impliedSpeedKmh));
+        }
         return RuleResult.notFired(ruleId());
     }
 }
@@ -177,11 +194,13 @@ public class GeolocationVelocityRule implements FraudRule {
 public class FraudRuleEngine {
 
     private final List<FraudRule> rules;
-    private final FraudRuleConfigRepository configRepo;
+    // Cached view of rule config (refreshed every few seconds) — a database
+    // query per rule per payment would blow the latency budget
+    private final FraudRuleConfigCache configRepo;
 
-    public FraudRuleEngine(List<FraudRule> rules, FraudRuleConfigRepository configRepo) {
+    public FraudRuleEngine(List<FraudRule> rules, FraudRuleConfigCache configRepo) {
         // Rules are discovered via Spring's @Component scanning
-        this.rules = Collections.unmodifiableList(rules);
+        this.rules = List.copyOf(rules);
         this.configRepo = configRepo;
     }
 
@@ -199,6 +218,8 @@ public class FraudRuleEngine {
             try {
                 result = rule.evaluate(context);
             } catch (Exception e) {
+                // Fail-open per rule: count it (an error spike can mean an
+                // attack on a dependency) and alert if the rate rises
                 log.warn("Rule {} threw exception — treating as not fired: {}",
                         rule.ruleId(), e.getMessage());
                 result = RuleResult.error(rule.ruleId(), e.getMessage());
@@ -248,32 +269,35 @@ The rules engine provides deterministic, explainable decisions but cannot detect
 public class MlFraudScoringClient {
 
     private static final Duration TIMEOUT = Duration.ofMillis(80);
-    private static final int FALLBACK_SCORE = 0; // fail-open: treat ML timeout as low risk
 
     private final WebClient modelClient;
     private final MeterRegistry meterRegistry;
 
+    /** Returns an UNAVAILABLE result (no score) on timeout or error — never a fake 0. */
     public MlScoreResult score(FraudAssessmentContext context) {
         FraudFeatureVector features = extractFeatures(context);
 
-        try {
-            return modelClient.post()
-                    .uri("/v2/fraud-score")
-                    .bodyValue(features)
-                    .retrieve()
-                    .bodyToMono(MlScoreResult.class)
-                    .timeout(TIMEOUT)
-                    .block();
-        } catch (TimeoutException e) {
-            meterRegistry.counter("fraud.ml.timeout").increment();
-            log.warn("ML model timed out for transactionId={}; using fallback score={}",
-                    context.transactionId(), FALLBACK_SCORE);
-            return MlScoreResult.fallback(FALLBACK_SCORE, "MODEL_TIMEOUT");
-        } catch (Exception e) {
-            meterRegistry.counter("fraud.ml.error").increment();
-            log.error("ML model error for transactionId={}: {}", context.transactionId(), e.getMessage());
-            return MlScoreResult.fallback(FALLBACK_SCORE, "MODEL_ERROR");
-        }
+        // Reactor's timeout() signals a TimeoutException INSIDE the pipeline;
+        // block() would rethrow it wrapped, so `catch (TimeoutException e)` around
+        // block() does not even compile. Handle errors in the pipeline instead.
+        return modelClient.post()
+                .uri("/v2/fraud-score")
+                .bodyValue(features)
+                .retrieve()
+                .bodyToMono(MlScoreResult.class)
+                .timeout(TIMEOUT)
+                .onErrorResume(TimeoutException.class, e -> {
+                    meterRegistry.counter("fraud.ml.timeout").increment();
+                    log.warn("ML model timed out for transactionId={}", context.transactionId());
+                    return Mono.just(MlScoreResult.unavailable("MODEL_TIMEOUT"));
+                })
+                .onErrorResume(e -> {
+                    meterRegistry.counter("fraud.ml.error").increment();
+                    log.error("ML model error for transactionId={}: {}",
+                            context.transactionId(), e.getMessage());
+                    return Mono.just(MlScoreResult.unavailable("MODEL_ERROR"));
+                })
+                .block();
     }
 
     private FraudFeatureVector extractFeatures(FraudAssessmentContext ctx) {
@@ -281,8 +305,8 @@ public class MlFraudScoringClient {
                 // Transaction features
                 .transactionAmount(ctx.amount())
                 .transactionAmountZScore(ctx.amountZScoreVsHistory())   // pre-computed
-                .hourOfDay(ctx.requestedAt().getHour())
-                .dayOfWeek(ctx.requestedAt().getDayOfWeek().getValue())
+                .hourOfDay(ctx.requestedAtLocal().getHour())            // customer's local time
+                .dayOfWeek(ctx.requestedAtLocal().getDayOfWeek().getValue())
                 .merchantCategoryCode(ctx.merchantCategoryCode())
                 .isFirstTimePayee(ctx.isFirstTimePayee())
                 // Account features
@@ -302,7 +326,7 @@ public class MlFraudScoringClient {
 }
 ```
 
-The combined score from rules engine and ML model is blended to produce the final fraud assessment score:
+The rules score and the ML score are blended into the final score. Two safety details matter. First, if the model is unavailable the service decides on the rules alone — blending in a fake score of 0 would turn a rules score of 80 (BLOCK) into 32 (PASS) exactly when the model is down, which is what an attacker overloading the model would want. Second, the final decision is never *less* severe than the rules engine's own decision, so a low ML score cannot quietly cancel a strong rule:
 
 ```java
 // FraudAssessmentService.java
@@ -321,22 +345,26 @@ public class FraudAssessmentService {
 
         MlScoreResult mlResult = mlClient.score(context);
 
-        int blendedScore = (int) Math.round(
-                rulesResult.aggregateScore() * RULES_WEIGHT
-              + mlResult.fraudScore()         * ML_WEIGHT);
+        int blendedScore = mlResult.isAvailable()
+                ? (int) Math.round(rulesResult.aggregateScore() * RULES_WEIGHT
+                                 + mlResult.fraudScore()         * ML_WEIGHT)
+                : rulesResult.aggregateScore();     // model down → rules alone, never a fake 0
 
-        FraudDecision finalDecision = scoreToDecision(blendedScore);
+        // Never less severe than what the rules engine decided on its own
+        FraudDecision finalDecision = FraudDecision.mostSevere(
+                scoreToDecision(blendedScore), rulesResult.decision());
 
         FraudAssessment assessment = FraudAssessment.builder()
                 .transactionId(context.transactionId())
                 .customerId(context.customerId())
                 .rulesScore(rulesResult.aggregateScore())
-                .mlScore(mlResult.fraudScore())
+                .mlScore(mlResult.isAvailable() ? mlResult.fraudScore() : null)
+                .mlFallbackReason(mlResult.unavailableReason())
                 .blendedScore(blendedScore)
                 .decision(finalDecision)
                 .firedRules(rulesResult.firedRules())
                 .mlModelVersion(mlResult.modelVersion())
-                .assessedAt(Instant.now())
+                .assessedAt(clock.instant())
                 .build();
 
         assessmentRepository.save(assessment);
@@ -412,10 +440,10 @@ sequenceDiagram
     Customer->>PG: POST /payments (amount, payee, channel)
     PG->>FA: assess(FraudAssessmentContext)
     FA->>RE: evaluate(context)
-    RE-->>FA: RulesEngineResult{score: 35, decision: CHALLENGE}
+    RE-->>FA: RulesEngineResult{score: 35, decision: REVIEW}
     FA->>ML: score(featureVector)
     ML-->>FA: MlScoreResult{fraudScore: 62, model: v3.1.2}
-    FA->>FA: blend(rules=35×0.4 + ml=62×0.6) = 51 → CHALLENGE
+    FA->>FA: blend(rules=35×0.4 + ml=62×0.6) = 51 → CHALLENGE\n(more severe than REVIEW, so it stands)
     FA->>DB: INSERT fraud_assessment
     FA-->>PG: FraudAssessment{decision: CHALLENGE, blendedScore: 51}
     PG->>PG: Initiate step-up authentication
@@ -440,11 +468,11 @@ The CHALLENGE decision triggers step-up authentication — additional friction p
 | 80+ | Block with manual review | Risk too high for automated challenge; human decision required |
 
 > [!WARNING]
-> Step-up authentication for APP fraud presents a paradox: a victim being socially engineered will complete any challenge you present, because they genuinely believe the payment is legitimate. For high-APP-risk transactions (first-time payee, full-balance transfer, beneficiary account age < 30 days), consider adding a "cooling off" notification — a push notification or in-app message warning the customer of common fraud patterns associated with the transaction characteristics, with a 10-minute delay before the payment is processed. UK Finance's Contingent Reimbursement Model (CRM) Code and the PSR's mandatory reimbursement scheme (from October 2024) both cite "effective warnings" as a key obligation.
+> Step-up authentication for APP fraud presents a paradox: a victim being socially engineered will complete any challenge you present, because they genuinely believe the payment is legitimate. For high-APP-risk transactions (first-time payee, full-balance transfer, beneficiary account age < 30 days), consider adding a "cooling off" notification — a push notification or in-app message warning the customer of common fraud patterns associated with the transaction characteristics, with a 10-minute delay before the payment is processed. The voluntary Contingent Reimbursement Model (CRM) Code made "effective warnings" a core obligation; since October 2024 the PSR's mandatory reimbursement scheme makes most APP losses the firms' cost regardless, so warnings and delays now protect the bank's own money as well as the customer's.
 
 ## Chargeback Feedback Loop
 
-The fraud model's accuracy degrades over time as fraud patterns evolve. Chargebacks — customer disputes that result in a transaction being reversed — provide the most reliable labelled fraud outcomes available. Building the feedback loop is architecturally straightforward but operationally critical.
+The fraud model's accuracy degrades over time as fraud patterns evolve. Chargebacks — card disputes that result in a transaction being reversed — are an important source of labelled outcomes, but not every chargeback is fraud: the scheme reason code says whether the dispute is about fraud or about something else (goods not received, wrong amount), and only fraud reason codes become fraud labels. For account-to-account payments, which have no chargebacks, the labels come from confirmed APP fraud claims and reimbursement decisions. Building the feedback loop is architecturally straightforward but operationally critical.
 
 ```java
 // ChargebackFeedbackService.java
@@ -460,27 +488,31 @@ public class ChargebackFeedbackService {
 
         assessment.ifPresentOrElse(
             fa -> {
-                fa.setOutcome(FraudOutcome.FRAUD_CONFIRMED);
+                // Only FRAUD reason codes are fraud labels; other disputes
+                // (goods not received, duplicate charge) are not
+                boolean isFraud = event.reasonCategory() == DisputeCategory.FRAUD;
+                fa.setOutcome(isFraud ? FraudOutcome.FRAUD_CONFIRMED : FraudOutcome.CHARGEBACK);
                 fa.setChargebackId(event.chargebackId());
-                fa.setOutcomeUpdatedAt(Instant.now());
+                fa.setOutcomeUpdatedAt(clock.instant());
                 assessmentRepo.save(fa);
 
-                // Emit training event for model retraining pipeline
-                trainingEventPublisher.publish(ModelTrainingEvent.builder()
+                // Training event written to the OUTBOX in the same transaction —
+                // publishing straight to Kafka here would be a dual write
+                outbox.save(ModelTrainingEvent.builder()
                         .assessmentId(fa.getAssessmentId())
                         .transactionId(event.originalTransactionId())
                         .customerId(fa.getCustomerId())
                         .rulesScore(fa.getRulesScore())
                         .mlScore(fa.getMlScore())
                         .blendedScore(fa.getBlendedScore())
-                        .fraudLabel(true)
-                        .eventTimestamp(Instant.now())
+                        .fraudLabel(isFraud)
+                        .eventTimestamp(clock.instant())
                         .build());
 
                 log.info("Chargeback feedback recorded: assessmentId={}, transactionId={}, " +
-                        "originalMlScore={}, originalDecision={}",
+                        "fraud={}, originalMlScore={}, originalDecision={}",
                         fa.getAssessmentId(), event.originalTransactionId(),
-                        fa.getMlScore(), fa.getDecision());
+                        isFraud, fa.getMlScore(), fa.getDecision());
             },
             () -> log.warn("No fraud assessment found for chargebackTransactionId={}",
                     event.originalTransactionId())
@@ -498,11 +530,11 @@ The `ModelTrainingEvent` is consumed by the data science team's retraining pipel
 
 **Q1: Your blended fraud score for a transaction is 48 — just below the CHALLENGE threshold of 50. The ML model returned a fallback score of 0 due to a 90ms timeout that exceeded the 80ms budget. If the ML model had been available and returned a score of 75, the blended score would have been 59 (CHALLENGE). What architectural safeguards should you have in place, and is "fail-open" (treat timeout as low risk) the right default?**
 
-A: "Fail-open" on ML timeout is a deliberate policy choice that prioritises payment completion over fraud prevention when the model is unavailable. It is defensible for routine outages (a brief model restart) but dangerous if the model is degraded under fraud attack (attackers sometimes attempt to overwhelm model endpoints to cause timeouts and exploit the fail-open). Architectural safeguards should include: (1) circuit breaker with a half-open probe mode — after N consecutive timeouts, increase the fallback score to a conservative default (e.g., 50 for CHALLENGE rather than 0) until the circuit recovers; (2) separate alerting for ML timeout rate — if >2% of transactions are timing out, page on-call; (3) a configurable per-channel fail-safe policy — high-risk channels (international wires) might fail-block rather than fail-open; (4) post-authorisation retrospective scoring — when the ML model recovers, re-score recent fail-open transactions and flag those that now score above the BLOCK threshold for manual review.
+A: "Fail-open" on ML timeout is a deliberate policy choice that prioritises payment completion over fraud prevention when the model is unavailable. It is defensible for routine outages (a brief model restart) but dangerous if the model is degraded under fraud attack (attackers sometimes attempt to overwhelm model endpoints to cause timeouts and exploit the fail-open). Note also that blending a fallback of 0 into the score is the worst version of fail-open — it actively *lowers* the score; this lesson's `FraudAssessmentService` decides on the rules alone when the model is unavailable. Architectural safeguards should include: (1) circuit breaker with a half-open probe mode — after N consecutive timeouts, increase the fallback score to a conservative default (e.g., 50 for CHALLENGE rather than 0) until the circuit recovers; (2) separate alerting for ML timeout rate — if >2% of transactions are timing out, page on-call; (3) a configurable per-channel fail-safe policy — high-risk channels (international wires) might fail-block rather than fail-open; (4) post-authorisation retrospective scoring — when the ML model recovers, re-score recent fail-open transactions and flag those that now score above the BLOCK threshold for manual review.
 
-**Q2: A fraud analyst tells you the false-positive rate has reached 8% — 8 in every 100 blocked transactions are legitimate. She wants you to raise the BLOCK threshold from 80 to 85. Walk through the trade-off analysis you would perform before making this change.**
+**Q2: A fraud analyst tells you the false-positive rate has reached 8% — 8 in every 100 blocked transactions are legitimate. They want you to raise the BLOCK threshold from 80 to 85. Walk through the trade-off analysis you would perform before making this change.**
 
-A: Raise the threshold by 5 points would likely reduce the false-positive rate but increase the false-negative rate. The analysis should quantify: (1) current false-positive rate and the volume of legitimate payments being blocked (and the customer friction cost per block — lost customer lifetime value, complaint handling cost); (2) current false-negative rate from labelled chargeback data — what is the actual fraud loss per basis point of threshold change; (3) shadow-mode simulation — run the new threshold of 85 against historical assessments and compute the marginal fraud loss vs marginal false-positive reduction; (4) regulatory obligation — the PSR mandatory reimbursement scheme makes undetected APP fraud directly costly to the institution; this must be in the loss model; (5) segment analysis — a uniform threshold change may be wrong; a 5-point raise for established customers with long transaction history and no prior fraud may be safe, while maintaining the 80 threshold for new customers or high-risk channels. The correct answer is almost never a global threshold change but a segmented threshold matrix.
+A: Raising the threshold by 5 points would likely reduce the false-positive rate but increase the false-negative rate. The analysis should quantify: (1) current false-positive rate and the volume of legitimate payments being blocked (and the customer friction cost per block — lost customer lifetime value, complaint handling cost); (2) current false-negative rate from labelled chargeback data — what is the actual fraud loss per basis point of threshold change; (3) shadow-mode simulation — run the new threshold of 85 against historical assessments and compute the marginal fraud loss vs marginal false-positive reduction; (4) regulatory obligation — the PSR mandatory reimbursement scheme makes undetected APP fraud directly costly to the institution; this must be in the loss model; (5) segment analysis — a uniform threshold change may be wrong; a 5-point raise for established customers with long transaction history and no prior fraud may be safe, while maintaining the 80 threshold for new customers or high-risk channels. The correct answer is almost never a global threshold change but a segmented threshold matrix.
 
 ## Practical Challenge
 
@@ -512,7 +544,7 @@ A: Raise the threshold by 5 points would likely reduce the false-positive rate b
 
 3. **Build the ML feature vector validation pipeline.** Before sending a `FraudFeatureVector` to the ML scoring service, validate that all features are within expected ranges (e.g., `accountAgeDays >= 0`, `balanceAfterTransactionPct` between -1.0 and 1.0, `amountZScore` between -10 and 10). Features outside these ranges indicate upstream data quality issues and should be flagged with a `FEATURE_OUT_OF_RANGE` metric counter per feature name. Write a unit test that injects an invalid feature vector and verifies the validation rejects it before the HTTP call is made.
 
-4. **Implement the APP fraud cooling-off notification.** For transactions scoring between 40 and 79 where `isFirstTimePayee=true` AND `balanceAfterTransactionPct > 0.80` (more than 80% of balance), hold the payment for 10 minutes and send the customer a push notification with a warning message and a "confirm" / "cancel" option. Write the state machine that transitions the payment from `PENDING_COOLING_OFF` to `COOLING_OFF_CONFIRMED` or `COOLING_OFF_CANCELLED`, and add a Testcontainers test that verifies a payment held in cooling-off is automatically cancelled after the 10-minute window if no customer response is received.
+4. **Implement the APP fraud cooling-off notification.** For transactions scoring between 40 and 79 where `isFirstTimePayee=true` AND `transferPctOfBalance > 0.80` (the payment moves more than 80% of the balance), hold the payment for 10 minutes and send the customer a push notification with a warning message and a "confirm" / "cancel" option. Write the state machine that transitions the payment from `PENDING_COOLING_OFF` to `COOLING_OFF_CONFIRMED` or `COOLING_OFF_CANCELLED`, and add a Testcontainers test that verifies a payment held in cooling-off is automatically cancelled after the 10-minute window if no customer response is received.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -526,7 +558,7 @@ A: Raise the threshold by 5 points would likely reduce the false-positive rate b
         "No — fail-closed is always safer and must be the default for all channels"
       ],
       "correct": 2,
-      "explanation": "Fail-open prioritises payment completion but is dangerous if attackers overwhelm model endpoints to exploit it. Safeguards include: circuit breaker with conservative fallback scores after N consecutive timeouts; separate alerting for ML timeout rate; configurable per-channel fail-safe policy (high-risk channels fail-block); post-authorisation retrospective scoring when model recovers."
+      "explanation": "Fail-open prioritises payment completion but is dangerous if attackers overwhelm model endpoints to exploit it — and blending a fallback of 0 actively lowers the score. Safeguards: decide on the rules alone (or a conservative default) when the model is unavailable; a circuit breaker; separate alerting for ML timeout rate; a per-channel fail-safe policy (high-risk channels fail-block); and re-scoring fail-open transactions when the model recovers."
     },
     {
       "text": "A fraud analyst wants to raise the BLOCK threshold from 80 to 85 to reduce the 8% false-positive rate. What is the most important analysis to perform before making this change?",
@@ -574,7 +606,7 @@ A: Raise the threshold by 5 points would likely reduce the false-positive rate b
     },
     {
       "id": "4",
-      "description": "Implement the APP fraud cooling-off notification for transactions scoring 40-79 where `isFirstTimePayee=true` AND `balanceAfterTransactionPct > 0.80`. Hold the payment for 10 minutes, send a push notification with confirm/cancel options. Write the state machine transitioning `PENDING_COOLING_OFF` to `COOLING_OFF_CONFIRMED` or `COOLING_OFF_CANCELLED`. Add a Testcontainers test verifying auto-cancellation after 10 minutes without customer response."
+      "description": "Implement the APP fraud cooling-off notification for transactions scoring 40-79 where `isFirstTimePayee=true` AND `transferPctOfBalance > 0.80` (the payment moves more than 80% of the balance). Hold the payment for 10 minutes, send a push notification with confirm/cancel options. Write the state machine transitioning `PENDING_COOLING_OFF` to `COOLING_OFF_CONFIRMED` or `COOLING_OFF_CANCELLED`. Add a Testcontainers test verifying auto-cancellation after 10 minutes without customer response."
     }
   ]
 }

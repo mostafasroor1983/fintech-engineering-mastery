@@ -103,39 +103,42 @@ SVIDs are short-lived (default 1-hour TTL). SPIRE Agents automatically rotate th
 
 ```java
 /**
- * Demonstrates fetching an X.509 SVID from SPIRE via the
- * Workload API (gRPC on Unix domain socket /run/spire/sockets/agent.sock).
- *
- * In production use the official SPIFFE Helper sidecar or the
- * java-spiffe library instead of raw gRPC.
+ * Fetches this workload's X.509 SVID from the SPIRE Agent's Workload API
+ * (Unix domain socket) using the java-spiffe library.
+ * With Istio, Envoy does this for you; use it directly for workloads
+ * without a sidecar.
  */
 @Component
-public class SpiffeIdentityLoader {
+public class SpiffeIdentityLoader implements DisposableBean {
 
-    private static final String SPIRE_SOCKET =
-        "unix:///run/spire/sockets/agent.sock";
+    private static final String SPIRE_SOCKET = "unix:/run/spire/sockets/agent.sock";
 
-    private volatile X509Certificate currentSvid;
-    private volatile PrivateKey       currentKey;
+    private final X509Source source;
 
-    @PostConstruct
-    public void startRotationLoop() {
-        // java-spiffe library handles rotation automatically
-        X509Source source = X509Source.newSource(
-            X509Source.newOptions()
-                .spiffeSocketPath(SPIRE_SOCKET)
-                .build()
-        );
-        source.addListener(update -> {
-            this.currentSvid = update.defaultSvid().certificates().get(0);
-            this.currentKey  = update.defaultSvid().privateKey();
-            log.info("SVID rotated, expires: {}",
-                currentSvid.getNotAfter());
-        });
+    public SpiffeIdentityLoader() throws Exception {
+        // DefaultX509Source watches the Workload API and swaps in each
+        // rotated SVID automatically — no rotation loop of our own
+        this.source = DefaultX509Source.newSource(
+            X509SourceOptions.builder().spiffeSocketPath(SPIRE_SOCKET).build());
     }
 
     public X509Certificate currentCertificate() {
-        return currentSvid;
+        return source.getX509Svid().getLeaf();
+    }
+
+    /** TLS context whose key and trust managers follow every rotation. */
+    public SSLContext sslContextForLedgerCalls() throws Exception {
+        return SpiffeSslContextFactory.getSslContext(SslContextOptions.builder()
+            .x509Source(source)
+            // Zero trust: accept only the peer we expect, not any SPIFFE ID
+            .acceptedSpiffeIdsSupplier(() -> Set.of(
+                SpiffeId.parse("spiffe://fintech.internal/ns/payments/sa/ledger-svc")))
+            .build());
+    }
+
+    @Override
+    public void destroy() {
+        source.close();
     }
 }
 ```
@@ -166,7 +169,7 @@ Mutual TLS means both sides of a connection present and verify an X.509 certific
 
 - **Authentication** — each party proves cryptographic identity
 - **Encryption** — all traffic is encrypted in transit
-- **Non-repudiation** — certificates are auditable
+- **Auditability** — every connection carries a verifiable workload identity that can be logged
 
 ```
   payment-svc (client)              ledger-svc (server)
@@ -218,12 +221,15 @@ spec:
       │                           │── mTLS handshake ────────►│
       │                           │◄─ peer SVID verified ─────│
       │                           │                           │
-      │  At T=55m (5m before      │                           │
-      │  expiry), SPIRE Agent     │                           │
+      │  At T=30m (half the TTL), │                           │
+      │  SPIRE Agent rotates:     │                           │
       │── new SVID ──────────────►│  hot-reload, no downtime  │
 ```
 
-Istio's Envoy sidecar automatically picks up the new certificate without connection interruption.
+Istio's Envoy sidecar automatically picks up the new certificate (via SDS) without connection interruption.
+
+> [!NOTE]
+> Out of the box, Istio issues workload certificates from istiod's own CA with the trust domain `cluster.local`; it can instead be integrated with SPIRE. Whichever you use, the principals in `AuthorizationPolicy` must use the same trust domain as the certificates (`cluster.local/ns/...` below, or `fintech.internal/ns/...` with a SPIRE trust domain).
 
 ---
 
@@ -231,12 +237,12 @@ Istio's Envoy sidecar automatically picks up the new certificate without connect
 
 ### 4.1 Why Dynamic Credentials Matter
 
-Static database passwords embedded in environment variables or Kubernetes secrets are a PCI-DSS finding and an operational risk. Vault's Database Secrets Engine issues short-lived, unique credentials per workload.
+Static database passwords embedded in environment variables or Kubernetes secrets are hard to rotate, often shared, and a frequent audit finding (PCI DSS v4.0 Requirement 8.6 expects application and system account credentials to be managed and changed). Vault's Database Secrets Engine issues short-lived, unique credentials per workload.
 
 ```
   payment-svc Pod                  Vault Server              PostgreSQL
        │                               │                         │
-       │── Vault login (SVID JWT) ────►│                         │
+       │── Vault login (K8s SA token) ►│                         │
        │◄─ Vault token (30-min TTL) ───│                         │
        │                               │                         │
        │── GET /db/creds/payment-role ►│                         │
@@ -285,8 +291,8 @@ vault write database/roles/payment-db-role \
 
 ### 4.3 Spring Boot Integration via Vault Agent
 
-```yaml
-# vault-agent-config.hcl (runs as init container)
+```hcl
+# vault-agent-config.hcl (runs as a sidecar so it can keep renewing the lease)
 auto_auth {
   method "kubernetes" {
     mount_path = "auth/kubernetes"
@@ -313,8 +319,12 @@ EOT
 //     config:
 //       import: "optional:file:/vault/secrets/database.properties"
 //
-// The HikariCP connection pool will get new credentials on lease renewal
-// if Vault Agent re-renders the template before TTL expiry.
+// Caution: Spring reads this file ONCE, at startup. Vault renews the lease
+// (same username/password) until max_ttl; after that Vault issues NEW
+// credentials that this pool would never see. Either use Spring Cloud Vault
+// (it renews leases and emits SecretLeaseCreatedEvent — push the new
+// credentials into Hikari via HikariConfigMXBean), or roll the pods before
+// max_ttl.
 @Configuration
 public class DatasourceConfig {
 
@@ -327,9 +337,8 @@ public class DatasourceConfig {
         config.setJdbcUrl(url);
         config.setUsername(user);
         config.setPassword(pass);
-        // Allow pool reconnect on credential rotation
-        config.setConnectionTestQuery("SELECT 1");
-        config.setMaxLifetime(Duration.ofMinutes(14).toMillis()); // < 15m Vault TTL
+        // Recycle connections well before the credential lease ends
+        config.setMaxLifetime(Duration.ofMinutes(14).toMillis()); // < 15m default_ttl
         return new HikariDataSource(config);
     }
 }
@@ -403,7 +412,7 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels:
-              name: vault
+              kubernetes.io/metadata.name: vault
       ports:
         - port: 8200
     - ports:                 # DNS (kube-dns)
@@ -466,7 +475,9 @@ spec:
             methods: ["POST"]
             paths: ["/v1/entries"]
 ---
-# Deny everything else (implicit deny)
+# An ALLOW policy already denies every request it does not match. This DENY
+# additionally rejects any request without an mTLS identity, even if a broader
+# ALLOW policy is added later by mistake.
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
 metadata:
@@ -617,18 +628,18 @@ PCI-DSS Requirement 1 mandates that cardholder data environment (CDE) systems ar
 |---|---|
 | Kubernetes NetworkPolicy `default-deny-all` | Req 1.3.1: Restrict inbound traffic to only what is necessary |
 | Namespace isolation with `namespaceSelector` | Req 1.3.2: Restrict outbound traffic to only necessary connections |
-| Istio mTLS STRICT in CDE namespace | Req 1.2.1: Configuration standards for all security components |
+| Istio mTLS STRICT in CDE namespace | Supports segmentation by authenticating every connection (Req 4.2.1 itself covers open, public networks) |
 
-### 8.2 Requirement 7 — Access Control
+### 8.2 Requirements 7 and 8 — Access Control and Authentication
 
-PCI-DSS Requirement 7 mandates least-privilege access for all systems.
+PCI-DSS Requirement 7 mandates least-privilege access; Requirement 8 covers identification and authentication, including application and system accounts.
 
-| Zero-Trust Control | PCI-DSS Req 7 Mapping |
+| Zero-Trust Control | PCI-DSS v4.0 Mapping |
 |---|---|
-| SPIFFE SVID per workload | Req 7.1: Limit access to system components only to those individuals whose job requires such access |
-| Vault dynamic credentials (15-min TTL) | Req 7.2.3: Revoke access immediately when no longer needed |
-| Istio AuthorizationPolicy (service-to-service) | Req 7.3.2: All access control systems are in use |
-| OPA ABAC policies | Req 7.3.1: Implement an access control model based on least privilege |
+| SPIFFE SVID per workload | Req 8.6: application and system accounts are identified and managed — each workload has its own identity |
+| Vault dynamic credentials (15-min TTL) | Req 8.6.3: application and system account passwords are protected against misuse and changed — here they expire automatically |
+| Istio AuthorizationPolicy (service-to-service) | Req 7.2.1 / 7.2.2: a defined access control model, with access granted only where needed |
+| OPA ABAC policies | Req 7.2.1: access control model enforcing least privilege for people (e.g. approval limits) |
 
 ---
 
@@ -639,22 +650,18 @@ PCI-DSS Requirement 7 mandates least-privilege access for all systems.
 **Scenario:** SPIRE Server becomes unavailable during Black Friday peak. SVID TTL (1 h) elapses. All inter-service calls fail with TLS handshake errors.
 
 ```java
-// BAD: No retry or fallback for SVID fetch
-X509Source source = X509Source.newSource(options);  // throws if SPIRE unavailable
+// BAD: a single SPIRE Server and a 1-hour SVID TTL. Agents rotate at half the
+// TTL, so a SPIRE Server outage of ~30 minutes starts expiring certificates.
 
-// GOOD: Use SPIRE Agent caching + exponential backoff
-// The SPIRE Agent caches SVIDs on disk. Configure the agent with:
-// trust_bundle_path = "/run/spire/bundle/bundle.crt"
-// sds.enabled = true          ← Istio/Envoy uses SDS, not direct API
-
-// Also configure Envoy's min_ttl for certificate reload:
-// envoyFilter sets secret_manager_config.tls_session_ticket_key_rotation_interval
-// to 10 min less than SVID TTL, ensuring proactive rotation.
-
-// Operational fix: SPIRE Server HA with 3 replicas + etcd backend
+// GOOD: give yourself headroom
+//  - SPIRE Server HA: several replicas sharing an external datastore
+//    (PostgreSQL or MySQL — not the default embedded SQLite)
+//  - server.conf: default_x509_svid_ttl = "4h"  -> agents rotate at ~2h,
+//    so an outage of up to ~2h is absorbed without a failed handshake
+//  - alert on agent-to-server sync failures and on SVID age
 ```
 
-**Fix:** Run SPIRE Server with HA (3 replicas, etcd backend). Configure SPIRE Agent `x509_svid_ttl` to 4h with rotation at 50% TTL (2h headroom). Set Kubernetes readiness probe on the SPIRE Agent pod to block pod scheduling if agent is unhealthy.
+**Fix:** Run SPIRE Server with HA (several replicas sharing a PostgreSQL or MySQL datastore). Set the server's `default_x509_svid_ttl` to 4h; agents rotate at half the TTL, giving about 2 hours to recover the server. Monitor the agents' health and their sync with the server.
 
 ### Pitfall 2: OPA policy evaluation adds latency to every request
 
@@ -715,12 +722,12 @@ spec:
 
 ## 10. Production Checklist
 
-- [ ] SPIRE Server deployed with HA (3 replicas, etcd backend), not embedded SQLite
+- [ ] SPIRE Server deployed with HA (several replicas, shared PostgreSQL/MySQL datastore), not embedded SQLite
 - [ ] All namespaces have `default-deny-all` NetworkPolicy as baseline
 - [ ] Istio `PeerAuthentication` set to STRICT mTLS in all CDE namespaces
 - [ ] PERMISSIVE mTLS used only during migration with a tracked deadline for removal
 - [ ] Vault Database Secrets Engine configured for all database connections
-- [ ] Vault lease TTL is less than HikariCP `maxLifetime` to prevent stale connection errors
+- [ ] HikariCP `maxLifetime` is shorter than the credential lease, and the app picks up new credentials before the lease's `max_ttl`
 - [ ] Istio `AuthorizationPolicy` denies all traffic by default; only explicit ALLOW rules grant access
 - [ ] OPA deployed as sidecar with bundle replication; never as a remote synchronous call
 - [ ] DNS egress (UDP/53, TCP/53) explicitly permitted in all Egress NetworkPolicies
@@ -737,23 +744,23 @@ spec:
       "text": "A SPIFFE SVID has a 1-hour TTL. SPIRE Server becomes unavailable at T=50min. What happens to running services?",
       "options": [
         "All inter-service calls immediately fail because Envoy cannot validate certificates",
-        "The SPIRE Agent's cached SVID remains valid for the remaining 10 minutes; calls fail only after full expiry if SPIRE is still down",
+        "The SVID already held by the agent and Envoy stays valid until its expiry (10 more minutes); calls fail only after that if SPIRE Server is still down",
         "Istio automatically falls back to plaintext HTTP when mTLS certificates expire",
         "Services continue indefinitely because Kubernetes Service discovery bypasses mTLS"
       ],
       "correct": 1,
-      "explanation": "SPIRE Agents cache SVIDs locally. The cached certificate is cryptographically valid until its NotAfter field. Services continue operating for the remaining TTL. The risk is if SPIRE Server is still unavailable when rotation would normally occur, leaving no path to get a fresh SVID. This is why HA SPIRE Server and longer TTLs with early rotation (e.g., rotate at 50% TTL) are production requirements."
+      "explanation": "An SVID is valid until its NotAfter time whether or not SPIRE Server is reachable, so services keep working for the remaining TTL. The risk is that no fresh SVID can be issued while the server is down. Normally agents rotate at half the TTL, so a 1-hour TTL leaves only about 30 minutes of headroom — which is why HA SPIRE Server and a longer TTL (e.g. 4h, rotating at ~2h) are production requirements."
     },
     {
       "text": "Which PCI-DSS requirement is most directly satisfied by Vault dynamic database credentials with 15-minute TTL?",
       "options": [
-        "Requirement 3 — Protect stored cardholder data",
-        "Requirement 6 — Develop and maintain secure systems",
-        "Requirement 7.2.3 — Revoke access immediately when no longer needed",
-        "Requirement 10 — Log and monitor all access"
+        "Requirement 3 — Protect stored account data",
+        "Requirement 6 — Develop and maintain secure systems and software",
+        "Requirement 8.6 — Manage application and system accounts and their credentials (8.6.3: protect and change them)",
+        "Requirement 10 — Log and monitor all access to system components and cardholder data"
       ],
       "correct": 2,
-      "explanation": "PCI-DSS Requirement 7.2.3 requires that access is revoked immediately when it is no longer needed. Dynamic credentials with a 15-minute TTL automatically expire, meaning a compromised credential is useless in under 15 minutes without any manual revocation action. This is a stronger control than static passwords which must be manually rotated."
+      "explanation": "PCI DSS v4.0 Requirement 8.6 covers application and system accounts; 8.6.3 requires their passwords to be protected against misuse and changed periodically. Dynamic credentials with a 15-minute TTL expire on their own and are unique per workload, so a leaked credential is useless within minutes without any manual rotation — a much stronger control than a static password."
     },
     {
       "text": "A team applies default-deny-all NetworkPolicy to the payments namespace. All service-to-service calls immediately fail. What is the most likely cause?",

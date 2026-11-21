@@ -14,7 +14,7 @@ tags: ["real-time-payments", "Faster-Payments", "SEPA-Instant", "RTP", "latency"
 java-versions: [17, 21]
 topics:
   - "Real-Time Payment Scheme Comparison"
-  - "The 20-Second Rule"
+  - "The End-to-End Time Budget"
   - "Interbank Settlement Model"
   - "FasterPaymentsGateway with Timeout and Fallback"
   - "End-to-End Faster Payments Sequence"
@@ -35,7 +35,9 @@ references:
   - "Bank for International Settlements, 'Fast Payments — Enhancing the Speed and Availability of Retail Payments', CPMI Report No. 154, 2016"
 ---
 
-Real-time payments (RTP) have fundamentally changed consumer and business expectations: a payment that once took three days via BACS or one day via ACH now settles permanently in under 10 seconds around the clock, every day of the year. For the engineers building the systems that deliver this capability, real-time is not a marketing claim — it is a hard engineering constraint. Every network hop, every database round trip, every AML rule evaluation, and every account validation call must fit inside a strict latency budget. Schemes like UK Faster Payments (FPS), SEPA Instant Credit Transfer (SCT Inst), US RTP, and Brazil's PIX impose irrevocable credit that cannot be recalled once confirmed. Getting the architecture wrong means either refusing legitimate payments (high timeout rates, poor availability) or crediting fraud-induced payments that can never be recovered.
+## Overview
+
+Real-time payments (RTP) have fundamentally changed consumer and business expectations: a payment that once took three days via BACS or one day via ACH now settles permanently in under 10 seconds around the clock, every day of the year. For the engineers building the systems that deliver this capability, real-time is not a marketing claim — it is a hard engineering constraint. Every network hop, every database round trip, every AML rule evaluation, and every account validation call must fit inside a strict latency budget. Schemes like UK Faster Payments (FPS), SEPA Instant Credit Transfer (SCT Inst), US RTP and FedNow, and Brazil's PIX impose irrevocable credit that cannot be recalled once confirmed. Getting the architecture wrong means either refusing legitimate payments (high timeout rates, poor availability) or crediting fraud-induced payments that can never be recovered.
 
 ## Learning Objectives
 
@@ -45,12 +47,12 @@ Real-time payments (RTP) have fundamentally changed consumer and business expect
 - Implement a `FasterPaymentsGateway` class with a configurable per-request timeout, circuit breaker, and fallback to a slower payment rail
 - Build a latency budget allocator that partitions the total scheme SLA across internal processing stages
 - Explain why irrevocability is a design constraint, not just a business rule, and how it drives fraud architecture decisions
-- Map pacs.008 fields to FPS ISO 20022 message requirements and implement scheme-specific validation
+- Map pacs.008 fields to an instant-scheme ISO 20022 profile and implement scheme-specific validation
 - Identify the participation requirements a bank must meet to connect to a real-time scheme and their engineering implications
 
 ## Business Context
 
-In March 2024, a mid-tier UK bank's FPS gateway experienced a 47-minute degradation during which 98% of outbound Faster Payments were timing out at the scheme boundary. The root cause was a Redis cluster failover that caused the idempotency-key lookup to degrade from 2ms to 1,800ms per call. This single hop consumed the entire 15-second internal timeout budget, causing the gateway to return a timeout response to customers — but critically, some of those payments had already been forwarded to the scheme and were being processed. When engineers restarted the service, 2,340 payments were submitted a second time. Because the gateway had not properly set the pacs.028 (payment status request) deduplication tracking, 1,180 of those duplicate submissions resulted in double credits to beneficiaries. The total exposure was £4.2 million. The recovery involved three weeks of bilateral negotiations with counterparty banks and voluntary recovery requests to beneficiary customers. The incident was a direct consequence of not designing the latency budget with failure modes in mind: idempotency checks must be on the fastest possible path, not on a shared cache with a 30-second timeout.
+*Composite example (based on common industry failure patterns, not a specific bank):* a bank's Faster Payments gateway suffered a long degradation in which almost all outbound payments timed out. A cache cluster failover made the idempotency-key lookup slow down from about 2 ms to nearly 2 seconds per call; this one hop used up most of the internal time budget, so the gateway reported timeouts to customers — but some of those payments had already been forwarded to the scheme and were processed. When engineers restarted the service, the timed-out payments were submitted again, and because the gateway did not check the status of in-flight payments first, many beneficiaries were credited twice. Because instant payments are irrevocable, recovery meant weeks of bank-to-bank negotiation and requests to beneficiaries to return money voluntarily. The lesson: design the latency budget with failure modes in mind — the idempotency check must be on the fastest, most reliable path, and an unknown outcome must be investigated, never blindly retried.
 
 ## Real-Time Payment Scheme Comparison
 
@@ -58,21 +60,21 @@ In March 2024, a mid-tier UK bank's FPS gateway experienced a 47-minute degradat
 |---------|--------|------------------------|--------------|------------|
 | Launched | 2008 | 2017 | 2017 | 2020 |
 | Availability | 24/7/365 | 24/7/365 | 24/7/365 | 24/7/365 |
-| Scheme SLA | 15 seconds | 10 seconds | 10 seconds | 10 seconds |
-| Max transaction | £1,000,000 | €100,000 | $1,000,000 | No limit (BRL) |
-| Settlement model | Deferred net | TIPS (RTGS) | RTGS (TCH) | SPI (central bank RTGS) |
-| Message standard | ISO 20022 | ISO 20022 | ISO 20022 | PIX (ISO 20022 derived) |
-| Participation | Via direct or agency | Via TIPS or EBA STEP2-T | Direct or via aggregator | Mandatory for large banks |
+| Time limit (typical) | Seconds (this lesson assumes a 15 s budget) | 10 seconds | Seconds | Seconds |
+| Max transaction (scheme) | £1,000,000 (banks set lower limits) | No scheme maximum since October 2025 (banks/customers may set limits) | $10,000,000 (since 2025) | No scheme limit; banks set limits (e.g. at night) |
+| Settlement model | Deferred net settlement in Bank of England RTGS (several cycles per day, collateralised) | Real-time in central bank money via TIPS, or via EBA RT1 | Real-time, prefunded joint account at the Federal Reserve | Real-time in central bank money (SPI) |
+| Message standard | ISO 8583-based today; ISO 20022 planned under the New Payments Architecture | ISO 20022 | ISO 20022 | ISO 20022 |
+| Participation | Directly or via an indirect access provider | Via TIPS or EBA RT1 | Direct or via a service provider | Mandatory for large institutions |
 | Irrevocable? | Yes | Yes | Yes | Yes |
-| Alias/proxy support | Confirmation of Payee (CoP) | IBAN only | No native alias | PIX Keys (CPF/email/phone) |
-| Recall mechanism | IBAN credit recall (2024) | SCT Inst recall | RTP Request for Return | PIX devolution (90 days) |
+| Payee check | Confirmation of Payee (CoP) | Verification of Payee (mandatory in the euro area since October 2025) | — (no native alias) | PIX keys (CPF/CNPJ, e-mail, phone, random key) |
+| After-the-fact recovery | Bank-to-bank recovery; mandatory APP fraud reimbursement since October 2024 | Recall via camt.056 | Request for Return of Funds | MED special return mechanism for fraud |
 
 > [!NOTE]
-> SEPA Instant settles via the ECB's TIPS (TARGET Instant Payment Settlement) infrastructure using real-time RTGS, meaning each payment settles in central bank money immediately. UK FPS uses deferred net settlement — positions are netted throughout the day and settled in CHAPS. This distinction matters for liquidity: a bank on TIPS must pre-fund a TIPS account; a bank on FPS must manage intraday net positions within agreed bilateral limits.
+> SEPA Instant can settle via the Eurosystem's TIPS (TARGET Instant Payment Settlement), where each payment settles individually in central bank money immediately. UK FPS uses deferred net settlement: customers are credited in seconds, but the banks' net positions are settled in several cycles per business day in the Bank of England's RTGS, and participants must hold collateral to cover their positions. This matters for liquidity: a bank on TIPS must pre-fund its TIPS account; a bank on FPS must fund its collateral and manage its intraday net position. In the US, FedNow (launched 2023) is a second instant scheme alongside RTP.
 
-## The 20-Second Rule
+## The End-to-End Time Budget
 
-The "20-second rule" (we use 15s for FPS specifically) refers to the total wall-clock time from when the payer's bank receives the payment instruction to when the beneficiary's bank has confirmed credit. Inside that window, the following must complete:
+The time budget is the total wall-clock time from when the payer's bank receives the payment instruction to when the beneficiary's bank has confirmed credit. Schemes set their own limits (SEPA Instant: 10 seconds); this lesson uses a 15-second end-to-end budget for FPS as a working assumption. Inside that window, the following must complete:
 
 ```mermaid
 gantt
@@ -111,7 +113,7 @@ The main latency contributors:
 | Sanctions screening | < 500ms | External service call |
 | Fraud scoring | < 300ms | ML model inference |
 | Account lookup + debit | < 50ms | DB lock contention |
-| Scheme network round-trip | < 3s | SWIFT/Vocalink hop |
+| Scheme network round-trip | < 3s | Scheme infrastructure hop |
 | Receiving bank processing | < 5s | External, uncontrollable |
 | Confirmation + notify | < 100ms | Async notification |
 
@@ -122,7 +124,7 @@ The main latency contributors:
 
 **Real-Time Gross Settlement (RTGS):** Each payment settles individually and immediately in central bank money. The sending bank's TIPS/SPI account is debited and the receiving bank's account is credited atomically. There is no credit risk between banks. Requires pre-funded liquidity.
 
-**Deferred Net Settlement (DNS):** Payments flow in real time to beneficiaries, but the interbank settlement (netting of positions) happens at pre-defined windows (e.g., every hour in FPS via CHAPS). Banks have bilateral net credit limits — if Bank A's net position against Bank B exceeds the limit, further payments are blocked. This model requires careful intraday liquidity monitoring.
+**Deferred Net Settlement (DNS):** Payments flow in real time to beneficiaries, but the interbank settlement (netting of positions) happens at pre-defined settlement cycles (for FPS, several per business day in the Bank of England's RTGS). Each bank's net debit position is capped by the collateral it has posted — when a bank reaches its cap, further outbound payments are refused until it settles or adds collateral. This model requires careful intraday liquidity monitoring.
 
 ```mermaid
 graph TB
@@ -132,9 +134,9 @@ graph TB
     end
 
     subgraph "DNS Model (UK FPS)"
-        S2["Sending Bank\n(Net Position: -£200K)"] -->|"pacs.008 → Vocalink"| VL["Vocalink\nFPS Central Infrastructure"]
-        VL -->|"pacs.002 ← confirm"| R2["Receiving Bank\n(Net Position: +£200K)"]
-        VL -->|"Netting window\n(every 60 min)"| CHAPS["Bank of England\nCHAPS RTGS"]
+        S2["Sending Bank\n(Net Position: -£200K)"] -->|"payment message"| VL["FPS Central\nInfrastructure"]
+        VL -->|"confirmation"| R2["Receiving Bank\n(Net Position: +£200K)"]
+        VL -->|"Settlement cycles\n(several per day)"| CHAPS["Bank of England\nRTGS"]
     end
 
     style TIPS fill:#1e3a5f,color:#fff
@@ -147,6 +149,7 @@ graph TB
 A production-grade FPS gateway must handle scheme timeouts, idempotency, circuit breaking, and fallback gracefully:
 
 ```java
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.timelimiter.TimeLimiter;
@@ -154,44 +157,45 @@ import io.github.resilience4j.timelimiter.TimeLimiterConfig;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeoutException;
 
 @Service
 public class FasterPaymentsGateway {
 
     private static final Duration SCHEME_TIMEOUT  = Duration.ofSeconds(13);
-    private static final Duration INTERNAL_BUDGET = Duration.ofSeconds(15);
 
-    private final VocalinkSchemeClient schemeClient;
+    private final SchemeClient schemeClient;
     private final IdempotencyStore idempotencyStore;
-    private final BacsPaymentFallback bacsFallback;
+    private final ExecutorService schemeExecutor;   // dedicated, bounded — never commonPool
     private final CircuitBreaker circuitBreaker;
     private final TimeLimiter timeLimiter;
 
-    public FasterPaymentsGateway(VocalinkSchemeClient schemeClient,
+    public FasterPaymentsGateway(SchemeClient schemeClient,
                                   IdempotencyStore idempotencyStore,
-                                  BacsPaymentFallback bacsFallback) {
-        this.schemeClient    = schemeClient;
+                                  ExecutorService schemeExecutor) {
+        this.schemeClient     = schemeClient;
         this.idempotencyStore = idempotencyStore;
-        this.bacsFallback    = bacsFallback;
+        this.schemeExecutor   = schemeExecutor;
 
         CircuitBreakerConfig cbConfig = CircuitBreakerConfig.custom()
                 .failureRateThreshold(50)
                 .waitDurationInOpenState(Duration.ofSeconds(30))
                 .slidingWindowSize(20)
-                .recordExceptions(SchemeTimeoutException.class, SchemeUnavailableException.class)
+                .recordExceptions(TimeoutException.class, SchemeUnavailableException.class)
                 .build();
         this.circuitBreaker = CircuitBreaker.of("fps-scheme", cbConfig);
 
         TimeLimiterConfig tlConfig = TimeLimiterConfig.custom()
                 .timeoutDuration(SCHEME_TIMEOUT)
+                // Cancelling the future does NOT recall a message already sent
                 .cancelRunningFuture(true)
                 .build();
         this.timeLimiter = TimeLimiter.of("fps-timeout", tlConfig);
     }
 
     public PaymentResult submitPayment(FpsPaymentRequest request) {
-        // Step 1: idempotency check — must be fastest possible path
+        // Step 1: idempotency check — must be the fastest, most reliable path
         IdempotencyResult idempotency = idempotencyStore.checkAndReserve(request.endToEndId());
         if (idempotency.alreadyProcessed()) {
             return idempotency.previousResult();
@@ -202,7 +206,7 @@ public class FasterPaymentsGateway {
             PaymentResult result = circuitBreaker.executeCallable(
                 () -> timeLimiter.executeFutureSupplier(
                     () -> CompletableFuture.supplyAsync(
-                        () -> schemeClient.submit(buildPacs008(request))
+                        () -> schemeClient.submit(request), schemeExecutor
                     )
                 )
             );
@@ -210,43 +214,46 @@ public class FasterPaymentsGateway {
             return result;
 
         } catch (TimeoutException ex) {
-            // Scheme timeout — payment MAY have been received by scheme
-            // We must NOT resubmit without querying status first
-            log.warn("FPS scheme timeout for E2EId={}, querying status before fallback",
-                     request.endToEndId());
+            // Scheme timeout — the payment MAY have been received and credited.
+            // Never resubmit or switch rails until the outcome is known
+            log.warn("Scheme timeout for E2EId={}, querying status", request.endToEndId());
 
             PaymentStatus status = querySchemeStatus(request.endToEndId());
-            if (status == PaymentStatus.ACCC) {
-                // Already credited — return success, do not fallback
-                PaymentResult recovered = PaymentResult.alreadyCredited(request.endToEndId());
-                idempotencyStore.recordResult(request.endToEndId(), recovered);
-                return recovered;
-            }
-            return fallbackToBacs(request);
+            PaymentResult outcome = switch (status) {
+                case ACCC -> PaymentResult.alreadyCredited(request.endToEndId());
+                case RJCT -> PaymentResult.realTimeFailedOfferAlternative(request.endToEndId());
+                // Unknown or still pending: hold for investigation — NO fallback,
+                // NO automatic resubmission (that is how double payments happen)
+                default   -> PaymentResult.pendingInvestigation(request.endToEndId());
+            };
+            idempotencyStore.recordResult(request.endToEndId(), outcome);
+            return outcome;
 
-        } catch (CircuitBreakerOpenException ex) {
-            log.warn("FPS circuit breaker open — routing to fallback rail");
-            return fallbackToBacs(request);
+        } catch (CallNotPermittedException ex) {
+            // Circuit open: the payment was NOT sent, so offering another rail is safe
+            log.warn("Scheme circuit breaker open — payment not sent");
+            PaymentResult notSent = PaymentResult.realTimeUnavailableOfferAlternative(request.endToEndId());
+            idempotencyStore.recordResult(request.endToEndId(), notSent);
+            return notSent;
 
         } catch (SchemeRejectionException ex) {
-            // Permanent rejection — do not fallback, return error to customer
+            // Permanent rejection — return error to customer
             PaymentResult rejection = PaymentResult.schemeRejected(ex.getReasonCode());
             idempotencyStore.recordResult(request.endToEndId(), rejection);
             return rejection;
-        }
-    }
 
-    private PaymentResult fallbackToBacs(FpsPaymentRequest request) {
-        // Notify customer that RTP is unavailable; offer BACS (T+1)
-        log.info("Falling back to BACS for E2EId={}", request.endToEndId());
-        return bacsFallback.submit(request);
+        } catch (Exception ex) {
+            // Any other failure after sending: outcome unknown → investigate
+            PaymentResult unknown = PaymentResult.pendingInvestigation(request.endToEndId());
+            idempotencyStore.recordResult(request.endToEndId(), unknown);
+            return unknown;
+        }
     }
 
     private PaymentStatus querySchemeStatus(String endToEndId) {
         try {
-            Pacs028StatusRequest statusReq = Pacs028StatusRequest.forEndToEndId(endToEndId);
-            Pacs002StatusResponse response = schemeClient.requestStatus(statusReq);
-            return mapStatusCode(response.getTxSts());
+            // Status enquiry to the scheme (in ISO 20022 schemes: pacs.028 → pacs.002)
+            return schemeClient.requestStatus(endToEndId);
         } catch (Exception e) {
             log.error("Status query failed for E2EId={}", endToEndId, e);
             return PaymentStatus.UNKNOWN;
@@ -256,7 +263,7 @@ public class FasterPaymentsGateway {
 ```
 
 > [!NOTE]
-> The fallback to BACS is a customer experience decision, not a technical requirement. Many schemes require the bank to inform the customer synchronously that the real-time payment could not be processed, then offer alternatives. Never silently resubmit a timed-out real-time payment as BACS without customer consent — the customer may have already retried manually, leading to a duplicate.
+> Switching to a slower rail (such as BACS) is a customer-experience decision, not a technical requirement. Offer it only when the real-time payment is **known not to have been made** (rejected, or never sent because the circuit was open), and with the customer's consent. Never silently resubmit a timed-out real-time payment on another rail — it may already have been credited, and the customer may also retry manually, leading to a duplicate.
 
 ## End-to-End Faster Payments Sequence
 
@@ -264,19 +271,19 @@ public class FasterPaymentsGateway {
 sequenceDiagram
     participant Payer
     participant SendBank as Sending Bank
-    participant FPS as Vocalink FPS
+    participant FPS as Scheme Infrastructure
     participant RecvBank as Receiving Bank
     participant Payee
 
     Payer->>SendBank: Initiate payment (mobile/API)
     SendBank->>SendBank: Validate, screen, reserve funds
-    SendBank->>FPS: pacs.008 (FI Credit Transfer)
+    SendBank->>FPS: Payment message (pacs.008 in ISO 20022 schemes)
     FPS->>FPS: Validate message, check scheme rules
-    FPS->>RecvBank: pacs.008 (forwarded)
+    FPS->>RecvBank: Payment message (forwarded)
     RecvBank->>RecvBank: Account lookup, AML, credit check
     RecvBank->>RecvBank: Credit beneficiary account
-    RecvBank-->>FPS: pacs.002 (ACCC — Accepted Credit Completed)
-    FPS-->>SendBank: pacs.002 (ACCC forwarded)
+    RecvBank-->>FPS: Positive response (pacs.002 ACCC in ISO 20022 schemes)
+    FPS-->>SendBank: Response forwarded
     SendBank->>SendBank: Confirm debit, release reservation
     SendBank-->>Payer: Payment confirmed (push notification)
     RecvBank-->>Payee: Funds available notification
@@ -287,11 +294,11 @@ sequenceDiagram
 
 Once a pacs.002 with status `ACCC` is received, the payment **cannot be unilaterally reversed**. This is a fundamental scheme rule, not a technical limitation. It means:
 
-1. **Fraud must be stopped before submission.** Post-submission fraud controls (chargebacks, recalls) exist as bilateral negotiation processes (UK: CoP recall, SEPA: recall via camt.056), not guaranteed reversal mechanisms.
+1. **Fraud must be stopped before submission.** Post-submission recovery exists only as best-effort processes (UK: bank-to-bank recovery; SEPA: recall via camt.056), not guaranteed reversal mechanisms. In the UK, the sending and receiving PSPs must also reimburse victims of APP fraud (mandatory since October 2024, up to a set limit), which makes prevention a direct cost question for banks.
 
 2. **Authorised push payment (APP) fraud** is the dominant threat model. The payer is tricked into authorising a legitimate payment to a fraudster-controlled account. By the time the payer reports fraud, the money has moved onward and the receiving bank may have no funds to return.
 
-3. **Account validation (Confirmation of Payee / CoP)** at submission time is therefore a mandatory engineering control in UK FPS. The sending bank must confirm that the account name matches the account number before allowing the payment. SEPA Instant has the IBAN name check in development; PIX has alias-based verification.
+3. **Payee name checks** at submission time are therefore a key engineering control. In the UK, Confirmation of Payee (CoP) — required for most payment providers — checks that the name the payer typed matches the account holder before the payment is sent. In the euro area, Verification of Payee has been mandatory since October 2025 under the Instant Payments Regulation. PIX uses keys (aliases) that show the payee's name before confirmation.
 
 ```java
 public class ConfirmationOfPayeeService {
@@ -315,20 +322,23 @@ public class ConfirmationOfPayeeService {
 ```
 
 > [!IMPORTANT]
-> When CoP returns `UNAVAILABLE` (the registry service is down), UK FPS rules permit proceeding without verification, but your system **must log this as a degraded check** and flag the payment for enhanced post-settlement monitoring. Never treat CoP unavailability as a silent pass — it must be an observable event in your monitoring stack.
+> When CoP is `UNAVAILABLE` (the responding bank cannot be reached), the payment may usually proceed after the customer is warned that the name could not be checked — but your system **must log this as a degraded check** and flag the payment for enhanced monitoring. Never treat CoP unavailability as a silent pass — it must be an observable event in your monitoring stack.
 
-## ISO 20022 pacs.008 for FPS
+## ISO 20022 pacs.008 for an Instant Scheme (illustrative profile)
 
-FPS adopted ISO 20022 in 2023 as part of the New Payments Architecture (NPA) programme. FPS-specific mandatory fields beyond base pacs.008 CBPR+ requirements:
+> [!NOTE]
+> Today FPS still uses its ISO 8583-based message standard; moving UK retail payments to ISO 20022 is part of the New Payments Architecture (NPA) programme, which has been delayed. The profile below is an **illustrative, FPS-style** example of how a domestic instant scheme narrows the base pacs.008 — SEPA Instant, US RTP, FedNow and PIX all use ISO 20022 with their own rulebooks. Always implement from the real scheme rulebook.
+
+Scheme-specific rules on top of the base pacs.008 (illustrative):
 
 | Element | FPS Requirement | Notes |
 |---------|----------------|-------|
-| `PmtTpInf/LclInstrm/Cd` | `FPS` | Identifies FPS as the scheme |
+| `PmtTpInf/LclInstrm/Cd` | Scheme code | Identifies the instant scheme |
 | `EndToEndId` | Must not be `NOTPROVIDED` | Scheme enforced |
 | `Dbtr/PstlAdr/Ctry` | Mandatory | GB for domestic |
 | `DbtrAcct/Id/Othr/SchmeNm/Cd` | `BBAN` for sort code / account | UK account format |
 | `CdtrAcct/Id/Othr/SchmeNm/Cd` | `BBAN` | UK account format |
-| `SttlmMtd` | `CLRG` | Clearing (Vocalink) settlement |
+| `SttlmMtd` | `CLRG` | Settled through the clearing system |
 | `IntrBkSttlmAmt Ccy` | `GBP` | FPS is GBP only |
 
 A Java builder for FPS-compliant pacs.008:
@@ -395,9 +405,9 @@ public class FpsPacs008Builder {
         AccountIdentification4Choice id = new AccountIdentification4Choice();
         GenericAccountIdentification1 othr = new GenericAccountIdentification1();
         othr.setId(sortCode + accountNumber); // 6-digit sort code + 8-digit account
-        GenericFinancialIdentification1 schme = new GenericFinancialIdentification1();
+        AccountSchemeName1Choice schme = new AccountSchemeName1Choice();
         schme.setCd("BBAN");
-        // set scheme name
+        othr.setSchmeNm(schme);              // tells the receiver how to read the Id
         id.setOthr(othr);
         acct.setId(id);
         return acct;
@@ -428,11 +438,11 @@ Maintaining p99 within budget requires: connection pooling on all external calls
 
 **Q1: Your FPS gateway has a 13-second timeout for the scheme round-trip. A payment times out at second 13 and you have no pacs.002 response. Your fallback logic immediately submits the same payment to BACS. The next day you discover the FPS payment was processed successfully — the pacs.002 was delivered at second 13.5, after your timeout fired. What is the customer impact and what engineering control would have prevented it?**
 
-A: The customer received a double payment: the beneficiary was credited once via FPS (£X) and once via BACS (£X). The debtor was debited twice. The engineering control that prevents this is a **status inquiry before fallback**: on FPS timeout, the gateway must issue a pacs.028 (Payment Status Request) to Vocalink and wait for a pacs.002 response before deciding to fallback. If pacs.002 returns `ACCC`, suppress the fallback entirely. Only if status is `RJCT` or if the status request itself times out should a fallback be considered — and in the latter case, the payment should be held for manual review rather than auto-routed to another rail. Additionally, the idempotency store must record the original FPS endToEndId as "in-flight" so that any BACS submission with the same reference is rejected as a duplicate.
+A: The customer received a double payment: the beneficiary was credited once via FPS (£X) and once via BACS (£X). The debtor was debited twice. The engineering control that prevents this is a **status inquiry before fallback**: on FPS timeout, the gateway must send a status enquiry to the scheme (in ISO 20022 schemes, a pacs.028 answered by a pacs.002) and wait for the answer before deciding anything. If pacs.002 returns `ACCC`, suppress the fallback entirely. Only if status is `RJCT` or if the status request itself times out should a fallback be considered — and in the latter case, the payment should be held for manual review rather than auto-routed to another rail. Additionally, the idempotency store must record the original FPS endToEndId as "in-flight" so that any BACS submission with the same reference is rejected as a duplicate.
 
 **Q2: A receiving bank's FPS processing takes 8 seconds on average but spikes to 14 seconds at p99 during peak hours. The scheme SLA is 15 seconds total. The sending bank consumes 4 seconds on its own processing. Is this arrangement within SLA, and what can the sending bank do if it regularly observes 15-second total round-trip times even when its own processing is 3 seconds?**
 
-A: The arrangement is at risk. 4 seconds (sending bank) + 8 seconds average (receiving bank) = 12 seconds, leaving only 3 seconds for scheme routing overhead. At p99, 4 + 14 = 18 seconds, which exceeds the 15-second SLA. The sending bank cannot control the receiving bank's internal processing, but it can: (1) monitor per-counterparty latency and report persistent SLA breaches to the scheme operator (Vocalink), which has the authority to sanction non-compliant participants; (2) adjust its own processing budget dynamically — if scheme routing overhead is known to be low, the sending bank can trade some of its 4-second budget for scheme monitoring; (3) pre-emptively alert customers when paying to known slow counterparties that the payment may exceed the standard SLA. Ultimately, scheme SLA compliance is a bilateral obligation enforced by the scheme operator, not achievable by one participant alone.
+A: The arrangement is at risk. 4 seconds (sending bank) + 8 seconds average (receiving bank) = 12 seconds, leaving only 3 seconds for scheme routing overhead. At p99, 4 + 14 = 18 seconds, which exceeds the 15-second SLA. The sending bank cannot control the receiving bank's internal processing, but it can: (1) monitor per-counterparty latency and report persistent breaches to the scheme operator (Pay.UK for FPS), which can act against non-compliant participants; (2) adjust its own processing budget dynamically — if scheme routing overhead is known to be low, the sending bank can trade some of its 4-second budget for scheme monitoring; (3) pre-emptively alert customers when paying to known slow counterparties that the payment may exceed the standard SLA. Ultimately, scheme SLA compliance is a bilateral obligation enforced by the scheme operator, not achievable by one participant alone.
 
 ## Practical Challenge
 
@@ -440,9 +450,9 @@ A: The arrangement is at risk. 4 seconds (sending bank) + 8 seconds average (rec
 
 2. **Idempotency store:** Implement `RedisIdempotencyStore` using Spring Data Redis. The store must: atomically set a key (endToEndId → `IN_FLIGHT`) with a 30-second TTL using `SET NX EX`; on completion, update the key to the final result with a 24-hour TTL; on cache miss (Redis unavailable), fall back to a PostgreSQL table with an advisory lock. Write an integration test using Testcontainers (Redis + PostgreSQL) that verifies that two concurrent submissions of the same endToEndId result in exactly one scheme call.
 
-3. **Confirmation of Payee integration:** Build a `CopEnrichedPaymentValidator` that wraps `ConfirmationOfPayeeService` and enforces the following policy: `EXACT_MATCH` → proceed; `CLOSE_MATCH` → proceed but require explicit customer confirmation flag in the request; `NO_MATCH` → reject with reason code `ACMT03` (account name mismatch); `UNAVAILABLE` → proceed but set `degradedCopCheck=true` on the payment record. Write parameterized JUnit 5 tests for all five `MatchLevel` values.
+3. **Confirmation of Payee integration:** Build a `CopEnrichedPaymentValidator` that wraps `ConfirmationOfPayeeService` and enforces the following policy: `EXACT_MATCH` → proceed; `CLOSE_MATCH` → proceed but require explicit customer confirmation flag in the request; `NO_MATCH` → block, with reason `NAME_MISMATCH` (the customer may still choose to proceed only after a clear warning, under your policy); `UNAVAILABLE` → proceed after a warning and set `degradedCopCheck=true` on the payment record. Write parameterized JUnit 5 tests for every CoP result.
 
-4. **FPS scheme simulator:** Build a lightweight Spring Boot test server that exposes a `/fps/submit` endpoint accepting pacs.008 XML and returning a pacs.002 XML response. The simulator should: validate the pacs.008 schema; return `ACCC` for valid payments within a configurable delay (default 2s); return `RJCT` with reason `AC01` (invalid account) for accounts ending in `9999`; return a timeout (delayed response beyond 13s) for payments with `EndToEndId` starting with `TIMEOUT-`. Use this simulator in an integration test suite for `FasterPaymentsGateway` to validate the timeout, circuit breaker, and fallback flows without connecting to Vocalink.
+4. **FPS scheme simulator:** Build a lightweight Spring Boot test server that exposes a `/fps/submit` endpoint accepting pacs.008 XML and returning a pacs.002 XML response. The simulator should: validate the pacs.008 schema; answer pacs.028 status enquiries; return `ACCC` for valid payments within a configurable delay (default 2s); return `RJCT` with reason `AC01` (invalid account) for accounts ending in `9999`; return a timeout (delayed response beyond 13s) for payments with `EndToEndId` starting with `TIMEOUT-`. Use this simulator in an integration test suite for `FasterPaymentsGateway` to validate the timeout, circuit breaker, and fallback flows without connecting to the real scheme.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -456,10 +466,10 @@ A: The arrangement is at risk. 4 seconds (sending bank) + 8 seconds average (rec
         "The BACS payment was rejected due to insufficient funds"
       ],
       "correct": 1,
-      "explanation": "The customer received a double payment: the beneficiary was credited once via FPS and once via BACS. The debtor was debited twice. The correct control is to issue a pacs.028 (Payment Status Request) on FPS timeout before deciding to fallback, only falling back if status is `RJCT` or if the status request itself times out."
+      "explanation": "The beneficiary was credited once via FPS and once via BACS, and the debtor was debited twice. A timeout is an unknown outcome, not a failure. The correct control is to send a status enquiry to the scheme first; switch rails only if the payment is known to have been rejected, and hold the payment for investigation if the status is still unknown. Because instant payments are irrevocable, the duplicate can only be recovered by asking the beneficiary to return it."
     },
     {
-      "text": "What is the total FPS scheme SLA for a payment, and what does it mean for a sending bank that itself consumes 4 seconds of processing?",
+      "text": "This lesson assumes a 15-second end-to-end budget for FPS. What does that mean for a sending bank that itself consumes 4 seconds of processing?",
       "options": [
         "30 seconds total; the sending bank has 26 seconds remaining",
         "15 seconds total; only 11 seconds remain for scheme routing and receiving bank processing",
@@ -467,7 +477,7 @@ A: The arrangement is at risk. 4 seconds (sending bank) + 8 seconds average (rec
         "60 seconds total; there is plenty of headroom"
       ],
       "correct": 1,
-      "explanation": "The FPS scheme SLA is 15 seconds total. With the sending bank consuming 4 seconds, only 11 seconds remain for scheme routing overhead and the receiving bank's internal processing. At p99, a receiving bank taking 14 seconds would cause total round-trip of 4 + 14 = 18 seconds, breaching the SLA."
+      "explanation": "With a 15-second end-to-end budget and 4 seconds used by the sending bank, only 11 seconds remain for the scheme's own routing and the receiving bank's processing. At p99, a receiving bank taking 14 seconds would make the total 4 + 14 = 18 seconds — over budget. This is why every internal stage needs its own budget and why the sending bank should keep its own share small."
     },
     {
       "text": "What does the Confirmation of Payee (CoP) service return when the name provided matches the account holder's name exactly?",
@@ -478,7 +488,7 @@ A: The arrangement is at risk. 4 seconds (sending bank) + 8 seconds average (rec
         "NAME_CONFIRMED"
       ],
       "correct": 1,
-      "explanation": "CoP returns `EXACT_MATCH` when the name provided by the payer matches the name registered to the account exactly. The five possible results are: EXACT_MATCH (proceed), CLOSE_MATCH (require confirmation), NO_MATCH (reject with ACMT03), UNAVAILABLE (proceed with degraded flag), and ACCOUNT_DOES_NOT_EXIST."
+      "explanation": "CoP returns `EXACT_MATCH` when the name the payer entered matches the name on the account. The other results in this lesson's model are CLOSE_MATCH (show the actual name and ask the payer to confirm), NO_MATCH (block or strongly warn), ACCOUNT_NOT_FOUND, BUSINESS_MATCH (account type differs) and UNAVAILABLE (proceed only after a warning, logged as a degraded check)."
     }
   ]
 }
@@ -500,11 +510,11 @@ A: The arrangement is at risk. 4 seconds (sending bank) + 8 seconds average (rec
     },
     {
       "id": "3",
-      "description": "Build a `CopEnrichedPaymentValidator` wrapping `ConfirmationOfPayeeService` enforcing: `EXACT_MATCH` → proceed; `CLOSE_MATCH` → proceed but require explicit customer confirmation flag; `NO_MATCH` → reject with `ACMT03`; `UNAVAILABLE` → proceed with `degradedCopCheck=true`. Write parameterized JUnit 5 tests for all five `MatchLevel` values."
+      "description": "Build a `CopEnrichedPaymentValidator` wrapping `ConfirmationOfPayeeService` enforcing: `EXACT_MATCH` → proceed; `CLOSE_MATCH` → proceed only with an explicit customer confirmation flag; `NO_MATCH` → block with reason `NAME_MISMATCH`; `UNAVAILABLE` → proceed after a warning with `degradedCopCheck=true`. Write parameterized JUnit 5 tests for every CoP result."
     },
     {
       "id": "4",
-      "description": "Build a lightweight Spring Boot FPS scheme simulator that exposes `/fps/submit` accepting pacs.008 XML and returning pacs.002. Return `ACCC` after a configurable delay (default 2s), `RJCT` with `AC01` for accounts ending in `9999`, and a timeout for `EndToEndId` starting with `TIMEOUT-`. Use in integration tests to validate timeout, circuit breaker, and fallback flows."
+      "description": "Build a lightweight Spring Boot scheme simulator that exposes `/fps/submit` accepting pacs.008 XML and returning pacs.002, plus a status-enquiry endpoint (pacs.028). Return `ACCC` after a configurable delay (default 2s), `RJCT` with `AC01` for accounts ending in `9999`, and a timeout for `EndToEndId` starting with `TIMEOUT-` (while still crediting it, so the status enquiry later returns ACCC). Use it in integration tests to validate the timeout, status-enquiry, circuit breaker and no-double-payment flows."
     }
   ]
 }

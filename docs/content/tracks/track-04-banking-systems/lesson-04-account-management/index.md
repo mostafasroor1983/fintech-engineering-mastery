@@ -47,6 +47,8 @@ references:
   - "EBA — Guidelines on Internal Governance Under the CRD"
 ---
 
+## Overview
+
 The account is the atom of the banking system — every customer relationship, every financial obligation, and every regulatory requirement ultimately resolves to an account record with a status, a balance, and a set of permitted operations. While Lesson 1 introduced the account concept in the context of core banking architecture, this lesson examines account management in full depth: how different account types encode different financial relationships, how the account state machine protects both the customer and the bank from invalid operations, and what the lifecycle from opening to closure looks like in production Java code backed by a correctly modelled database.
 
 ## Learning Objectives
@@ -63,7 +65,7 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-In 2019, the UK's Financial Conduct Authority fined a tier-2 bank £76 million for failures in its account dormancy management. The bank had failed to correctly identify and transfer dormant customer balances to the Reclaim Fund under the Dormant Bank and Building Society Accounts Act 2008. An audit found 340,000 accounts that had exceeded 15 years of inactivity without being classified as dormant — the bank's account lifecycle system had a defect where accounts transitioned to `DORMANT` status correctly, but the downstream job that checked "has this been dormant for 15 years and been reported to Reclaim Fund?" was filtering on `updated_at` (which was updated whenever interest was auto-applied) rather than `last_customer_initiated_transaction_at`. Interest accrual every month was resetting the inactivity clock. The fix required a schema change — adding `last_customer_initiated_at` as a separate column — and a backfill of 2.1 million rows.
+*Composite example (based on common industry failure patterns, not a specific bank):* a UK bank taking part in the dormant assets scheme had to identify accounts with no customer-initiated activity for 15 years, so their balances could be transferred to the Reclaim Fund under the Dormant Bank and Building Society Accounts Act 2008. An internal audit found hundreds of thousands of accounts that should have been identified but never were. Accounts moved to `DORMANT` status correctly, but the downstream job that checked "15 years without customer activity?" filtered on `updated_at` — and `updated_at` changed whenever interest was applied automatically. Monthly interest kept resetting the inactivity clock. The fix needed a schema change — a separate `last_customer_initiated_at` column — a backfill of millions of rows from transaction history, and remediation work with the regulator.
 
 ## Account Type Taxonomy
 
@@ -78,7 +80,7 @@ Not all accounts are alike. The account type encodes the financial relationship 
 | **Credit Card Account** | Asset | Debit | No | Revolving credit; statement balance owed |
 | **Nostro Account** | Asset | Debit | N/A | Bank's account held at another bank |
 | **Vostro Account** | Liability | Credit | Yes (to other bank) | Another bank's account held here |
-| **Suspense Account** | Either | Either | N/A | Temporary holding; must clear by EOD |
+| **Suspense Account** | Either | Either | N/A | Temporary holding; investigated and cleared, usually daily |
 | **Internal / Expense** | Expense/Income | Varies | N/A | P&L tracking, fee collection |
 
 > [!NOTE]
@@ -94,8 +96,8 @@ stateDiagram-v2
     ACTIVE --> FROZEN : Compliance hold, fraud suspicion, court order
     FROZEN --> ACTIVE : Hold lifted by compliance officer
     ACTIVE --> DORMANT : No customer-initiated activity for 12–24 months (product-dependent)
-    DORMANT --> ACTIVE : Customer initiates any transaction
-    DORMANT --> RECLAIMED : 15 years dormant — transferred to Reclaim Fund (UK)
+    DORMANT --> ACTIVE : Customer identity verified, then reactivated
+    DORMANT --> RECLAIMED : 15 years without customer activity, transferred to Reclaim Fund (UK, participating banks)
     ACTIVE --> CLOSURE_PENDING : Customer closure request received
     FROZEN --> CLOSURE_PENDING : Regulatory instruction to close
     CLOSURE_PENDING --> CLOSED : Balance swept, all holds released
@@ -111,7 +113,8 @@ stateDiagram-v2
     end note
 
     note right of DORMANT
-        Transactions: BLOCKED
+        Debits: BLOCKED until reactivation
+        Credits: usually accepted
         Interest: May still accrue
         Statements: Suppressed
         Reactivation: Self-service or branch
@@ -213,7 +216,8 @@ public class AccountLifecycleService {
 
     private final AccountRepository accountRepository;
     private final AccountStatusHistoryRepository historyRepository;
-    private final ApplicationEventPublisher eventPublisher;
+    private final HoldRepository holdRepository;
+    private final OutboxRepository outbox;
 
     private static final Map<AccountStatus, Set<AccountStatus>> ALLOWED_TRANSITIONS =
         Map.of(
@@ -352,19 +356,29 @@ public class AccountLifecycleService {
                 "Account must be in CLOSURE_PENDING status; current: " + account.getStatus());
         }
 
-        // Sweep remaining balance if non-zero
-        if (account.getLedgerBalance() != 0) {
+        // An overdrawn account cannot simply be swept: the debt must be
+        // repaid or moved to a collections process first
+        if (account.getLedgerBalance() < 0) {
+            throw new InvalidStateTransitionException(
+                "Account is overdrawn; settle the debt before closure");
+        }
+
+        // Sweep remaining balance if non-zero. The sweep POSTS A JOURNAL ENTRY;
+        // the balances change through that posting — never by setting them to 0
+        if (account.getLedgerBalance() > 0) {
             sweepBalance(account, sweepDestinationAccountId, closedBy);
+        }
+        if (account.getLedgerBalance() != 0 || account.getAvailableBalance() != 0) {
+            throw new IllegalStateException("Balance not zero after sweep — refusing to close");
         }
 
         transitionStatus(account, AccountStatus.CLOSED, closedBy, reason, null);
         account.setClosedAt(Instant.now());
         account.setClosureReason(reason);
-        account.setLedgerBalance(0);
-        account.setAvailableBalance(0);
 
         Account closed = accountRepository.save(account);
-        eventPublisher.publishEvent(new AccountClosedEvent(accountId, closedBy, reason));
+        // Outbox: the event is published only if this transaction commits
+        outbox.save(OutboxEvent.of(new AccountClosedEvent(accountId, closedBy, reason)));
         return closed;
     }
 
@@ -397,7 +411,7 @@ public class AccountLifecycleService {
 
 ## Regulatory Dormancy Detection
 
-Under the UK Dormant Bank and Building Society Accounts Act 2008, accounts with no customer-initiated activity for 15 years must be reported and balances transferred to the Reclaim Fund. The dormancy detection job must use the correct inactivity field.
+Under the UK Dormant Bank and Building Society Accounts Act 2008, banks that take part in the dormant assets scheme can transfer the balances of accounts with no customer-initiated activity for 15 years to the Reclaim Fund (the customer keeps the right to reclaim the money). Whether for that scheme or for the bank's own dormancy rules, the detection job must use the correct inactivity field.
 
 ```java17
 @Service
@@ -411,11 +425,13 @@ public class DormancyDetectionService {
     public void detectAndMarkDormantAccounts() {
         // Product-defined inactivity thresholds:
         // Current accounts: 24 months; Savings: 12 months
-        LocalDateTime currentThreshold  = LocalDateTime.now().minusMonths(24);
-        LocalDateTime savingsThreshold  = LocalDateTime.now().minusMonths(12);
+        OffsetDateTime now              = OffsetDateTime.now(ZoneOffset.UTC);
+        OffsetDateTime currentThreshold = now.minusMonths(24);
+        OffsetDateTime savingsThreshold = now.minusMonths(12);
 
         // Fetch accounts eligible for dormancy — those with no customer activity since threshold
         // Note: last_customer_initiated_at, NOT last_system_activity_at or updated_at
+        // (with millions of accounts, process in pages rather than one big list)
         List<Account> eligible = accountRepository.findDormancyCandidates(
             currentThreshold, savingsThreshold);
 
@@ -446,13 +462,14 @@ WHERE a.status = 'ACTIVE'
   )
 ORDER BY a.last_customer_initiated_at ASC;
 
--- Find accounts that have been DORMANT for 15 years — Reclaim Fund candidates
-SELECT a.id, a.account_number, a.ledger_balance, a.dormant_at
+-- Reclaim Fund candidates: 15 years since the last CUSTOMER activity
+-- (not 15 years since the account was marked dormant)
+SELECT a.id, a.account_number, a.ledger_balance, a.last_customer_initiated_at
 FROM accounts a
 WHERE a.status = 'DORMANT'
-  AND a.dormant_at < now() - INTERVAL '15 years'
+  AND a.last_customer_initiated_at < now() - INTERVAL '15 years'
   AND a.ledger_balance > 0
-ORDER BY a.dormant_at ASC;
+ORDER BY a.last_customer_initiated_at ASC;
 ```
 
 ## Available Balance vs Ledger Balance
@@ -484,13 +501,14 @@ graph TD
 | `pending_debits` | Outbound funds not yet settled | At payment initiation | Input to available_balance calculation |
 
 > [!IMPORTANT]
-> `available_balance` should be stored as a denormalised column, not computed on each transaction request. Computing it dynamically from `SUM(journal_entry_lines)` minus `SUM(active_holds)` for every authorisation request is too slow at scale. Update it atomically in the same transaction as hold placement and release, using optimistic locking (`version` column) to prevent concurrent modification.
+> `available_balance` should be stored as a denormalised column, not computed on each transaction request. Computing it dynamically from `SUM(journal_entry_lines)` minus `SUM(active_holds)` for every authorisation request is too slow at scale. Update it in the same transaction as hold placement and release, with a single conditional `UPDATE` (check and change in one atomic statement), so concurrent requests cannot both pass the funds check. Reconcile it regularly against the ledger.
 
 ```java17
-// Atomic available balance update — called when placing or releasing a hold
-@Transactional(isolation = Isolation.SERIALIZABLE)
+// Atomic available balance update — called when placing or releasing a hold.
+// One conditional UPDATE: the funds check and the change happen atomically
+// in the database, so READ COMMITTED is enough (no SERIALIZABLE needed)
+@Transactional
 public void updateAvailableBalance(UUID accountId, long delta) {
-    // Optimistic lock: fail if another thread modified the account since we read it
     int updated = jdbc.update("""
         UPDATE accounts
         SET available_balance = available_balance + ?,
@@ -503,14 +521,12 @@ public void updateAvailableBalance(UUID accountId, long delta) {
     );
 
     if (updated == 0) {
-        // Either insufficient funds or concurrent modification — re-read to determine which
-        Account account = accountRepository.findById(accountId).orElseThrow();
-        long projectedBalance = account.getAvailableBalance() + delta;
-        if (projectedBalance < -account.getOverdraftLimit()) {
-            throw new InsufficientFundsException(accountId, delta, account.getAvailableBalance(),
-                account.getOverdraftLimit());
-        }
-        throw new OptimisticLockException("Concurrent modification on account " + accountId);
+        // No row changed: the account does not exist, or the new balance
+        // would break the overdraft limit
+        Account account = accountRepository.findById(accountId)
+            .orElseThrow(() -> new AccountNotFoundException(accountId));
+        throw new InsufficientFundsException(accountId, delta, account.getAvailableBalance(),
+            account.getOverdraftLimit());
     }
 }
 ```
@@ -523,7 +539,7 @@ public void updateAvailableBalance(UUID accountId, long delta) {
     "question": "A dormant account detection job uses `updated_at` to find inactive accounts. The bank auto-applies monthly interest to all savings accounts. What is the consequence of this implementation?",
     "options": [
       "No consequence — interest application proves the account is still economically active",
-      "The dormancy clock is never triggered — updated_at resets every month, so accounts never qualify for dormancy status",
+      "The job marks every savings account dormant immediately, because interest is not a customer action",
       "The job runs correctly but produces false positives for accounts without interest",
       "Interest application updates updated_at, resetting the inactivity period to zero every month — genuinely inactive accounts never reach the dormancy threshold"
     ],
@@ -536,7 +552,7 @@ public void updateAvailableBalance(UUID accountId, long delta) {
     "options": [
       "£600 — the full ledger balance",
       "£400 — ledger balance minus existing holds",
-      "£600 — existing holds plus the overdraft limit",
+      "£200 — only the overdraft limit",
       "£400 available_balance plus £200 overdraft = £600 maximum additional hold permitted"
     ],
     "correct": 3,

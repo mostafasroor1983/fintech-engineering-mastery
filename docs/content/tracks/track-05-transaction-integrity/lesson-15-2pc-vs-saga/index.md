@@ -11,6 +11,8 @@ tags: [2PC, saga, distributed-transactions, trade-offs, XA]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 The question of whether to use two-phase commit or a saga is not an ideological one — it is an engineering decision driven by the failure characteristics of your specific infrastructure. Principal engineers who default to "sagas everywhere because 2PC is bad" or "2PC because we need ACID" without analyzing the deployment context are trading one set of failure modes for another without understanding either. Two-phase commit provides linearizability and atomicity at the cost of blocking under coordinator failure. Sagas provide non-blocking coordination at the cost of eventual consistency, dirty reads, and compensation complexity. Both are legitimate tools. The goal of this lesson is to give you the decision framework to choose correctly — and to understand the hybrid pattern that sidesteps the trade-off for the most common fintech use case.
 
 ## Learning Objectives
@@ -25,7 +27,7 @@ The question of whether to use two-phase commit or a saga is not an ideological 
 
 ## Business Context
 
-In 2017, a Tier-1 US bank's treasury system used XA transactions to coordinate writes across its core banking database, a risk calculation database, and a JMS message queue. Under normal operation, the system processed 8,000 transactions per day with sub-second commit times. During a planned failover test of the Oracle RAC cluster acting as the XA coordinator, 23 transactions entered a "in doubt" state: each participant had voted "yes" in Phase 1 but the coordinator crashed before delivering Phase 2 commit messages. All 23 transactions held row-level locks on both databases for 4 hours — the duration of the unplanned incident response. The locked rows included high-value positions on interest rate swaps. The risk system could not recompute valuations for those positions, causing incorrect risk reports to be delivered to the trading desk. Post-mortem finding: "XA provides atomicity but not availability. Under coordinator failure, we have neither." The team subsequently migrated to a saga with a local DB transaction plus outbox, which they described as "2PC minus the coordinator" — a description this lesson will make precise.
+*Composite example:* a large bank's treasury system used XA transactions to coordinate writes across its core banking database, a risk calculation database, and a JMS message queue. Under normal operation, the system processed 8,000 transactions per day with sub-second commit times. During a planned failover test of the node running the XA transaction manager, 23 transactions entered a "in doubt" state: each participant had voted "yes" in Phase 1 but the coordinator crashed before delivering Phase 2 commit messages. All 23 transactions held row-level locks on both databases for 4 hours — the duration of the unplanned incident response. The locked rows included high-value positions on interest rate swaps. The risk system could not recompute valuations for those positions, causing incorrect risk reports to be delivered to the trading desk. Post-mortem finding: "XA provides atomicity but not availability. Under coordinator failure, we have neither." The team subsequently migrated to a saga with a local DB transaction plus outbox, which they described as "2PC minus the coordinator" — a description this lesson will make precise.
 
 ## 2PC Mechanics: Locks, Phases, and the Coordinator
 
@@ -62,7 +64,7 @@ The critical vulnerability is visible in the diagram: if the coordinator crashes
 
 ## XA Transactions in Java
 
-The Java Transaction API (JTA) exposes XA coordination through `javax.transaction.xa.XAResource`. Spring wraps this with `JtaTransactionManager`. A typical configuration spanning a PostgreSQL database and an ActiveMQ JMS queue:
+The Java Transaction API (JTA) exposes XA coordination through `javax.transaction.xa.XAResource` (in the JDK), while `UserTransaction` and `TransactionManager` live in the `jakarta.transaction` package in Spring 6 / Spring Boot 3. Spring wraps this with `JtaTransactionManager`. A typical configuration spanning a PostgreSQL database and an ActiveMQ JMS queue:
 
 ```java
 @Configuration
@@ -130,7 +132,7 @@ public class PaymentProcessingService {
 This is genuine atomicity across two resource managers. The XA coordinator (Atomikos in this example) manages the two-phase commit protocol transparently.
 
 > [!NOTE]
-> XA transactions require XA-capable drivers and connection pools. Not all JDBC drivers support XA fully; PostgreSQL's `PGXADataSource` does, but its XA implementation has known limitations with certain transaction patterns. Test XA failure scenarios explicitly in a staging environment before relying on them in production. Atomikos and Bitronix are the two most widely deployed open-source JTA transaction managers for Spring; Bitronix reached end-of-life in 2016 so Atomikos is the current recommendation.
+> XA transactions require XA-capable drivers and connection pools. PostgreSQL's `PGXADataSource` supports XA, but the server must allow prepared transactions: `max_prepared_transactions` is **0 by default**, which makes every prepare fail. Set it to at least the number of concurrent XA transactions — and monitor `pg_prepared_xacts`, because an orphaned prepared transaction holds its locks and blocks vacuum until someone resolves it. Test XA failure scenarios explicitly in a staging environment before relying on them in production. Bitronix is no longer maintained, and Spring Boot 3 dropped its built-in JTA auto-configuration for Atomikos; use Atomikos's own Spring Boot 3 starter or Narayana.
 
 ## 2PC Failure Modes
 
@@ -138,7 +140,7 @@ This is genuine atomicity across two resource managers. The XA coordinator (Atom
 
 **Failure Mode 2 — Network partition during commit.** The coordinator sends commit to Participant 1 successfully. The network partitions, and the commit message never reaches Participant 2. Participant 1 commits and releases locks. Participant 2 holds its locks waiting for a message that will not arrive until connectivity is restored. The two participants are now inconsistent: one has committed, one has not. This cannot occur with a single-database local transaction.
 
-**Failure Mode 3 — Participant timeout under coordinator overload.** If the coordinator is slow to send Phase 2 messages (high GC pause, CPU saturation), participants may time out waiting and must decide whether to abort unilaterally. Most XA implementations do not allow unilateral abort after a "yes" vote; the participant must wait. Under sustained coordinator overload, all XA-coordinated transactions effectively halt.
+**Failure Mode 3 — Participant timeout under coordinator overload.** If the coordinator is slow to send Phase 2 messages (high GC pause, CPU saturation), participants wait with their locks held. After a "yes" vote the protocol does not allow a participant to abort on its own. Some resource managers can be told to make a *heuristic* decision (commit or roll back without the coordinator) — but if the coordinator decided the other way, the result is a "heuristic mixed" outcome: exactly the inconsistency 2PC was supposed to prevent, now to be repaired by hand. Under sustained coordinator overload, all XA-coordinated transactions effectively halt.
 
 ```java
 // Demonstrating coordinator timeout — this is what NOT to do in production
@@ -206,12 +208,13 @@ flowchart TD
     style HYBRID2 fill:#cce5ff,color:#000
 ```
 
-**Use 2PC when all five conditions hold:**
+**Use 2PC only when all of these conditions hold:**
 1. All participants are in the same datacenter (sub-millisecond coordinator round trips).
 2. All participants expose XA-capable resource managers (PostgreSQL, ActiveMQ, IBM MQ).
 3. Three or fewer participants (each additional participant multiplies the failure surface).
 4. Transaction duration is under 2 seconds including all participant processing.
 5. Strong atomicity is a hard requirement and compensations are not acceptable (e.g., regulatory ledger entries that must be atomically paired with their confirmation message).
+6. The coordinator is highly available, with a durable transaction log and fast failover.
 
 **Use Saga when any of these apply:**
 - Any participant is reached over HTTP or is in a different datacenter.
@@ -221,7 +224,7 @@ flowchart TD
 - Compensations are well-defined and implementable as idempotent operations.
 
 > [!IMPORTANT]
-> The "fewer than three participants" rule for 2PC is a heuristic, not a hard limit. With three participants, a coordinator crash in Phase 2 means two participants hold locks while one may have committed — a three-way inconsistency that is exponentially harder to diagnose and resolve than a two-way inconsistency. For financial systems where "in doubt" transactions require manual resolution, every additional XA participant multiplies the incident response cost.
+> The "three or fewer participants" rule for 2PC is a heuristic, not a hard limit. Every additional participant is one more resource that can be left "in doubt" with locks held, one more driver whose XA behaviour must be tested, and one more system to inspect during recovery. For financial systems where "in doubt" transactions require manual resolution, each additional XA participant raises the incident response cost.
 
 ## The Hybrid Pattern: Best of Both Worlds
 
@@ -264,7 +267,7 @@ The relay (Lesson 13's `OutboxRelay`) then asynchronously delivers the outbox ev
 - **No XA coordinator** — there is no distributed transaction manager to crash, no participants to leave "in doubt," and no cross-system locks.
 - **At-least-once delivery with idempotent consumers** — the relay may deliver the event more than once after a crash-restart cycle; downstream consumers deduplicate by outbox event ID (covered in Lesson 13).
 
-This pattern is used by virtually every high-volume payment system that has migrated away from XA. It is what the treasury system in the Business Context section adopted after their 2017 incident.
+This pattern is widely used by high-volume payment systems that have moved away from XA. It is what the treasury system in the Business Context section adopted after its incident.
 
 ```mermaid
 graph LR

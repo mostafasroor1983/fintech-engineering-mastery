@@ -11,6 +11,8 @@ tags: [Semaphore, CountDownLatch, CyclicBarrier, Phaser, synchronizers]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 The `java.util.concurrent` synchronizer toolkit gives Principal Engineers precise, composable coordination primitives beyond the coarse-grained `synchronized` keyword. Each class encodes a different coordination *protocol*: who waits for whom, how many times, and whether participants can dynamically join or leave. Choosing the wrong primitive leads to either correctness failures (using a one-shot latch where a reusable barrier is needed) or unnecessary complexity (using a Phaser where a simple Semaphore suffices). In payments and banking systems, these primitives sit at the core of batch processing pipelines, API rate-limiting clients, and startup sequencing logic.
 
 ## Learning Objectives
@@ -41,7 +43,7 @@ semaphore.acquire(n);                                  // acquire n permits atom
 semaphore.release();                                   // return permit
 semaphore.release(n);                                  // return n permits
 boolean acquired = semaphore.tryAcquire();             // non-blocking attempt
-boolean acquired = semaphore.tryAcquire(500, MILLIS);  // try with timeout
+boolean acquired = semaphore.tryAcquire(500, TimeUnit.MILLISECONDS);  // try with timeout
 int available    = semaphore.availablePermits();
 ```
 
@@ -58,7 +60,7 @@ Semaphore fair    = new Semaphore(10, true);
 ```
 
 > [!NOTE]
-> In payment processing, fairness matters. If a Semaphore guards a shared pricing-engine connection and you use a non-fair semaphore, long-running batch threads can repeatedly re-acquire the permit while real-time authorisation threads starve. Use fair semaphores whenever latency guarantees span across thread populations with different priorities.
+> In payment processing, fairness matters. If a Semaphore guards a shared pricing-engine connection and you use a non-fair semaphore, batch threads that keep re-acquiring permits can starve real-time authorisation threads. A fair semaphore prevents starvation (FIFO order) — but it does **not** give real-time threads priority: they still queue behind batch threads. When two traffic classes have different latency needs, give each its own permit quota (for example a separate semaphore for batch). Note also that the untimed `tryAcquire()` ignores fairness and barges in; `tryAcquire(timeout, unit)` respects it.
 
 ### Fintech Example — Fraud API Rate Limiter
 
@@ -87,6 +89,9 @@ public class FraudScoringClient {
     public FraudScoringClient(FraudApiHttpClient httpClient, MeterRegistry meterRegistry) {
         this.httpClient    = httpClient;
         this.meterRegistry = meterRegistry;
+        // Register the gauge ONCE — it samples availablePermits() on each scrape
+        meterRegistry.gauge("fraud.semaphore.available", concurrencyGuard,
+                            Semaphore::availablePermits);
     }
 
     /**
@@ -103,8 +108,6 @@ public class FraudScoringClient {
                 + concurrencyGuard.getQueueLength() + " threads waiting");
         }
 
-        meterRegistry.gauge("fraud.semaphore.available", concurrencyGuard,
-                            Semaphore::availablePermits);
         try {
             return httpClient.postScoreRequest(payment);
         } finally {
@@ -127,17 +130,20 @@ public class FraudScoringClient {
 
 ```java
 /**
- * A fixed-size pool of database connections guarded by a Semaphore.
- * Demonstrates binary (1-permit) and counting semaphore patterns.
+ * A fixed-size pool of database connections guarded by a counting Semaphore.
+ * (Teaching example — in production use HikariCP, which also validates
+ *  and replaces broken connections.)
  */
 public class LedgerConnectionPool {
 
     private final Semaphore        permits;
+    // Thread-safe queue: several permit holders poll/offer at the same time.
+    // (A plain ArrayDeque here would be a data race.)
     private final Queue<Connection> pool;
 
     public LedgerConnectionPool(int poolSize, DataSource dataSource) throws SQLException {
         this.permits = new Semaphore(poolSize, true);
-        this.pool    = new ArrayDeque<>(poolSize);
+        this.pool    = new ConcurrentLinkedQueue<>();
         for (int i = 0; i < poolSize; i++) {
             pool.add(dataSource.getConnection());
         }
@@ -186,6 +192,8 @@ long remaining = latch.getCount();             // current count (for diagnostics
 The payment batch engine connects to three regional clearing networks (SEPA, SWIFT, ACH) at startup. No payment instructions should be accepted until all three connections are confirmed. A `CountDownLatch(3)` is the canonical tool.
 
 ```java
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -197,21 +205,27 @@ public class BatchEngineStartup {
     private static final long   STARTUP_TIMEOUT_SEC = 30;
 
     private final CountDownLatch feedsReady = new CountDownLatch(FEED_COUNT);
+    private final Queue<String>  failedFeeds = new ConcurrentLinkedQueue<>();
 
     public void start() throws InterruptedException {
         ExecutorService startupPool = Executors.newFixedThreadPool(FEED_COUNT);
 
-        startupPool.submit(new FeedConnector("SEPA",  feedsReady));
-        startupPool.submit(new FeedConnector("SWIFT", feedsReady));
-        startupPool.submit(new FeedConnector("ACH",   feedsReady));
+        startupPool.submit(new FeedConnector("SEPA",  feedsReady, failedFeeds));
+        startupPool.submit(new FeedConnector("SWIFT", feedsReady, failedFeeds));
+        startupPool.submit(new FeedConnector("ACH",   feedsReady, failedFeeds));
 
         startupPool.shutdown();
 
-        boolean allUp = feedsReady.await(STARTUP_TIMEOUT_SEC, TimeUnit.SECONDS);
-        if (!allUp) {
+        boolean allReported = feedsReady.await(STARTUP_TIMEOUT_SEC, TimeUnit.SECONDS);
+        if (!allReported) {
             throw new IllegalStateException(
                 "Batch engine startup timeout: " + feedsReady.getCount()
-                + " feed(s) did not connect within " + STARTUP_TIMEOUT_SEC + "s");
+                + " feed(s) did not report within " + STARTUP_TIMEOUT_SEC + "s");
+        }
+        // Every feed reported — but a report can be a FAILURE. Check explicitly:
+        // counting a failed connection as "ready" would open the gate wrongly
+        if (!failedFeeds.isEmpty()) {
+            throw new IllegalStateException("Feeds failed to connect: " + failedFeeds);
         }
         System.out.println("All feeds connected — batch engine accepting instructions");
     }
@@ -222,10 +236,12 @@ public class BatchEngineStartup {
 
         private final String           networkName;
         private final CountDownLatch   latch;
+        private final Queue<String>    failures;
 
-        FeedConnector(String networkName, CountDownLatch latch) {
+        FeedConnector(String networkName, CountDownLatch latch, Queue<String> failures) {
             this.networkName = networkName;
             this.latch       = latch;
+            this.failures    = failures;
         }
 
         @Override
@@ -234,12 +250,12 @@ public class BatchEngineStartup {
                 connectToNetwork(networkName);     // blocks until TCP handshake completes
                 System.out.println(networkName + " feed connected");
             } catch (Exception e) {
-                // Log, alert, potentially trigger circuit breaker
+                // Record the failure so the caller fails fast instead of waiting
+                // for the full timeout
+                failures.add(networkName);
                 System.err.println(networkName + " feed failed: " + e.getMessage());
-                // Note: we do NOT call countDown() here — the latch timeout will fire
             } finally {
-                latch.countDown();   // signal regardless — let caller inspect getCount()
-                                     // if failure should still unblock, call countDown() in catch
+                latch.countDown();   // "this feed has reported" — success OR failure
             }
         }
 
@@ -265,6 +281,7 @@ public class AuthorisationLoadTest {
 
     public void run() throws InterruptedException {
         int threadCount = 50;
+        CountDownLatch ready      = new CountDownLatch(threadCount); // all at the gate
         CountDownLatch startGun   = new CountDownLatch(1);   // 1 controller releases all
         CountDownLatch allDone    = new CountDownLatch(threadCount);
 
@@ -272,6 +289,7 @@ public class AuthorisationLoadTest {
             final int txId = i;
             new Thread(() -> {
                 try {
+                    ready.countDown();
                     startGun.await();                        // all block here
                     submitAuthorisation("TXN-" + txId);
                 } catch (InterruptedException e) {
@@ -282,7 +300,7 @@ public class AuthorisationLoadTest {
             }).start();
         }
 
-        Thread.sleep(100);         // let all threads reach the gate
+        ready.await();             // every thread is at the gate (no guessing with sleep)
         startGun.countDown();      // release all 50 threads simultaneously
         allDone.await();           // wait for all results
         System.out.println("Load test complete");
@@ -448,7 +466,11 @@ for (int day = 1; day <= 5; day++) {  // Monday through Friday
     for (String region : regions) {
         pool.submit(new RegionalSettlementProcessor(region, dailyBarrier));
     }
-    // After all 4 arrive and reconcileAction runs, barrier resets for next day
+    // After all 4 arrive and reconcileAction runs, barrier resets for next day.
+    // Wait for the day to finish before submitting the next one: the barrier
+    // only counts arrivals, so with a larger pool it could group Monday's
+    // EMEA with Tuesday's APAC
+    waitForDayToComplete(day);
 }
 ```
 
@@ -463,8 +485,9 @@ private void processWithBarrier(CyclicBarrier barrier) {
         doWork();
         barrier.await(10, TimeUnit.SECONDS);
     } catch (TimeoutException e) {
-        // This thread timed out — this also breaks the barrier for all other waiters
-        barrier.reset();   // only safe if you can guarantee no other thread is mid-await
+        // This thread timed out — that ALREADY breaks the barrier: every other
+        // waiter gets BrokenBarrierException. Do not call reset() here; reset
+        // only after all parties have left, as part of a controlled restart
         throw new SettlementException("Regional processor timed out at barrier", e);
     } catch (BrokenBarrierException e) {
         // Another participant failed; this processor should also abort
@@ -513,7 +536,7 @@ phaser.awaitAdvanceInterruptibly(phase, timeout, unit);
 
 // Termination
 boolean terminated = phaser.isTerminated();
-// Terminate by returning negative phase from onAdvance():
+// Terminate by returning true from onAdvance() (phase numbers then become negative):
 // protected boolean onAdvance(int phase, int registeredParties) {
 //     return phase >= MAX_PHASE || registeredParties == 0;
 // }
@@ -521,7 +544,7 @@ boolean terminated = phaser.isTerminated();
 
 ### Fintech Example — Multi-Step Payment Processing Pipeline
 
-A payment orchestration pipeline has three phases: validation, enrichment, and routing. Worker threads process batches of payment instructions. Some workers handle only validation (they deregister after phase 0). A dynamic set of enrichment workers joins at phase 1.
+A payment orchestration pipeline has three phases: validation, enrichment, and routing. Worker threads process batches of payment instructions. Validation-and-enrichment workers take part in phases 0 and 1 and then deregister. Routing workers are registered from the start but only do work in phase 2 — they arrive without waiting in the earlier phases.
 
 ```java
 import java.util.concurrent.Phaser;
@@ -570,12 +593,11 @@ public class PaymentPipeline {
         // Orchestrator participates in phase synchronisation
         phaser.arriveAndAwaitAdvance();   // phase 0 → 1
         phaser.arriveAndAwaitAdvance();   // phase 1 → 2
-        phaser.arriveAndDeregister();     // orchestrator exits after phase 2 setup
+        int last = phaser.arriveAndDeregister();   // leave in phase 2
 
-        // Wait for pipeline termination
-        while (!phaser.isTerminated()) {
-            Thread.sleep(50);
-        }
+        // Wait for phase 2 to finish (the phaser then terminates). awaitAdvance
+        // works without being registered — no busy-wait loop needed
+        phaser.awaitAdvance(last);
         pool.shutdown();
         System.out.println("Pipeline complete, final phase: " + phaser.getPhase());
     }
@@ -651,11 +673,12 @@ class RoutingOnlyWorker implements Runnable {
     @Override
     public void run() {
         try {
-            // Skip phase 0 and phase 1 by arriving without blocking
-            phaser.arrive();   // phase 0: arrive but don't await
-            phaser.awaitAdvance(phaser.getPhase());   // wait passively for phase 1 to start
-            phaser.arrive();   // phase 1: arrive but don't await
-            phaser.awaitAdvance(phaser.getPhase());   // wait passively for phase 2 to start
+            // Skip phase 0 and phase 1: arrive, then wait for THAT phase to end.
+            // Use the phase number returned by arrive(): calling getPhase()
+            // afterwards is a race — if we were the last to arrive, the phase
+            // has already advanced and we would wait for the WRONG phase
+            phaser.awaitAdvance(phaser.arrive());   // phase 0 → 1
+            phaser.awaitAdvance(phaser.arrive());   // phase 1 → 2
 
             // Phase 2: Routing
             System.out.println("RoutingWorker-" + workerId + " routing payments");
@@ -715,7 +738,7 @@ Phaser weeklyPhaser = new Phaser(WORKER_COUNT) {
 
 ## 5. Common Mistake: CountDownLatch Where CyclicBarrier Is Needed
 
-This is one of the most common concurrency bugs in batch payment systems. The symptoms are subtle: settlement runs correctly on the first day, then hangs forever on the second day.
+This is one of the most common concurrency bugs in batch payment systems. The symptoms are subtle: settlement runs correctly on the first day; on the second day the latch is already at zero, so `await()` returns at once and **reconciliation runs before the regions have finished** — no error, just wrong numbers.
 
 ```java
 // BUG: CountDownLatch used for a recurring nightly settlement
@@ -759,7 +782,9 @@ public class CorrectSettlementCoordinator {
                 }
             });
         }
-        // Reconciliation runs as the barrier action — no separate await needed here
+        // Reconciliation runs as the barrier action — no separate await needed here.
+        // If any region fails, the barrier stays BROKEN for every later night
+        // until reset() — make recovery an explicit, monitored step
     }
 }
 ```
@@ -776,8 +801,8 @@ public class CorrectSettlementCoordinator {
 | **Barrier action** | No | No | Yes (last thread) | Via `onAdvance()` |
 | **Dynamic join/leave** | Implicit (acquire/release) | No | No | Yes (register/deregister) |
 | **Waiting model** | Permit availability | Count reaches zero | All parties arrive | Phase advance |
-| **Interrupt handling** | `InterruptedException` | `InterruptedException` | `BrokenBarrierException` | Returns negative phase |
-| **Termination** | Manual (drain permits) | Implicit (count=0) | Manual or broken | `onAdvance()` returns true |
+| **Interrupt handling** | `InterruptedException` | `InterruptedException` | Interrupted thread: `InterruptedException`; other waiters: `BrokenBarrierException` | `arriveAndAwaitAdvance()` is not interruptible; use `awaitAdvanceInterruptibly()` |
+| **Termination** | N/A | Implicit (count=0) | Stays broken after a failure until `reset()` | `onAdvance()` returns true (then phase numbers are negative) |
 | **Fairness option** | Yes (`new Semaphore(n, true)`) | N/A | N/A | N/A |
 | **Best fintech use case** | API rate limiting, connection pools | Startup gates, test harnesses | End-of-day settlement phases | Multi-step payment pipelines |
 
@@ -805,11 +830,11 @@ flowchart TD
 
 **Q1: A fraud detection service issues scoring requests to an external ML API. The contract states a maximum of 20 concurrent in-flight requests. Occasionally, 50 payment authorisation threads all arrive simultaneously. What happens if you use `new Semaphore(20, false)` versus `new Semaphore(20, true)`, and which is more appropriate here?**
 
-A: With a non-fair semaphore (`false`), when a permit is released the JVM can grant it to any waiting thread — including one that just arrived. This can cause high-priority real-time authorisation threads to starve if a wave of batch threads is constantly arriving and re-acquiring permits. With a fair semaphore (`true`), permits are granted in FIFO order, guaranteeing that no thread waits indefinitely. For payment authorisation, where customer-facing latency SLAs apply, the fair semaphore is more appropriate despite its slightly lower throughput. The throughput difference is typically less than 5% under moderate contention, while starvation prevention is a hard correctness requirement for real-time payments.
+A: With a non-fair semaphore (`false`), a released permit can go to any thread — including one that just arrived and "barges" ahead of the queue. If batch threads keep arriving and re-acquiring permits, real-time authorisation threads can starve. With a fair semaphore (`true`), permits are granted in FIFO order, so no thread waits indefinitely. For payment authorisation, the fair semaphore is the safer choice, but it costs throughput under heavy contention (more thread hand-offs) — measure it. And fairness only prevents starvation; it does not put real-time calls first. If real-time and batch traffic share the API, give each its own permit quota.
 
-**Q2: An end-of-day settlement system uses a `CyclicBarrier(4)` to coordinate four regional processors. During a Thursday run, the APAC processor throws an uncaught `RuntimeException` after calling `barrier.await()` but before all four have arrived. What happens to the other three processors waiting at the barrier?**
+**Q2: An end-of-day settlement system uses a `CyclicBarrier(4)` to coordinate four regional processors. During a Thursday run, the APAC processor throws an uncaught `RuntimeException` *before* it reaches `barrier.await()`. The other three are already waiting at the barrier. What happens to them?**
 
-A: When a thread's `await()` call is interrupted, times out, or the barrier is broken, `BrokenBarrierException` is thrown to all currently waiting threads and to any thread that subsequently calls `await()` while the barrier is in the broken state. In this case, the APAC thread's exception causes the barrier to be marked broken. The three waiting threads (EMEA, AMERICAS, DOMESTIC) each receive a `BrokenBarrierException`. They must catch this exception, abort their local settlement work, and trigger an operational alert. The barrier remains broken until `barrier.reset()` is called — which should only happen after all participant threads have been confirmed to have exited the barrier, otherwise `reset()` itself throws `BrokenBarrierException` in remaining waiters.
+A: They wait **forever** (if they use the untimed `await()`). The barrier does not know that APAC died — a thread that never calls `await()` does not break it. The barrier breaks only when a waiting thread is interrupted or times out, when the barrier action throws, or when `reset()` is called. So always use `await(timeout, unit)`: the first waiter to time out gets `TimeoutException` and breaks the barrier, and the other waiters receive `BrokenBarrierException`. They must abort their local settlement work and trigger an operational alert. The barrier then stays broken until `reset()` — call it only as part of a controlled restart, after all parties have left.
 
 ---
 
@@ -837,7 +862,7 @@ Design and implement a `RiskAwareBatchProcessor` that orchestrates a three-phase
 {
   "questions": [
     {
-      "text": "An end-of-day settlement system uses CountDownLatch(4) to coordinate four regional processors. After running correctly on Monday, the system hangs on Tuesday. What is the most likely cause?",
+      "text": "An end-of-day settlement system uses CountDownLatch(4) to coordinate four regional processors. After running correctly on Monday, on Tuesday the master reconciliation starts before the regions have finished. What is the most likely cause?",
       "options": [
         "The CountDownLatch was garbage collected between runs",
         "CountDownLatch is a one-shot primitive and cannot be reused — the latch count is already zero from Monday's run, so await() returns immediately without waiting",
@@ -856,7 +881,7 @@ Design and implement a `RiskAwareBatchProcessor` that orchestrates a three-phase
         "Replace with a ReentrantLock(true) fair lock for each API call"
       ],
       "correct": 1,
-      "explanation": "A non-fair semaphore (false) can grant permits to any waiting thread, including newly arrived ones. Under sustained load, real-time threads can starve if batch threads continuously acquire and release permits before real-time threads get a turn. A fair semaphore (true) grants permits in FIFO arrival order, guaranteeing that no thread waits indefinitely. The throughput difference is typically less than 5% under moderate contention."
+      "explanation": "A non-fair semaphore (false) can give a released permit to any thread, including one that just arrived. Under sustained load, real-time threads can starve if batch threads keep acquiring permits first. A fair semaphore (true) grants permits in FIFO order, so no thread waits indefinitely. It costs some throughput under heavy contention, and it does not give real-time calls priority — for that, give each traffic class its own permit quota."
     },
     {
       "text": "A Phaser is used for a 3-phase payment batch. During phase 1, one of 5 workers throws an uncaught exception before calling arriveAndAwaitAdvance(). What happens to the other 4 workers waiting at phase 1?",

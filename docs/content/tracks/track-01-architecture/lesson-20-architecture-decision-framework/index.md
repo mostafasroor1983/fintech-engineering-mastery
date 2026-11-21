@@ -3,7 +3,7 @@ id: track-01-lesson-20
 title: "Principal Engineer's Architecture Decision Framework"
 slug: architecture-decision-framework
 track: track-01
-trackName: "Financial Services Architecture"
+trackName: "Advanced Software Architecture"
 sequence: 20
 difficulty: principal
 estimatedMinutes: 65
@@ -194,7 +194,9 @@ public class PaymentOrchestrationService {
 
         LedgerPostingResult posting = ledger.postHold(payment);  // in-process
 
-        // Asynchronous — customer does not wait for these
+        // Asynchronous — customer does not wait for these. The event is written to
+        // an outbox table in the same transaction as the payment and relayed to
+        // Kafka after commit (see the ADR below) — never sent straight to the broker
         events.publish(new PaymentSubmittedEvent(payment));
         // -> notification-service picks this up: sends confirmation email
         // -> fraud-service picks this up: updates velocity counters
@@ -298,17 +300,19 @@ public enum ConsistencyRequirement {
 
 ```java
 // The account balance must be strongly consistent.
-// Use a single-master database with synchronous replication for reads.
+// Read it on the primary, inside the transaction that changes it.
 @Repository
 public class StronglyConsistentAccountRepository {
 
     private final JdbcTemplate primaryJdbc;   // Always read from primary
 
-    @Transactional(isolation = Isolation.SERIALIZABLE)
+    // Must run inside the caller's @Transactional; READ COMMITTED + FOR UPDATE is
+    // enough here. NOWAIT would fail at once on a busy account — prefer a short
+    // lock_timeout (e.g. SET LOCAL lock_timeout = '2s').
     public Optional<Account> findAndLockForUpdate(String accountId) {
         return primaryJdbc.query(
             // SELECT FOR UPDATE prevents concurrent balance modifications
-            "SELECT * FROM accounts WHERE account_id = ? FOR UPDATE NOWAIT",
+            "SELECT * FROM accounts WHERE account_id = ? FOR UPDATE",
             accountRowMapper, accountId
         ).stream().findFirst();
     }
@@ -450,7 +454,7 @@ or if Debezium operational overhead becomes significant.
 Choosing Kafka, Kubernetes, service mesh, or any other technology because it looks impressive — not because the problem demands it. This introduces operational complexity that the team then has to maintain for years.
 
 **2. Cargo-Cult Architecture**
-"Netflix/Uber/Revolut uses microservices, therefore we should too." These companies built their architectures in response to specific scale problems they had at specific points in their growth. Their architecture is the answer to their question, not yours.
+"Netflix and Uber use microservices, therefore we should too." These companies built their architectures in response to specific scale problems they had at specific points in their growth. Their architecture is the answer to their question, not yours.
 
 **3. Architecture by Consensus**
 Requiring unanimous agreement for every architectural decision leads to either decision paralysis or mediocre compromises that please no one and satisfy no constraints. The principal engineer's job is to decide, not to build consensus for its own sake.
@@ -540,7 +544,7 @@ Code reviews that check architectural compliance are inconsistent and don't scal
         "Optimising for the exceptional case — the team is designing for Netflix-scale traffic. The principal engineer should provide current traffic metrics."
       ],
       "correct": 1,
-      "explanation": "This is cargo-cult architecture — adopting a technology because another company uses it, not because the problem requires it. Netflix/Uber/Revolut built their architectures in response to specific scale problems at specific growth stages. The correct first question is: what is the actual throughput, ordering, and replay requirement? The answer often reveals that simpler alternatives (a database queue, SQS) are sufficient."
+      "explanation": "This is cargo-cult architecture — adopting a technology because another company uses it, not because the problem requires it. Netflix and Uber built their architectures in response to specific scale problems at specific growth stages. The correct first question is: what is the actual throughput, ordering, and replay requirement? The answer often reveals that simpler alternatives (a database queue, SQS) are sufficient."
     },
     {
       "text": "According to the principal engineer's decision checklist, which condition makes a decision reversible and therefore appropriate for less rigorous analysis?",

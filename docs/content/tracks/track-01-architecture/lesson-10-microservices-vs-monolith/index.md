@@ -34,7 +34,7 @@ The microservices vs monolith debate is one of the most reliably misframed decis
 - Articulate the specific trade-offs between monolith, modular monolith, and microservices across deployment, latency, team topology, and operational complexity dimensions
 - Apply Conway's Law to predict how an organisation's communication structure will shape its architecture
 - Use the modular monolith as a deliberate intermediate step between monolith and microservices
-- Implement `@Module` boundary enforcement with ArchUnit to prevent cross-module coupling
+- Enforce module boundaries with ArchUnit (or Spring Modulith) to prevent cross-module coupling
 - Explain why distributed transactions are the core technical cost of microservices and name three patterns to manage them
 - Describe the strangler fig pattern and the four phases required to migrate a legacy financial service safely
 - Identify the conditions under which microservices are the wrong choice — startup stage, single team, tight coupling
@@ -42,7 +42,7 @@ The microservices vs monolith debate is one of the most reliably misframed decis
 
 ## Business Context
 
-In 2019, a European bank rebuilt its retail banking platform from a 15-year-old Oracle FORMS monolith into 47 microservices over 18 months. The project cost €14M. At go-live, the system required 23 Kubernetes namespaces, 180 container images, and a 12-person platform engineering team just to keep it running. The 6-person product development team spent more time debugging distributed tracing spans than building features. P99 latency for a simple balance check — a single query in the monolith — was 340ms due to 4 network hops through authentication, account, balance, and notification services.
+Consider a European bank (a composite example) that rebuilt its retail banking platform from a 15-year-old Oracle FORMS monolith into 47 microservices over 18 months. The project cost €14M. At go-live, the system required 23 Kubernetes namespaces, 180 container images, and a 12-person platform engineering team just to keep it running. The 6-person product development team spent more time debugging distributed tracing spans than building features. P99 latency for a simple balance check — a single query in the monolith — was 340ms due to 4 network hops through authentication, account, balance, and notification services.
 
 Two years later, the team collapsed 38 of the 47 services back into a modular monolith, retaining only the services that mapped to genuinely independent business domains with separate teams. The lesson: microservices are a solution to an organisational scaling problem. Applied prematurely, they create a distributed system without the organisational structure to justify one.
 
@@ -123,6 +123,8 @@ class PaymentProcessingEngine {
 }
 ```
 
+In Spring Boot, Spring Modulith can verify these boundaries out of the box: each top-level package under the application package is a module, and `ApplicationModules.of(Application.class).verify()` fails the build when one module reaches into another's internals.
+
 ### Enforcing Module Boundaries with ArchUnit
 
 Without automated enforcement, module boundaries erode within months. Engineers under time pressure import internal classes directly, bypassing the module API. ArchUnit makes the boundary executable.
@@ -133,10 +135,10 @@ public class ModuleBoundaryTest {
 
     @ArchTest
     static final ArchRule paymentsModule_mustOnlyExposeApiPackage =
-        noClasses()
+        classes()
             .that().resideInAPackage("com.bank.payments.internal..")
-            .should().beAccessedByClassesThat()
-            .resideOutsideOfPackage("com.bank.payments..");
+            .should().onlyBeAccessed()
+            .byAnyPackage("com.bank.payments..");
 
     @ArchTest
     static final ArchRule accountsModule_mustNotDependOnPaymentsInternal =
@@ -168,7 +170,7 @@ Three patterns address this problem:
 
 | Pattern | Consistency | Complexity | Fintech Use |
 |---|---|---|---|
-| **Two-Phase Commit (2PC)** | Strong (eventual on failure) | Very high — coordinator, protocol | Legacy, avoid in new systems |
+| **Two-Phase Commit (2PC)** | Strong, but participants block if the coordinator fails | Very high — coordinator, XA support everywhere | Legacy, avoid in new systems |
 | **Saga Pattern** | Eventual with compensating transactions | High — choreography or orchestration | Payments, loan origination |
 | **Transactional Outbox** | Eventual, at-least-once | Medium — outbox table, relay | Event publishing reliability |
 
@@ -185,12 +187,14 @@ public class PaymentSagaOrchestrator {
     private final NotificationService notificationService;
     private final SagaStateRepository sagaStateRepository;
 
-    @Transactional
+    // No @Transactional here: each step's state must commit on its own so that a
+    // crashed saga can be resumed from the last completed step. Every remote call
+    // carries the saga id as its idempotency key, so a resumed step is safe to repeat.
     public void execute(ProcessPaymentSaga saga) {
         try {
             // Step 1: Reserve funds (debit hold)
             ReservationId reservation = accountService.reserveFunds(
-                saga.sourceAccountId(), saga.amount());
+                saga.sagaId(), saga.sourceAccountId(), saga.amount());
             saga.setReservationId(reservation);
             sagaStateRepository.save(saga.withState(FUNDS_RESERVED));
 
@@ -199,6 +203,7 @@ public class PaymentSagaOrchestrator {
             if (decision.isRejected()) {
                 compensate(saga); // release reservation
                 saga.fail("Rejected by fraud engine: " + decision.reason());
+                sagaStateRepository.save(saga.withState(FAILED));
                 return;
             }
             sagaStateRepository.save(saga.withState(FRAUD_CLEARED));
@@ -212,9 +217,13 @@ public class PaymentSagaOrchestrator {
             notificationService.sendPaymentConfirmation(saga.customerId(), saga.paymentId());
 
         } catch (InsufficientFundsException | AccountNotFoundException ex) {
+            // Business rejection: undo what was done and finish the saga
+            compensate(saga);
             saga.fail(ex.getMessage());
             sagaStateRepository.save(saga.withState(FAILED));
         }
+        // Technical failures (timeouts, crashes) are NOT caught: the saga stays in
+        // its last committed state and a recovery job resumes it later.
     }
 
     private void compensate(ProcessPaymentSaga saga) {
@@ -267,7 +276,7 @@ graph LR
 | All services deployed together | Microservices with synchronised releases are a distributed monolith |
 
 > [!NOTE]
-> Martin Fowler's recommendation, stated explicitly in 2015 and unchanged since: "Don't start a new project with microservices, even if you're sure your application will be large enough to make it worthwhile." Begin with a modular monolith. Extract services when team structure and domain knowledge justify it.
+> Martin Fowler's "MonolithFirst" (2015) puts it this way: "you shouldn't start a new project with microservices, even if you're sure your application will be big enough to make it worthwhile." (The same site also publishes a counter-argument by Stefan Tilkov — the point is to decide deliberately.) Begin with a modular monolith. Extract services when team structure and domain knowledge justify it.
 
 ## Knowledge Check
 
@@ -324,25 +333,25 @@ A: The saga state is persisted after each step in `sagaStateRepository`. On rest
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Microservices vs Monolith \u2014 The Architecture Decision \u2014 Production Implementation",
+  "title": "Microservices vs Monolith — The Architecture Decision — Production Implementation",
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
     {
       "id": "1",
-      "description": "Write three ArchUnit tests enforcing: (a) fraud module accesses account data only via AccountService API; (b) no cross-module internal package access; (c) domain events only published through DomainEv"
+      "description": "Write three ArchUnit tests that enforce: (a) the fraud module must only access account data through the `AccountService` API interface, never through JPA repositories; (b) no module may directly instantiate a class from another module's `internal` package; (c) domain events must only be published through the `DomainEventPublisher` interface, not through direct Spring `ApplicationEventPublisher` autowiring in domain classes."
     },
     {
       "id": "2",
-      "description": "Using Conway's Law, select the first module to extract as a microservice. Justify based on team ownership, coupling score, data ownership, and team operational maturity"
+      "description": "Using the Conway's Law decision framework, determine which module to extract as the first microservice. Justify your choice based on: team ownership clarity, coupling score (number of incoming vs outgoing dependencies), data ownership, and operational maturity of the team."
     },
     {
       "id": "3",
-      "description": "Design four migration phases for your chosen module. For each phase: routing mechanism, fitness function, and rollback procedure"
+      "description": "Design the four phases of a strangler fig migration for the module you chose in Task 2. For each phase: define the routing mechanism, the fitness function that must pass before advancing to the next phase, and the rollback procedure."
     },
     {
       "id": "4",
-      "description": "Design ProcessPaymentSaga spanning payment and account services. Define steps, compensating transactions, state machine transitions, and idempotency strategy for each step"
+      "description": "The payment flow currently runs as a single ACID transaction spanning accounts and fraud. After extraction, it will span two services. Design the saga for `ProcessPaymentSaga` with explicit steps, compensating transactions for each failure scenario, and the state machine transitions. Identify which steps must be idempotent and explain how idempotency is implemented for each."
     }
   ]
 }

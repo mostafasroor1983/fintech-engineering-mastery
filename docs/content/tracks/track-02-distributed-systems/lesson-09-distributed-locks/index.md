@@ -42,7 +42,7 @@ Distributed locks coordinate exclusive access to a shared resource across multip
 
 ## Business Context
 
-In November 2020, a fintech payment processor experienced a double-settlement incident affecting 2,100 transactions totalling £1.4 million. The root cause was a distributed lock implementation that did not use fencing tokens. The end-of-day settlement job ran on three pods. The team had implemented a Redis-based lock using `SET NX EX 300` (a 5-minute TTL). On the day of the incident: Pod A acquired the lock at 23:00:00 and began processing. At 23:03:15, Pod A paused for a full GC cycle lasting 4 minutes and 52 seconds. At 23:03:15 + 300s = 23:08:15, the lock expired. Pod B acquired the lock at 23:08:17 and began processing the same settlement batch. Pod A resumed at 23:08:07, 8 seconds before the lock expired on Pod B, and both pods submitted settlement files to the payment network simultaneously. The settlement network accepted both. The fix required: (1) fencing tokens on every write so storage could reject stale lock holders, (2) lock TTL increased to 20 minutes with a watchdog heartbeat to extend while the job is running, (3) idempotency checks in the downstream payment network adapter. The incident cost the company £1.4M in duplicate settlements and £280,000 in reconciliation labour.
+Consider a composite example drawn from typical incidents. A payment processor runs its end-of-day settlement job on three pods, protected by a Redis lock taken with `SET NX EX 300` (a 5-minute TTL) and no fencing tokens. Pod A takes the lock at 23:00:00 and starts processing. At 23:03:00 Pod A freezes in a stop-the-world GC pause that lasts about 5 minutes. At 23:05:00 the lock expires, and at 23:05:02 Pod B takes it and starts processing the same settlement batch. At 23:08:00 Pod A wakes up, still believing it holds the lock, and continues. Both pods submit settlement files to the payment network, which accepts both — thousands of transactions are settled twice, followed by weeks of reconciliation work. The fixes: (1) fencing tokens on every write, so storage rejects a stale lock holder; (2) a watchdog that extends the lock while the job runs — which helps with long jobs but not with pauses; (3) an idempotency check (a unique settlement-file ID) in the adapter that submits to the payment network.
 
 ## When Distributed Locks Are Needed
 
@@ -62,9 +62,9 @@ Redlock was proposed by Redis creator Salvatore Sanfilippo to provide a distribu
 
 **Algorithm:**
 1. Record the current time `T1`.
-2. Sequentially attempt to acquire the lock on all N Redis nodes using `SET key uuid PX timeout NX`. Use a small per-node timeout (e.g., `timeout / N / 10`) to avoid waiting on slow nodes.
-3. Count the number of successful acquisitions. If the count is at least `ceil(N/2) + 1` (majority quorum) **and** the total elapsed time is less than the lock TTL, the lock is acquired.
-4. The effective lock validity time is `TTL - elapsed`.
+2. Sequentially attempt to acquire the lock on all N Redis nodes using `SET key uuid PX timeout NX`. Use a per-node timeout much smaller than the TTL (e.g., 5–50ms for a 10-second TTL) to avoid waiting on slow nodes.
+3. Count the number of successful acquisitions. If the count is at least `floor(N/2) + 1` (majority quorum) **and** the total elapsed time is less than the lock TTL, the lock is acquired.
+4. The effective lock validity time is `TTL - elapsed - clock drift allowance`.
 5. To release, DELETE the key from all nodes where it was acquired, using a Lua script to verify the UUID matches before deleting (prevents releasing another holder's lock).
 
 ```
@@ -78,11 +78,11 @@ Elapsed time: 11ms ✗ Lock NOT acquired — release acquired nodes
 ```
 
 > [!WARNING]
-> Redlock is controversial. Martin Kleppmann's analysis shows that clock drift and GC pauses can cause safety violations even with the majority quorum. For financial systems, prefer a single Redis instance with a fencing token (simpler, faster, still requires fencing) or a database advisory lock backed by MVCC. Use Redlock only when you can tolerate rare lock safety violations and have fencing token protection at the storage layer.
+> Redlock is controversial. Martin Kleppmann's analysis shows that clock drift and GC pauses can cause safety violations even with the majority quorum. For financial systems, prefer a single Redis instance plus fencing tokens (simpler, faster), a PostgreSQL advisory lock, or a CP coordination service such as etcd or ZooKeeper. Use Redlock only when you can tolerate rare lock safety violations and have fencing token protection at the storage layer.
 
 ## Redisson RLock Implementation
 
-Redisson is the production-grade Java client for Redis that implements Redlock (and many other distributed primitives). It includes a watchdog that automatically extends the lock TTL while the holder is alive.
+Redisson is a production-grade Java client for Redis with many distributed primitives. Its `RLock` is a lock on one Redis deployment (its RedLock class is deprecated). It includes a watchdog that automatically extends the lock TTL while the holder is alive — but only when you do not pass a lease time.
 
 ```java
 @Service
@@ -91,7 +91,6 @@ public class SettlementJobService {
     private final RedissonClient redissonClient;
     private final SettlementBatchProcessor batchProcessor;
     private static final String LOCK_KEY = "settlement:daily-run";
-    private static final long LOCK_TTL_SECONDS = 1200; // 20 minutes
     private static final long WAIT_TIMEOUT_SECONDS = 5;
 
     public void runDailySettlement(LocalDate settlementDate) {
@@ -99,11 +98,11 @@ public class SettlementJobService {
 
         boolean acquired = false;
         try {
-            // waitTime: how long to wait if lock is held by another node
-            // leaseTime: lock TTL — Redisson watchdog extends this automatically
-            //            while this JVM is alive; -1 means watchdog only
-            acquired = lock.tryLock(
-                WAIT_TIMEOUT_SECONDS, LOCK_TTL_SECONDS, TimeUnit.SECONDS);
+            // waitTime: how long to wait if the lock is held by another node.
+            // No leaseTime: the lock starts with lockWatchdogTimeout (30s) and the
+            // watchdog renews it while this JVM is alive. Passing an explicit
+            // leaseTime (e.g. tryLock(5, 1200, SECONDS)) DISABLES the watchdog.
+            acquired = lock.tryLock(WAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             if (!acquired) {
                 log.info("Settlement for {} already running on another node — skipping",
@@ -148,8 +147,9 @@ public class RedissonConfig {
             .setRetryAttempts(3)
             .setRetryInterval(1500);
 
-        // Watchdog: automatically renews lock every 10s if the JVM is alive
-        // This protects against false expiry during long-running operations
+        // Watchdog: renews locks taken WITHOUT a leaseTime every 10s while the
+        // JVM is alive. It protects long jobs, not GC pauses: a paused JVM
+        // cannot renew, so the lock still expires — hence fencing tokens.
         config.setLockWatchdogTimeout(30_000); // 30 seconds
 
         return Redisson.create(config);
@@ -192,26 +192,18 @@ public class FencedSettlementStorage {
 
     private final JdbcTemplate jdbc;
 
-    // Write with fencing token — storage rejects if token is not newer
+    // Write with fencing token — storage rejects if token is not newer.
+    // The token must come from the lock service at acquisition time, e.g.
+    // INCR settlement:lock:token in Redis, a database sequence, the etcd key
+    // revision, or Redisson's RFencedLock.
     public void writeSettlementBatch(
             String batchId,
             List<SettlementEntry> entries,
             long fencingToken) {
 
-        // Check the last accepted fencing token for this batch type
-        Long lastToken = jdbc.queryForObject(
-            "SELECT last_fencing_token FROM settlement_locks WHERE batch_type = ?",
-            Long.class, "daily-settlement");
-
-        if (lastToken != null && fencingToken <= lastToken) {
-            throw new StaleLockException(String.format(
-                "Fencing token %d rejected — storage has seen token %d. " +
-                "This write is from a process that held an expired lock.",
-                fencingToken, lastToken));
-        }
-
-        // Update the token and write the batch atomically
-        jdbc.update("""
+        // Update the token and write the batch in ONE atomic statement.
+        // (A separate SELECT-then-write would race with a newer holder.)
+        int rows = jdbc.update("""
             WITH token_update AS (
                 UPDATE settlement_locks
                 SET last_fencing_token = ?
@@ -225,12 +217,18 @@ public class FencedSettlementStorage {
             """,
             fencingToken, fencingToken,
             batchId, serializeEntries(entries), fencingToken);
+
+        if (rows == 0) {
+            throw new StaleLockException(
+                "Fencing token " + fencingToken + " rejected — a newer lock " +
+                "holder has already written. This process held an expired lock.");
+        }
     }
 }
 ```
 
 > [!NOTE]
-> Redisson's `RLock` uses a Lua script for atomic lock release that checks the holder's UUID, but it does not implement fencing tokens at the storage layer. You must implement fencing at the storage layer yourself for strong safety guarantees. The lock prevents concurrent access in the common case; the fencing token protects against the rare GC/network pause scenario.
+> Redisson's `RLock` uses a Lua script for atomic lock release that checks the holder's UUID, but it does not give you a fencing token (newer Redisson versions add `RFencedLock`, which does), and no lock library can check tokens at your storage layer. You must implement fencing at the storage layer yourself for strong safety guarantees. The lock prevents concurrent access in the common case; the fencing token protects against the rare GC/network pause scenario.
 
 ## PostgreSQL Advisory Locks
 
@@ -245,62 +243,74 @@ public class PaymentFileProcessor {
     private final PaymentParser paymentParser;
     private final PaymentSubmitter paymentSubmitter;
 
-    // Uses PostgreSQL advisory lock keyed on a hash of the file name.
-    // Prevents concurrent processing of the same file across pods.
+    private final DataSource dataSource;
+
+    // Uses a PostgreSQL SESSION advisory lock keyed on a hash of the file name.
+    // A session lock belongs to ONE connection, so lock and unlock must run on
+    // the same connection. With a pool, JdbcTemplate may hand out a different
+    // connection per call — and a pooled connection is not closed, so a lock
+    // left on it would stay held. Hence a dedicated connection for the lock.
     public ProcessingResult processFile(String fileName) {
         long lockKey = computeLockKey(fileName);
 
-        // pg_try_advisory_lock is non-blocking — returns false if lock is held
-        Boolean acquired = jdbc.queryForObject(
-            "SELECT pg_try_advisory_lock(?)", Boolean.class, lockKey);
-
-        if (!Boolean.TRUE.equals(acquired)) {
-            log.info("File {} is already being processed by another pod — skipping",
-                fileName);
-            return ProcessingResult.skipped(fileName);
-        }
-
-        // Lock is held for the duration of this DB session (connection).
-        // The connection is returned to the pool at the end of this method,
-        // which releases the advisory lock automatically.
-        try {
-            log.info("Acquired advisory lock {} for file {}", lockKey, fileName);
-
-            byte[] fileContent = fileStorage.download(fileName);
-            List<Payment> payments = paymentParser.parse(fileContent);
-
-            // Mark the file as in-progress in DB (idempotency guard)
-            jdbc.update(
-                "INSERT INTO processed_files (name, status, started_at) " +
-                "VALUES (?, 'PROCESSING', NOW()) " +
-                "ON CONFLICT (name) DO NOTHING",
-                fileName);
-
-            // Check if the INSERT succeeded (no conflict = not yet processed)
-            int alreadyProcessed = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM processed_files " +
-                "WHERE name = ? AND status = 'COMPLETED'",
-                Integer.class, fileName);
-
-            if (alreadyProcessed > 0) {
-                log.info("File {} already completed — skipping duplicate", fileName);
-                return ProcessingResult.duplicate(fileName);
+        try (Connection lockConn = dataSource.getConnection()) {
+            if (!tryAdvisoryLock(lockConn, lockKey)) {
+                log.info("File {} is already being processed by another pod — skipping",
+                    fileName);
+                return ProcessingResult.skipped(fileName);
             }
-
-            int submitted = paymentSubmitter.submitBatch(payments);
-
-            jdbc.update(
-                "UPDATE processed_files SET status = 'COMPLETED', " +
-                "completed_at = NOW(), payment_count = ? WHERE name = ?",
-                submitted, fileName);
-
-            return ProcessingResult.success(fileName, submitted);
-
-        } finally {
-            // Explicitly release the advisory lock before returning connection to pool
-            jdbc.update("SELECT pg_advisory_unlock(?)", lockKey);
-            log.info("Released advisory lock {} for file {}", lockKey, fileName);
+            try {
+                return processLocked(fileName);
+            } finally {
+                // Explicit release on the SAME connection before it goes back to the pool
+                try (PreparedStatement ps =
+                         lockConn.prepareStatement("SELECT pg_advisory_unlock(?)")) {
+                    ps.setLong(1, lockKey);
+                    ps.execute();
+                }
+                log.info("Released advisory lock {} for file {}", lockKey, fileName);
+            }
+        } catch (SQLException e) {
+            throw new FileProcessingException(fileName, e);
         }
+    }
+
+    private boolean tryAdvisoryLock(Connection conn, long key) throws SQLException {
+        // pg_try_advisory_lock is non-blocking — returns false if the lock is held
+        try (PreparedStatement ps = conn.prepareStatement("SELECT pg_try_advisory_lock(?)")) {
+            ps.setLong(1, key);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        }
+    }
+
+    private ProcessingResult processLocked(String fileName) {
+        // Idempotency guard: a file that already COMPLETED is never processed again
+        jdbc.update(
+            "INSERT INTO processed_files (name, status, started_at) " +
+            "VALUES (?, 'PROCESSING', NOW()) ON CONFLICT (name) DO NOTHING",
+            fileName);
+        Integer completed = jdbc.queryForObject(
+            "SELECT COUNT(*) FROM processed_files WHERE name = ? AND status = 'COMPLETED'",
+            Integer.class, fileName);
+        if (completed != null && completed > 0) {
+            log.info("File {} already completed — skipping duplicate", fileName);
+            return ProcessingResult.duplicate(fileName);
+        }
+
+        byte[] fileContent = fileStorage.download(fileName);
+        List<Payment> payments = paymentParser.parse(fileContent);
+
+        // A crash mid-batch leaves status PROCESSING; the retry resubmits, so
+        // each payment must carry its own idempotency key downstream
+        int submitted = paymentSubmitter.submitBatch(payments);
+
+        jdbc.update(
+            "UPDATE processed_files SET status = 'COMPLETED', " +
+            "completed_at = NOW(), payment_count = ? WHERE name = ?",
+            submitted, fileName);
+        return ProcessingResult.success(fileName, submitted);
     }
 
     private long computeLockKey(String fileName) {
@@ -342,7 +352,8 @@ Boolean acquired = redisTemplate.opsForValue()
 
 // CORRECT with watchdog (Redisson) — TTL extended automatically while JVM alive
 RLock lock = redissonClient.getLock("settlement:daily-run");
-lock.tryLock(5, 1200, TimeUnit.SECONDS); // wait 5s, TTL 20 min, watchdog active
+lock.tryLock(5, TimeUnit.SECONDS);        // wait 5s, no leaseTime => watchdog active
+// lock.tryLock(5, 1200, TimeUnit.SECONDS) would set a fixed 20-min TTL, NO watchdog
 ```
 
 ## Why Distributed Locks Are Hard
@@ -353,7 +364,7 @@ lock.tryLock(5, 1200, TimeUnit.SECONDS); // wait 5s, TTL 20 min, watchdog active
 | Clock skew | Clocks drift between nodes; Redlock TTL calculation incorrect | Use NTP + conservative TTL margins |
 | Network partition | Lock holder partitioned from Redis; lock expires; dual holders | Fencing token + write quorum |
 | Process suspend | VM live-migrated or container paused by orchestrator | Same as GC pause — fencing token |
-| Redis failover | Redis replica promoted; in-memory lock state lost | Redlock (N independent nodes) or Redisson with persistence |
+| Redis failover | Async replication: a promoted replica may not have the lock | Fencing tokens; or a CP store (etcd, ZooKeeper) for the lock |
 
 ## Alternatives to Distributed Locks
 
@@ -373,7 +384,7 @@ A: Without fencing tokens, both pods write settlement data concurrently. The res
 
 **Q2: You are choosing between a Redis distributed lock and a PostgreSQL advisory lock for preventing two pods from processing the same payment file. The processing takes 2–10 minutes and the application uses PostgreSQL as its primary database. Which should you use?**
 
-A: Use PostgreSQL advisory locks. The reasons: (1) you already have a PostgreSQL connection for recording processing status — using the same connection for the advisory lock avoids an extra Redis dependency; (2) the lock is automatically released when the connection is returned to the pool, providing liveness guarantee without TTL management; (3) advisory locks are durable within the session — if the application pod crashes, the connection is closed and PostgreSQL releases the lock immediately. Redis locks require a watchdog to handle pod crashes, which adds complexity. Advisory locks are the right tool when the coordination domain is the same as the storage domain.
+A: Use PostgreSQL advisory locks. The reasons: (1) you already have a PostgreSQL connection for recording processing status — using the same connection for the advisory lock avoids an extra Redis dependency; (2) no TTL to manage: the lock lives exactly as long as the database session that holds it; (3) if the application pod crashes, its connection closes and PostgreSQL releases the lock (immediately on a clean disconnect, or after TCP keepalive detects a vanished host). One caveat: with a connection pool, take and release the lock on the same dedicated connection — a pooled connection is not closed, so a forgotten session lock stays held. Redis locks require a watchdog to handle pod crashes, which adds complexity. Advisory locks are the right tool when the coordination domain is the same as the storage domain.
 
 ## Practical Challenge
 
@@ -387,7 +398,7 @@ A: Use PostgreSQL advisory locks. The reasons: (1) you already have a PostgreSQL
 
 3. **PostgreSQL advisory lock:** Write `PaymentFileProcessor.processFile(String s3Key)` using `pg_try_advisory_lock` on a hash of `s3Key`. Include: non-blocking acquisition, skip logic if held, file processing, idempotency guard against re-processing completed files, and explicit `pg_advisory_unlock` in the `finally` block.
 
-4. **Identify the anti-pattern:** A team proposes using `SELECT balance FROM accounts WHERE id = ? FOR UPDATE` as a distributed lock to prevent two pods from debiting the same account simultaneously. Explain the two problems with this approach at scale (hint: consider connection pool exhaustion and lock timeout across service boundaries), and propose the correct alternative using optimistic locking.
+4. **Identify the anti-pattern:** A team takes `SELECT balance FROM accounts WHERE id = ? FOR UPDATE` and then, while still holding the row lock, calls a remote fraud service that can take up to 2 seconds. A short row lock for the debit itself is correct; holding it across a remote call is not. Explain the two problems at scale (hint: connection pool exhaustion and lock waits across service boundaries), and propose the fix: make remote calls before the transaction and keep the lock short, or use optimistic locking with `@Version` and a retry.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -414,7 +425,7 @@ A: Use PostgreSQL advisory locks. The reasons: (1) you already have a PostgreSQL
         "Java synchronized block on a static variable"
       ],
       "correct": 2,
-      "explanation": "pg_try_advisory_lock is ideal: it uses the same PostgreSQL connection already open for processing state, it auto-releases when the connection closes (pod crash = immediate release), and it is non-blocking (pg_try_advisory_lock returns false rather than waiting). SELECT FOR UPDATE holds a row lock for the entire processing duration which is too long. Redis Redlock adds infrastructure complexity that is unwarranted when PostgreSQL is already available. A Java synchronized block is process-scoped, not distributed."
+      "explanation": "pg_try_advisory_lock is ideal: it uses the PostgreSQL database the service already depends on, it is released when the holding session ends (a pod crash closes the connection), and it is non-blocking (it returns false rather than waiting). Take and release it on one dedicated connection, because a pooled connection is not closed. SELECT FOR UPDATE would hold a row lock inside a transaction for the entire multi-minute processing time. Redis Redlock adds infrastructure complexity that is unwarranted when PostgreSQL is already available. A Java synchronized block is process-scoped, not distributed."
     }
   ]
 }
@@ -422,25 +433,25 @@ A: Use PostgreSQL advisory locks. The reasons: (1) you already have a PostgreSQL
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Distributed Locks \u2014 Redlock and Advisory Locks \u2014 Production Implementation",
+  "title": "Exactly-Once Nightly Settlement with Locks and Fencing Tokens",
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
     {
       "id": "1",
-      "description": "Implement `NightlySettlementJob` with Redisson `RLock`, watchdog (`leaseTime = -1`), 5-second wait, and correct `isHeldByCurrentThread()` release guard"
+      "description": "Implement NightlySettlementJob with Redisson RLock taken without a leaseTime (so the watchdog renews it), a 5-second wait, and a finally block that unlocks only when isHeldByCurrentThread() is true. Explain why an explicit leaseTime of 1200 seconds disables the watchdog."
     },
     {
       "id": "2",
-      "description": "Write `SettlementAuditStore.writeSettlementRecord()` with PostgreSQL CAS fencing token check that rejects writes where `fencing_token <= last_accepted_"
+      "description": "Write SettlementAuditStore.writeSettlementRecord(record, fencingToken) as a single atomic PostgreSQL statement that rejects writes where fencing_token <= last_accepted_token and throws when no row was written. Explain where the token comes from and why Redisson's UUID check on unlock is not enough."
     },
     {
       "id": "3",
-      "description": "Write `PaymentFileProcessor.processFile(String s3Key)` using `pg_try_advisory_lock` with skip logic, idempotency guard, and explicit `pg_advisory_unloc"
+      "description": "Write PaymentFileProcessor.processFile(String s3Key) using pg_try_advisory_lock on a hash of s3Key, on one dedicated connection: non-blocking acquisition, skip if held, an idempotency guard for completed files, and pg_advisory_unlock on the same connection in finally."
     },
     {
       "id": "4",
-      "description": "Explain why `SELECT FOR UPDATE` as a distributed lock causes connection pool exhaustion at scale and propose the correct optimistic locking alternative"
+      "description": "A team holds SELECT ... FOR UPDATE on an account row while calling a slow remote fraud service. Explain why this exhausts connection pools and spreads lock waits across services, and propose the fix: remote calls before the transaction, short locks, or optimistic locking with @Version and retry."
     }
   ]
 }

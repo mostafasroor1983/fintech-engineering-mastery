@@ -48,7 +48,10 @@ Regulatory context:
   - Basel III: banks must maintain capital for operational risk
   - PCI-DSS: cardholder data must be recoverable
   - FFIEC: US banks must demonstrate DR capability
-  - DORA (EU): digital operational resilience, mandatory DR testing
+  - DORA (EU, since Jan 2025): ICT business continuity and DR plans,
+    tested regularly; major-incident reporting
+  - UK operational resilience (PRA/FCA): important business services must
+    stay within set impact tolerances (fully in force since March 2025)
 ```
 
 ## 2. DR Tiers — Cold, Warm, Hot
@@ -106,14 +109,23 @@ public enum DRTier {
 
 ```bash
 # PostgreSQL primary configuration (postgresql.conf)
-# Synchronous replication for Tier 1 (zero RPO)
-synchronous_commit = remote_write        # Wait for replica WAL write
-synchronous_standby_names = 'dr-replica' # Named replica list
+# Synchronous replication for Tier 1 (near-zero RPO)
+synchronous_commit = remote_write        # Commit waits until a standby has WRITTEN the WAL
+                                         # (survives a primary crash; use 'on' to wait for
+                                         #  the standby's FLUSH — stronger, slightly slower)
+synchronous_standby_names = 'ANY 1 (dr-replica-a, dr-replica-b)'
+                                         # ANY 1 of 2: with a single named standby, its
+                                         # failure would BLOCK every commit on the primary
 wal_level = replica                      # Enable replication WAL
 max_wal_senders = 10                     # Allow up to 10 replicas
 wal_keep_size = 1GB                      # Keep 1GB of WAL for replicas
 archive_mode = on
 archive_command = 'aws s3 cp %p s3://payment-wal-archive/%f'
+                                         # must exit non-zero on failure; in production
+                                         # prefer a tool such as pgBackRest or WAL-G
+# Note: a synchronous standby in ANOTHER region adds one cross-region round
+# trip to every commit — many teams keep the sync standby in-region and
+# replicate to the DR region asynchronously (RPO = seconds).
 ```
 
 ```java
@@ -136,10 +148,12 @@ public class PostgresFailoverConfig {
     public DataSource failoverAwareDataSource() {
         HikariConfig config = new HikariConfig();
 
-        // Use multi-host JDBC URL for automatic failover
-        // Patroni updates the CNAME when it promotes a replica
-        config.setJdbcUrl("jdbc:postgresql://payment-primary.db.internal:5432/payments" +
-            "?targetServerType=primary" +      // Always connect to primary
+        // Multi-host JDBC URL: the driver tries each host and keeps the one
+        // that is currently the primary. (Alternative: a single name that
+        // always points at the leader — e.g. HAProxy, vip-manager or a
+        // Kubernetes Service fed by Patroni; Patroni itself does not edit DNS.)
+        config.setJdbcUrl("jdbc:postgresql://pg-node-1:5432,pg-node-2:5432,pg-node-3:5432/payments" +
+            "?targetServerType=primary" +      // Only accept the writable primary
             "&loginTimeout=5" +                 // 5s login timeout
             "&socketTimeout=10");               // 10s socket timeout
 
@@ -148,9 +162,8 @@ public class PostgresFailoverConfig {
         config.setMaxLifetime(300_000);            // 5min max connection age (cycling prevents stale)
         config.setInitializationFailTimeout(-1);   // Don't fail startup if DB unavailable
 
-        // Retry on connection failure (for during Patroni promotion window)
-        config.setConnectionRetryAttempts(3);
-        config.setConnectionRetryInterval(2_000);
+        // HikariCP has no "connection retry" settings: retries during the
+        // promotion window belong in the application (see the repository below)
 
         return new HikariDataSource(config);
     }
@@ -159,7 +172,9 @@ public class PostgresFailoverConfig {
 /**
  * Failover-aware repository with retry logic.
  * During Patroni failover (typically 15–30s), connections may fail.
- * We need to retry with exponential backoff during this window.
+ * Retrying READS with backoff during this window is safe. A WRITE whose
+ * connection dropped during COMMIT has an unknown outcome — retry it only
+ * if it is idempotent (claim-first / unique key), never blindly.
  */
 @Repository
 @RequiredArgsConstructor
@@ -221,7 +236,16 @@ primary->dr.groups = payment-processor, fraud-consumer
 primary->dr.replication.factor = 3
 primary->dr.tasks.max = 4
 
-# Offset sync: DR consumers can resume from correct offset after failover
+# By default MM2 RENAMES topics on the target ("primary.payment-events").
+# Keep the original names so DR consumers subscribe unchanged (Kafka 3.0+):
+replication.policy.class = org.apache.kafka.connect.mirror.IdentityReplicationPolicy
+
+# MM2 replication is ASYNCHRONOUS: events produced in the last seconds before
+# a disaster may not have reached DR — RPO for Kafka is seconds, not zero.
+
+# Offset sync: DR consumers can resume from (close to) the right offset after
+# failover — offsets are synced only while the group is inactive on the target,
+# so expect some reprocessing: consumers must be idempotent
 emit.checkpoints.interval.seconds = 60
 sync.group.offsets.enabled = true
 sync.group.offsets.interval.seconds = 60
@@ -242,18 +266,22 @@ public class KafkaDRConsumer {
     )
     public void processPaymentEvent(
             ConsumerRecord<String, PaymentEvent> record,
-            @Header(KafkaHeaders.RECEIVED_TOPIC) String topic) {
+            @Header(KafkaHeaders.RECEIVED_TOPIC) String topic,
+            Acknowledgment ack) {
 
         log.debug("Processing payment event offset={} partition={}",
             record.offset(), record.partition());
 
         try {
-            paymentEventHandler.handle(record.value());
+            paymentEventHandler.handle(record.value());   // idempotent
         } catch (Exception e) {
             log.error("Failed to process payment event offset={}", record.offset(), e);
-            // Send to DLQ — do NOT stop consumer
+            // Send to DLQ (synchronously) — do NOT stop consumer
             dlqSender.send(record, e);
         }
+        // AckMode.MANUAL_IMMEDIATE: without this the offset is NEVER committed
+        // and every restart replays the partition
+        ack.acknowledge();
     }
 }
 
@@ -261,8 +289,11 @@ public class KafkaDRConsumer {
 public class DRAwareKafkaConfig {
 
     /**
-     * Factory that can be reconfigured to point to DR cluster.
-     * During DR activation, call switchToDRCluster() to redirect.
+     * Listener factory for the active cluster. The bootstrap servers are fixed
+     * when the consumers are created: to switch to the DR cluster at runtime,
+     * stop the listener containers (KafkaListenerEndpointRegistry), point the
+     * consumer factory at the DR bootstrap servers, and start them again —
+     * or use a DNS alias for the bootstrap servers that DR activation repoints.
      */
     @Bean
     public ConcurrentKafkaListenerContainerFactory<String, PaymentEvent>
@@ -308,7 +339,8 @@ public class DRAwareKafkaConfig {
  *
  * Rule 3: Idempotent operations.
  *   - Every write operation must be safe to retry
- *   - Idempotency keys stored in Redis (cross-region replicated)
+ *   - Idempotency enforced by a UNIQUE key in the database (replicated with
+ *     it); Redis is only a fast cache in front of it
  *
  * Rule 4: External state only.
  *   - Database: PostgreSQL with streaming replication
@@ -322,7 +354,7 @@ public class StatelessPaymentService {
     // All state externalized — no instance-local state
 
     public PaymentResponse processPayment(PaymentRequest request) {
-        // 1. Idempotency key check (Redis — cross-region replicated)
+        // 1. Idempotency check (cache first; the database UNIQUE key decides)
         Optional<PaymentResponse> existing =
             idempotencyKeyStore.get(request.getIdempotencyKey());
         if (existing.isPresent()) return existing.get();
@@ -341,7 +373,8 @@ public class StatelessPaymentService {
         idempotencyKeyStore.store(request.getIdempotencyKey(), response,
             Duration.ofHours(24));
 
-        // 6. Publish event (Kafka — MirrorMaker replicated)
+        // 6. Publish event via the transactional outbox (written in the same
+        //    DB transaction as the payment), relayed to Kafka and mirrored
         eventPublisher.publish(PaymentProcessedEvent.from(response));
 
         return response;
@@ -401,6 +434,7 @@ public class DRDrillOrchestrator {
 
     public DRDrillResult executeDatabaseFailoverDrill() {
         Instant drillStart = Instant.now();
+        // Run in staging, or in production only inside an approved drill window
         log.info("DR DRILL STARTED: PostgreSQL primary failover");
 
         // 1. Record baseline metrics
@@ -437,7 +471,9 @@ public class DRDrillOrchestrator {
             .rtoTarget(Duration.ofMinutes(15))
             .rtoAchieved(timeToRecovery)
             .rtoMet(timeToRecovery.compareTo(Duration.ofMinutes(15)) < 0)
-            .dataLossDetected(false)  // Verify via idempotency key audit
+            // Compare payments committed before the failure (audit log /
+            // idempotency records) with what the new primary holds
+            .dataLossDetected(!verifyNoCommittedPaymentsLost(failureTime))
             .baseline(baseline)
             .postDrill(postDrill)
             .build();
@@ -484,63 +520,87 @@ PagerDuty alert: "PostgreSQL Primary Unreachable" (severity P1)
 ## Step 4: Notify stakeholders (ongoing)
 1. Post in #incidents Slack channel every 10 minutes
 2. Update status page at status.example.com
-3. Email regulatory contact if outage exceeds 15 minutes (DORA requirement)
+3. Start the major-incident classification with Compliance. If the incident
+   is classified as major under DORA, the initial notification is due within
+   4 hours of classification (and no later than 24 hours after detection)
 ```
 
 ## 8. Regulatory Notification Requirements
 
 ```java
 /**
- * Automated regulatory notification for prolonged outages.
+ * Regulatory notification tracking for operational incidents.
  * Financial institutions have obligations to notify regulators
  * of significant operational incidents.
  *
- * DORA (EU): Notify within 4 hours of classification as "major incident"
- * FCA (UK): Notify as soon as practicable if incident affects customers
- * OCC (US): Notify within 36 hours for bank service outages
+ * DORA (EU): initial notification within 4 hours of classifying an incident
+ *   as MAJOR, and no later than 24 hours after becoming aware of it;
+ *   intermediate report within 72 hours; final report within one month
+ * FCA (UK): notify as soon as practicable (Principle 11 / SUP 15)
+ * OCC/Fed/FDIC (US): notify within 36 hours of determining a
+ *   "notification incident"
+ *
+ * The clock starts at CLASSIFICATION, not at "4 hours of outage". And the
+ * report itself is approved by a human: this service drafts it and pages
+ * Compliance — it does not auto-send to the regulator.
  */
 @Component
 @RequiredArgsConstructor
 @Slf4j
 public class RegulatoryNotificationService {
 
+    private static final Duration DORA_AFTER_CLASSIFICATION = Duration.ofHours(4);
+    private static final Duration DORA_AFTER_DETECTION      = Duration.ofHours(24);
+
     @Scheduled(fixedDelay = 60_000)
-    public void checkOutageDurationAndNotify() {
+    public void checkIncidentsAndNotify() {
         List<ActiveIncident> incidents = incidentRepository.findActiveIncidents();
 
         for (ActiveIncident incident : incidents) {
-            Duration outageTime = Duration.between(incident.getStartTime(), Instant.now());
+            Instant now = Instant.now();
 
-            // DORA: Major incident notification at 4 hours
-            if (outageTime.toHours() >= 4 &&
-                    !incident.isDoraNotificationSent() &&
-                    incident.isCustomerFacing()) {
-                sendDoraNotification(incident);
-                incident.setDoraNotificationSent(true);
+            // DORA: once classified as major, draft the initial report at once
+            // and track the deadline (whichever comes first)
+            if (incident.getClassifiedMajorAt() != null && !incident.isDoraReportDrafted()) {
+                Instant deadline = earliest(
+                    incident.getClassifiedMajorAt().plus(DORA_AFTER_CLASSIFICATION),
+                    incident.getDetectedAt().plus(DORA_AFTER_DETECTION));
+                draftDoraInitialReport(incident, deadline);
+                incident.setDoraReportDrafted(true);
                 incidentRepository.save(incident);
             }
 
             // Internal escalation at 15 minutes (exceeds Tier 1 RTO)
+            Duration outageTime = Duration.between(incident.getStartTime(), now);
             if (outageTime.toMinutes() >= 15 &&
                     !incident.isEscalated() &&
                     incident.getSeverity() == Severity.P1) {
                 escalateToLeadership(incident);
                 incident.setEscalated(true);
+                incidentRepository.save(incident);   // persist, or it escalates every minute
             }
         }
     }
 
-    private void sendDoraNotification(ActiveIncident incident) {
-        log.info("Sending DORA regulatory notification for incident={}", incident.getId());
-        // Send structured notification to regulator API or email
-        regulatorNotificationClient.notify(DoraIncidentReport.builder()
+    private void draftDoraInitialReport(ActiveIncident incident, Instant deadline) {
+        log.info("Drafting DORA initial report for incident={} deadline={}",
+            incident.getId(), deadline);
+        DoraIncidentReport draft = DoraIncidentReport.builder()
             .incidentId(incident.getId())
             .startTime(incident.getStartTime())
             .description(incident.getDescription())
             .impactedServices(incident.getImpactedServices())
             .customersAffected(incident.getEstimatedCustomerImpact())
             .currentStatus(incident.getStatus())
-            .build());
+            .build();
+        reportDraftRepository.save(draft);
+        alerting.page(PagerDutyAlert.critical(
+            "DORA major incident — initial report due by " + deadline
+                + ". Review and submit: incident " + incident.getId()));
+    }
+
+    private static Instant earliest(Instant a, Instant b) {
+        return a.isBefore(b) ? a : b;
     }
 }
 ```
@@ -578,7 +638,8 @@ A Business Continuity Plan (BCP) for a financial institution must contain:
    - Version control (every BCP change is tracked)
 
 6. REGULATORY NOTIFICATIONS
-   - DORA / FCA / OCC thresholds and procedures
+   - DORA / FCA / US regulator thresholds and procedures
+     (who classifies an incident as major, and who approves each report)
    - Contact list for each regulator
    - Template notifications ready to send
 ```
@@ -590,21 +651,36 @@ A Business Continuity Plan (BCP) for a financial institution must contain:
   "questions": [
     {
       "text": "A payment processing system has an RTO of 15 minutes and an RPO of 1 minute. Which DR tier is appropriate?",
-      "options": ["Cold standby with daily backups", "Warm standby with asynchronous replication", "Hot standby with synchronous replication", "Active-active with eventual consistency"],
+      "options": [
+        "Cold standby with daily backups",
+        "Warm standby with asynchronous replication",
+        "Hot standby with synchronous replication",
+        "Active-active with eventual consistency"
+      ],
       "correct": 2,
       "explanation": "An RTO of 15 minutes and RPO of 1 minute requires a hot standby (Tier 1). Cold standby takes 4–24 hours to restore. Warm standby can achieve RTO of 15 min–4 hours but RPO of seconds to minutes may exceed 1 minute under high write loads. Hot standby with synchronous replication ensures near-zero data loss."
     },
     {
       "text": "What is the purpose of a tabletop exercise in disaster recovery?",
-      "options": ["To measure the actual RTO achieved by the system", "To rehearse failover procedures verbally and identify gaps without causing actual downtime", "To replicate data from primary to standby", "To run chaos engineering experiments"],
+      "options": [
+        "To measure the actual RTO achieved by the system",
+        "To rehearse failover procedures verbally and identify gaps without causing actual downtime",
+        "To replicate data from primary to standby",
+        "To run chaos engineering experiments"
+      ],
       "correct": 1,
       "explanation": "A tabletop exercise is a discussion-based simulation where the team walks through a failure scenario verbally. Its value is in discovering gaps — missing runbooks, undocumented procedures, missing alert configurations — before an actual DR drill or real failure."
     },
     {
       "text": "Under DORA (Digital Operational Resilience Act), within what timeframe must a financial institution notify regulators after classifying an incident as 'major'?",
-      "options": ["1 hour", "4 hours", "24 hours", "36 hours"],
+      "options": [
+        "1 hour",
+        "4 hours",
+        "24 hours",
+        "36 hours"
+      ],
       "correct": 1,
-      "explanation": "DORA requires notification to competent authorities within 4 hours of classifying an incident as a major incident. This is stricter than OCC (36 hours for US banks) and requires automated monitoring to track incident duration and trigger notifications."
+      "explanation": "Under DORA's reporting rules, the initial notification to the competent authority is due within 4 hours of classifying an incident as major — and no later than 24 hours after the firm became aware of it — followed by an intermediate report within 72 hours and a final report within one month. Note the clock starts at classification, not at 4 hours of outage. US banks have 36 hours to notify their primary regulator of a notification incident."
     }
   ]
 }
@@ -616,10 +692,22 @@ A Business Continuity Plan (BCP) for a financial institution must contain:
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Configure HikariCP for PostgreSQL failover resilience: multi-host JDBC URL with targetServerType=primary, connectionTimeout 3s, keepaliveTime 30s, and Spring @Retryable on repository methods that retries CannotGetJdbcConnectionException up to 10 times with exponential backoff during the Patroni promotion window."},
-    {"id": "2", "description": "Implement a DRDrillOrchestrator that: records a steady-state baseline, stops the primary container, measures time to Patroni promotion, measures time to application recovery (by polling a health endpoint), verifies post-drill steady state, and returns a DRDrillResult with rtoMet boolean."},
-    {"id": "3", "description": "Build a RegulatoryNotificationService that tracks active incidents, sends a DORA notification when customer-facing outage reaches 4 hours, escalates P1 incidents to leadership at 15 minutes (exceeding Tier 1 RTO), and records notification timestamps to prevent duplicate sends."},
-    {"id": "4", "description": "Write a Kafka MirrorMaker 2 configuration for replicating payment-events, fraud-alerts, and settlement-events to a DR cluster with offset sync enabled, and implement a DRAwareKafkaConfig factory that can be switched to the DR bootstrap servers at runtime without redeployment."}
+    {
+      "id": "1",
+      "description": "Configure HikariCP for PostgreSQL failover resilience: a multi-host JDBC URL with targetServerType=primary (or a leader endpoint maintained by HAProxy / vip-manager), connectionTimeout 3s, keepaliveTime 30s, and Spring @Retryable on READ repository methods that retries CannotGetJdbcConnectionException up to 10 times with exponential backoff during the Patroni promotion window. Explain why writes with an unknown commit outcome must not be retried blindly."
+    },
+    {
+      "id": "2",
+      "description": "Implement a DRDrillOrchestrator that: records a steady-state baseline, stops the primary container, measures time to Patroni promotion, measures time to application recovery (by polling a health endpoint), verifies post-drill steady state, and returns a DRDrillResult with rtoMet boolean."
+    },
+    {
+      "id": "3",
+      "description": "Build a RegulatoryNotificationService that tracks active incidents, drafts the DORA initial report as soon as an incident is classified as major (deadline: 4 hours after classification, at most 24 hours after detection) and pages Compliance to approve and submit it, escalates P1 incidents to leadership at 15 minutes (exceeding Tier 1 RTO), and persists notification state to prevent duplicate sends."
+    },
+    {
+      "id": "4",
+      "description": "Write a Kafka MirrorMaker 2 configuration for replicating payment-events, fraud-alerts, and settlement-events to a DR cluster with offset sync enabled and the IdentityReplicationPolicy (so topic names are unchanged), and implement a DRAwareKafkaConfig that can be switched to the DR bootstrap servers at runtime by stopping and restarting the listener containers — without redeployment."
+    }
   ]
 }
 -->

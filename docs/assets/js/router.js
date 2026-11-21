@@ -104,7 +104,7 @@ EM.Router = (function () {
           result.then(function (html) { _inject(html); })
                 .catch(function (err) {
                   console.error('[EM.Router] Handler error:', err);
-                  _inject(_errorPage('Failed to load page. See console for details.'));
+                  _inject(_errorPage(EM.t('err.failedPage')));
                 });
         } else {
           _inject(result || '');
@@ -139,16 +139,16 @@ EM.Router = (function () {
   function _notFoundPage(path) {
     return '<div class="coming-soon">' +
       '<div class="coming-soon-icon">' + EM.Icons.search + '</div>' +
-      '<h1 class="coming-soon-title">Page Not Found</h1>' +
-      '<p class="coming-soon-desc">No route matched <code>' + _esc(path) + '</code>.</p>' +
-      '<button class="btn btn-secondary" onclick="EM.Router.navigate(\'/\')">Go to Dashboard</button>' +
+      '<h1 class="coming-soon-title">' + EM.t('err.notFound') + '</h1>' +
+      '<p class="coming-soon-desc">' + _esc(EM.t('err.noRoute', { path: '\u0000' })).replace('\u0000', '<code>' + _esc(path) + '</code>') + '</p>' +
+      '<button class="btn btn-secondary" onclick="EM.Router.navigate(\'/\')">' + EM.t('err.toDashboard') + '</button>' +
     '</div>';
   }
 
   function _errorPage(msg) {
     return '<div class="error-wrap">' +
       '<div class="error-icon">&#9888;</div>' +
-      '<h2 class="error-title">Something went wrong</h2>' +
+      '<h2 class="error-title">' + EM.t('err.wrong') + '</h2>' +
       '<p class="error-msg">' + _esc(msg) + '</p>' +
     '</div>';
   }

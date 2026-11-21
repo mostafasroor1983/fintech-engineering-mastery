@@ -11,6 +11,8 @@ tags: [event-sourcing, append-only, event-store, snapshot, audit-trail]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 Event sourcing is not a storage optimisation — it is a fundamentally different answer to the question "what is the truth?" In a conventional system the truth is the current row in the accounts table. In an event-sourced system the truth is the ordered log of things that *happened*, and the balance is a derivative you compute by replaying that log. For financial ledgers this distinction is transformative: you get a full, immutable audit trail without a separate audit table, the ability to recompute any historical balance at any point in time, and a natural integration point for downstream projections and regulatory reports.
 
 ## Learning Objectives
@@ -24,9 +26,9 @@ Event sourcing is not a storage optimisation — it is a fundamentally different
 
 ## Business Context
 
-In Q4 2021, a European digital bank was investigated by its national financial regulator following a customer complaint. The customer alleged that a fee had been deducted twice from their account. The bank's engineering team could confirm the current balance but could not definitively reconstruct the exact sequence of operations that led to it. Their audit log existed, but it was written as a best-effort side effect of mutations — the application updated the `accounts` row and *then* inserted into `audit_log`. On two occasions that month, a database connection failure caused the update to commit but the audit insert to be lost in an in-flight retry. The regulator levied a €240,000 fine for inadequate record-keeping and ordered an independent system audit.
+*Composite example:* a European digital bank is investigated by its national financial regulator following a customer complaint. The customer alleged that a fee had been deducted twice from their account. The bank's engineering team could confirm the current balance but could not definitively reconstruct the exact sequence of operations that led to it. Their audit log existed, but it was written as a best-effort side effect of mutations — the application updated the `accounts` row and *then* inserted into `audit_log`. On two occasions that month, a database connection failure caused the update to commit but the audit insert to be lost in an in-flight retry. The regulator found the record-keeping inadequate and ordered an independent system audit.
 
-The bank rebuilt the accounts subsystem using event sourcing. The event store became the write-once source of truth; the balance row became a projection derived from it. With this architecture, the balance and the audit trail are the same artefact — not two separate systems that can drift apart. By the time the regulator returned for a follow-up review, the team could reconstruct every account state at any microsecond with a single SQL query.
+The bank rebuilt the accounts subsystem using event sourcing. The event store became the write-once source of truth; the balance row became a projection derived from it. With this architecture, the balance and the audit trail are the same artefact — not two separate systems that can drift apart. By the time the regulator returned for a follow-up review, the team could reconstruct the state of any account at any past moment by replaying its events.
 
 ## Event Sourcing Fundamentals
 
@@ -100,9 +102,8 @@ CREATE TABLE account_events (
     CONSTRAINT uq_account_events_seq UNIQUE (account_id, sequence_number)
 );
 
--- Index for efficient replay from latest snapshot + N events
-CREATE INDEX ix_account_events_account_seq
-    ON account_events (account_id, sequence_number);
+-- No extra index needed: the UNIQUE constraint already creates a B-tree index
+-- on (account_id, sequence_number), which serves replay "from snapshot + N events".
 ```
 
 Appending an event must check that the expected sequence number is not already taken:
@@ -148,8 +149,9 @@ public class Account {
     private long        version    = -1L; // last applied sequence number
 
     // Factory: reconstruct from an ordered event list
-    public static Account reconstitute(List<AccountEvent> events) {
+    public static Account reconstitute(UUID accountId, List<AccountEvent> events) {
         Account account = new Account();
+        account.id = accountId;
         for (AccountEvent event : events) {
             account.apply(event);
         }
@@ -196,16 +198,22 @@ public class AccountCommandService {
             .stream()
             .map(serializer::deserialize)
             .toList();
+        if (events.isEmpty()) {
+            throw new AccountNotFoundException(accountId);
+        }
 
-        Account account = Account.reconstitute(events);
+        Account account = Account.reconstitute(accountId, events);
 
         // Command → event (business rules validated here)
         MoneyWithdrawn event = account.withdraw(amount, reference);
 
         // Append — the UNIQUE constraint on (account_id, sequence_number)
-        // rejects a concurrent writer who appended the same sequence first
+        // rejects a concurrent writer who appended the same sequence first.
+        // saveAndFlush: send the INSERT now, so the violation surfaces HERE and
+        // not later at commit. We only translate and rethrow — the transaction
+        // is aborted, so the caller retries in a NEW transaction.
         try {
-            eventRepository.save(serializer.serialize(event));
+            eventRepository.saveAndFlush(serializer.serialize(event));
         } catch (DataIntegrityViolationException ex) {
             throw new ConcurrentModificationException(
                 "Concurrent write on account " + accountId + "; caller should retry", ex);
@@ -231,9 +239,8 @@ CREATE TABLE account_snapshots (
     CONSTRAINT pk_account_snapshots PRIMARY KEY (account_id, sequence_number)
 );
 
--- Only the latest snapshot per account is relevant for reads
-CREATE INDEX ix_account_snapshots_latest
-    ON account_snapshots (account_id, sequence_number DESC);
+-- The primary key index (account_id, sequence_number) also finds the latest
+-- snapshot per account (B-tree indexes can be scanned backwards).
 ```
 
 ```java
@@ -311,74 +318,86 @@ CREATE TABLE account_balance_projection (
 @RequiredArgsConstructor
 public class AccountBalanceProjector {
 
-    private final JdbcTemplate jdbc;
+    // Named parameters (:id) need NamedParameterJdbcTemplate, not JdbcTemplate
+    private final NamedParameterJdbcTemplate jdbc;
 
     // Called by an event consumer (e.g., a Kafka listener or outbox poller)
     public void on(AccountEvent event) {
         switch (event) {
             case MoneyDeposited e  -> credit(e.accountId(), e.amount(),  e.sequenceNumber());
             case MoneyWithdrawn e  -> debit(e.accountId(),  e.amount(),  e.sequenceNumber());
-            case AccountFrozen  e  -> freeze(e.accountId(),              e.sequenceNumber());
-            case AccountUnfrozen e -> unfreeze(e.accountId(),            e.sequenceNumber());
+            case AccountFrozen  e  -> setFrozen(e.accountId(), true,     e.sequenceNumber());
+            case AccountUnfrozen e -> setFrozen(e.accountId(), false,    e.sequenceNumber());
         }
     }
 
+    // Every update accepts ONLY the next event: last_event_seq = seq - 1
     private void credit(UUID id, BigDecimal amount, long seq) {
-        jdbc.update("""
+        int rows = jdbc.update("""
             INSERT INTO account_balance_projection
                         (account_id, balance, last_event_seq, updated_at)
-                 VALUES (:id, :amount, :seq, now())
+                 SELECT :id, :amount, :seq, now()
+                  WHERE :seq = 0                       -- a new row only for the first event
             ON CONFLICT (account_id) DO UPDATE
-                SET balance       = account_balance_projection.balance + EXCLUDED.balance,
+                SET balance        = account_balance_projection.balance + EXCLUDED.balance,
                     last_event_seq = EXCLUDED.last_event_seq,
-                    updated_at    = now()
-             WHERE account_balance_projection.last_event_seq < EXCLUDED.last_event_seq
+                    updated_at     = now()
+              WHERE account_balance_projection.last_event_seq = EXCLUDED.last_event_seq - 1
             """,
             Map.of("id", id, "amount", amount, "seq", seq));
+        if (rows == 0 && seq > 0) {
+            rows = jdbc.update("""
+                UPDATE account_balance_projection
+                   SET balance = balance + :amount, last_event_seq = :seq, updated_at = now()
+                 WHERE account_id = :id AND last_event_seq = :seq - 1
+                """, Map.of("id", id, "amount", amount, "seq", seq));
+        }
+        requireApplied(rows, id, seq);
     }
 
     private void debit(UUID id, BigDecimal amount, long seq) {
-        jdbc.update("""
+        int rows = jdbc.update("""
             UPDATE account_balance_projection
-               SET balance       = balance - :amount,
+               SET balance        = balance - :amount,
                    last_event_seq = :seq,
-                   updated_at    = now()
-             WHERE account_id = :id
-               AND last_event_seq < :seq
+                   updated_at     = now()
+             WHERE account_id     = :id
+               AND last_event_seq = :seq - 1
             """,
             Map.of("id", id, "amount", amount, "seq", seq));
+        requireApplied(rows, id, seq);
     }
 
-    private void freeze(UUID id, long seq) {
-        jdbc.update("""
+    private void setFrozen(UUID id, boolean frozen, long seq) {
+        int rows = jdbc.update("""
             UPDATE account_balance_projection
-               SET frozen        = TRUE,
+               SET frozen         = :frozen,
                    last_event_seq = :seq,
-                   updated_at    = now()
-             WHERE account_id = :id
-               AND last_event_seq < :seq
+                   updated_at     = now()
+             WHERE account_id     = :id
+               AND last_event_seq = :seq - 1
             """,
-            Map.of("id", id, "seq", seq));
+            Map.of("id", id, "frozen", frozen, "seq", seq));
+        requireApplied(rows, id, seq);
     }
 
-    private void unfreeze(UUID id, long seq) {
-        jdbc.update("""
-            UPDATE account_balance_projection
-               SET frozen        = FALSE,
-                   last_event_seq = :seq,
-                   updated_at    = now()
-             WHERE account_id = :id
-               AND last_event_seq < :seq
-            """,
-            Map.of("id", id, "seq", seq));
+    // 0 rows means: a duplicate (already applied → ignore) or a GAP (an earlier
+    // event is missing → fail, so the consumer retries later instead of skipping it)
+    private void requireApplied(int rows, UUID id, long seq) {
+        if (rows == 1) return;
+        List<Long> last = jdbc.queryForList(
+            "SELECT last_event_seq FROM account_balance_projection WHERE account_id = :id",
+            Map.of("id", id), Long.class);
+        if (!last.isEmpty() && last.get(0) >= seq) return;   // duplicate
+        throw new ProjectionGapException(id, last.isEmpty() ? null : last.get(0), seq);
     }
 }
 ```
 
-The `WHERE last_event_seq < :seq` guard ensures the projection is idempotent — replaying an event that was already applied has no effect, which is critical for at-least-once event consumers.
+The `WHERE last_event_seq = :seq - 1` guard accepts only the *next* event. It makes the projection idempotent — replaying an event that was already applied has no effect, which is critical for at-least-once event consumers — and it also refuses to skip ahead.
 
 > [!WARNING]
-> Out-of-order event delivery is possible in distributed systems. The projection guard `last_event_seq < :seq` protects against duplicate delivery but not against gaps. If event 7 arrives before event 6, the projection will apply 7 and then reject 6 as a stale update, leaving the projection permanently inconsistent. For strict ordering guarantees, partition event consumers by `account_id` so all events for a given account are processed sequentially.
+> Out-of-order event delivery is possible in distributed systems. A weaker guard such as `last_event_seq < :seq` protects against duplicates but not against gaps: if event 7 arrives before event 6, it applies 7 and then rejects 6 as stale, leaving the projection permanently wrong. The strict guard `last_event_seq = :seq - 1` rejects event 7 with a `ProjectionGapException`, so the consumer retries it later (after 6). To make gaps rare in the first place, partition event consumers by `account_id` so all events for a given account are processed in order.
 
 ## Trade-offs and When Not to Use Event Sourcing
 
@@ -408,7 +427,7 @@ Two queries. The first is a `SELECT` that fetches all 5,000 `AccountEventEntity`
 
 **Q2: The projection updater processes events from a Kafka topic. Due to a Kafka consumer group rebalance, event sequence 12 for account A is delivered twice. What prevents the projection from applying a double debit?**
 
-The `WHERE last_event_seq < :seq` predicate in the `UPDATE` statement. On the first delivery, `last_event_seq` is 11, so 11 < 12 is true and the update executes. After the update, `last_event_seq` is 12. On the second (duplicate) delivery, 12 < 12 is false and the `UPDATE` affects zero rows. The projection is idempotent: replaying any already-applied event has no effect on the stored balance.
+The `WHERE last_event_seq = :seq - 1` predicate in the `UPDATE` statement. On the first delivery, `last_event_seq` is 11, so the condition 11 = 12 − 1 is true and the update executes. After the update, `last_event_seq` is 12. On the second (duplicate) delivery, 12 = 11 is false and the `UPDATE` affects zero rows; the projector sees that 12 was already applied and ignores the message. The projection is idempotent: replaying any already-applied event has no effect on the stored balance.
 
 ## Practical Challenge
 
@@ -420,7 +439,7 @@ A regulated investment platform must rebuild its cash account subsystem after a 
 
 **Task 3 — Historical balance query.** Implement `CashAccountQueryService.balanceAt(UUID accountId, Instant pointInTime)`. The method must replay only events with `occurred_at <= pointInTime`. Do not use a snapshot — the result must be computed entirely from the raw event log to guarantee accuracy. This is the method used by the regulatory audit team.
 
-**Task 4 — Projection gap detection.** The projection consumer receives events out of order intermittently. Implement a nightly reconciliation job `ProjectionReconciliationJob` that, for each account, computes the balance from raw events and compares it against `account_balance_projection.balance`. Log any discrepancy as an error with account ID, event-sourced balance, projected balance, and the difference. Explain what schema change to `account_balance_projection` would make gap detection more precise.
+**Task 4 — Projection gap detection.** The projection consumer receives events out of order intermittently. Implement a nightly reconciliation job `ProjectionReconciliationJob` that, for each account, computes the balance from raw events and compares it against `account_balance_projection.balance`. Log any discrepancy as an error with account ID, event-sourced balance, projected balance, and the difference. Explain why the strict next-sequence guard (`last_event_seq = seq - 1`) detects gaps that a `last_event_seq < seq` guard would silently skip.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -434,18 +453,18 @@ A regulated investment platform must rebuild its cash account subsystem after a 
         "5,001 queries — one per historical event plus one INSERT"
       ],
       "correct": 2,
-      "explanation": "Without a snapshot, the command service must replay the entire event log to reconstitute the aggregate. Query 1: SELECT all 5,000 AccountEventEntity rows ordered by sequence_number for the account_id — the application replays them in memory calling apply() 5,000 times. Query 2: INSERT of the new MoneyWithdrawn event. The UNIQUE(account_id, sequence_number) constraint acts as the optimistic concurrency check — a concurrent writer appending the same sequence produces a DataIntegrityViolationException. Snapshots reduce query 1 to only fetching events after the snapshot sequence."
+      "explanation": "Without a snapshot, the command service must replay the entire event log to reconstitute the aggregate. Query 1: SELECT all 5,000 AccountEventEntity rows ordered by sequence_number for the account_id — the application replays them in memory calling apply() 5,000 times. Query 2: INSERT of the new MoneyWithdrawn event. The UNIQUE(account_id, sequence_number) constraint acts as the optimistic concurrency check — a concurrent writer appending the same sequence produces a DataIntegrityViolationException (surfaced at once with saveAndFlush). Snapshots reduce query 1 to only fetching events after the snapshot sequence."
     },
     {
       "text": "The projection updater receives event sequence 12 for account A twice due to a Kafka consumer group rebalance. What prevents the projection from applying a double debit?",
       "options": [
         "The UNIQUE(account_id, sequence_number) constraint on account_events rejects the duplicate",
-        "The WHERE last_event_seq < :seq predicate in the UPDATE statement — on the second delivery last_event_seq is already 12, so 12 < 12 is false and the UPDATE affects zero rows",
+        "The WHERE last_event_seq = :seq - 1 predicate in the UPDATE statement — on the second delivery last_event_seq is already 12, so 12 = 11 is false and the UPDATE affects zero rows",
         "The projection consumer's @KafkaListener automatically deduplicates by partition offset",
         "Kafka's enable.idempotence=true setting prevents the same event from being delivered twice"
       ],
       "correct": 1,
-      "explanation": "The WHERE last_event_seq < :seq guard makes projection updates idempotent. First delivery: last_event_seq = 11, condition 11 < 12 is true, debit applied, last_event_seq updated to 12. Second (duplicate) delivery: last_event_seq = 12, condition 12 < 12 is false, UPDATE affects zero rows, balance unchanged. This guard is critical for at-least-once consumers — it ensures replaying any already-applied event has no effect."
+      "explanation": "The WHERE last_event_seq = :seq - 1 guard accepts only the next event, which makes projection updates idempotent. First delivery: last_event_seq = 11, condition 11 = 12 − 1 is true, debit applied, last_event_seq updated to 12. Second (duplicate) delivery: last_event_seq = 12, condition 12 = 11 is false, the UPDATE affects zero rows, and the projector ignores the already-applied event. The same guard also rejects an event that arrives too early (a gap) instead of skipping the missing one."
     },
     {
       "text": "When is event sourcing NOT appropriate for a financial aggregate, despite its audit trail benefits?",
@@ -468,10 +487,22 @@ A regulated investment platform must rebuild its cash account subsystem after a 
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Design a sealed interface CashAccountEvent with four concrete record types relevant to investment accounts: CashDeposited, CashWithdrawn, DividendCredited, and PlatformFeeCharged. Each record must include all fields needed to reconstruct the balance at any point in time (accountId, sequenceNumber, occurredAt, amount, reference). Implement Account.apply() as an exhaustive switch expression using Java 21 sealed type pattern matching."},
-    {"id": "2", "description": "Implement CashAccountEventStore.append(CashAccountEvent event) that inserts into account_events and catches DataIntegrityViolationException on the UNIQUE(account_id, sequence_number) constraint, rethrowing it as a typed ConcurrentAppendException that includes the conflicting sequence number and a message instructing the caller to reload the aggregate and retry."},
-    {"id": "3", "description": "Implement CashAccountQueryService.balanceAt(UUID accountId, Instant pointInTime) that replays ONLY events with occurred_at <= pointInTime from the raw event log without using any snapshot. This is the regulatory audit method — accuracy is non-negotiable. Write a test that posts 10 events at known timestamps, then queries balanceAt() at timestamps between events, asserting the correct intermediate balance at each point."},
-    {"id": "4", "description": "Implement ProjectionReconciliationJob that, for each account, queries the full event log to compute the event-sourced balance, then compares it against account_balance_projection.balance. Log discrepancies with account_id, event_sourced_balance, projected_balance, and difference_cents. Explain what adding an expected_sequence_number column to account_balance_projection would enable, and why last_event_seq alone is insufficient to detect out-of-order delivery gaps."}
+    {
+      "id": "1",
+      "description": "Design a sealed interface CashAccountEvent with four concrete record types relevant to investment accounts: CashDeposited, CashWithdrawn, DividendCredited, and PlatformFeeCharged. Each record must include all fields needed to reconstruct the balance at any point in time (accountId, sequenceNumber, occurredAt, amount, reference). Implement Account.apply() as an exhaustive switch expression using Java 21 sealed type pattern matching."
+    },
+    {
+      "id": "2",
+      "description": "Implement CashAccountEventStore.append(CashAccountEvent event) that inserts into account_events and catches DataIntegrityViolationException on the UNIQUE(account_id, sequence_number) constraint, rethrowing it as a typed ConcurrentAppendException that includes the conflicting sequence number and a message instructing the caller to reload the aggregate and retry."
+    },
+    {
+      "id": "3",
+      "description": "Implement CashAccountQueryService.balanceAt(UUID accountId, Instant pointInTime) that replays ONLY events with occurred_at <= pointInTime from the raw event log without using any snapshot. This is the regulatory audit method — accuracy is non-negotiable. Write a test that posts 10 events at known timestamps, then queries balanceAt() at timestamps between events, asserting the correct intermediate balance at each point."
+    },
+    {
+      "id": "4",
+      "description": "Implement ProjectionReconciliationJob that, for each account, queries the full event log to compute the event-sourced balance, then compares it against account_balance_projection.balance. Log discrepancies with account_id, event_sourced_balance, projected_balance, and difference_cents. Explain why the strict next-sequence guard (last_event_seq = seq - 1) detects out-of-order delivery gaps that a last_event_seq < seq guard would silently skip."
+    }
   ]
 }
 -->

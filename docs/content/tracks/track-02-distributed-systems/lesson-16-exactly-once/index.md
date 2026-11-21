@@ -39,8 +39,8 @@ The cost of exactly-once comes from coordination:
 
 1. **Atomic write spanning two systems** — writing to Kafka AND to a database atomically requires either 2PC (high latency, low availability) or the outbox pattern (eventual consistency, operational overhead).
 2. **Deduplication storage** — the system must remember every message ID it has seen within the deduplication window, consuming memory or disk proportional to message volume.
-3. **Ordering constraints** — idempotent producers in Kafka enforce strict ordering per partition, limiting parallelism.
-4. **Throughput reduction** — Kafka's transactional API adds ~20% overhead versus non-transactional producers in benchmarks.
+3. **Ordering constraints** — per-partition order must be preserved through retries, which caps in-flight requests per connection at 5.
+4. **Throughput reduction** — Kafka's transactional API adds extra round trips and commit markers per transaction; the overhead is noticeable for small transactions and shrinks as transactions get larger.
 
 > [!WARNING]
 > Exactly-once at the **infrastructure layer** (Kafka EOS) does not give you exactly-once at the **application layer** if your consumer handler is not idempotent. Infrastructure EOS ensures the message is in the topic exactly once — but if your consumer crashes after writing to the database but before committing the Kafka offset, you will reprocess. Application-layer idempotency is always required.
@@ -102,7 +102,7 @@ try {
 }
 ```
 
-The `transactional.id` enables cross-restart deduplication. If a producer with `payment-producer-1` crashes mid-transaction, when it restarts with the same `transactional.id` the broker will:
+The `transactional.id` gives continuity across restarts ("zombie fencing"). If a producer with `payment-producer-1` crashes mid-transaction, when it restarts with the same `transactional.id` the broker will:
 1. Fence the old producer epoch (previous instance cannot write).
 2. Abort the in-flight transaction.
 3. Assign a new epoch to the new instance.
@@ -121,8 +121,9 @@ public class KafkaTransactionConfig {
     public ProducerFactory<String, String> transactionalProducerFactory(
             KafkaProperties props) {
         Map<String, Object> config = props.buildProducerProperties(null);
-        config.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG,  "payment-tx-");
         config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        // The prefix (set below) makes the factory create one transactional.id
+        // per producer: payment-tx-0, payment-tx-1, ...
         DefaultKafkaProducerFactory<String, String> factory =
             new DefaultKafkaProducerFactory<>(config);
         factory.setTransactionIdPrefix("payment-tx-");
@@ -247,7 +248,11 @@ public class OutboxRelay {
     @Scheduled(fixedDelay = 100)  // poll every 100ms
     @Transactional
     public void relay() {
-        List<OutboxEvent> pending = outboxRepo.findUnpublished(50);  // batch of 50
+        // SELECT ... WHERE published_at IS NULL AND attempts < 5
+        //   ORDER BY created_at LIMIT 50 FOR UPDATE SKIP LOCKED
+        // SKIP LOCKED lets several relay instances run without publishing the
+        // same rows; the row locks are held until this transaction commits.
+        List<OutboxEvent> pending = outboxRepo.findUnpublishedForUpdate(50);
 
         for (OutboxEvent event : pending) {
             try {
@@ -269,7 +274,7 @@ public class OutboxRelay {
 }
 ```
 
-The outbox relay delivers at-least-once to Kafka. Consumer-side idempotency (Lesson 14) handles the occasional duplicate. The combination provides **effective exactly-once** for business outcomes.
+The outbox relay delivers at-least-once to Kafka: a crash after the send but before the commit publishes the row again. Consumer-side idempotency (Lesson 14) handles the occasional duplicate. The combination provides **effective exactly-once** for business outcomes. Two refinements for production: back off between attempts (record a `next_attempt_at`), and if per-aggregate order matters, stop publishing an aggregate's later events while an earlier one is failing.
 
 ---
 
@@ -285,7 +290,10 @@ Polling the outbox table adds latency and DB load. Debezium's Change Data Captur
     "database.hostname": "postgres",
     "database.port": "5432",
     "database.user": "debezium",
+    "database.password": "${file:/secrets/debezium.properties:password}",
     "database.dbname": "payments",
+    "topic.prefix": "payments",
+    "plugin.name": "pgoutput",
     "table.include.list": "public.outbox_events",
     "transforms": "outbox",
     "transforms.outbox.type":
@@ -300,7 +308,7 @@ Polling the outbox table adds latency and DB load. Debezium's Change Data Captur
 }
 ```
 
-Debezium reads WAL changes and publishes to Kafka without polling. The outbox row is captured exactly once from the WAL, providing very low latency (sub-second) and no polling DB overhead.
+Debezium reads WAL changes and publishes to Kafka without polling, giving very low latency (sub-second) and no polling load on the database. Delivery is still at-least-once: after a connector restart, recent rows can be emitted again — so consumers deduplicate on the outbox event `id`, which the EventRouter puts in a message header. Remember to delete published outbox rows (or insert and delete in the same transaction — the WAL still carries the insert).
 
 ---
 
@@ -371,17 +379,20 @@ public class PaymentProcessedConsumer {
                    containerFactory = "kafkaListenerContainerFactory")
     @Transactional
     public void consume(ConsumerRecord<String, String> record) {
-        String messageId = record.headers()
-            .lastHeader("message-id")
-            .map(h -> new String(h.value()))
-            .orElse(record.key() + ":" + record.offset());
+        // Use the outbox event id. Do NOT fall back to key + offset: a message
+        // published twice by the relay has two different offsets.
+        Header idHeader = record.headers().lastHeader("id");   // may be null
+        if (idHeader == null) {
+            throw new InvalidMessageException("Missing outbox event id header");
+        }
+        String messageId = new String(idHeader.value(), StandardCharsets.UTF_8);
 
-        // Idempotency check — in same DB transaction as the business logic
-        if (dedupeRepo.existsByMessageId(messageId)) {
+        // Claim the id first: INSERT ... ON CONFLICT DO NOTHING, in the same DB
+        // transaction as the business logic. 0 rows inserted = duplicate.
+        if (!dedupeRepo.insertIfAbsent(messageId, eventDate(record))) {
             log.debug("Duplicate message {} — skipping", messageId);
             return;
         }
-        dedupeRepo.markProcessed(messageId);
 
         PaymentProcessedEvent event = fromJson(record.value());
         accountService.applyPayment(event);
@@ -393,9 +404,13 @@ public class PaymentProcessedConsumer {
 ```sql
 CREATE TABLE processed_messages (
     message_id   VARCHAR(256) NOT NULL,
+    event_date   DATE         NOT NULL,  -- date the EVENT was created (from the
+                                         -- message), so a duplicate always lands
+                                         -- in the same partition as the original
     processed_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    CONSTRAINT pk_processed_messages PRIMARY KEY (message_id)
-) PARTITION BY RANGE (processed_at);
+    -- On a partitioned table the primary key must include the partition key
+    CONSTRAINT pk_processed_messages PRIMARY KEY (message_id, event_date)
+) PARTITION BY RANGE (event_date);
 
 -- Weekly partition rotation — drop old partitions instead of DELETE
 CREATE TABLE processed_messages_2024_w01
@@ -417,7 +432,7 @@ For application-layer deduplication tables:
 | 10,000 msg/s | 24 hours | ~864M rows ≈ 100GB |
 | 1,000 msg/s | 7 days | ~600M rows ≈ 70GB |
 
-Partitioning by `processed_at` date enables efficient range deletion by dropping old partitions with `DROP TABLE processed_messages_2024_w01` — zero I/O compared to a DELETE of 86M rows.
+Partitioning by event date enables efficient range deletion by dropping old partitions with `DROP TABLE processed_messages_2024_w01` — zero I/O compared to a DELETE of 86M rows.
 
 ---
 
@@ -453,7 +468,7 @@ Alert when:
 
 For most fintech workloads, the combination of:
 
-1. **Transactional outbox** (exactly-once from DB to Kafka)
+1. **Transactional outbox** (no lost events: every committed change is published at least once)
 2. **Idempotent consumers** (deduplicate on consumer side)
 3. **Business-level idempotency keys** (Lesson 14)
 
@@ -463,9 +478,9 @@ For most fintech workloads, the combination of:
 
 ## Regulatory Exactly-Once Requirements
 
-SEPA credit transfers, SWIFT MT103s, and Open Banking payment orders have regulatory requirements for exactly-once processing. Regulators care about business outcomes, not infrastructure guarantees:
+No regulation names a delivery guarantee such as "exactly-once". Regulators care about business outcomes for SEPA credit transfers, SWIFT payments, and Open Banking payment orders:
 
-- A SEPA payment debited twice violates the Payment Services Directive.
+- A SEPA payment debited twice is an incorrectly executed payment under PSD2: the payer's bank must put it right promptly, and it counts against the firm.
 - A SWIFT message sent twice causes correspondent bank confusion and potential duplicate settlement.
 - The compliance defence is demonstrating that your deduplication mechanism has no gaps — not that you used Kafka EOS.
 
@@ -517,7 +532,7 @@ Do you need exactly-once across multiple independent services?
         "No — kafkaTemplate.send() is always fire-and-forget"
       ],
       "correct": 1,
-      "explanation": "DataSourceTransactionManager only manages the JDBC connection. KafkaTemplate uses a separate Kafka transaction. Without ChainedTransactionManager or the outbox pattern, the DB can commit while the Kafka send fails, publishing an event with no corresponding DB record — or the reverse."
+      "explanation": "DataSourceTransactionManager only manages the JDBC connection. KafkaTemplate uses a separate Kafka transaction (or none). Even the old ChainedTransactionManager only commits one after the other (best effort), so a crash between the two commits still leaves a gap. The DB can commit while the Kafka send fails — a payment with no event — or the reverse. The transactional outbox closes this gap."
     },
     {
       "text": "What problem does the transactional outbox pattern solve that Kafka EOS alone cannot?",

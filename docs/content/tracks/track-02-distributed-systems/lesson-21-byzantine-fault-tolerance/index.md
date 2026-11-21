@@ -49,7 +49,7 @@ Lamport, Shostak, and Pease introduced the **Byzantine Generals Problem** in 198
 
 The key insight from the original paper:
 
-**With f Byzantine (traitorous) nodes, you need at least 3f+1 total nodes to reach agreement.**
+**With f Byzantine (traitorous) nodes, you need at least 3f+1 total nodes to reach agreement.** (This holds for unsigned "oral" messages; the same 3f+1 bound applies to practical protocols on real, partially synchronous networks even with signatures. Only in a fully synchronous network can signed messages do with fewer.)
 
 For f=1 (one traitor): need at least 4 nodes (3×1+1=4)
 For f=2 (two traitors): need at least 7 nodes (3×2+1=7)
@@ -59,16 +59,14 @@ This is fundamentally different from crash fault tolerance, which only requires 
 ```
 Why 3f+1?
 
-The honest nodes must distinguish between:
-- Messages from traitors (up to f)
-- Messages from honest nodes that received traitor messages (up to f more)
+A node can only wait for n - f replies: up to f nodes may never answer.
+Of those n - f replies, up to f may come from traitors.
+So at least (n - f) - f = n - 2f replies are honest, and the honest
+replies must outnumber the traitors' replies:
 
-After receiving n-1 messages (from all other nodes), each honest node
-must be able to identify the majority honest value.
-
-Minimum condition: (n - f) > 2f
-                   n > 3f
-                   n >= 3f + 1
+    n - 2f > f
+    n > 3f
+    n >= 3f + 1
 ```
 
 ---
@@ -102,6 +100,8 @@ public class PbftReplica {
     private final MessageLog messageLog = new MessageLog();
     private final Map<String, Set<PrepareMessage>> prepareLog = new ConcurrentHashMap<>();
     private final Map<String, Set<CommitMessage>> commitLog = new ConcurrentHashMap<>();
+    private final Set<String> commitSent = ConcurrentHashMap.newKeySet();   // once per (view, seq)
+    private final Set<String> executed   = ConcurrentHashMap.newKeySet();
 
     public PbftReplica(String replicaId, int totalReplicas) {
         this.replicaId = replicaId;
@@ -171,13 +171,15 @@ public class PbftReplica {
      * enters "prepared" state, broadcasts COMMIT.
      */
     public void handlePrepare(PrepareMessage msg) {
-        if (!isValid(msg)) return;
+        // Valid signature AND the digest matches the PRE-PREPARE we accepted
+        if (!isValid(msg) || !messageLog.matchesPrePrepare(msg)) return;
 
         String key = msg.view() + ":" + msg.sequenceNumber();
         prepareLog.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet()).add(msg);
 
-        // Need 2f PREPARE messages (not counting own pre-prepare) to be "prepared"
-        if (prepareLog.get(key).size() >= 2 * faultThreshold) {
+        // Prepared = the PRE-PREPARE plus 2f matching PREPAREs from different
+        // replicas. commitSent.add() is true only once, so COMMIT goes out once.
+        if (prepareLog.get(key).size() >= 2 * faultThreshold && commitSent.add(key)) {
             log.debug("Reached prepared state for seq={}", msg.sequenceNumber());
 
             CommitMessage commit = CommitMessage.builder()
@@ -203,8 +205,8 @@ public class PbftReplica {
         String key = msg.view() + ":" + msg.sequenceNumber();
         commitLog.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet()).add(msg);
 
-        // Need 2f+1 commits to reach "committed" state
-        if (commitLog.get(key).size() >= 2 * faultThreshold + 1) {
+        // Need 2f+1 matching commits (own included) to reach "committed" state
+        if (commitLog.get(key).size() >= 2 * faultThreshold + 1 && executed.add(key)) {
             // Execute the operation (must be in sequence number order)
             executeInOrder(msg.sequenceNumber());
         }
@@ -247,8 +249,10 @@ public class PbftViewChangeManager {
         log.warn("Initiating view change: view {} → {}. Primary suspected Byzantine.",
             suspectedView, newView);
 
-        // Collect prepared state from current view to carry forward
-        List<PreparedState> preparedStates = messageLog.getCommittedThrough(suspectedView);
+        // Carry forward every request this replica has PREPARED (with its
+        // proof: the pre-prepare and 2f prepares), so the new primary
+        // cannot drop or reorder anything that may already be committed
+        List<PreparedState> preparedStates = messageLog.getPreparedSinceCheckpoint();
 
         ViewChangeMessage viewChange = ViewChangeMessage.builder()
             .newView(newView)
@@ -262,8 +266,8 @@ public class PbftViewChangeManager {
     }
 
     /**
-     * When the new primary receives 2f+1 VIEW-CHANGE messages,
-     * it broadcasts a NEW-VIEW message and takes over.
+     * When the new primary has 2f+1 valid VIEW-CHANGE messages (its own
+     * included), it broadcasts a NEW-VIEW message and takes over.
      */
     public void handleViewChange(ViewChangeMessage msg) {
         viewChangeLog.add(msg);
@@ -286,17 +290,19 @@ public class PbftViewChangeManager {
 
 The most prominent application of BFT in fintech is blockchain. Proof-of-Work (Bitcoin) and Proof-of-Stake (Ethereum post-merge) are Byzantine fault-tolerant consensus mechanisms, but they sacrifice performance (throughput, latency) for open membership.
 
-Permissioned blockchain networks (Hyperledger Fabric, R3 Corda, Quorum) use classical BFT variants:
-- **Hyperledger Fabric**: Uses ordering service (RAFT-based, not BFT by default; can plug in BFT orderers)
-- **Tendermint / CometBFT**: Used by Cosmos-based payment networks; provides instant finality with BFT
-- **PBFT variants**: Used in many enterprise blockchain platforms
+Permissioned blockchain networks choose their consensus per deployment:
+- **Hyperledger Fabric**: the ordering service uses Raft (crash-tolerant) by default; Fabric v3.0 added a BFT orderer (SmartBFT)
+- **R3 Corda**: uses notaries to prevent double-spends; a notary cluster can run a crash-tolerant or a BFT protocol
+- **ConsenSys Quorum (GoQuorum / Besu)**: QBFT or IBFT (BFT), or Raft
+- **Tendermint / CometBFT**: used by Cosmos-based networks; BFT with instant finality
 
 ```java
 /**
  * Example: Interacting with a Hyperledger Fabric network
  * for cross-institutional payment settlement.
- * Fabric provides BFT-like guarantees through its ordering service
- * and endorsement policy (k-of-n peer endorsement).
+ * The endorsement policy (k-of-n organisations must sign the result)
+ * protects against dishonest peers executing the chaincode; the
+ * ordering service is BFT only if a BFT orderer is configured.
  */
 @Service
 public class FabricPaymentSettlementClient {
@@ -308,7 +314,6 @@ public class FabricPaymentSettlementClient {
         Contract contract = network.getContract("payment-settlement");
 
         // Endorsement policy ensures multiple orgs sign off on the transaction
-        // (equivalent to requiring k-of-n Byzantine-fault-tolerant agreement)
         byte[] result = contract.submitTransaction(
             "settlePayment",
             request.paymentId(),
@@ -460,7 +465,7 @@ public class BftNetworkSizer {
 **BFT** is appropriate when:
 - Multiple independent, potentially adversarial organizations participate
 - Nodes may be compromised by external attackers
-- Regulatory requirements mandate verifiable, tamper-evident consensus
+- The business needs consensus that no single participant can subvert, with a verifiable, tamper-evident record
 - The system handles high-value, final settlement (not just best-effort)
 
 ```java
@@ -511,7 +516,7 @@ public class ConsensusProtocolSelector {
 
 ## Message Complexity and Scalability
 
-PBFT has **O(n²)** message complexity per consensus round (every node sends a message to every other node in the prepare and commit phases). This limits practical BFT cluster sizes:
+PBFT has **O(n²)** message complexity per consensus round (every node sends a message to every other node in the prepare and commit phases). Newer protocols such as HotStuff (and its descendants) reduce this to O(n) by routing votes through the leader and aggregating signatures. For classic PBFT, the quadratic cost limits practical cluster sizes:
 
 | Nodes (n) | Messages per round | Practical? |
 |---|---|---|
@@ -646,13 +651,13 @@ public class BftPaymentValidator {
 
 ### Pitfall 3: BFT Performance Expectations
 
-BFT protocols are significantly slower than CFT protocols. Set realistic performance expectations:
+BFT protocols are significantly slower than CFT protocols. Rough orders of magnitude (they depend heavily on hardware, batching, message size, and network distance):
 
 - **Raft** (CFT): ~10,000-50,000 TPS on commodity hardware
 - **PBFT** (BFT): ~1,000-10,000 TPS on small clusters (< 20 nodes)
 - **Tendermint** (BFT): ~1,000-10,000 TPS
 
-For high-throughput payment systems, BFT at the core settlement layer with CFT at the transaction processing layer is the standard architecture.
+For high-throughput payment systems, a common consortium design is BFT at the shared settlement layer and CFT inside each institution's transaction processing.
 
 ---
 
@@ -670,6 +675,8 @@ Byzantine Fault Tolerance is the most robust — and most expensive — form of 
 | Use case | Single-org | Multi-org, blockchain |
 
 BFT is the right tool for permissioned blockchain networks, cross-institutional settlement systems, and any financial infrastructure where the threat model includes compromised or malicious participants. For single-organization financial infrastructure, CFT provides better performance and simpler operations at acceptable security.
+
+The fundamental trade-off: **every Byzantine fault you tolerate costs you one node more than a crash fault would**. For financial systems where trust can be established through regulation, legal agreements, and access controls, eliminating Byzantine faults from the threat model — and using CFT — is often the correct engineering decision.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -702,12 +709,23 @@ BFT is the right tool for permissioned blockchain networks, cross-institutional 
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Implement a simplified PBFT simulation with 4 nodes (3f+1 for f=1) using Java threads. Run a normal-case protocol flow for a settlement transaction: pre-prepare, prepare, and commit phases. Verify that the transaction is committed when all 4 nodes are honest."},
-    {"id": "2", "description": "Extend the simulation to introduce one Byzantine node that sends conflicting vote messages (yes to nodes A and B, no to nodes C and D). Verify that the protocol still reaches agreement among the 3 correct nodes, confirming Byzantine tolerance with f=1 and N=4."},
-    {"id": "3", "description": "Analyze the performance trade-off: measure message complexity of PBFT (O(N^2)) vs Raft (O(N)) for N = 4, 7, 10 nodes by counting messages in your simulation. Document at what N the BFT overhead becomes impractical for a real-time settlement use case with a 100ms SLA."},
-    {"id": "4", "description": "Design a threat model for a permissioned blockchain settlement network with 7 member banks. Identify which failure scenarios require BFT (compromised validator, equivocation) versus which are handled by standard CFT (node crash, network partition). Write a one-page architecture decision record justifying the choice of Hyperledger Fabric over Raft for this scenario."}
+    {
+      "id": "1",
+      "description": "Implement a simplified PBFT simulation with 4 nodes (3f+1 for f=1) using Java threads. Run a normal-case protocol flow for a settlement transaction: pre-prepare, prepare, and commit phases. Verify that the transaction is committed when all 4 nodes are honest."
+    },
+    {
+      "id": "2",
+      "description": "Extend the simulation so that one of the 4 nodes is Byzantine: it sends PREPARE and COMMIT votes for one value to two of the honest nodes and for a conflicting value to the third. Verify that the 3 honest nodes still agree on a single result, confirming Byzantine tolerance with f=1 and N=4."
+    },
+    {
+      "id": "3",
+      "description": "Analyze the performance trade-off: measure message complexity of PBFT (O(N^2)) vs Raft (O(N)) for N = 4, 7, 10 nodes by counting messages in your simulation. Document at what N the BFT overhead becomes impractical for a real-time settlement use case with a 100ms SLA."
+    },
+    {
+      "id": "4",
+      "description": "Design a threat model for a permissioned blockchain settlement network with 7 member banks. Identify which failure scenarios require BFT (compromised validator, equivocation) and which are handled by standard CFT (node crash, network partition). Write a one-page architecture decision record justifying a BFT ordering service (for example Hyperledger Fabric with SmartBFT) over a Raft-based one for this scenario."
+    }
   ]
 }
 -->
 
-The fundamental trade-off: **every Byzantine fault you tolerate costs you one node more than a crash fault would**. For financial systems where trust can be established through regulation, legal agreements, and access controls, eliminating Byzantine faults from the threat model — and using CFT — is often the correct engineering decision.

@@ -144,7 +144,7 @@ The `workQueue` choice fundamentally shapes pool behaviour:
 
 | Queue | Bounded? | Behaviour |
 |---|---|---|
-| `SynchronousQueue` | No | Direct handoff — task runs or creates new thread immediately |
+| `SynchronousQueue` | Capacity 0 | Direct handoff — an idle thread takes the task, or a new thread is created (up to max), or it is rejected |
 | `ArrayBlockingQueue(n)` | Yes | FIFO, fixed capacity, back-pressure, allows `maximumPoolSize` growth |
 | `LinkedBlockingQueue()` | No (Integer.MAX_VALUE) | Unbounded — `maximumPoolSize` never reached |
 | `LinkedBlockingQueue(n)` | Yes | FIFO, bounded, same as Array but linked nodes |
@@ -181,7 +181,10 @@ public class PaymentExecutorConfig {
         @Override
         public Thread newThread(Runnable r) {
             Thread t = new Thread(r, prefix + "-" + count.incrementAndGet());
-            t.setDaemon(true); // Don't prevent JVM shutdown
+            // NOT daemon: daemon threads are killed mid-task when the JVM exits.
+            // Payment threads should finish their work during a graceful
+            // shutdown (executor.shutdown() + awaitTermination(...))
+            t.setDaemon(false);
             return t;
         }
     }
@@ -349,7 +352,7 @@ Map<CurrencyPair, Double> rates = currencyPairs.parallelStream()
 | Blocking I/O | Fine — threads wait | Problematic — reduces parallelism |
 | Optimal workload | I/O-bound services | CPU-bound divide-and-conquer |
 | Overhead per task | Low | Slightly higher (deque management) |
-| Virtual threads (Java 21) | ✗ Platform threads only | ✗ Platform threads only |
+| Role in virtual threads (Java 21) | None | The default virtual-thread scheduler is a `ForkJoinPool` of carrier threads |
 
 ## Executor Isolation — Bulkhead Pattern
 
@@ -406,9 +409,13 @@ public class ExecutorConfig {
         // Audit writes can be slow — keep isolated so slow DB doesn't affect payments
         return new ThreadPoolExecutor(
             5, 15, 60L, TimeUnit.SECONDS,
-            new ArrayBlockingQueue<>(10_000), // Large queue — audit is durable, can lag
+            new ArrayBlockingQueue<>(10_000), // Large queue — audit may lag a little
             namedFactory("audit"),
-            new DiscardAndLogPolicy("audit") // Audit lag is acceptable; payment lag is not
+            // NEVER discard audit records: a gap in the audit trail is a
+            // compliance failure. CallerRunsPolicy slows the submitter instead.
+            // (Better still: write audit events to an outbox table in the
+            // business transaction, and ship them asynchronously.)
+            new ThreadPoolExecutor.CallerRunsPolicy()
         );
     }
 
@@ -416,7 +423,7 @@ public class ExecutorConfig {
         AtomicInteger count = new AtomicInteger();
         return r -> {
             Thread t = new Thread(r, prefix + "-" + count.incrementAndGet());
-            t.setDaemon(true);
+            t.setDaemon(false);   // let in-flight work finish on graceful shutdown
             return t;
         };
     }
@@ -434,7 +441,9 @@ public class ExecutorConfig {
     @Bean("paymentExecutor")
     public ExecutorService paymentExecutor() {
         // Virtual thread per task — JVM schedules on carrier threads automatically
-        // No pool sizing. No queue capacity. No rejection policy needed.
+        // No pool sizing and no queue — but concurrency is now UNBOUNDED, so
+        // protect scarce downstream resources (DB connections, partner API
+        // rate limits) with a Semaphore or the connection pool's own limit
         return Executors.newVirtualThreadPerTaskExecutor();
     }
 
@@ -459,11 +468,11 @@ Java 21 virtual threads fundamentally change the thread pool model for I/O-bound
 | Aspect | Platform Thread Pool | Virtual Thread Executor |
 |---|---|---|
 | Sizing | Manual formula required | Automatic — JVM manages |
-| Queue management | Manual capacity + policy | Not needed |
+| Queue management | Manual capacity + policy | No pool queue — limit access to scarce resources with semaphores |
 | Memory per thread | ~1 MB stack | ~few KB |
 | Blocking I/O | Blocks OS thread | Parks virtual thread |
 | Optimal for | CPU-bound + mixed | I/O-bound workloads |
-| `synchronized` blocks | Fine | Causes carrier pinning |
+| `synchronized` blocks | Fine | Pins the carrier when blocking (Java 21–23; fixed in JDK 24) |
 | Throughput ceiling | Pool size × 1/blocking_ratio | Near-unlimited |
 
 > [!IMPORTANT]

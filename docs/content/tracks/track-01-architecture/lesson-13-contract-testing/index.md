@@ -3,7 +3,7 @@ id: track-01-lesson-13
 title: "Contract Testing — Consumer-Driven Contracts with Pact"
 slug: contract-testing
 track: track-01
-trackName: "Financial Services Architecture"
+trackName: "Advanced Software Architecture"
 sequence: 13
 difficulty: advanced
 estimatedMinutes: 75
@@ -147,14 +147,19 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.TestPropertySource;
 
+import feign.FeignException;
+
 import java.math.BigDecimal;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @ExtendWith(PactConsumerTestExt.class)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
-@PactTestFor(providerName = "account-service")
-@TestPropertySource(properties = "account.service.url=http://localhost:${pact.mock.port}")
+// Fixed port: the Spring context (and the Feign client URL) is built before the mock server starts
+@PactTestFor(providerName = "account-service", port = "8089")
+@TestPropertySource(properties = "account.service.url=http://localhost:8089")
 class AccountClientContractTest {
 
     @Autowired
@@ -181,8 +186,8 @@ class AccountClientContractTest {
                     .stringMatcher("currency", "GBP|USD|EUR", "GBP")
                     .stringMatcher("status", "ACTIVE|SUSPENDED", "ACTIVE")
                     .stringType("customerId", "CUST-12345")
-                    .datetime("createdAt", "yyyy-MM-dd'T'HH:mm:ssZ",
-                              "2024-01-15T10:30:00+0000")
+                    .datetime("createdAt", "yyyy-MM-dd'T'HH:mm:ssXXX",
+                              "2024-01-15T10:30:00Z")
                 )
             .toPact();
     }
@@ -256,7 +261,7 @@ class AccountClientContractTest {
 A common mistake is writing consumer contracts that assert exact values (e.g., `availableBalance = 5000.00`). This creates brittle contracts that break when test data changes. Instead:
 
 - Use **type matchers** (`stringType`, `decimalType`, `integerType`) for field shapes
-- Use **regex matchers** for structured formats (account IDs, ISBANs, currencies)
+- Use **regex matchers** for structured formats (account IDs, IBANs, currencies)
 - Use **exact values** only when semantic equality is contractual (status enum values, error codes)
 
 ```java
@@ -299,7 +304,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.math.BigDecimal;
@@ -324,7 +329,7 @@ class AccountServiceProviderTest {
     @Autowired
     private MockMvc mockMvc;
 
-    @MockBean
+    @MockitoBean   // replaces the deprecated @MockBean (Spring Boot 3.4+)
     private AccountRepository accountRepository;
 
     @BeforeEach
@@ -450,8 +455,8 @@ pact {
         pactBrokerUrl = System.getenv("PACT_BROKER_URL") ?: "http://localhost:9292"
         pactBrokerUsername = System.getenv("PACT_BROKER_USERNAME") ?: "admin"
         pactBrokerPassword = System.getenv("PACT_BROKER_PASSWORD") ?: "secret"
-        consumerVersion = project.version
-        tags = [System.getenv("GIT_BRANCH") ?: "local", "latest"]
+        consumerVersion = System.getenv("GIT_SHA") ?: project.version   // git SHA in CI
+        consumerBranch = System.getenv("GIT_BRANCH") ?: "local"         // branches replace tags
     }
 }
 ```
@@ -490,10 +495,9 @@ jobs:
           PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL }}
           PACT_BROKER_USERNAME: ${{ secrets.PACT_BROKER_USERNAME }}
           PACT_BROKER_PASSWORD: ${{ secrets.PACT_BROKER_PASSWORD }}
-        run: |
-          ./gradlew test pactPublish \
-            -Dpact.consumer.version=${{ github.sha }} \
-            -Dpact.tag=${{ github.ref_name }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_BRANCH: ${{ github.ref_name }}
+        run: ./gradlew test pactPublish
 
       - name: Can I deploy?
         env:
@@ -515,15 +519,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify provider contracts
+      - name: Verify provider contracts (JUnit 5 provider tests)
         env:
           PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL }}
-          PACT_PROVIDER_VERSION: ${{ github.sha }}
         run: |
-          ./gradlew pactVerify \
+          ./gradlew test --tests '*ProviderTest' \
             -Dpact.broker.url=$PACT_BROKER_URL \
-            -Dpact.provider.version=$PACT_PROVIDER_VERSION \
-            -Dpact.publish.results=true
+            -Dpact.provider.version=${{ github.sha }} \
+            -Dpact.provider.branch=${{ github.ref_name }} \
+            -Dpact.verifier.publishResults=true
 ```
 
 ### Webhook-Triggered Verification
@@ -537,12 +541,12 @@ curl -X POST "http://localhost:9292/webhooks" \
   -u "admin:secret" \
   -d '{
     "description": "Trigger account-service verification when payment-service publishes",
-    "events": [{"name": "contract_content_changed"}],
+    "events": [{"name": "contract_requiring_verification_published"}],
     "request": {
       "method": "POST",
       "url": "https://api.github.com/repos/myorg/account-service/actions/workflows/provider-verify.yml/dispatches",
       "headers": {
-        "Authorization": "Bearer ${user.name}",
+        "Authorization": "Bearer REPLACE_WITH_GITHUB_TOKEN",
         "Content-Type": "application/json"
       },
       "body": {
@@ -563,7 +567,7 @@ curl -X POST "http://localhost:9292/webhooks" \
 
 For teams already using OpenAPI specs, Pact can be combined with OpenAPI validation to enforce schema compliance:
 
-```java
+```groovy
 // Use swagger-request-validator-pact for OpenAPI + Pact hybrid approach
 dependencies {
     testImplementation 'com.atlassian.oai:swagger-request-validator-pact:2.40.0'
@@ -573,39 +577,20 @@ dependencies {
 ```java
 // Validate that the provider's OpenAPI spec covers all consumer interactions
 @Test
-void openApiSpecCoversPactInteractions() throws IOException {
-    String openApiSpec = Files.readString(
-        Path.of("src/main/resources/openapi/account-service-v1.yaml")
-    );
+void openApiSpecCoversPactInteractions() throws Exception {
+    // The consumer's pact file (downloaded from the broker in CI)
+    URL pactFile = Path.of("build/pacts/payment-service-account-service.json").toUri().toURL();
 
-    OpenApiInteractionValidator validator = OpenApiInteractionValidator
-        .createForInlineApiSpecification(openApiSpec)
+    PactProviderValidator validator = PactProviderValidator
+        .createFor("src/main/resources/openapi/account-service-v1.yaml")
+        .withConsumer("payment-service", pactFile)
         .build();
 
-    // Load the pact file produced by consumer tests
-    Pact pact = PactReader.loadPact(
-        new File("build/pacts/payment-service-account-service.json")
-    );
+    PactProviderValidationResults results = validator.validate();
 
-    for (Interaction interaction : pact.getInteractions()) {
-        Request request = ((RequestResponseInteraction) interaction).getRequest();
-        Response response = ((RequestResponseInteraction) interaction).getResponse();
-
-        SimpleRequest simpleRequest = SimpleRequest.Builder
-            .from(request.getMethod(), request.getPath())
-            .withBody(request.getBody().orElse(""))
-            .build();
-
-        SimpleResponse simpleResponse = SimpleResponse.Builder
-            .status(response.getStatus())
-            .withBody(response.getBody().orElse(""))
-            .build();
-
-        ValidationReport report = validator.validate(simpleRequest, simpleResponse);
-        assertThat(report.getMessages())
-            .as("OpenAPI violations in interaction: %s", interaction.getDescription())
-            .isEmpty();
-    }
+    assertThat(results.hasErrors())
+        .as("OpenAPI violations in pact interactions: %s", results.getValidationFailureReport())
+        .isFalse();
 }
 ```
 
@@ -614,15 +599,16 @@ void openApiSpecCoversPactInteractions() throws IOException {
 For payment APIs, enforce backwards compatibility rules as part of CI:
 
 ```yaml
-# .spectral.yml — governance rules for payment API
+# .spectral.yml — governance rules for payment API (Spectral lints one spec at a time)
 rules:
-  # Ensure no required fields are removed (breaking change)
-  no-required-field-removal:
-    message: "Removing a required field is a breaking change"
+  # Error responses must use RFC 9457 problem details
+  error-responses-use-problem-json:
+    message: "4xx responses must be application/problem+json"
     severity: error
-    given: "$.paths[*][*].requestBody.content[*].schema.required"
+    given: "$.paths[*][*].responses['400','404','409','422'].content"
     then:
-      function: schema
+      field: "application/problem+json"
+      function: truthy
 
   # Payment amounts must always be string (to preserve precision)
   payment-amount-string-type:
@@ -635,6 +621,8 @@ rules:
       functionOptions:
         values: ["string"]
 ```
+
+Spectral checks one version of the spec. To catch breaking changes *between* versions — a removed response field, a new required request field — diff the old and new spec in CI with a tool such as oasdiff: `oasdiff breaking main.yaml head.yaml --fail-on ERR`.
 
 ---
 
@@ -685,15 +673,22 @@ RequestResponsePact fraudAssessmentPact(PactDslWithProvider builder) {
 Pact Broker supports **Pending Pacts** — a feature critical for fintech teams adopting contract testing incrementally. When a consumer publishes a new contract that the provider hasn't yet verified, it is marked as "pending" and failing verification does not break the provider's CI pipeline.
 
 ```java
+@Provider("account-service")
 @PactBroker(
     url = "${pact.broker.url}",
-    consumersWithSelectors = {
-        @ConsumerVersionSelectors(tag = "main"),
-        @ConsumerVersionSelectors(deployedOrReleased = true)
-    },
-    enablePendingPacts = true,        // Don't fail build for new unverified pacts
-    providerTagsToCheckFunctionallyEquivalent = {"main"}
+    enablePendingPacts = "true",   // don't fail the build for new, never-verified pacts
+    providerBranch = "main"        // pending status is tracked per provider branch
 )
+class AccountServiceProviderTest {
+
+    @PactBrokerConsumerVersionSelectors
+    static SelectorBuilder consumerVersionSelectors() {
+        return new SelectorBuilder()
+            .mainBranch()            // consumers' main branch
+            .deployedOrReleased();   // versions running in any environment
+    }
+    // ... verifyPact and @State methods as above
+}
 ```
 
 This allows:
@@ -716,7 +711,7 @@ If the consumer writes `given("account has sufficient balance")` but the provide
 Contracts verify that services can communicate — not that the business logic is correct. Do not use Pact to test that "a payment is declined when balance is insufficient." Use service-level integration tests for that.
 
 **4. Not Publishing Provider Verification Results**
-If providers don't publish verification results back to the Pact Broker, the `can-i-deploy` check cannot determine whether it is safe to deploy. Always set `-Dpact.publish.results=true` in CI.
+If providers don't publish verification results back to the Pact Broker, the `can-i-deploy` check cannot determine whether it is safe to deploy. Always set `-Dpact.verifier.publishResults=true` (with `pact.provider.version` and `pact.provider.branch`) in CI.
 
 **5. Ignoring Contract Drift in Long-Running Services**
 Payment platforms evolve. Set up Pact webhooks so that when any consumer publishes a new pact version, the provider's CI is immediately triggered — otherwise drift accumulates silently.
@@ -743,11 +738,13 @@ pact-broker record-deployment \
 Verify against contracts that are deployed to production, not just the latest:
 
 ```java
-@ConsumerVersionSelectors({
-    @ConsumerVersionSelector(deployedOrReleased = true),  // currently in prod
-    @ConsumerVersionSelector(branch = "main"),             // what will be deployed next
-    @ConsumerVersionSelector(matchingBranch = true)        // feature branch pacts (WIP)
-})
+@PactBrokerConsumerVersionSelectors
+static SelectorBuilder consumerVersionSelectors() {
+    return new SelectorBuilder()
+        .deployedOrReleased()   // currently in an environment (e.g. production)
+        .mainBranch()           // what will be deployed next
+        .matchingBranch();      // consumer pacts from a feature branch with the same name
+}
 ```
 
 **Store Pact files in source control as a fallback**

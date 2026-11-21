@@ -185,10 +185,10 @@ public class Account {
 | **Current Account** | Day-to-day transactional account | Liability; customer owns balance |
 | **Savings Account** | Interest-bearing deposit | Liability; restricted withdrawal |
 | **Loan Account** | Credit extended to customer | Asset; customer owes balance |
-| **Credit Card** | Revolving credit | Asset (outstanding) + Liability (payments received) |
+| **Credit Card** | Revolving credit | Asset while the customer owes money; a credit balance (overpayment) is a liability |
 | **Nostro Account** | Bank's account at another bank | Asset; held for correspondent banking |
-| **Vostro Account** | Another bank's account at this bank | Liability |
-| **Suspense Account** | Temporary holding; must clear to £0 by EOD | Internal |
+| **Vostro Account** | Another bank's account at this bank | Liability (owed to that bank) |
+| **Suspense Account** | Temporary holding for items not yet matched; investigated and cleared to £0, usually daily | Internal |
 | **Settlement Account** | Used during payment clearing | Internal |
 
 ### Account Status State Machine
@@ -269,32 +269,39 @@ sequenceDiagram
 
 ```mermaid
 gantt
-    title BACS Settlement Cycle (Day D = submission)
+    title BACS three-day cycle (simplified)
     dateFormat  D
     axisFormat  Day %d
 
-    section Bank A (Payer)
-    Funds debited from available balance  :done, 1, 1d
-    Transaction enters CLEARING state     :done, 1, 1d
-    Interbank settlement completes        :done, 3, 1d
-    Ledger balance updated                :done, 3, 1d
+    section Originating bank
+    Day 1 input, payment file submitted to Bacs        :done, 1, 1d
+    Day 2 processing, Bacs validates and sorts         :done, 2, 1d
+    Day 3 entry day, payer debited and banks settle  :done, 3, 1d
 
-    section Bank B (Payee)
-    Pending credit created                :active, 1, 2d
-    Funds confirmed available             :done, 3, 1d
+    section Receiving bank
+    Day 2 receives the incoming payment file           :active, 2, 1d
+    Day 3 entry day, payee credited                    :done, 3, 1d
 ```
 
 ### Real-Time Gross Settlement (RTGS) — Immediate
 
-The Bank of England's RTGS system (CHAPS in the UK) settles each payment individually and immediately. Each payment is irrevocably settled within seconds. No batching, no netting, no overnight risk.
+In the UK, CHAPS payments settle individually and immediately in the Bank of England's RTGS system — each payment is final and irrevocable within seconds. No batching, no netting, no overnight settlement risk.
+
+Note the difference between **customer posting** and **interbank settlement**. Faster Payments credits the customer within seconds, but the banks settle with each other later, in several net settlement cycles per day. The core banking system must track both.
 
 ```java17
-// Different balance update strategies per payment type
+// Different balance update strategies per payment type.
+// This models INTERBANK settlement timing; customer-facing posting can be
+// earlier (Faster Payments credits the customer within seconds).
 public enum PaymentSettlementType {
-    IMMEDIATE,     // CHAPS, SEPA Instant — update ledger balance immediately
-    SAME_DAY,      // FPS (Faster Payments) — typically seconds to minutes
-    NEXT_DAY,      // BACS Day 1
-    THREE_DAY      // BACS Day 3
+    IMMEDIATE(0),   // CHAPS (RTGS) — settled individually, immediately
+    INTRADAY(0),    // Faster Payments — customer credited in seconds; banks net-settle later the same day
+    NEXT_DAY(1),
+    THREE_DAY(2);   // BACS — entry on the 3rd day (2 business days after input)
+
+    private final int settlementDayOffset;   // business days after submission
+    PaymentSettlementType(int offset) { this.settlementDayOffset = offset; }
+    public int settlementDayOffset() { return settlementDayOffset; }
 }
 
 @Service
@@ -307,9 +314,10 @@ public class BalanceUpdateService {
                 ledgerService.postTransfer(tx.getSourceId(), tx.getDestId(),
                                            tx.getAmount(), tx.getCurrency());
             }
-            case SAME_DAY, NEXT_DAY, THREE_DAY -> {
+            case INTRADAY, NEXT_DAY, THREE_DAY -> {
                 // Create pending entry — ledger balance updated at settlement
-                pendingEntryService.createPending(tx, type.getSettlementDay());
+                pendingEntryService.createPending(tx,
+                    businessCalendar.addBusinessDays(tx.getSubmittedOn(), type.settlementDayOffset()));
             }
         }
     }
@@ -339,7 +347,7 @@ graph TD
 **Legacy characteristics:**
 - Single database shared by all functions
 - Nightly batch windows (1–4 AM) for interest accrual, statements, and reporting
-- Expensive vendor licences (Temenos T24, Oracle FLEXCUBE, Finastra Fusion)
+- Often a packaged vendor product (for example Temenos Transact/T24, Oracle FLEXCUBE, Finastra) with expensive licences and customisation
 - Difficult to extend without vendor involvement
 - Proven, battle-tested reliability over decades
 
@@ -385,7 +393,7 @@ graph TB
 **Cloud-native characteristics:**
 - Independent deployable services with separate databases
 - Event-driven architecture — `TransactionPostedEvent`, `AccountStatusChangedEvent`
-- Continuous availability — no nightly batch windows (interest calculated in-stream or on-demand)
+- Continuous availability — no downtime for nightly batches (end-of-day work still exists, but runs alongside live traffic)
 - Self-managed PostgreSQL or cloud RDS instead of DB2
 - Higher engineering complexity but lower total cost of ownership at scale
 
@@ -409,13 +417,18 @@ public class CoreBankingClient {
         );
     }
 
-    // Post a transaction to the CBS ledger
-    // Idempotency key prevents duplicates on retry
+    // Post a transaction to the CBS ledger.
+    // The Idempotency-Key header lets the CBS recognise a retry of the SAME
+    // request (e.g. after a timeout) and return the original result instead
+    // of posting twice. The key is created once per business request and
+    // reused on every retry.
     public TransactionReference postTransaction(PostTransactionRequest request) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Idempotency-Key", request.idempotencyKey());
         return circuitBreaker.executeSupplier(() ->
             restTemplate.postForObject(
                 "/cbs/transactions",
-                request,
+                new HttpEntity<>(request, headers),
                 TransactionReference.class
             )
         );
@@ -437,6 +450,7 @@ public record AccountSummary(
     Instant lastUpdatedAt
 ) {
     // Convenience method — computed from components
+    // (assumes availableBalance already includes any authorised overdraft)
     public boolean canDebit(long amount) {
         return status == AccountStatus.ACTIVE && availableBalance >= amount;
     }
@@ -467,32 +481,41 @@ Every core banking system performs end-of-day (EOD) batch processing. This is a 
 @Service
 public class EndOfDayProcessor {
 
-    // Triggered at business day close — often 11:59 PM local time or configurable
+    // Triggered at business day close. Real systems check the business
+    // calendar (bank holidays), not just MON-FRI, and make sure only ONE
+    // instance runs EOD (e.g. a database-backed scheduler lock).
     @Scheduled(cron = "0 59 23 * * MON-FRI")
-    @Transactional
     public void runEndOfDay() {
-        log.info("EOD processing started for business date: {}", businessCalendar.today());
+        LocalDate businessDate = businessCalendar.today();
+        if (!businessCalendar.isBusinessDay(businessDate)) return;
+        log.info("EOD processing started for business date: {}", businessDate);
+
+        // NOT one big @Transactional: accruing interest for millions of accounts
+        // in a single transaction would hold locks for hours. Each step commits
+        // in chunks and is idempotent per business date, so a failed EOD can be
+        // re-run safely from the step that failed.
 
         // Step 1: Freeze intraday processing (some banks do, some don't)
         transactionGateway.enterEndOfDayMode();
 
         try {
             // Step 2: Accrue interest on all interest-bearing accounts
-            interestAccrualService.accrueAll(businessCalendar.today());
+            interestAccrualService.accrueAll(businessDate);
 
             // Step 3: Apply charges on accounts due today
-            chargesService.applyDueCharges(businessCalendar.today());
+            chargesService.applyDueCharges(businessDate);
 
             // Step 4: Settle outstanding BACS/SEPA batches
-            settlementService.settleOutstandingBatches(businessCalendar.today());
+            settlementService.settleOutstandingBatches(businessDate);
 
             // Step 5: Generate statements for accounts due statements
-            statementService.generateDueStatements(businessCalendar.today());
+            statementService.generateDueStatements(businessDate);
 
-            // Step 6: Trial balance check — total debits must equal credits
-            trialBalanceService.assertBalance(businessCalendar.today());
+            // Step 6: Trial balance check — total debits must equal credits.
+            // If it fails, STOP: do not advance the date; raise an incident
+            trialBalanceService.assertBalance(businessDate);
 
-            // Step 7: Advance to next business date
+            // Step 7: Advance to next business date (only after all checks pass)
             businessCalendar.advanceToNextBusinessDay();
 
         } finally {
@@ -571,7 +594,7 @@ public class EndOfDayProcessor {
     },
     {
       "id": "pc-cba-02",
-      "description": "Draw the transaction state machine for a BACS payment: from RECEIVED through to SETTLED or DECLINED, noting which state transitions update the ledger balance vs the available balance."
+      "description": "Draw the transaction state machine for a BACS payment: from RECEIVED through to SETTLED or DECLINED (including the three-day cycle: input, processing, entry day), noting which state transitions update the ledger balance vs the available balance."
     },
     {
       "id": "pc-cba-03",

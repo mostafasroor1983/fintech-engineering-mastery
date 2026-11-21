@@ -49,6 +49,8 @@ references:
   - "PostgreSQL Documentation — SELECT FOR UPDATE and Advisory Locks"
 ---
 
+## Overview
+
 Funds reservation — the act of earmarking money for a pending obligation before the funds actually leave the account — is the mechanism that bridges the gap between the moment a payment is authorised and the moment it settles. Without holds, two concurrent authorisations for a customer with a £500 balance could each see £500 available and both approve, leaving the account £500 overdrawn when both settle. This lesson examines the holds system in full technical detail: schema design, the atomic `place()` and `settle()` operations, hold expiry, partial settlement patterns, and the interactions between holds and overdraft limits that make available balance calculation surprisingly complex.
 
 ## Learning Objectives
@@ -66,7 +68,7 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-In 2017, a UK prepaid card issuer experienced a £2.3 million operational loss over a 72-hour weekend period. Their card authorisation service approved transactions by checking `ledger_balance >= amount`. On Friday afternoon, a customer with a £200 balance received their monthly salary of £1,500 — bringing their balance to £1,700. Between Saturday morning and Sunday evening, the customer made 23 card transactions totalling £1,650. Each transaction was approved against the current ledger balance — but the system processed all 23 authorisations concurrently without holds. Because each authorisation checked the same £1,700 starting balance rather than reserving funds atomically, all 23 were approved. When settlement ran on Monday morning, 11 transactions were funded normally; the remaining 12 — totalling £890 — resulted in forced debit balances the prepaid issuer had to absorb. The root cause: checking ledger balance without atomic hold placement is not thread-safe. The fix was an `account_holds` table with `SELECT FOR UPDATE` locking.
+*Composite example (based on common industry failure patterns, not a specific company):* a prepaid card issuer's authorisation service approved transactions by checking `ledger_balance >= amount` — without reserving anything. Over a busy weekend, customers' card transactions were authorised concurrently. Each authorisation checked the same starting balance instead of reserving funds atomically, so many transactions were approved that together exceeded the balance. When settlement ran on Monday, the issuer was left with negative balances on prepaid accounts — losses it had to absorb, because prepaid customers have no credit line. The root cause: checking a balance without atomically placing a hold is not safe under concurrency. The fix was an `account_holds` table, with the funds check and the hold placed atomically under a row lock.
 
 ## Why Holds Exist: The Pre-Auth Race Condition
 
@@ -94,7 +96,7 @@ sequenceDiagram
     Note over T2: £400 > £200 — DECLINED ✓
 ```
 
-The `SELECT FOR UPDATE` acquires a row-level lock for the duration of the hold placement transaction. No other transaction can read or modify the account row until the hold is committed. This serialises concurrent authorisations and eliminates the race.
+The `SELECT FOR UPDATE` acquires a row-level lock for the duration of the hold placement transaction. No other transaction can lock or modify the account row until the hold is committed (plain reads still see the last committed value in PostgreSQL). This serialises concurrent authorisations and eliminates the race. A single conditional `UPDATE ... WHERE available_balance >= :amount` achieves the same atomically when no other checks are needed.
 
 > [!IMPORTANT]
 > `SELECT FOR UPDATE` is the correct tool here, not application-level locking or optimistic locking (`version` column). Optimistic locking retries on conflict — but a retry would re-read the already-reduced balance and correctly decline. However, under high concurrency, optimistic lock retries create thundering-herd retries. For hold placement, pessimistic locking (`SELECT FOR UPDATE`) is preferred because holds are short-lived (milliseconds) and contention on a single account is rare in practice.
@@ -149,15 +151,17 @@ CREATE TABLE account_holds (
         CHECK (status != 'SETTLED' OR settlement_ref IS NOT NULL)
 );
 
--- Index for available balance calculation — the hot path
+-- Index for available balance calculation — the hot path.
+-- A PARTIALLY_SETTLED hold still reserves its remaining amount
 CREATE INDEX idx_holds_account_active
     ON account_holds (account_id, currency)
-    WHERE status = 'ACTIVE';
+    INCLUDE (remaining_amount)
+    WHERE status IN ('ACTIVE', 'PARTIALLY_SETTLED');
 
 -- Index for expiry job
 CREATE INDEX idx_holds_expiry
     ON account_holds (expires_at)
-    WHERE status = 'ACTIVE';
+    WHERE status IN ('ACTIVE', 'PARTIALLY_SETTLED');
 ```
 
 ## Available Balance SQL with Active Holds
@@ -183,7 +187,7 @@ SELECT
 FROM accounts a
 LEFT JOIN account_holds h
     ON h.account_id = a.id
-   AND h.status = 'ACTIVE'
+   AND h.status IN ('ACTIVE', 'PARTIALLY_SETTLED')
    AND h.currency = a.currency
    AND h.expires_at > now()   -- Exclude logically expired holds even if job hasn't run yet
 WHERE a.id = :accountId
@@ -202,6 +206,7 @@ public class HoldService {
     private final AccountRepository accountRepository;
     private final AccountHoldRepository holdRepository;
     private final JournalEntryService journalEntryService;
+    private final BusinessCalendar businessCalendar;
 
     /**
      * Place a hold on an account atomically.
@@ -252,35 +257,49 @@ public class HoldService {
     }
 
     /**
-     * Settle a hold — releases the hold and posts definitive ledger journal entries.
-     * Supports partial settlement: a hotel pre-auth for £120 settling for £95.
+     * Settle (part of) a hold — posts the definitive ledger entry for the
+     * settled amount. Supports partial settlement: a hotel pre-auth for £120
+     * settling for £95. When cmd.isFinal() is true, whatever is left on the
+     * hold is released back to available balance.
      */
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public SettlementResult settle(SettleHoldCommand cmd) {
+        // Lock order everywhere: hold first, then account (prevents deadlock)
         AccountHold hold = holdRepository.findByIdForUpdate(cmd.holdId());
+
+        // Idempotency: the same settlement record processed twice must not post twice
+        if (journalEntryService.existsBySource("HOLD_SETTLEMENT", cmd.settlementReference())) {
+            return new SettlementResult(hold.getId(), 0, hold.getStatus());
+        }
 
         if (hold.getStatus() != HoldStatus.ACTIVE
                 && hold.getStatus() != HoldStatus.PARTIALLY_SETTLED) {
+            // A late presentment for an expired/released hold is NOT rejected
+            // here silently — see the note on late presentments below
             throw new InvalidHoldStateException(
                 "Cannot settle hold in status: " + hold.getStatus() +
                 ". Must be ACTIVE or PARTIALLY_SETTLED.");
         }
 
         if (cmd.settleAmountMinorUnits() > hold.getRemainingAmount()) {
+            // Scheme rules allow some captures above the authorised amount
+            // (e.g. tips); real systems handle that as an explicit case
             throw new InvalidOperationException(
                 "Settlement amount %d exceeds remaining hold amount %d"
                     .formatted(cmd.settleAmountMinorUnits(), hold.getRemainingAmount()));
         }
 
-        Account account = accountRepository.findByIdForUpdate(cmd.accountId());
+        Account account = accountRepository.findByIdForUpdate(hold.getAccountId());
 
-        // Post ledger journal entry for the settled amount
+        // Post ledger journal entry for the settled amount.
+        // sourceRef = the settlement reference (unique per settlement record),
+        // so two partial settlements of one hold are two distinct journals
         journalEntryService.post(PostJournalEntryCommand.builder()
             .description("Card settlement: " + hold.getPaymentId())
-            .businessDate(LocalDate.now())
+            .businessDate(businessCalendar.today())
             .entryType(EntryType.PAYMENT)
             .sourceSystem("HOLD_SETTLEMENT")
-            .sourceRef(hold.getId().toString())
+            .sourceRef(cmd.settlementReference())
             .postedBy("SYSTEM:SETTLEMENT_JOB")
             .lines(List.of(
                 new PostJournalEntryCommand.Line(
@@ -288,36 +307,29 @@ public class HoldService {
                     "Card payment settlement"),
                 new PostJournalEntryCommand.Line(
                     "1001", Side.CR, cmd.settleAmountMinorUnits(), cmd.currency(),
-                    "Nostro settlement")
+                    "Scheme settlement")
             ))
             .build());
 
-        long previousRemaining = hold.getRemainingAmount();
         hold.setSettledAmount(hold.getSettledAmount() + cmd.settleAmountMinorUnits());
         hold.setRemainingAmount(hold.getRemainingAmount() - cmd.settleAmountMinorUnits());
         hold.setSettledAt(Instant.now());
         hold.setSettlementRef(cmd.settlementReference());
 
+        // Settled part: ledger goes down, the hold goes down by the same amount
+        // → available_balance (= ledger − holds) is UNCHANGED for that part.
+        // Keep the account's denormalised ledger_balance in step with the journal
+        account.setLedgerBalance(account.getLedgerBalance() - cmd.settleAmountMinorUnits());
+
+        // Final settlement: release whatever the merchant did not use
+        if (cmd.isFinal() && hold.getRemainingAmount() > 0) {
+            account.setAvailableBalance(account.getAvailableBalance() + hold.getRemainingAmount());
+            hold.setRemainingAmount(0L);
+        }
+
         boolean fullySettled = hold.getRemainingAmount() == 0;
         hold.setStatus(fullySettled ? HoldStatus.SETTLED : HoldStatus.PARTIALLY_SETTLED);
         holdRepository.save(hold);
-
-        // Ledger balance decreases by settled amount (journal entry already posted)
-        // Available balance: the hold was already reducing available_balance.
-        // Remaining hold still reduces it; released portion restores it.
-        long releasedFromHold = previousRemaining - hold.getRemainingAmount();
-        // settled amount moved from "hold" to "ledger debit" — net: available_balance unchanged
-        // but ledger_balance decreases
-        account.setLedgerBalance(account.getLedgerBalance() - cmd.settleAmountMinorUnits());
-        // If partial: remaining hold still active. If full: restore remaining hold to available.
-        if (fullySettled) {
-            // No remaining hold — the previously reserved available balance stays consumed (now a ledger debit)
-            // But the hold-portion that wasn't settled (if partial pre-auth) is released
-            long unusedHoldAmount = hold.getOriginalAmount() - hold.getSettledAmount();
-            if (unusedHoldAmount > 0) {
-                account.setAvailableBalance(account.getAvailableBalance() + unusedHoldAmount);
-            }
-        }
         accountRepository.save(account);
 
         return new SettlementResult(hold.getId(), cmd.settleAmountMinorUnits(), hold.getStatus());
@@ -352,7 +364,7 @@ public class HoldService {
     }
 
     private void validateAccountEligibleForHold(Account account) {
-        if (!Set.of(AccountStatus.ACTIVE).contains(account.getStatus())) {
+        if (account.getStatus() != AccountStatus.ACTIVE) {
             throw new AccountNotEligibleException(
                 "Cannot place hold on account in status: " + account.getStatus() +
                 ". Account must be ACTIVE.");
@@ -363,7 +375,10 @@ public class HoldService {
 
 ## Hold Expiry Background Job
 
-Pre-authorisations have a maximum validity window (Visa: 7 days for most merchants; 30 days for hotels and car rentals). After expiry, the hold must be released — the funds should return to the customer's available balance.
+Pre-authorisations have a maximum validity window set by scheme rules — for example around 7 days for most merchants and up to around 30 days for hotels and car rental (check the current rules for each scheme and merchant type). After expiry, the hold is released and the funds return to the customer's available balance.
+
+> [!IMPORTANT]
+> **Late presentments still happen.** A merchant may submit the capture after the hold has expired. The issuer usually still has to pay the scheme, so the clearing must be posted as a debit even though no hold exists — possibly taking the account below zero. Design `settle()` to handle "no active hold" as an explicit case (post the debit, flag the account), not as an error that drops the transaction.
 
 ```java17
 @Service
@@ -449,7 +464,7 @@ sequenceDiagram
     H->>ACQ: Incremental auth +£45 (minibar)
     ACQ->>SCH: Incremental auth request £45
     SCH->>ISS: Adjust hold: £300 → £345
-    ISS->>ACC: Increase hold by £45 → available_balance = £455
+    ISS->>ACC: Increase hold by £45 (original and remaining) → available_balance = £455
     ISS-->>SCH: APPROVED
 
     Note over G,ACC: Check-out — Final Settlement £290
@@ -457,7 +472,7 @@ sequenceDiagram
     H->>ACQ: Final settlement capture £290
     ACQ->>SCH: Clearing file (TC05)
     SCH->>ISS: Clearing presentment £290
-    ISS->>ISS: settle(holdId, amount=£290)
+    ISS->>ISS: settle(holdId, amount=£290, final=true)
     ISS->>ACC: Post journal DR customer a/c £290<br/>ledger_balance: £800→£510
     ISS->>ACC: Release unused hold: £345-£290=£55 returned<br/>available_balance: £455+£55=£510
     ACC-->>ISS: Updated: ledger=£510, available=£510
@@ -487,10 +502,11 @@ public record PartialSettlementSummary(
     }
 
     // For customer display: "£29.50 of £34.00 reserved has been charged"
+    // Format from minor units with BigDecimal — never via double
     public String customerSummary() {
-        return "£%,.2f of £%,.2f reserved has been charged".formatted(
-            totalSettled  / 100.0,
-            originalHoldAmount / 100.0
+        return "£%s of £%s reserved has been charged".formatted(
+            BigDecimal.valueOf(totalSettled, 2).toPlainString(),
+            BigDecimal.valueOf(originalHoldAmount, 2).toPlainString()
         );
     }
 }
@@ -501,13 +517,13 @@ public PartialSettlementSummary processCarRentalSettlement(
         long firstInstalment, long secondInstalment,
         String settlementRef) {
 
-    // First partial settlement
+    // First partial settlement — not final, the rest stays reserved
     holdService.settle(SettleHoldCommand.of(holdId, accountId, firstInstalment,
-        "GBP", settlementRef + "-1"));
+        "GBP", settlementRef + "-1", false));
 
-    // Second partial settlement — finalises the hold
-    SettlementResult final = holdService.settle(SettleHoldCommand.of(holdId, accountId,
-        secondInstalment, "GBP", settlementRef + "-2"));
+    // Second partial settlement — final: any unused remainder is released
+    holdService.settle(SettleHoldCommand.of(holdId, accountId,
+        secondInstalment, "GBP", settlementRef + "-2", true));
 
     AccountHold hold = holdRepository.findById(holdId).orElseThrow();
     return new PartialSettlementSummary(
@@ -525,15 +541,15 @@ public PartialSettlementSummary processCarRentalSettlement(
 
 The overdraft limit extends the ceiling below which available balance can fall. This interaction must be modelled precisely.
 
-| Account State | Ledger Balance | Active Holds | Overdraft Limit | Available Balance | Can Place £50 Hold? |
-|---|---|---|---|---|---|
-| Normal | £500 | £0 | £0 | £500 | Yes (£500 remaining) |
-| With hold | £500 | £200 | £0 | £300 | Yes (£300 remaining) |
-| Near limit | £500 | £450 | £0 | £50 | Yes (exactly £50) |
-| At limit | £500 | £500 | £0 | £0 | No — would go negative |
-| With overdraft | £100 | £50 | £200 | £250 | Yes (£250 remaining) |
-| Overdraft in use | £50 | £200 | £200 | £50 | Yes (£50 remaining within overdraft) |
-| Overdraft maxed | £50 | £250 | £200 | £0 | No — would exceed overdraft ceiling |
+| Account State | Ledger Balance | Active Holds | Overdraft Limit | Available Balance (ledger − holds) | Capacity (available + overdraft) | Can Place £50 Hold? |
+|---|---|---|---|---|---|---|
+| Normal | £500 | £0 | £0 | £500 | £500 | Yes |
+| With hold | £500 | £200 | £0 | £300 | £300 | Yes |
+| Near limit | £500 | £450 | £0 | £50 | £50 | Yes (exactly £50) |
+| At limit | £500 | £500 | £0 | £0 | £0 | No — no capacity left |
+| With overdraft | £100 | £50 | £200 | £50 | £250 | Yes |
+| Overdraft in use | £50 | £200 | £200 | −£150 | £50 | Yes (exactly £50) |
+| Overdraft maxed | £50 | £250 | £200 | −£200 | £0 | No — would exceed overdraft ceiling |
 
 ```java17
 // Overdraft-aware capacity check
@@ -604,7 +620,7 @@ if (cmd.amountMinorUnits() > capacity) {
     },
     {
       "id": "pc-fr-03",
-      "description": "Implement the partial settlement scenario for a hotel: (1) place a hold for £200 at check-in; (2) call settle() for £180 at checkout; (3) verify that the remaining £20 of the hold is released and restored to available_balance; (4) verify the ledger_balance decreased by exactly £180. Write this as a Spring integration test with assertions on all four balance fields."
+      "description": "Implement the partial settlement scenario for a hotel: (1) place a hold for £200 at check-in; (2) call settle() for £180 at checkout as the FINAL settlement; (3) verify that the remaining £20 of the hold is released and restored to available_balance; (4) verify the ledger_balance decreased by exactly £180. Also verify that processing the same settlement record twice posts only once. Write this as a Spring integration test with assertions on all four balance fields."
     },
     {
       "id": "pc-fr-04",

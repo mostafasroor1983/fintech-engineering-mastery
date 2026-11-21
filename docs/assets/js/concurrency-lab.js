@@ -12,8 +12,63 @@ EM.ConcurrencyLab = (function () {
   /* ----------------------------------------------------------
      State
   ---------------------------------------------------------- */
-  var _data        = null;   // cached { experiments: [...] }
-  var _loadPromise = null;   // singleton fetch promise
+  var _data        = null;   // cached { experiments: [...] } for the current language
+  var _loadPromises = {};    // one fetch per language
+  var _fallback    = {};     // lang -> true when English data is shown in another UI language
+
+  EM.I18n.add({
+    en: {
+      'clab.title': 'Concurrency & Failure Lab',
+      'clab.subtitle': 'Interactive experiments: reproduce, understand, and fix concurrency and financial system failures',
+      'clab.all': 'All', 'clab.catJava': 'Java Concurrency', 'clab.catAsync': 'Async & Reactive', 'clab.catFin': 'Financial Systems',
+      'clab.start': 'Start Experiment →', 'clab.notFound': 'Experiment “{id}” not found.', 'clab.crumb': 'Concurrency Lab',
+      'clab.min': '{n} min',
+      'clab.tScenario': 'Scenario', 'clab.tBad': 'Bad Code', 'clab.tWhy': 'Why it Fails', 'clab.tSim': 'Simulation', 'clab.tFix': 'Fix',
+      'clab.tAlt': 'Alternatives', 'clab.tTests': 'Tests', 'clab.tMon': 'Monitoring', 'clab.tProd': 'Production', 'clab.tQuiz': 'Assessment',
+      'clab.related': 'Related Lessons', 'clab.trackLesson': 'Track {t} · Lesson {l}', 'clab.impact': 'Impact:', 'clab.line': 'Line {n}',
+      'clab.jmm': 'JMM Note:', 'clab.note': 'Note:',
+      'clab.simDisclaimer': 'This is a conceptual execution trace, not a live execution. Race conditions are non-deterministic and may not reproduce the same way on every JVM or machine.',
+      'clab.reset': 'Reset', 'clab.prev': 'Prev', 'clab.play': 'Play', 'clab.pause': 'Pause', 'clab.next': 'Next',
+      'clab.stepOf': 'Step {n} of {total}', 'clab.showFixed': 'Show Fixed Execution',
+      'clab.noSteps': 'No simulation steps defined.', 'clab.noParticipants': 'No participants defined.',
+      'clab.keyChanges': 'Key Changes', 'clab.noAlts': 'No alternatives documented.', 'clab.whenToUse': 'When to use:',
+      'clab.noTests': 'No tests documented.',
+      'clab.testDisclaimer': 'Race conditions are non-deterministic. Tests that rely on Thread.sleep() or timing may not reliably reproduce the failure on all machines/JVM implementations.',
+      'clab.symptoms': 'Symptoms', 'clab.debugCmds': 'Debug Commands', 'clab.recs': 'Recommendations',
+      'clab.noQuiz': 'No assessment questions available.', 'clab.score': 'Score: {a} / {b}',
+      'clab.perfect': 'Perfect! 🎉', 'clab.good': 'Good work!', 'clab.keep': 'Keep studying!',
+      'clab.col.approach': 'Approach', 'clab.col.throughput': 'Throughput', 'clab.col.notes': 'Notes'
+    },
+    ar: {
+      'clab.title': 'مختبر التزامن والأعطال',
+      'clab.subtitle': 'تجارب تفاعلية: أعد إنتاج أعطال التزامن والأنظمة المالية، وافهم سببها، وأصلحها',
+      'clab.all': 'الكل', 'clab.catJava': 'التزامن في Java', 'clab.catAsync': 'البرمجة غير المتزامنة والتفاعلية', 'clab.catFin': 'الأنظمة المالية',
+      'clab.start': 'ابدأ التجربة ←', 'clab.notFound': 'التجربة “{id}” غير موجودة.', 'clab.crumb': 'مختبر التزامن',
+      'clab.min': '{n} دقيقة',
+      'clab.tScenario': 'السيناريو', 'clab.tBad': 'الشيفرة الخاطئة', 'clab.tWhy': 'سبب العطل', 'clab.tSim': 'المحاكاة', 'clab.tFix': 'الإصلاح',
+      'clab.tAlt': 'البدائل', 'clab.tTests': 'الاختبارات', 'clab.tMon': 'المراقبة', 'clab.tProd': 'بيئة الإنتاج', 'clab.tQuiz': 'التقييم',
+      'clab.related': 'دروس ذات صلة', 'clab.trackLesson': 'المسار {t} · الدرس {l}', 'clab.impact': 'الأثر:', 'clab.line': 'السطر {n}',
+      'clab.jmm': 'ملاحظة حول نموذج ذاكرة Java:', 'clab.note': 'ملاحظة:',
+      'clab.simDisclaimer': 'هذا تتبّع تنفيذ توضيحي وليس تنفيذًا حقيقيًا. حالات التسابق غير حتمية، وقد لا تتكرر بالطريقة نفسها على كل JVM أو جهاز.',
+      'clab.reset': 'إعادة', 'clab.prev': 'السابق', 'clab.play': 'تشغيل', 'clab.pause': 'إيقاف', 'clab.next': 'التالي',
+      'clab.stepOf': 'الخطوة {n} من {total}', 'clab.showFixed': 'عرض التنفيذ بعد الإصلاح',
+      'clab.noSteps': 'لا توجد خطوات محاكاة.', 'clab.noParticipants': 'لا توجد أطراف معرّفة.',
+      'clab.keyChanges': 'أهم التغييرات', 'clab.noAlts': 'لا توجد بدائل موثّقة.', 'clab.whenToUse': 'متى تستخدمه:',
+      'clab.noTests': 'لا توجد اختبارات موثّقة.',
+      'clab.testDisclaimer': 'حالات التسابق غير حتمية. الاختبارات التي تعتمد على Thread.sleep() أو التوقيت قد لا تُظهر العطل بشكل ثابت على كل الأجهزة أو إصدارات JVM.',
+      'clab.symptoms': 'الأعراض', 'clab.debugCmds': 'أوامر التشخيص', 'clab.recs': 'التوصيات',
+      'clab.noQuiz': 'لا توجد أسئلة تقييم.', 'clab.score': 'النتيجة: {a} من {b}',
+      'clab.perfect': 'ممتاز! 🎉', 'clab.good': 'عمل جيد!', 'clab.keep': 'واصل المذاكرة!',
+      'clab.col.approach': 'الأسلوب', 'clab.col.throughput': 'الإنتاجية', 'clab.col.notes': 'ملاحظات'
+    }
+  });
+
+  function _cdir() { return _fallback[EM.I18n.lang()] ? ' dir="ltr"' : ''; }
+
+  /* Escape prose and turn `backticked` fragments into isolated LTR code spans */
+  function _rt(s) {
+    return _esc(s).replace(/`([^`]+)`/g, '<code class="lab-code" dir="ltr">$1</code>');
+  }
 
   /* Simulation state — one active experiment at a time */
   var _simState = {
@@ -41,17 +96,13 @@ EM.ConcurrencyLab = (function () {
      Data Loading
   ---------------------------------------------------------- */
   function _loadData() {
-    if (_loadPromise) return _loadPromise;
-    _loadPromise = fetch('data/concurrency-lab.json')
-      .then(function (r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
-      })
-      .then(function (json) {
-        _data = json;
-        return json;
-      });
-    return _loadPromise;
+    var lang = EM.I18n.lang();
+    if (!_loadPromises[lang]) {
+      _loadPromises[lang] = EM.I18n.fetchJSON('data/concurrency-lab.json')
+        .then(function (res) { _fallback[lang] = res.fallback; return res.body; })
+        .catch(function (err) { delete _loadPromises[lang]; throw err; });
+    }
+    return _loadPromises[lang].then(function (json) { _data = json; return json; });
   }
 
   function _findExperiment(id) {
@@ -84,17 +135,25 @@ EM.ConcurrencyLab = (function () {
 
   function _categoryLabel(cat) {
     var c = (cat || '').toLowerCase();
-    if (c.indexOf('java') !== -1)      return 'Java Concurrency';
-    if (c.indexOf('async') !== -1)     return 'Async & Reactive';
-    if (c.indexOf('financial') !== -1) return 'Financial Systems';
+    if (c.indexOf('java') !== -1)      return EM.t('clab.catJava');
+    if (c.indexOf('async') !== -1)     return EM.t('clab.catAsync');
+    if (c.indexOf('financial') !== -1) return EM.t('clab.catFin');
     return cat;
+  }
+
+  function _categoryKey(cat) {
+    var c = (cat || '').toLowerCase();
+    if (c.indexOf('java') !== -1)      return 'java';
+    if (c.indexOf('async') !== -1)     return 'async';
+    if (c.indexOf('financial') !== -1) return 'financial';
+    return 'other';
   }
 
   function _tagsHtml(tags) {
     if (!tags || !tags.length) return '';
     return '<div class="clab-card-tags">' +
       tags.map(function (t) {
-        return '<span class="clab-tag">' + _esc(t) + '</span>';
+        return '<span class="clab-tag" dir="ltr">' + _esc(t) + '</span>';
       }).join('') +
     '</div>';
   }
@@ -110,35 +169,40 @@ EM.ConcurrencyLab = (function () {
   }
 
   function _buildIndexHtml(experiments) {
-    var categories = ['ALL', 'JAVA CONCURRENCY', 'ASYNC & REACTIVE', 'FINANCIAL SYSTEMS'];
+    var categories = [
+      { key: 'ALL',       label: EM.t('clab.all') },
+      { key: 'java',      label: EM.t('clab.catJava') },
+      { key: 'async',     label: EM.t('clab.catAsync') },
+      { key: 'financial', label: EM.t('clab.catFin') }
+    ];
 
     var filterTabs = '<div class="clab-filter-tabs" role="tablist">' +
       categories.map(function (cat, i) {
         return '<button class="clab-filter-tab' + (i === 0 ? ' active' : '') + '" ' +
-          'data-filter="' + _esc(cat) + '" ' +
+          'data-filter="' + _esc(cat.key) + '" ' +
           'role="tab" aria-selected="' + (i === 0 ? 'true' : 'false') + '" ' +
           'onclick="EM.ConcurrencyLab._filterCards(this)">' +
-          _esc(cat) +
+          _esc(cat.label) +
         '</button>';
       }).join('') +
     '</div>';
 
     var cards = experiments.map(function (exp) {
       var color = _categoryColor(exp.category);
-      return '<div class="clab-card" data-category="' + _esc(_categoryLabel(exp.category).toUpperCase()) + '">' +
+      return '<div class="clab-card" data-category="' + _esc(_categoryKey(exp.category)) + '">' +
         '<div class="clab-card-header">' +
           '<span class="clab-card-category clab-cat-' + _esc(color) + '">' +
             _esc(_categoryLabel(exp.category)) +
           '</span>' +
         '</div>' +
         '<div class="clab-card-body">' +
-          '<h3 class="clab-card-title">' + _esc(exp.title) + '</h3>' +
-          '<p class="clab-card-subtitle">' + _esc(exp.subtitle || '') + '</p>' +
+          '<h3 class="clab-card-title"' + _cdir() + '>' + _esc(exp.title) + '</h3>' +
+          '<p class="clab-card-subtitle"' + _cdir() + '>' + _esc(exp.subtitle || '') + '</p>' +
           _tagsHtml(exp.tags) +
         '</div>' +
         '<div class="clab-card-footer">' +
           '<button class="clab-card-btn" onclick="EM.Router.navigate(\'/concurrency-lab/' + _esc(exp.id) + '\')">' +
-            'Start Experiment &rarr;' +
+            _esc(EM.t('clab.start')) +
           '</button>' +
         '</div>' +
       '</div>';
@@ -148,10 +212,11 @@ EM.ConcurrencyLab = (function () {
       '<div class="clab-index-header">' +
         '<div class="clab-index-icon-wrap">' + (EM.Icons.lab || '') + '</div>' +
         '<div>' +
-          '<h1 class="page-title">Concurrency &amp; Failure Lab</h1>' +
-          '<p class="clab-index-subtitle">Interactive experiments: reproduce, understand, and fix concurrency and financial system failures</p>' +
+          '<h1 class="page-title">' + _esc(EM.t('clab.title')) + '</h1>' +
+          '<p class="clab-index-subtitle">' + _esc(EM.t('clab.subtitle')) + '</p>' +
         '</div>' +
       '</div>' +
+      (_fallback[EM.I18n.lang()] ? EM.I18n.fallbackNote() : '') +
       filterTabs +
       '<div class="clab-cards-grid" id="clab-cards-grid">' + cards + '</div>' +
     '</div>';
@@ -164,7 +229,7 @@ EM.ConcurrencyLab = (function () {
     return _loadData().then(function () {
       var exp = _findExperiment(id);
       if (!exp) {
-        return '<div class="clab-experiment"><p class="clab-error">Experiment &ldquo;' + _esc(id) + '&rdquo; not found.</p></div>';
+        return '<div class="clab-experiment"><p class="clab-error">' + _esc(EM.t('clab.notFound', { id: id })) + '</p></div>';
       }
       return _buildExperimentHtml(exp);
     });
@@ -176,20 +241,20 @@ EM.ConcurrencyLab = (function () {
     /* ---- Breadcrumb ---- */
     var breadcrumb =
       '<nav class="clab-breadcrumb">' +
-        '<a href="#" onclick="EM.Router.navigate(\'/concurrency-lab\');return false;">Concurrency Lab</a>' +
+        '<a href="#" onclick="EM.Router.navigate(\'/concurrency-lab\');return false;">' + _esc(EM.t('clab.crumb')) + '</a>' +
         '<span class="clab-bc-sep">&rsaquo;</span>' +
         '<span class="clab-bc-cat">' + _esc(_categoryLabel(exp.category)) + '</span>' +
         '<span class="clab-bc-sep">&rsaquo;</span>' +
-        '<span class="clab-bc-current">' + _esc(exp.title) + '</span>' +
+        '<span class="clab-bc-current"' + _cdir() + '>' + _esc(exp.title) + '</span>' +
       '</nav>';
 
     /* ---- Header ---- */
     var diffBadge = exp.difficulty
-      ? '<span class="badge badge-' + _esc(exp.difficulty) + '">' + _esc(exp.difficulty) + '</span>'
+      ? '<span class="badge badge-' + _esc(exp.difficulty) + '">' + _esc(EM.t('badge.' + exp.difficulty) !== 'badge.' + exp.difficulty ? EM.t('badge.' + exp.difficulty) : exp.difficulty) + '</span>'
       : '';
     var mins = exp.estimatedMinutes || exp.estimatedTime;
     var timeBadge = mins
-      ? '<span class="clab-time-badge">' + (EM.Icons.clock || '&#128336;') + ' ' + _esc(String(mins)) + ' min</span>'
+      ? '<span class="clab-time-badge">' + (EM.Icons.clock || '&#128336;') + ' ' + _esc(EM.t('clab.min', { n: mins })) + '</span>'
       : '';
 
     var header =
@@ -198,23 +263,23 @@ EM.ConcurrencyLab = (function () {
           '<span class="clab-card-category clab-cat-' + _esc(color) + '">' + _esc(_categoryLabel(exp.category)) + '</span>' +
           diffBadge + timeBadge +
         '</div>' +
-        '<h1 class="clab-exp-title">' + _esc(exp.title) + '</h1>' +
-        '<p class="clab-exp-subtitle">' + _esc(exp.subtitle || '') + '</p>' +
+        '<h1 class="clab-exp-title"' + _cdir() + '>' + _esc(exp.title) + '</h1>' +
+        '<p class="clab-exp-subtitle"' + _cdir() + '>' + _esc(exp.subtitle || '') + '</p>' +
         _tagsHtml(exp.tags) +
       '</div>';
 
     /* ---- Tab bar ---- */
     var TABS = [
-      { id: 'scenario',      label: 'Scenario'    },
-      { id: 'bad-code',      label: 'Bad Code'    },
-      { id: 'why-fails',     label: 'Why it Fails'},
-      { id: 'simulation',    label: 'Simulation'  },
-      { id: 'fix',           label: 'Fix'         },
-      { id: 'alternatives',  label: 'Alternatives'},
-      { id: 'tests',         label: 'Tests'       },
-      { id: 'monitoring',    label: 'Monitoring'  },
-      { id: 'production',    label: 'Production'  },
-      { id: 'assessment',    label: 'Assessment'  }
+      { id: 'scenario',      label: EM.t('clab.tScenario') },
+      { id: 'bad-code',      label: EM.t('clab.tBad')      },
+      { id: 'why-fails',     label: EM.t('clab.tWhy')      },
+      { id: 'simulation',    label: EM.t('clab.tSim')      },
+      { id: 'fix',           label: EM.t('clab.tFix')      },
+      { id: 'alternatives',  label: EM.t('clab.tAlt')      },
+      { id: 'tests',         label: EM.t('clab.tTests')    },
+      { id: 'monitoring',    label: EM.t('clab.tMon')      },
+      { id: 'production',    label: EM.t('clab.tProd')     },
+      { id: 'assessment',    label: EM.t('clab.tQuiz')     }
     ];
 
     var tabBar =
@@ -246,7 +311,8 @@ EM.ConcurrencyLab = (function () {
 
     var html =
       '<div class="clab-experiment" data-exp-id="' + _esc(exp.id) + '">' +
-        breadcrumb + header + tabBar + panels +
+        breadcrumb + (_fallback[EM.I18n.lang()] ? EM.I18n.fallbackNote() : '') + header + tabBar +
+        (_cdir() ? panels.replace('<div class="clab-panels">', '<div class="clab-panels" dir="ltr">') : panels) +
       '</div>';
 
     /* Schedule Prism highlight after injection */
@@ -259,6 +325,7 @@ EM.ConcurrencyLab = (function () {
         });
         /* Init production checklist */
         _initChecklist(exp.id);
+        _fillLessonTitles(container);
       });
     });
 
@@ -276,18 +343,20 @@ EM.ConcurrencyLab = (function () {
     var lessons = '';
     if (exp.relatedLessons && exp.relatedLessons.length) {
       lessons = '<div class="clab-related-lessons">' +
-        '<h4>Related Lessons</h4><ul>' +
+        '<h4>' + _esc(EM.t('clab.related')) + '</h4><ul>' +
         exp.relatedLessons.map(function (l) {
           /* relatedLessons is an array of lesson-id strings like "track-06-lesson-02" */
           if (typeof l === 'string') {
             var parts  = l.split('-');
             var trackN = parts[1] || '';
             var lessonN = parts[3] || '';
-            var label  = 'Track ' + trackN + ' · Lesson ' + lessonN;
+            var label  = EM.t('clab.trackLesson', { t: trackN, l: lessonN });   // replaced by the title once loaded
             /* Build a path: /tracks/:trackId/lessons/:lessonId */
             var trackId  = l.replace(/(lesson-\d+)$/, '').replace(/-$/, '');
             var route    = '/tracks/' + trackId + '/lessons/' + l;
-            return '<li><a href="#" onclick="EM.Router.navigate(\'' + _esc(route) + '\');return false;">' + _esc(label) + '</a></li>';
+            return '<li><a href="#' + _esc(route) + '" data-lesson-id="' + _esc(l) + '">' +
+              '<span class="clab-related-num" dir="ltr">T' + _esc(trackN) + '·L' + _esc(lessonN) + '</span>' +
+              '<span class="clab-related-title">' + _esc(label) + '</span></a></li>';
           }
           return '<li><a href="#" onclick="EM.Router.navigate(\'' + _esc(l.path || '/') + '\');return false;">' + _esc(l.title || l) + '</a></li>';
         }).join('') +
@@ -295,10 +364,34 @@ EM.ConcurrencyLab = (function () {
     }
 
     return _wrapPanel('scenario', true,
-      '<div class="clab-scenario-text">' + _esc(scenarioText) + '</div>' +
-      (impact ? '<div class="clab-callout clab-callout-warn"><strong>&#9888; Impact:</strong> ' + _esc(impact) + '</div>' : '') +
+      '<div class="clab-scenario-text">' + _rt(scenarioText) + '</div>' +
+      (impact ? '<div class="clab-callout clab-callout-warn"><strong>&#9888; ' + _esc(EM.t('clab.impact')) + '</strong> ' + _rt(impact) + '</div>' : '') +
       lessons
     );
+  }
+
+  /* Replace "Track 03 · Lesson 07" placeholders with real lesson titles */
+  function _fillLessonTitles(container) {
+    var links = container.querySelectorAll('[data-lesson-id]');
+    if (!links.length) return;
+    var byTrack = {};
+    links.forEach(function (a) {
+      var tid = a.getAttribute('data-lesson-id').split('-lesson-')[0];
+      (byTrack[tid] = byTrack[tid] || []).push(a);
+    });
+    Object.keys(byTrack).forEach(function (tid) {
+      var t = (EM.App.tracks || []).filter(function (x) { return x.id === tid; })[0];
+      if (!t) return;
+      EM.I18n.fetchJSON('content/tracks/' + tid + '-' + t.slug + '/_track.json').then(function (res) {
+        var titles = {};
+        (res.body.lessons || []).forEach(function (l) { titles[l.id] = l.title; });
+        byTrack[tid].forEach(function (a) {
+          var title = titles[a.getAttribute('data-lesson-id')];
+          var span = a.querySelector('.clab-related-title');
+          if (title && span) span.textContent = title;
+        });
+      }).catch(function () { /* keep the placeholder */ });
+    });
   }
 
   /* ----------------------------------------------------------
@@ -316,7 +409,7 @@ EM.ConcurrencyLab = (function () {
     if (annotArr.length) {
       annotations = '<div class="clab-annotations">' +
         annotArr.map(function (a) {
-          return '<div class="clab-annotation"><span class="clab-ann-line">Line ' + _esc(String(a.line)) + '</span> ' + _esc(a.note || a.text || '') + '</div>';
+          return '<div class="clab-annotation"><span class="clab-ann-line">' + _esc(EM.t('clab.line', { n: a.line })) + '</span> ' + _rt(a.note || a.text || '') + '</div>';
         }).join('') +
       '</div>';
     }
@@ -335,9 +428,9 @@ EM.ConcurrencyLab = (function () {
   function _panelWhyFails(exp) {
     var wf = exp.whyItFails || {};
     var body =
-      '<div class="clab-why-text">' + _esc(wf.explanation || exp.failureExplanation || '') + '</div>';
+      '<div class="clab-why-text">' + _rt(wf.explanation || exp.failureExplanation || '') + '</div>';
     if (wf.jmmNote || exp.jmmNote) {
-      body += '<div class="clab-callout clab-callout-info"><strong>JMM Note:</strong> ' + _esc(wf.jmmNote || exp.jmmNote) + '</div>';
+      body += '<div class="clab-callout clab-callout-info"><strong>' + _esc(EM.t('clab.jmm')) + '</strong> ' + _rt(wf.jmmNote || exp.jmmNote) + '</div>';
     }
     return _wrapPanel('why-fails', false, body);
   }
@@ -353,23 +446,22 @@ EM.ConcurrencyLab = (function () {
 
     var disclaimer =
       '<div class="clab-callout clab-callout-info clab-sim-disclaimer">' +
-        '<strong>Note:</strong> This is a <em>conceptual</em> execution trace, not a live execution. ' +
-        'Race conditions are non-deterministic and may not reproduce the same way on every JVM or machine.' +
+        '<strong>' + _esc(EM.t('clab.note')) + '</strong> ' + _esc(EM.t('clab.simDisclaimer')) +
       '</div>';
 
     var controls =
       '<div class="clab-sim-controls">' +
-        '<button class="clab-sim-btn" title="Reset" onclick="EM.ConcurrencyLab._simReset()">&#9612;&#9612; Reset</button>' +
-        '<button class="clab-sim-btn" title="Prev" onclick="EM.ConcurrencyLab._simPrev()">&#9664; Prev</button>' +
-        '<button class="clab-sim-btn clab-sim-play-btn" id="clab-play-btn" title="Play/Pause" onclick="EM.ConcurrencyLab._simPlay()">&#9654; Play</button>' +
-        '<button class="clab-sim-btn" title="Next" onclick="EM.ConcurrencyLab._simNext()">Next &#9654;</button>' +
-        '<span class="clab-sim-step-info" id="clab-step-info">Step 0 of ' + _esc(String(totalSteps)) + '</span>' +
+        '<button class="clab-sim-btn" title="' + EM.t('clab.reset') + '" onclick="EM.ConcurrencyLab._simReset()">&#9612;&#9612; ' + EM.t('clab.reset') + '</button>' +
+        '<button class="clab-sim-btn" title="' + EM.t('clab.prev') + '" onclick="EM.ConcurrencyLab._simPrev()"><span class="rtl-flip">&#9664;</span> ' + EM.t('clab.prev') + '</button>' +
+        '<button class="clab-sim-btn clab-sim-play-btn" id="clab-play-btn" title="' + EM.t('clab.play') + '" onclick="EM.ConcurrencyLab._simPlay()">&#9654; ' + EM.t('clab.play') + '</button>' +
+        '<button class="clab-sim-btn" title="' + EM.t('clab.next') + '" onclick="EM.ConcurrencyLab._simNext()">' + EM.t('clab.next') + ' <span class="rtl-flip">&#9654;</span></button>' +
+        '<span class="clab-sim-step-info" id="clab-step-info">' + _esc(EM.t('clab.stepOf', { n: 0, total: totalSteps })) + '</span>' +
       '</div>';
 
     var toggle = safeSteps.length
       ? '<label class="clab-sim-toggle">' +
           '<input type="checkbox" onchange="EM.ConcurrencyLab._simToggleSafe(this.checked)" id="clab-safe-toggle"> ' +
-          'Show Fixed Execution' +
+          _esc(EM.t('clab.showFixed')) +
         '</label>'
       : '';
 
@@ -396,7 +488,7 @@ EM.ConcurrencyLab = (function () {
   function _buildThreadTimeline(sim, steps) {
     var threads = sim.threads || [];
     var totalSteps = steps.length;
-    if (!totalSteps) return '<p class="clab-muted">No simulation steps defined.</p>';
+    if (!totalSteps) return '<p class="clab-muted">' + EM.t('clab.noSteps') + '</p>';
 
     /* Column template: [thread-name, step1, step2, ...] */
     var colTemplate = 'auto repeat(' + totalSteps + ', 1fr)';
@@ -496,7 +588,7 @@ EM.ConcurrencyLab = (function () {
   /* ---- Sequence Diagram ---- */
   function _buildSequenceDiagram(sim, steps) {
     var participants = sim.participants || [];
-    if (!participants.length) return '<p class="clab-muted">No participants defined.</p>';
+    if (!participants.length) return '<p class="clab-muted">' + EM.t('clab.noParticipants') + '</p>';
     var colW = Math.max(120, Math.floor(600 / participants.length));
     var W    = colW * participants.length;
 
@@ -548,8 +640,8 @@ EM.ConcurrencyLab = (function () {
 
     var changes = '';
     if (keyChanges.length) {
-      changes = '<div class="clab-key-changes"><h4>Key Changes</h4><ul>' +
-        keyChanges.map(function (c) { return '<li>' + _esc(c) + '</li>'; }).join('') +
+      changes = '<div class="clab-key-changes"><h4>' + EM.t('clab.keyChanges') + '</h4><ul>' +
+        keyChanges.map(function (c) { return '<li>' + _rt(c) + '</li>'; }).join('') +
       '</ul></div>';
     }
 
@@ -557,7 +649,7 @@ EM.ConcurrencyLab = (function () {
       '<div class="clab-code-wrap">' +
         '<pre><code class="language-' + _esc(lang) + '">' + _esc(code) + '</code></pre>' +
       '</div>' +
-      (explanation ? '<p class="clab-fix-explanation">' + _esc(explanation) + '</p>' : '') +
+      (explanation ? '<p class="clab-fix-explanation">' + _rt(explanation) + '</p>' : '') +
       changes
     );
   }
@@ -567,22 +659,22 @@ EM.ConcurrencyLab = (function () {
   ---------------------------------------------------------- */
   function _panelAlternatives(exp) {
     var alts = exp.alternatives || [];
-    if (!alts.length) return _wrapPanel('alternatives', false, '<p class="clab-muted">No alternatives documented.</p>');
+    if (!alts.length) return _wrapPanel('alternatives', false, '<p class="clab-muted">' + EM.t('clab.noAlts') + '</p>');
 
     var body = alts.map(function (alt) {
       var lang = alt.language || 'java';
       var pros = alt.pros && alt.pros.length
-        ? '<ul class="clab-pros">' + alt.pros.map(function (p) { return '<li>&#10003; ' + _esc(p) + '</li>'; }).join('') + '</ul>'
+        ? '<ul class="clab-pros">' + alt.pros.map(function (p) { return '<li>&#10003; ' + _rt(p) + '</li>'; }).join('') + '</ul>'
         : '';
       var cons = alt.cons && alt.cons.length
-        ? '<ul class="clab-cons">' + alt.cons.map(function (c) { return '<li>&#10007; ' + _esc(c) + '</li>'; }).join('') + '</ul>'
+        ? '<ul class="clab-cons">' + alt.cons.map(function (c) { return '<li>&#10007; ' + _rt(c) + '</li>'; }).join('') + '</ul>'
         : '';
       var altCodeStr = Array.isArray(alt.code) ? alt.code.join('\n') : (alt.code || '');
       return '<div class="clab-alt-block">' +
         '<h3 class="clab-alt-title">' + _esc(alt.name) + '</h3>' +
         (altCodeStr ? '<div class="clab-code-wrap"><pre><code class="language-' + _esc(lang) + '">' + _esc(altCodeStr) + '</code></pre></div>' : '') +
         '<div class="clab-pros-cons">' + pros + cons + '</div>' +
-        (alt.whenToUse ? '<p class="clab-when-to-use"><strong>When to use:</strong> ' + _esc(alt.whenToUse) + '</p>' : '') +
+        (alt.whenToUse ? '<p class="clab-when-to-use"><strong>' + _esc(EM.t('clab.whenToUse')) + '</strong> ' + _rt(alt.whenToUse) + '</p>' : '') +
       '</div>';
     }).join('');
 
@@ -594,12 +686,11 @@ EM.ConcurrencyLab = (function () {
   ---------------------------------------------------------- */
   function _panelTests(exp) {
     var tests = exp.tests || [];
-    if (!tests.length) return _wrapPanel('tests', false, '<p class="clab-muted">No tests documented.</p>');
+    if (!tests.length) return _wrapPanel('tests', false, '<p class="clab-muted">' + EM.t('clab.noTests') + '</p>');
 
     var disclaimer =
       '<div class="clab-test-disclaimer clab-callout clab-callout-warn">' +
-        '&#9888; Race conditions are non-deterministic. Tests that rely on Thread.sleep() or timing ' +
-        'may not reliably reproduce the failure on all machines/JVM implementations.' +
+        '&#9888; ' + _esc(EM.t('clab.testDisclaimer')) +
       '</div>';
 
     var body = tests.map(function (test) {
@@ -611,8 +702,8 @@ EM.ConcurrencyLab = (function () {
           (test.name ? '<span class="clab-test-name">' + _esc(test.name) + '</span>' : '') +
         '</div>' +
         (test.code ? '<div class="clab-code-wrap"><pre><code class="language-' + _esc(lang) + '">' + _esc(Array.isArray(test.code) ? test.code.join('\n') : test.code) + '</code></pre></div>' : '') +
-        (test.explanation ? '<p class="clab-test-explanation">' + _esc(test.explanation) + '</p>' : '') +
-        (test.limitations ? '<div class="clab-callout clab-callout-warn">&#9888; ' + _esc(test.limitations) + '</div>' : '') +
+        (test.explanation ? '<p class="clab-test-explanation">' + _rt(test.explanation) + '</p>' : '') +
+        (test.limitations ? '<div class="clab-callout clab-callout-warn">&#9888; ' + _rt(test.limitations) + '</div>' : '') +
       '</div>';
     }).join('');
 
@@ -628,18 +719,18 @@ EM.ConcurrencyLab = (function () {
     var tips     = mon.debugTips || exp.debugTips || [];
 
     var symptomsHtml = symptoms.length
-      ? '<h4>Symptoms</h4><ul class="clab-symptom-list">' +
-          symptoms.map(function (s) { return '<li>' + _esc(s) + '</li>'; }).join('') +
+      ? '<h4>' + EM.t('clab.symptoms') + '</h4><ul class="clab-symptom-list">' +
+          symptoms.map(function (s) { return '<li>' + _rt(s) + '</li>'; }).join('') +
         '</ul>'
       : '';
 
     var tipsHtml = tips.length
-      ? '<h4>Debug Commands</h4>' +
+      ? '<h4>' + EM.t('clab.debugCmds') + '</h4>' +
           tips.map(function (t) {
             if (typeof t === 'string' && t.includes('\n')) {
               return '<pre class="clab-debug-cmd"><code>' + _esc(t) + '</code></pre>';
             }
-            return '<div class="clab-debug-tip">&#8226; ' + _esc(String(t)) + '</div>';
+            return '<div class="clab-debug-tip">&#8226; ' + _rt(String(t)) + '</div>';
           }).join('')
       : '';
 
@@ -657,27 +748,27 @@ EM.ConcurrencyLab = (function () {
 
     var checklistHtml = '';
     if (recs.length) {
-      checklistHtml = '<h4>Recommendations</h4><div class="clab-checklist" id="clab-checklist-' + _esc(exp.id) + '">' +
+      checklistHtml = '<h4>' + EM.t('clab.recs') + '</h4><div class="clab-checklist" id="clab-checklist-' + _esc(exp.id) + '">' +
         recs.map(function (rec, i) {
           var key = 'clab-check-' + exp.id + '-' + i;
           return '<label class="clab-checklist-item">' +
             '<input type="checkbox" id="' + _esc(key) + '" onchange="EM.ConcurrencyLab._saveChecklist(\'' + _esc(exp.id) + '\')">' +
-            '<span>' + _esc(rec) + '</span>' +
+            '<span>' + _rt(rec) + '</span>' +
           '</label>';
         }).join('') +
       '</div>';
     }
 
-    var notesHtml = notes ? '<p class="clab-perf-notes">' + _esc(notes) + '</p>' : '';
+    var notesHtml = notes ? '<p class="clab-perf-notes">' + _rt(notes) + '</p>' : '';
 
     var tableHtml = '';
     if (table.length) {
       var cols = Object.keys(table[0]);
       tableHtml = '<table class="clab-perf-table"><thead><tr>' +
-        cols.map(function (c) { return '<th>' + _esc(c) + '</th>'; }).join('') +
+        cols.map(function (c) { return '<th>' + _esc(EM.t('clab.col.' + c) !== 'clab.col.' + c ? EM.t('clab.col.' + c) : c) + '</th>'; }).join('') +
       '</tr></thead><tbody>' +
         table.map(function (row) {
-          return '<tr>' + cols.map(function (c) { return '<td>' + _esc(String(row[c] || '')) + '</td>'; }).join('') + '</tr>';
+          return '<tr>' + cols.map(function (c) { return '<td' + (c === 'notes' ? '' : ' dir="ltr"') + '>' + (c === 'notes' ? _rt(String(row[c] || '')) : _esc(String(row[c] || ''))) + '</td>'; }).join('') + '</tr>';
         }).join('') +
       '</tbody></table>';
     }
@@ -690,21 +781,21 @@ EM.ConcurrencyLab = (function () {
   ---------------------------------------------------------- */
   function _panelAssessment(exp) {
     var qs = exp.assessment || exp.quiz || [];
-    if (!qs.length) return _wrapPanel('assessment', false, '<p class="clab-muted">No assessment questions available.</p>');
+    if (!qs.length) return _wrapPanel('assessment', false, '<p class="clab-muted">' + EM.t('clab.noQuiz') + '</p>');
 
     var body = '<div class="clab-quiz" id="clab-quiz-' + _esc(exp.id) + '">' +
       qs.map(function (q, qi) {
         return '<div class="clab-quiz-question" data-qi="' + qi + '" data-answered="false">' +
-          '<p class="clab-quiz-q-text"><strong>Q' + (qi + 1) + '.</strong> ' + _esc(q.text || q.question || '') + '</p>' +
+          '<p class="clab-quiz-q-text"><strong>Q' + (qi + 1) + '.</strong> ' + _rt(q.text || q.question || '') + '</p>' +
           '<div class="clab-quiz-options">' +
             (q.options || []).map(function (opt, oi) {
               return '<button class="clab-quiz-option" ' +
                 'onclick="EM.ConcurrencyLab._answerQuiz(\'' + _esc(exp.id) + '\',' + qi + ',' + oi + ')" ' +
-                'data-oi="' + oi + '">' + _esc(opt) + '</button>';
+                'data-oi="' + oi + '">' + _rt(opt) + '</button>';
             }).join('') +
           '</div>' +
           '<div class="clab-quiz-explanation hidden" id="clab-qexpl-' + _esc(exp.id) + '-' + qi + '">' +
-            _esc(q.explanation || '') +
+            _rt(q.explanation || '') +
           '</div>' +
         '</div>';
       }).join('') +
@@ -918,19 +1009,19 @@ EM.ConcurrencyLab = (function () {
     var info = document.getElementById('clab-step-info');
     if (info) {
       var note = curStep && curStep.note ? ': ' + curStep.note : '';
-      info.textContent = 'Step ' + step + ' of ' + total + note;
+      info.innerHTML = _esc(EM.t('clab.stepOf', { n: step, total: total })) + _rt(note);
     }
 
     /* Play button icon */
     var playBtn = document.getElementById('clab-play-btn');
     if (playBtn) {
-      playBtn.innerHTML = _simState.playing ? '&#9646;&#9646; Pause' : '&#9654; Play';
+      playBtn.innerHTML = _simState.playing ? '&#9646;&#9646; ' + EM.t('clab.pause') : '&#9654; ' + EM.t('clab.play');
     }
 
     /* Annotation */
     var annEl = document.getElementById('clab-sim-annotation');
     if (annEl) {
-      annEl.textContent = curStep && curStep.annotation ? curStep.annotation : '';
+      annEl.innerHTML = curStep && curStep.annotation ? _rt(curStep.annotation) : '';
     }
 
     /* Highlight timeline columns */
@@ -1011,7 +1102,7 @@ EM.ConcurrencyLab = (function () {
           var endNote = _simState.showSafe
             ? (annSim.safeAnnotation  || '')
             : (annSim.bugAnnotation   || '');
-          if (endNote) annEl2.textContent = endNote;
+          if (endNote) annEl2.innerHTML = _rt(endNote);
         }
       }
     }
@@ -1183,8 +1274,8 @@ EM.ConcurrencyLab = (function () {
       var scoreEl = document.getElementById('clab-quiz-score-' + expId);
       if (scoreEl) {
         scoreEl.classList.remove('hidden');
-        scoreEl.innerHTML = '<strong>Score: ' + score + ' / ' + allQs.length + '</strong>' +
-          (score === allQs.length ? ' &mdash; Perfect! 🎉' : score >= allQs.length * 0.6 ? ' &mdash; Good work!' : ' &mdash; Keep studying!');
+        scoreEl.innerHTML = '<strong>' + _esc(EM.t('clab.score', { a: score, b: allQs.length })) + '</strong> &mdash; ' +
+          _esc(score === allQs.length ? EM.t('clab.perfect') : score >= allQs.length * 0.6 ? EM.t('clab.good') : EM.t('clab.keep'));
       }
     }
   }

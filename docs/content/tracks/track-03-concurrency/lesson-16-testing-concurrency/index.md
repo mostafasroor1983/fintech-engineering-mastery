@@ -184,7 +184,8 @@ public void debit_1000ConcurrentVirtualThreads_shouldNeverOverdraft()
     }
 
     start.countDown();
-    done.await(30, TimeUnit.SECONDS);
+    // Always check the await result: a timeout (deadlock, hung thread) must fail the test
+    assertThat(done.await(30, TimeUnit.SECONDS)).as("all threads finished").isTrue();
 
     // Financial invariant: balance + debited = initial
     assertThat(account.getBalance() + totalDebited.get()).isEqualTo(INITIAL);
@@ -256,7 +257,8 @@ public void transfers_concurrentBidirectional_shouldConserveBalance()
     long initialTotalBalance = accounts.values().stream()
         .mapToLong(BankAccount::getBalance).sum(); // £10,000 total
 
-    Random random = new Random();
+    // The map is only read by the worker threads (filled before they start),
+    // so a plain HashMap is safe here
     CountDownLatch start = new CountDownLatch(1);
     CountDownLatch done  = new CountDownLatch(100);
 
@@ -267,6 +269,7 @@ public void transfers_concurrentBidirectional_shouldConserveBalance()
         Thread.ofVirtual().start(() -> {
             try {
                 start.await();
+                ThreadLocalRandom random = ThreadLocalRandom.current(); // no shared Random
                 for (int i = 0; i < 100; i++) {
                     String fromId = "ACC-" + random.nextInt(10);
                     String toId   = "ACC-" + random.nextInt(10);
@@ -287,7 +290,8 @@ public void transfers_concurrentBidirectional_shouldConserveBalance()
     }
 
     start.countDown();
-    done.await(60, TimeUnit.SECONDS);
+    // A timeout here usually means a DEADLOCK (inconsistent lock ordering)
+    assertThat(done.await(60, TimeUnit.SECONDS)).as("no deadlock").isTrue();
 
     // INVARIANT: total balance must equal initial total balance
     long finalTotalBalance = accounts.values().stream()
@@ -318,7 +322,7 @@ public void transfers_concurrentBidirectional_shouldConserveBalance()
 
 ```java17
 import org.openjdk.jcstress.annotations.*;
-import org.openjdk.jcstress.infra.results.LL_Result;
+import org.openjdk.jcstress.infra.results.ZZ_Result;
 
 // jcstress test: verify AtomicLong is race-condition free for balance debit
 // Two actors run concurrently; arbiter checks the final state
@@ -326,7 +330,7 @@ import org.openjdk.jcstress.infra.results.LL_Result;
 @Outcome(id = "true, true",   expect = Expect.FORBIDDEN,   desc = "Both debits succeeded on £100 balance — race condition!")
 @Outcome(id = "true, false",  expect = Expect.ACCEPTABLE,  desc = "Thread 1 won")
 @Outcome(id = "false, true",  expect = Expect.ACCEPTABLE,  desc = "Thread 2 won")
-@Outcome(id = "false, false", expect = Expect.ACCEPTABLE,  desc = "Both failed — balance insufficient for each when checked")
+@Outcome(id = "false, false", expect = Expect.FORBIDDEN,   desc = "Both failed — impossible for a correct debit: £1.00 covers one £0.80 debit")
 @State
 public class AtomicBalanceDebitTest {
 
@@ -380,7 +384,7 @@ public class ConcurrentHashMapMergeTest {
 @Outcome(id = "-700", expect = Expect.FORBIDDEN, desc = "OVERDRAFT — balance went negative!")
 @Outcome(id = "100",  expect = Expect.ACCEPTABLE, desc = "Thread 1 debited £9")
 @Outcome(id = "200",  expect = Expect.ACCEPTABLE, desc = "Thread 2 debited £8")
-@Outcome(id = "1000", expect = Expect.ACCEPTABLE, desc = "Neither debited")
+@Outcome(id = "1000", expect = Expect.FORBIDDEN,  desc = "Neither debited — impossible: at least one check passes")
 @State
 public class CheckThenActRaceTest {
 
@@ -406,7 +410,8 @@ public class CheckThenActRaceTest {
         r.r1 = (int) balance.get();
     }
 }
-// jcstress will find the -700 outcome, confirming the race condition
+// jcstress will very likely observe the -700 outcome, confirming the race.
+// (The fix: a single atomic step — a CAS loop or updateAndGet with the check inside)
 ```
 
 ## Testing Database Concurrency with Testcontainers
@@ -449,7 +454,7 @@ class AccountRepositoryConcurrencyTest {
             Thread.ofVirtual().start(() -> {
                 try {
                     start.await();
-                    // Each thread tries to debit £30 — only ~33 should succeed
+                    // Each thread tries to debit £30 — exactly 33 can succeed (33 × £30 = £990)
                     if (accountService.debit("ACC-001", 3_000L)) {
                         successCount.incrementAndGet();
                     }
@@ -462,7 +467,7 @@ class AccountRepositoryConcurrencyTest {
         }
 
         start.countDown();
-        done.await(30, TimeUnit.SECONDS);
+        assertThat(done.await(30, TimeUnit.SECONDS)).isTrue();
 
         // Verify via DB — not in-memory
         long finalBalance = accountService.getBalance("ACC-001");
@@ -473,6 +478,9 @@ class AccountRepositoryConcurrencyTest {
         // Invariant: balance = initial - (successful debits × amount)
         assertThat(finalBalance)
             .isEqualTo(100_000L - successCount.get() * 3_000L);
+
+        // With correct locking, no debit is wrongly refused
+        assertThat(successCount.get()).isEqualTo(33);
     }
 }
 ```
@@ -480,14 +488,17 @@ class AccountRepositoryConcurrencyTest {
 ```java21
 // Java 21 — virtual threads with Testcontainers
 // 500 virtual threads can run concurrently without platform thread pool sizing concerns
+// (the DB connection pool still limits how many run SQL at the same time)
 @Test
 void optimisticLocking_highConcurrency_shouldHandleConflictsGracefully()
         throws InterruptedException {
 
+    accountService.create("ACC-OPT", 100_000L);   // £1,000
+
     int THREADS = 500; // 500 virtual threads — feasible with Java 21
     CountDownLatch start = new CountDownLatch(1);
     CountDownLatch done  = new CountDownLatch(THREADS);
-    AtomicInteger retryCount     = new AtomicInteger(0);
+    AtomicInteger conflictCount  = new AtomicInteger(0);
     AtomicInteger successCount   = new AtomicInteger(0);
 
     for (int t = 0; t < THREADS; t++) {
@@ -495,10 +506,11 @@ void optimisticLocking_highConcurrency_shouldHandleConflictsGracefully()
             try {
                 start.await();
                 try {
-                    accountService.updateWithOptimisticLock("ACC-001", 100L);
+                    accountService.debitWithOptimisticLock("ACC-OPT", 100L); // £1.00
                     successCount.incrementAndGet();
-                } catch (OptimisticLockException e) {
-                    retryCount.incrementAndGet(); // Count OptimisticLock conflicts
+                } catch (OptimisticLockingFailureException e) {
+                    // Spring wraps JPA's OptimisticLockException in this type
+                    conflictCount.incrementAndGet();
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -509,42 +521,44 @@ void optimisticLocking_highConcurrency_shouldHandleConflictsGracefully()
     }
 
     start.countDown();
-    done.await(60, TimeUnit.SECONDS);
+    assertThat(done.await(60, TimeUnit.SECONDS)).isTrue();
 
-    // Some conflicts expected under high concurrency — verify retry count is reasonable
-    assertThat(successCount.get() + retryCount.get()).isEqualTo(THREADS);
-    // Final balance must be consistent
-    assertThat(accountService.getBalance("ACC-001")).isGreaterThanOrEqualTo(0L);
+    // Every attempt either succeeded or reported a conflict — none vanished
+    assertThat(successCount.get() + conflictCount.get()).isEqualTo(THREADS);
+    // No lost update: the balance reflects exactly the successful debits
+    assertThat(accountService.getBalance("ACC-OPT"))
+        .isEqualTo(100_000L - successCount.get() * 100L);
 }
 ```
 
 ## Detecting Pinning in Integration Tests
 
 ```java21
-// Assert that a service method does not pin virtual threads during execution
+// Assert that a service method does not pin virtual threads during execution.
+// A RecordingStream starts its own JFR recording in this JVM
 @Test
 void paymentProcessing_onVirtualThread_shouldNotPinCarrierThread()
         throws Exception {
 
     AtomicInteger pinningEvents = new AtomicInteger(0);
 
-    // Register JFR event hook to count pinning events
-    try (var es = EventStream.openRepository()) {
-        es.onEvent("jdk.VirtualThreadPinned", event -> pinningEvents.incrementAndGet());
-        es.startAsync();
+    try (var rs = new RecordingStream()) {
+        rs.enable("jdk.VirtualThreadPinned").withThreshold(Duration.ZERO); // default is 20ms
+        rs.onEvent("jdk.VirtualThreadPinned", event -> pinningEvents.incrementAndGet());
+        rs.startAsync();
 
         // Run service on a virtual thread
         Thread vt = Thread.ofVirtual().start(() -> {
             paymentService.processPayment(testRequest);
         });
-        vt.join(5, TimeUnit.SECONDS);
+        assertThat(vt.join(Duration.ofSeconds(5))).as("finished in time").isTrue();
 
-        Thread.sleep(100); // Allow JFR events to flush
-
-        assertThat(pinningEvents.get())
-            .as("Payment processing must not pin virtual threads")
-            .isZero();
+        rs.stop();   // JDK 20+: flushes all pending events before returning
     }
+
+    assertThat(pinningEvents.get())
+        .as("Payment processing must not pin virtual threads")
+        .isZero();
 }
 ```
 
@@ -553,7 +567,7 @@ void paymentProcessing_onVirtualThread_shouldNotPinCarrierThread()
 <!-- KNOWLEDGE-CHECK [
   {
     "id": "kc-ct-01",
-    "question": "A `synchronized` debit method has a race condition: the balance check and the debit are not atomic. A unit test calling `account.debit(900)` from a single thread always passes. Why does the race never trigger in the unit test?",
+    "question": "A `debit` method (not synchronized) has a race condition: the balance check and the debit are not atomic. A unit test calling `account.debit(900)` from a single thread always passes. Why does the race never trigger in the unit test?",
     "options": [
       "Unit tests run faster than production — the race needs more time to manifest",
       "Unit tests are single-threaded and sequential; the race requires two threads executing simultaneously in a specific interleaving",

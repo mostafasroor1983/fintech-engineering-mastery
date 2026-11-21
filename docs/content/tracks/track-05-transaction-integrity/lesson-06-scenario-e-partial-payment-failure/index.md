@@ -55,6 +55,8 @@ references:
   - "Stripe Engineering — Designing Robust and Predictable APIs with Idempotency"
 ---
 
+## Overview
+
 A payment that is half-committed is worse than a payment that never happened. When a customer's card is charged by an external processor but the internal ledger never records the debit, the company has collected money it cannot account for — and the customer's balance is wrong. This scenario dissects exactly that failure mode, examines why standard database transactions cannot prevent it, and teaches you to build a compensation-based saga that recovers reliably even when the recovery itself fails.
 
 ## Learning Objectives
@@ -71,11 +73,11 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-Apex Payments operates an orchestrated payment flow for 2.3 million monthly active customers across six European markets. Each payment crosses four system boundaries: the internal funds reservation service, the external card processor (Worldpay or Adyen depending on the merchant's acquirer), the internal double-entry ledger, and the funds release service.
+*Composite example:* "Apex Payments", a fictional company, operates an orchestrated payment flow for 2.3 million monthly active customers across six European markets. Each payment crosses four system boundaries: the internal funds reservation service, the external card processor (Worldpay or Adyen depending on the merchant's acquirer), the internal double-entry ledger, and the funds release service.
 
 In a six-week period, the team observes 47 incidents where the card processor reports a successful charge but the internal ledger shows no corresponding debit. The incidents cluster around database connection pool exhaustion events — the ledger database is saturated during peak hours (08:00–09:30 CET), and the JDBC connection acquisition times out after 30 seconds. By that point Worldpay has already captured the funds.
 
-The financial impact: €184,000 in charges that cannot be matched to ledger entries, triggering manual reconciliation, delayed settlements, and three regulatory breach notifications under PSD2 Article 83 (transaction record-keeping obligations). The engineering team must produce a durable, automated fix within two sprints.
+The financial impact: €184,000 in charges that cannot be matched to ledger entries, triggering manual reconciliation, delayed settlements, and three notifications to the regulator about record-keeping failures. The engineering team must produce a durable, automated fix within two sprints.
 
 ## The Anatomy of Partial Failure
 
@@ -174,7 +176,10 @@ For payment orchestration:
 | 3 | Post ledger entry | Reverse ledger entry |
 | 4 | Release hold | (terminal — no compensation needed) |
 
-The key insight: when Step 3 fails, the saga does not roll forward. It **compensates backwards**, executing the compensating actions for Steps 2 and 1 in reverse order.
+The key insight: when Step 3 fails permanently, the saga **compensates backwards**, executing the compensating actions for Steps 2 and 1 in reverse order.
+
+> [!IMPORTANT]
+> Two rules decide when to compensate. **First, a timeout is not a failure.** If the charge call to the processor times out, the card may or may not have been charged. Releasing the hold and moving on would recreate exactly the incident above. The saga records `CHARGE_REQUESTED` *before* the call, and on a timeout moves to `CHARGE_UNKNOWN` and **queries the processor** (by the idempotency key) before deciding. **Second, prefer rolling forward for internal steps.** The ledger post is an internal, idempotent operation; a connection-pool timeout is transient. Refunding a customer who wanted to pay is a poor outcome — retrying the idempotent ledger post until it succeeds is usually better. Compensate when a step fails *permanently* (a decline, a validation error, a business rule).
 
 ```mermaid
 stateDiagram-v2
@@ -183,15 +188,19 @@ stateDiagram-v2
     INITIATED --> FUNDS_RESERVED : reserveFunds() OK
     INITIATED --> FAILED : reserveFunds() fails
 
-    FUNDS_RESERVED --> PROCESSOR_CHARGED : chargeProcessor() OK
-    FUNDS_RESERVED --> COMPENSATING : chargeProcessor() fails
+    FUNDS_RESERVED --> CHARGE_REQUESTED : state saved BEFORE the HTTP call
+    CHARGE_REQUESTED --> PROCESSOR_CHARGED : charge() OK
+    CHARGE_REQUESTED --> COMPENSATING : charge() definitively declined
+    CHARGE_REQUESTED --> CHARGE_UNKNOWN : timeout or crash — outcome unknown
+    CHARGE_UNKNOWN --> PROCESSOR_CHARGED : status query says charged
+    CHARGE_UNKNOWN --> COMPENSATING : status query says not charged
     COMPENSATING --> COMPENSATED : releaseHold() OK
-    COMPENSATING --> FAILED : releaseHold() fails (retried)
+    COMPENSATING --> FAILED : releaseHold() max retries exceeded
 
     PROCESSOR_CHARGED --> LEDGER_POSTED : postLedger() OK
-    PROCESSOR_CHARGED --> COMPENSATING_CHARGE : postLedger() fails
+    PROCESSOR_CHARGED --> COMPENSATING_CHARGE : postLedger() fails permanently
     COMPENSATING_CHARGE --> COMPENSATING : refundProcessor() OK
-    COMPENSATING_CHARGE --> FAILED : refundProcessor() fails (retried)
+    COMPENSATING_CHARGE --> FAILED : refundProcessor() max retries exceeded
 
     LEDGER_POSTED --> COMPLETED : releaseHold() OK
     LEDGER_POSTED --> COMPENSATING_HOLD : releaseHold() fails
@@ -222,6 +231,8 @@ CREATE TABLE payment_sagas (
     -- COMPLETED, COMPENSATING_CHARGE, COMPENSATING, COMPENSATED, FAILED
 
     -- References to work already done (needed for compensation)
+    -- INITIATED, FUNDS_RESERVED, CHARGE_REQUESTED, CHARGE_UNKNOWN, ... (see enum)
+    next_attempt_at     TIMESTAMPTZ,    -- backoff: when the scheduler may retry next
     hold_id             VARCHAR(100),   -- internal funds reservation ID
     processor_charge_id VARCHAR(100),   -- Worldpay/Adyen charge ID
     ledger_entry_id     UUID,           -- internal ledger entry ID
@@ -245,9 +256,9 @@ CREATE TABLE payment_sagas (
 -- Index for the background compensation scheduler
 CREATE INDEX idx_payment_sagas_compensation
     ON payment_sagas (state, updated_at)
-    WHERE state IN ('COMPENSATING_CHARGE', 'COMPENSATING', 'COMPENSATING_HOLD');
+    WHERE state IN ('CHARGE_UNKNOWN', 'COMPENSATING_CHARGE', 'COMPENSATING', 'COMPENSATING_HOLD');
 
--- Index for idempotent lookups by payment_id
+-- Idempotent lookups by payment_id: one saga per payment, ever
 CREATE UNIQUE INDEX idx_payment_sagas_payment_id
     ON payment_sagas (payment_id);
 ```
@@ -257,7 +268,7 @@ CREATE UNIQUE INDEX idx_payment_sagas_payment_id
 
 ## Java Implementation: PaymentSagaOrchestrator
 
-The orchestrator is the class that drives the saga forward. It owns the state transitions and persists every transition to the database before making the corresponding external call.
+The orchestrator is the class that drives the saga forward. It owns the state transitions and **commits** every transition in its own short transaction — in particular, it records `CHARGE_REQUESTED` *before* calling the processor. Nothing here may run inside one big `@Transactional`: the saga row would not be committed until the very end, so a crash halfway through would leave no trace of a charge that really happened.
 
 ```java
 @Service
@@ -275,7 +286,9 @@ public class PaymentSagaOrchestrator {
      * Entry point. Creates the saga record and drives it forward.
      * Returns when the saga reaches COMPLETED or hands off to compensation.
      */
-    @Transactional  // protects only the initial saga row creation
+    // NOT @Transactional: each sagaRepository.save() commits on its own.
+    // (A @Transactional here would wrap the HTTP call and every transition in one
+    //  transaction, committed only at the end — the opposite of what we need.)
     public SagaResult initiatePayment(PaymentRequest request) {
         // Create the saga record — this is the first durable write
         PaymentSaga saga = PaymentSaga.builder()
@@ -301,10 +314,23 @@ public class PaymentSagaOrchestrator {
             transitionTo(saga, SagaState.FUNDS_RESERVED,
                     s -> s.setHoldId(holdId));
 
-            // Step 2: Charge the external processor
-            ProcessorCharge charge = processorClient.charge(
-                    request.getCardToken(), saga.getAmountCents(), saga.getCurrency(),
-                    saga.getSagaId().toString());  // sagaId as idempotency key
+            // Step 2: Charge the external processor.
+            // Record the INTENT first: if we crash during the call, the recovery
+            // job finds CHARGE_REQUESTED and asks the processor what happened.
+            transitionTo(saga, SagaState.CHARGE_REQUESTED, s -> {});
+            ProcessorCharge charge;
+            try {
+                charge = processorClient.charge(
+                        request.getCardToken(), saga.getAmountCents(), saga.getCurrency(),
+                        saga.getSagaId().toString());  // sagaId as idempotency key
+            } catch (ProcessorTimeoutException e) {
+                // UNKNOWN outcome — never release the hold or "retry blindly" here.
+                // The scheduler queries the processor by idempotency key and decides.
+                transitionTo(saga, SagaState.CHARGE_UNKNOWN,
+                        s -> s.setFailureReason("Charge timed out — status query pending"));
+                return SagaResult.pending(saga.getSagaId(),
+                        "Payment status is being confirmed. Reference: " + saga.getSagaId());
+            }
             transitionTo(saga, SagaState.PROCESSOR_CHARGED,
                     s -> {
                         s.setProcessorChargeId(charge.getChargeId());
@@ -313,7 +339,8 @@ public class PaymentSagaOrchestrator {
                         s.addCompensationAction(CompensationAction.releaseHold(holdId));
                     });
 
-            // Step 3: Post to internal ledger
+            // Step 3: Post to internal ledger (idempotent on the charge id, so the
+            // scheduler can safely retry it — rolling forward — on a transient error)
             UUID ledgerEntryId = ledgerService.postPaymentDebit(
                     saga.getAccountId(), saga.getAmountCents(), saga.getCurrency(),
                     charge.getChargeId());
@@ -357,14 +384,16 @@ public class PaymentSagaOrchestrator {
         saga.setState(newState);
         mutation.accept(saga);
         saga.setUpdatedAt(Instant.now());
-        sagaRepository.save(saga);
+        sagaRepository.save(saga);   // its own short transaction — committed NOW
         log.info("Saga {} transitioned to {}", saga.getSagaId(), newState);
     }
 
     private void scheduleCompensation(PaymentSaga saga, Exception cause) {
         SagaState compensatingState = switch (saga.getState()) {
             case PROCESSOR_CHARGED -> SagaState.COMPENSATING_CHARGE;
+            case CHARGE_REQUESTED  -> SagaState.CHARGE_UNKNOWN;   // did the charge happen? ask first
             case FUNDS_RESERVED    -> SagaState.COMPENSATING;
+            case LEDGER_POSTED     -> SagaState.COMPENSATING_HOLD;
             default                -> SagaState.FAILED;
         };
         transitionTo(saga, compensatingState,
@@ -378,12 +407,14 @@ public class PaymentSagaOrchestrator {
 public enum SagaState {
     INITIATED,
     FUNDS_RESERVED,
+    CHARGE_REQUESTED,      // saved BEFORE the processor call
+    CHARGE_UNKNOWN,        // call timed out / crashed: query the processor first
     PROCESSOR_CHARGED,
     LEDGER_POSTED,
     COMPLETED,
     COMPENSATING_CHARGE,   // must refund processor AND release hold
     COMPENSATING,          // must only release hold
-    COMPENSATING_HOLD,     // ledger post succeeded, only hold release failed
+    COMPENSATING_HOLD,     // charge + ledger succeeded, only hold release failed
     COMPENSATED,           // all compensations done
     FAILED                 // terminal failure — manual intervention required
 }
@@ -435,9 +466,13 @@ public class ProcessorRefundClient {
             return response.getBody();
 
         } catch (HttpClientErrorException.UnprocessableEntity e) {
-            // 422: charge already fully refunded — idempotent success
-            log.info("Charge {} already refunded (saga {}). Treating as success.", chargeId, sagaId);
-            return RefundResponse.alreadyRefunded(chargeId);
+            // A 422 can mean many things — only the processor's specific
+            // "already refunded" error code is an idempotent success
+            if (isAlreadyRefunded(e.getResponseBodyAsString())) {
+                log.info("Charge {} already refunded (saga {}). Treating as success.", chargeId, sagaId);
+                return RefundResponse.alreadyRefunded(chargeId);
+            }
+            throw e;   // other 422s are permanent errors: needs a human, not retries
         }
         // Any other exception propagates — the scheduler will retry
     }
@@ -451,7 +486,9 @@ public class ProcessorRefundClient {
 
 What happens when the refund call itself fails? The processor could be down. The network could be congested. The service could restart mid-retry.
 
-The answer: the saga record in the database **is** the compensation queue. As long as the saga row exists in state `COMPENSATING_CHARGE` or `COMPENSATING`, the background scheduler will keep retrying. Even if the entire application restarts, the scheduler queries the database on startup and resumes all in-flight compensations.
+The answer: the saga record in the database **is** the compensation queue. As long as the saga row exists in a pending state (`CHARGE_UNKNOWN`, `COMPENSATING_CHARGE`, `COMPENSATING`, `COMPENSATING_HOLD`), the background scheduler will keep retrying. Even if the entire application restarts, the scheduler queries the database and resumes all in-flight work. (A separate recovery check should also pick up sagas stuck in `INITIATED`, `FUNDS_RESERVED` or `CHARGE_REQUESTED` for longer than a few minutes — the signature of a crash mid-flow.)
+
+Two details make the scheduler safe. Several application instances run it, so each one **claims** sagas with `SELECT ... FOR UPDATE SKIP LOCKED` and works on each saga in its own short transaction — never one transaction around the whole loop and its HTTP calls. And it saves progress after **each** step (refund done → `COMPENSATING`), so a failure while releasing the hold does not lead to calling the refund again from scratch.
 
 This is the outbox pattern applied to compensations: the durable store (Postgres) guarantees that compensation work is never lost, regardless of application-level failures.
 
@@ -463,29 +500,34 @@ public class CompensationScheduler {
 
     private final PaymentSagaRepository sagaRepository;
     private final ProcessorRefundClient refundClient;
+    private final ProcessorClient processorClient;
     private final FundsReservationService reservationService;
-    private final LedgerService ledgerService;
+    private final TransactionTemplate tx;
+    private final Clock clock;
 
     private static final int MAX_ATTEMPTS = 10;
     private static final Duration BASE_BACKOFF = Duration.ofSeconds(10);
 
     /**
-     * Runs every 30 seconds. Picks up all sagas in a compensating state
-     * and retries their compensation actions.
+     * Runs every 30 seconds. NOT @Transactional: claims a batch of due sagas
+     * (FOR UPDATE SKIP LOCKED, so instances never work on the same saga) and
+     * handles each one separately.
      */
     @Scheduled(fixedDelay = 30_000)
-    @Transactional
     public void processOutstandingCompensations() {
-        List<PaymentSaga> pending = sagaRepository
-                .findAllByStateInAndCompensationAttemptsLessThan(
-                        List.of(SagaState.COMPENSATING_CHARGE,
-                                SagaState.COMPENSATING,
-                                SagaState.COMPENSATING_HOLD),
-                        MAX_ATTEMPTS);
+        List<UUID> due = tx.execute(status -> sagaRepository.claimDueSagaIds(
+                List.of(SagaState.CHARGE_UNKNOWN, SagaState.COMPENSATING_CHARGE,
+                        SagaState.COMPENSATING, SagaState.COMPENSATING_HOLD),
+                clock.instant(), 50));
+        // claimDueSagaIds: SELECT saga_id ... WHERE state IN (...) AND
+        //   (next_attempt_at IS NULL OR next_attempt_at <= now) ORDER BY updated_at
+        //   LIMIT 50 FOR UPDATE SKIP LOCKED — and pushes next_attempt_at forward
+        //   as a lease, so another instance will not pick them up meanwhile.
 
-        log.info("Compensation scheduler: {} saga(s) require attention", pending.size());
+        log.info("Compensation scheduler: {} saga(s) require attention", due.size());
 
-        for (PaymentSaga saga : pending) {
+        for (UUID sagaId : due) {
+            PaymentSaga saga = sagaRepository.findById(sagaId).orElseThrow();
             try {
                 compensate(saga);
             } catch (Exception e) {
@@ -498,49 +540,64 @@ public class CompensationScheduler {
 
     private void compensate(PaymentSaga saga) {
         switch (saga.getState()) {
+            case CHARGE_UNKNOWN -> {
+                // Ask the processor what really happened (lookup by idempotency key)
+                ChargeStatus status = processorClient.findByIdempotencyKey(saga.getSagaId().toString());
+                if (status.charged()) {
+                    saga.setProcessorChargeId(status.chargeId());
+                    save(saga, SagaState.PROCESSOR_CHARGED);   // resume: post ledger (roll forward)
+                } else if (status.notFound() || status.declined()) {
+                    save(saga, SagaState.COMPENSATING);        // nothing was charged
+                }
+                // still processing at the processor: leave it, try again later
+            }
             case COMPENSATING_CHARGE -> {
-                // Must refund processor, then release hold
-                refundClient.refund(
-                        saga.getProcessorChargeId(),
-                        saga.getSagaId().toString(),
-                        saga.getAmountCents(),
-                        saga.getCurrency());
-                saga.setState(SagaState.COMPENSATING);
-                // Fall through to release hold
+                refundClient.refund(saga.getProcessorChargeId(), saga.getSagaId().toString(),
+                        saga.getAmountCents(), saga.getCurrency());
+                save(saga, SagaState.COMPENSATING);   // persist progress BEFORE the next step
                 releaseHold(saga);
-                saga.setState(SagaState.COMPENSATED);
+                save(saga, SagaState.COMPENSATED);
             }
             case COMPENSATING -> {
                 // Processor refunded (or was never charged). Just release hold.
                 releaseHold(saga);
-                saga.setState(SagaState.COMPENSATED);
+                save(saga, SagaState.COMPENSATED);
             }
             case COMPENSATING_HOLD -> {
-                // Ledger posted, processor not charged. Just release hold.
+                // Charge and ledger post succeeded; only the hold release is left.
                 releaseHold(saga);
-                saga.setState(SagaState.COMPLETED);
+                save(saga, SagaState.COMPLETED);
             }
+            default -> { }
         }
-        saga.setLastCompensationAt(Instant.now());
-        sagaRepository.save(saga);
-        log.info("Saga {} compensation completed. Final state: {}", saga.getSagaId(), saga.getState());
+        log.info("Saga {} processed. State: {}", saga.getSagaId(), saga.getState());
+    }
+
+    private void save(PaymentSaga saga, SagaState newState) {
+        saga.setState(newState);
+        saga.setLastCompensationAt(clock.instant());
+        sagaRepository.save(saga);   // own short transaction
     }
 
     private void releaseHold(PaymentSaga saga) {
         if (saga.getHoldId() != null) {
-            reservationService.releaseHold(saga.getHoldId());
+            reservationService.releaseHold(saga.getHoldId());   // idempotent
         }
     }
 
     private void incrementAttempts(PaymentSaga saga, Exception e) {
-        saga.setCompensationAttempts(saga.getCompensationAttempts() + 1);
-        saga.setLastCompensationAt(Instant.now());
-        if (saga.getCompensationAttempts() >= MAX_ATTEMPTS) {
+        int attempts = saga.getCompensationAttempts() + 1;
+        saga.setCompensationAttempts(attempts);
+        saga.setLastCompensationAt(clock.instant());
+        // Exponential backoff: 10s, 20s, 40s ... capped at 1 hour
+        long delaySeconds = Math.min(3600, BASE_BACKOFF.getSeconds() << Math.min(attempts, 10));
+        saga.setNextAttemptAt(clock.instant().plusSeconds(delaySeconds));
+        if (attempts >= MAX_ATTEMPTS) {
             saga.setState(SagaState.FAILED);
             saga.setFailureReason("Max compensation attempts exceeded: " + e.getMessage());
             log.error("Saga {} exceeded max compensation attempts. Manual intervention required.",
                     saga.getSagaId());
-            // Alert: publish to PagerDuty / internal alerting
+            alertingService.page("SAGA_TERMINAL_FAILURE", Map.of("saga_id", saga.getSagaId().toString()));
         }
         sagaRepository.save(saga);
     }
@@ -548,7 +605,7 @@ public class CompensationScheduler {
 ```
 
 > [!WARNING]
-> When `MAX_ATTEMPTS` is reached and the saga is marked `FAILED`, it must trigger an operational alert. A saga stuck in `FAILED` after exhausting retries means a customer was charged and no refund was successfully issued. This is a P1 incident requiring manual remediation and potentially a regulatory notification under PSD2. Silence is not acceptable — `FAILED` sagas must page someone.
+> When `MAX_ATTEMPTS` is reached and the saga is marked `FAILED`, it must trigger an operational alert. A saga stuck in `FAILED` after exhausting retries means a customer was charged and no refund was successfully issued. This is a P1 incident requiring manual remediation and possibly regulatory reporting. Silence is not acceptable — `FAILED` sagas must page someone.
 
 ## The JPA Entity
 
@@ -585,7 +642,7 @@ public class PaymentSaga {
     private String processorChargeId;
     private UUID ledgerEntryId;
 
-    @Type(JsonType.class)  // Hibernate Types for JSONB
+    @JdbcTypeCode(SqlTypes.JSON)  // Hibernate 6 maps JSON/JSONB natively
     @Column(columnDefinition = "jsonb")
     private List<CompensationAction> compensationActions;
 
@@ -594,6 +651,7 @@ public class PaymentSaga {
     private int compensationAttempts = 0;
 
     private Instant lastCompensationAt;
+    private Instant nextAttemptAt;
     private String failureReason;
 
     @Column(nullable = false)
@@ -663,9 +721,11 @@ The integration test simulates Step 3 (ledger post) failing after Step 2 (proces
 
 ```java
 @SpringBootTest
-@Transactional
 class PaymentSagaCompensationIntegrationTest {
 
+    // No class-level @Transactional: the orchestrator commits each transition
+    // separately, and a test transaction would hide whether that really happens.
+    // Clean the tables in @AfterEach instead.
     @Autowired
     private PaymentSagaOrchestrator orchestrator;
 
@@ -680,6 +740,9 @@ class PaymentSagaCompensationIntegrationTest {
 
     @MockBean
     private FundsReservationService reservationService;
+
+    @MockBean
+    private ProcessorClient processorClient;
 
     @Autowired
     private CompensationScheduler compensationScheduler;
@@ -714,6 +777,8 @@ class PaymentSagaCompensationIntegrationTest {
         SagaResult result = orchestrator.initiatePayment(request);
 
         // Assert: result indicates pending compensation
+        // (the ledger failure here is simulated as PERMANENT; a transient one
+        //  would be retried — rolled forward — by the scheduler instead)
         assertThat(result.getStatus()).isEqualTo(SagaResult.Status.PENDING_COMPENSATION);
 
         // Assert: saga was persisted in COMPENSATING_CHARGE state
@@ -788,7 +853,7 @@ class PaymentSagaCompensationIntegrationTest {
 ```
 
 > [!NOTE]
-> Notice that `CompensationScheduler` is not annotated `@MockBean` in the second and third tests — it is the **system under test**. The `LedgerService`, `ProcessorRefundClient`, and `FundsReservationService` are mocked because they cross external boundaries. The saga repository and the in-memory H2 database (or Testcontainers Postgres) are real. This gives you confidence that the state transitions, SQL queries, and retry logic all work correctly as an integrated unit.
+> Notice that `CompensationScheduler` is not annotated `@MockBean` in the second and third tests — it is the **system under test**. The `LedgerService`, `ProcessorClient`, `ProcessorRefundClient`, and `FundsReservationService` are mocked because they cross external boundaries. The saga repository and the database are real — use Testcontainers PostgreSQL rather than H2, because `FOR UPDATE SKIP LOCKED` and JSONB behave differently in H2. This gives you confidence that the state transitions, SQL queries, and retry logic all work correctly as an integrated unit.
 
 ## Operational Observability
 
@@ -879,7 +944,7 @@ The refund API must be (1) **idempotent** — calling `POST /refunds` multiple t
         "The failed saga can be retried by restarting the application"
       ],
       "correct": 1,
-      "explanation": "A FAILED saga after exhausted compensation retries means a customer was charged and the automated refund mechanism failed completely. This is a P1 incident requiring immediate manual intervention: manual refund processing through the processor portal, root cause analysis, and potentially regulatory notification under PSD2 Article 71 (payment execution liability). Silence is not acceptable."
+      "explanation": "A FAILED saga after exhausted compensation retries means a customer was charged and the automated refund mechanism failed completely. This is a P1 incident requiring immediate manual intervention: a manual refund through the processor, root cause analysis, and possibly regulatory reporting. Silence is not acceptable."
     }
   ]
 }

@@ -52,7 +52,7 @@ Event-driven architecture is not a technology choice — it is a design philosop
 
 ## Business Context
 
-TradeFlow, a cross-border B2B payment platform, processes 180,000 payment orders per day across 47 currencies. In 2025 Q1, the team replaced a synchronous payment processing chain (REST call → REST call → REST call) with an event-driven architecture. The initial implementation used choreography for all flows. Within two months, three production incidents traced to the same root cause: an implicit ordering dependency between the Ledger Service and the Compliance Reporting Service — compliance reports were being generated before the ledger entry was written, causing financial reporting discrepancies. The team had no visibility into the event processing order and no tooling to replay events to fix the state divergence. The incidents consumed 340 engineering-hours in diagnostics and state reconstruction. This lesson addresses the design discipline that would have prevented those incidents.
+TradeFlow, a cross-border B2B payment platform (a composite example), processes 180,000 payment orders per day across 47 currencies. In 2025 Q1, the team replaced a synchronous payment processing chain (REST call → REST call → REST call) with an event-driven architecture. The initial implementation used choreography for all flows. Within two months, three production incidents traced to the same root cause: an implicit ordering dependency between the Ledger Service and the Compliance Reporting Service — compliance reports were being generated before the ledger entry was written, causing financial reporting discrepancies. The team had no visibility into the event processing order and no tooling to replay events to fix the state divergence. The incidents consumed 340 engineering-hours in diagnostics and state reconstruction. This lesson addresses the design discipline that would have prevented those incidents.
 
 ## Event Types: Domain, Integration, and Commands
 
@@ -166,9 +166,11 @@ public class KafkaPaymentEventPublisher implements PaymentEventPublisher {
             kafkaTemplate.send(TOPIC, partitionKey, avroEvent)
                 .whenComplete((result, ex) -> {
                     if (ex != null) {
-                        throw new EventPublishingException(
-                            "Failed to publish PaymentCompletedEvent for payment: "
-                                + captured.paymentId(), ex);
+                        // Runs on a Kafka I/O thread after publish() returned:
+                        // throwing here reaches nobody. Log, count, and rely on the
+                        // outbox (Track 05) for guaranteed delivery.
+                        log.error("Failed to publish PaymentCompletedEvent for payment {}",
+                            captured.paymentId(), ex);
                     }
                 });
         }
@@ -206,7 +208,7 @@ spring:
         auto.register.schemas: false          # never auto-register in production
         use.latest.version: true
         acks: all                             # wait for all ISR replicas
-        enable.idempotence: true              # exactly-once producer semantics
+        enable.idempotence: true              # no duplicates from producer retries (not end-to-end exactly-once)
         max.in.flight.requests.per.connection: 5
     consumer:
       group-id: ledger-service
@@ -289,31 +291,34 @@ Event schemas evolve as business requirements change. Versioning strategy determ
 
 **Additive changes (backward-compatible):**
 - Adding a new optional field with a default value
-- Adding a new enum value at the end of an enum list
-- Widening a type (int → long)
+- Widening a type (int → long; Avro promotes the old value)
+- Reordering fields (Avro matches fields by name; Protobuf by field number, as long as numbers are kept)
+- Adding an enum symbol — only if the enum declares a `default` symbol, so readers that do not know the new symbol fall back to it; otherwise old readers fail
 
 **Breaking changes (require coordination):**
-- Renaming a field
-- Removing a field
-- Changing a field's type
-- Reordering fields (Avro uses field names, not positions — safe; Protobuf uses field numbers — safe if numbers are preserved)
+- Renaming a field (unless you add the old name as an Avro `alias`)
+- Removing a field that has no default
+- Changing a field's type to an incompatible one
 
 ```java
 // EventVersioningStrategy.java — example multi-version consumer
-@KafkaListener(topics = "payment.events", groupId = "ledger-service")
+@Component
 public class PaymentEventConsumer {
 
     @Autowired
     private LedgerService ledgerService;
 
+    @KafkaListener(topics = "payment.events", groupId = "ledger-service")
     public void onPaymentEvent(ConsumerRecord<String, GenericRecord> record) {
         GenericRecord avroRecord = record.value();
-        String version = (String) avroRecord.get("eventVersion");
+        String version = avroRecord.get("eventVersion").toString();
 
         switch (version) {
             case "1" -> handleV1(avroRecord);
             case "2" -> handleV2(avroRecord);
-            default -> log.warn("Unknown event version: {}. Skipping.", version);
+            // Never silently drop a financial event: fail so the error handler
+            // sends it to the dead-letter topic where someone will look at it.
+            default -> throw new UnsupportedEventVersionException(version);
         }
     }
 
@@ -360,7 +365,7 @@ class LedgerServicePaymentEventContractTest {
                 .stringType("occurredAt")
                 .stringType("paymentId")
                 .stringType("merchantId")
-                .decimalType("amountValue")        // expect a decimal string
+                .stringMatcher("amountValue", "\\d+\\.\\d{2}", "149.99")  // decimal string
                 .stringMatcher("amountCurrency", "[A-Z]{3}")
                 .stringType("capturedAt")
             )
@@ -386,16 +391,30 @@ class LedgerServicePaymentEventContractTest {
 // Provider side — PaymentService verifies it satisfies the consumer's contract
 @Provider("payment-service")
 @PactBroker(url = "${PACT_BROKER_URL}")
-@SpringBootTest
 class PaymentServiceContractVerificationTest {
 
+    @BeforeEach
+    void before(PactVerificationContext context) {
+        context.setTarget(new MessageTestTarget());   // message pact: no HTTP server
+    }
+
     @TestTemplate
-    @ExtendWith(PactVerificationSpringProvider.class)
+    @ExtendWith(PactVerificationInvocationContextProvider.class)
     void verifyPact(PactVerificationContext context) {
         context.verifyInteraction();
     }
+
+    // Must build the message with the real mapping code the producer uses
+    @PactVerifyProvider("a PaymentCompletedEvent v2")
+    String paymentCompletedEventV2() throws Exception {
+        return objectMapper.writeValueAsString(
+            PaymentCompletedEventJson.from(samplePaymentCapturedEvent()));
+    }
 }
 ```
+
+> [!NOTE]
+> Pact message contracts check the JSON shape of a message. If the topic carries Avro through a Schema Registry, the registry's compatibility check (with `auto.register.schemas: false` and a CI step that tests new schemas) does most of this job; Pact is still useful for semantic expectations such as "amountValue is a decimal string with two places".
 
 ## Event Replay and Projections
 
@@ -409,53 +428,55 @@ Event replay is the ability to re-process historical events to reconstruct or up
 @Service
 public class ProjectionRebuildService {
 
-    private final KafkaConsumerFactory<String, GenericRecord> consumerFactory;
+    private final ConsumerFactory<String, GenericRecord> consumerFactory;
     private final LedgerProjectionRepository projectionRepository;
 
     public void rebuildLedgerProjection(String topic,
                                         Instant fromTimestamp,
                                         Instant toTimestamp) {
-        Map<String, Object> consumerProps = new HashMap<>(
-            consumerFactory.getConfigurationProperties()
-        );
-        consumerProps.put(ConsumerConfig.GROUP_ID_CONFIG,
-            "ledger-rebuild-" + System.currentTimeMillis());
-        consumerProps.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        Properties overrides = new Properties();
+        overrides.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
 
-        try (Consumer<String, GenericRecord> consumer =
-                 consumerFactory.createConsumer(null, null, null, consumerProps)) {
+        try (Consumer<String, GenericRecord> consumer = consumerFactory.createConsumer(
+                 "ledger-rebuild-" + System.currentTimeMillis(), null, null, overrides)) {
 
-            // Seek to the timestamp-based offset
-            List<PartitionInfo> partitions = consumer.partitionsFor(topic);
+            List<TopicPartition> partitions = consumer.partitionsFor(topic).stream()
+                .map(p -> new TopicPartition(topic, p.partition()))
+                .toList();
+
+            // assign() first — seek() only works on assigned partitions
+            consumer.assign(partitions);
+
             Map<TopicPartition, Long> timestampMap = partitions.stream()
-                .collect(Collectors.toMap(
-                    p -> new TopicPartition(topic, p.partition()),
-                    p -> fromTimestamp.toEpochMilli()
-                ));
-
+                .collect(Collectors.toMap(tp -> tp, tp -> fromTimestamp.toEpochMilli()));
             Map<TopicPartition, OffsetAndTimestamp> offsets =
                 consumer.offsetsForTimes(timestampMap);
 
             offsets.forEach((tp, offsetAndTimestamp) -> {
                 if (offsetAndTimestamp != null) {
                     consumer.seek(tp, offsetAndTimestamp.offset());
+                } else {
+                    // No message at or after fromTimestamp in this partition
+                    consumer.seekToEnd(List.of(tp));
                 }
             });
 
-            // Process events within the time window
-            consumer.assign(offsets.keySet());
-            boolean running = true;
-            while (running) {
+            // Process events within the time window, partition by partition
+            Set<TopicPartition> finished = new HashSet<>();
+            while (finished.size() < partitions.size()) {
                 ConsumerRecords<String, GenericRecord> records =
                     consumer.poll(Duration.ofSeconds(5));
-                if (records.isEmpty()) break;
+                if (records.isEmpty()) break;   // caught up with the end of the log
 
                 for (ConsumerRecord<String, GenericRecord> record : records) {
+                    TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+                    if (finished.contains(tp)) continue;
                     if (Instant.ofEpochMilli(record.timestamp()).isAfter(toTimestamp)) {
-                        running = false;
-                        break;
+                        finished.add(tp);
+                        consumer.pause(List.of(tp));
+                        continue;
                     }
-                    projectionRepository.applyEvent(record.value());
+                    projectionRepository.applyEvent(record.value());   // must be idempotent
                 }
             }
         }
@@ -464,7 +485,7 @@ public class ProjectionRebuildService {
 ```
 
 > [!NOTE]
-> Kafka's default log retention is 7 days. For event replay to be viable beyond a week, configure topic-level retention to match your business needs: `retention.ms=2592000000` (30 days) for payment events is a reasonable baseline for most regulatory environments. For true event sourcing with indefinite replay, use a dedicated event store (EventStoreDB, AWS Kinesis Data Streams with extended retention) rather than relying on Kafka retention configuration.
+> Kafka's default log retention is 7 days. For event replay to be viable beyond a week, configure topic-level retention to match your business needs, for example `retention.ms=2592000000` (30 days) for payment events. Kafka can also keep data indefinitely (`retention.ms=-1`, ideally with tiered storage), but for event sourcing — loading one aggregate's full history quickly and appending with optimistic concurrency — a dedicated event store (a PostgreSQL table like the one below, or EventStoreDB) fits better than a Kafka topic.
 
 ## Event Store Basics
 
@@ -553,7 +574,7 @@ public class PostgresEventStore {
 |---|---|---|
 | **Event storms** | A single event triggers a cascade of events that triggers more events, overwhelming the system | Model events at the business fact level, not the technical operation level; set consumer lag alerts |
 | **Implicit ordering** | Consumers assume a specific order of events that is not guaranteed | Use Kafka partitioning for ordering within a partition key; never assume cross-partition order |
-| **Missing idempotency** | A consumer processes the same event twice on redelivery, causing duplicate effects | Every consumer must check `eventId` before processing; use idempotency tables or Kafka's exactly-once semantics |
+| **Missing idempotency** | A consumer processes the same event twice on redelivery, causing duplicate effects | Every consumer must de-duplicate on `eventId` in the same transaction as its side effect (Kafka exactly-once only covers Kafka-to-Kafka processing) |
 | **Fat events** | Events carry so much payload that they become a hidden API; consumers couple to payload structure | Keep event payloads minimal; consumers should fetch additional data via API if needed |
 | **Event sprawl** | Hundreds of event types with no clear taxonomy or ownership | Maintain an event catalog; each event type has a designated owning team and AsyncAPI documentation |
 
@@ -570,7 +591,9 @@ public void onPaymentCompleted(ConsumerRecord<String, PaymentCompletedEvent> rec
         return;
     }
 
-    // Process the event
+    // Process the event. An HTTP webhook cannot be rolled back: if the commit below
+    // fails, the event is redelivered and the webhook is sent again — so the webhook
+    // carries eventId as its Webhook-Id and the merchant de-duplicates on it.
     notificationService.sendMerchantWebhook(record.value());
 
     // Record as processed within the same transaction
@@ -596,11 +619,11 @@ public void onPaymentCompleted(ConsumerRecord<String, PaymentCompletedEvent> rec
 
 **Q:** The Ledger Service consumes `PaymentCompletedEvent` from Kafka. During a Kafka broker maintenance window, the consumer falls 90 minutes behind. When the consumer catches up, it processes 47,000 events in rapid succession. Three of these events have `eventId` values that the Ledger Service has already processed (they were originally processed via a different mechanism during the outage). What must the Ledger Service's consumer implementation do to handle this correctly, and what database schema supports that behaviour?
 
-**A:** The consumer must implement idempotency checking using the `eventId` field before processing each event. The correct implementation queries an `processed_events` table (or equivalent) for the `eventId` before creating the ledger entry. If the `eventId` is found, the consumer skips the event and commits the Kafka offset — it does not reprocess or raise an error. The database schema requires a `processed_events` table with at minimum a unique index on `event_id` and a `processed_at` timestamp for auditing: `CREATE TABLE processed_events (event_id VARCHAR(50) PRIMARY KEY, processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), consumer_group VARCHAR(100) NOT NULL)`. The insert of the `ProcessedEvent` record and the creation of the ledger entry must happen in a single database transaction; if the transaction rolls back, neither the event nor the ledger entry is recorded, and the event will be reprocessed on the next attempt. This combination of idempotency checking and transactional write ensures exactly-once ledger semantics even with Kafka's at-least-once delivery guarantee.
+**A:** The consumer must implement idempotency checking using the `eventId` field before processing each event. The correct implementation queries an `processed_events` table (or equivalent) for the `eventId` before creating the ledger entry. If the `eventId` is found, the consumer skips the event and commits the Kafka offset — it does not reprocess or raise an error. The database schema requires a `processed_events` table with at minimum a unique index on `event_id` and a `processed_at` timestamp for auditing: `CREATE TABLE processed_events (event_id VARCHAR(50) PRIMARY KEY, processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), consumer_group VARCHAR(100) NOT NULL)`. The insert of the `ProcessedEvent` record and the creation of the ledger entry must happen in a single database transaction; if the transaction rolls back, neither the event nor the ledger entry is recorded, and the event will be reprocessed on the next attempt. This combination of idempotency checking and transactional write gives an exactly-once *effect* on the ledger even with Kafka's at-least-once delivery.
 
 **Q:** A team publishes `PaymentCompletedEvent` v1 to Kafka and three downstream services consume it. Product asks for a new field `merchantReference` (the merchant's own reference for the payment) to be added to the event. Walk through the backward-compatible migration path, explaining what changes are needed in the producer and each consumer, and in what order deployments must happen.
 
-**A:** Since `merchantReference` is a new optional field (some payments may not have a merchant reference), this is a backward-compatible additive change, but it requires a careful deployment sequence to avoid consumer breakage. Step 1: Update the Avro schema to add `merchantReference` as a nullable field with a `null` default value: `{"name": "merchantReference", "type": ["null", "string"], "default": null}`. Register the new schema version in the Schema Registry with `BACKWARD` compatibility mode — this ensures existing v1 consumers can still read v2 events because the new field has a default. Step 2: Deploy the three downstream consumers first. Each consumer should handle the case where `merchantReference` is null (which it always will be initially). Deploy consumers before the producer so that when the producer starts sending the new field, all consumers are already capable of reading it. Step 3: Deploy the updated producer that populates `merchantReference` where available and sets it to `null` where not. The deployment order — consumers first, producer second — is the key: if the producer were deployed first, consumers reading v2 events with an unrecognised field would fail depending on their Avro reader configuration. With `BACKWARD` compatibility and consumers deployed first, the migration is zero-downtime. Step 4: After confirming all consumers are processing v2 events correctly, update each consumer to actively use the `merchantReference` field as appropriate for their business logic.
+**A:** Since `merchantReference` is a new optional field (some payments may not have a merchant reference), this is a backward-compatible additive change, but it requires a careful deployment sequence to avoid consumer breakage. Step 1: Update the Avro schema to add `merchantReference` as a nullable field with a `null` default value: `{"name": "merchantReference", "type": ["null", "string"], "default": null}`. Register the new schema version in the Schema Registry under `BACKWARD` (or `FULL`) compatibility. Adding an optional field with a default is compatible in both directions: a v2 reader can read old v1 data (the default fills the missing field), and a v1 reader simply ignores the extra field. Step 2: Deploy the three downstream consumers first. Each consumer should handle the case where `merchantReference` is null (which it always will be initially). Deploy consumers before the producer so that when the producer starts sending the new field, all consumers are already capable of reading it. Step 3: Deploy the updated producer that populates `merchantReference` where available and sets it to `null` where not. The deployment order — consumers first, producer second — is the key: `BACKWARD` compatibility only promises that new readers can read old data, so upgrading readers first is the safe default — with some reader setups (for example hand-written JSON parsing that rejects unknown fields), a producer deployed first would break consumers. With `BACKWARD` compatibility and consumers deployed first, the migration is zero-downtime. Step 4: After confirming all consumers are processing v2 events correctly, update each consumer to actively use the `merchantReference` field as appropriate for their business logic.
 
 ## Practical Challenge
 
@@ -624,7 +647,7 @@ public void onPaymentCompleted(ConsumerRecord<String, PaymentCompletedEvent> rec
         "Roll back to the earliest offset and reprocess all events from the start of the outage window."
       ],
       "correct": 1,
-      "explanation": "The consumer must implement idempotency checking using the eventId field. If the eventId is found in the processed_events table, the consumer skips the event and commits the Kafka offset — it does not reprocess or raise an error. This combination of idempotency checking and transactional write ensures exactly-once ledger semantics even with Kafka's at-least-once delivery guarantee."
+      "explanation": "The consumer must implement idempotency checking using the eventId field. If the eventId is found in the processed_events table, the consumer skips the event and commits the Kafka offset — it does not reprocess or raise an error. This combination of idempotency checking and transactional write gives an exactly-once effect on the ledger even with Kafka's at-least-once delivery."
     },
     {
       "text": "Which of the following correctly distinguishes a Domain Event from an Integration Event?",

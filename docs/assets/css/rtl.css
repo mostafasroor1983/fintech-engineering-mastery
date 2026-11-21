@@ -1,0 +1,192 @@
+/* ============================================================
+   ENGINEERING MASTERY — Arabic / right-to-left adjustments
+   Most layout already uses logical properties (margin-inline-*,
+   inset-inline-*), so this file only covers what cannot flip by itself.
+   ============================================================ */
+
+/* Arabic typography: a font with proper Arabic shaping, slightly taller
+   line height, and no letter-spacing (it breaks joined Arabic letters). */
+html[lang="ar"] body {
+  font-family: var(--font-arabic);
+  line-height: 1.8;
+}
+html[lang="ar"] button,
+html[lang="ar"] input,
+html[lang="ar"] select,
+html[lang="ar"] textarea {
+  font-family: var(--font-arabic);
+}
+html[lang="ar"] .page-title,
+html[lang="ar"] .dashboard-title,
+html[lang="ar"] .sidebar-label,
+html[lang="ar"] .scenario-num,
+html[lang="ar"] .stage-label,
+html[lang="ar"] .track-num,
+html[lang="ar"] .curriculum-row-num,
+html[lang="ar"] .priority-label,
+html[lang="ar"] .clab-filter-tab,
+html[lang="ar"] [class*="-label"] {
+  letter-spacing: 0;
+}
+
+/* Code, identifiers, commands and numbers stay left-to-right inside Arabic text */
+[dir="rtl"] pre,
+[dir="rtl"] code,
+[dir="rtl"] kbd,
+[dir="rtl"] samp,
+[dir="rtl"] .constraint-chip,
+[dir="rtl"] .mermaid-block,
+[dir="rtl"] .katex-display {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+[dir="rtl"] pre,
+[dir="rtl"] pre code {
+  text-align: left;
+}
+[dir="rtl"] :not(pre) > code {
+  unicode-bidi: isolate;
+}
+[dir="rtl"] .tag-chip,
+[dir="rtl"] .stack-pill {
+  unicode-bidi: isolate;
+}
+
+/* Directional icons (chevrons, arrows) point the other way */
+[dir="rtl"] .rtl-flip,
+[dir="rtl"] .rtl-flip svg,
+[dir="rtl"] .sidebar-collapse-btn svg {
+  transform: scaleX(-1);
+}
+[dir="rtl"] .sidebar-toggle-btn svg { transform: scaleX(-1); }
+[dir="rtl"] body.sidebar-collapsed .sidebar-toggle-btn svg,
+html[dir="rtl"] body.sidebar-collapsed .sidebar-toggle-btn svg { transform: none; }
+
+/* Mobile drawer slides in from the right */
+@media (max-width: 768px) {
+  [dir="rtl"] #sidebar { transform: translateX(100%); }
+  [dir="rtl"] #sidebar.open { transform: translateX(0); }
+}
+
+/* Language switcher */
+.lang-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: var(--bg-base);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--ease), color var(--ease), border-color var(--ease);
+  margin-inline-start: var(--sp-1);
+}
+.lang-switch:hover {
+  color: var(--text-primary);
+  border-color: var(--accent-border);
+  background: var(--bg-elevated);
+}
+.lang-switch svg { width: 15px; height: 15px; }
+.lang-switch .lang-switch-label { font-family: var(--font-arabic); line-height: 1; }
+
+/* Notice shown when a page has no Arabic version yet */
+.i18n-fallback-note {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: flex-start;
+  padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-5);
+  border: 1px solid var(--yellow);
+  background: var(--yellow-muted);
+  color: var(--text-primary);
+  border-radius: var(--r-lg);
+  font-size: var(--text-sm);
+}
+.i18n-fallback-note + * { margin-top: 0; }
+/* English content shown inside the Arabic UI keeps left-to-right reading order */
+.i18n-ltr { direction: ltr; text-align: left; }
+
+/* Small uppercase/mono labels: monospace fonts have no Arabic glyphs, so use the Arabic face */
+html[lang="ar"] [class*="-label"],
+html[lang="ar"] .scenario-num,
+html[lang="ar"] .track-num,
+html[lang="ar"] .curriculum-row-num,
+html[lang="ar"] .stage-progress-score,
+html[lang="ar"] .debrief-stage-num,
+html[lang="ar"] .debrief-stage-score,
+html[lang="ar"] .stage-score-of,
+html[lang="ar"] .final-score-tier {
+  font-family: var(--font-arabic);
+}
+
+
+/* Labels styled with the monospace font: switch to the Arabic face and drop letter-spacing
+   (monospace fonts have no Arabic glyphs, and spacing breaks joined letters). Numbers still render fine. */
+html[lang="ar"] .clab-lg-label,
+html[lang="ar"] .clab-seq-step-num,
+html[lang="ar"] .curriculum-row-lessons,
+html[lang="ar"] .curriculum-row-num,
+html[lang="ar"] .debrief-answer-label,
+html[lang="ar"] .debrief-kicker,
+html[lang="ar"] .debrief-related-num,
+html[lang="ar"] .debrief-stage-num,
+html[lang="ar"] .debrief-stage-score,
+html[lang="ar"] .final-score-value,
+html[lang="ar"] .kc-option-letter,
+html[lang="ar"] .kc-question-num,
+html[lang="ar"] .lesson-track-label,
+html[lang="ar"] .option-label,
+html[lang="ar"] .progress-overview-pct,
+html[lang="ar"] .progress-overview-value,
+html[lang="ar"] .scenario-context-label,
+html[lang="ar"] .scenario-num,
+html[lang="ar"] .scenario-score-value,
+html[lang="ar"] .sidebar-track-num,
+html[lang="ar"] .stage-label,
+html[lang="ar"] .stage-progress-score,
+html[lang="ar"] .stage-rationale-label,
+html[lang="ar"] .stage-score-points,
+html[lang="ar"] .stage-step-bubble,
+html[lang="ar"] .stat-value,
+html[lang="ar"] .tech-item-name,
+html[lang="ar"] .track-lessons,
+html[lang="ar"] .track-num {
+  font-family: var(--font-arabic);
+  letter-spacing: 0;
+}
+
+/* Inline letter-spacing (used on a few small labels) breaks joined Arabic letters */
+html[lang="ar"] [style*="letter-spacing"] { letter-spacing: 0 !important; }
+
+/* Arabic script has no true italics — browsers fake-slant it, which hurts readability.
+   Keep italics only inside LTR islands (English fallback content, code comments). */
+html[lang="ar"] em,
+html[lang="ar"] i,
+html[lang="ar"] blockquote,
+html[lang="ar"] .clab-muted,
+html[lang="ar"] .clab-when-to-use,
+html[lang="ar"] .clab-sim-annotation,
+html[lang="ar"] .clab-perf-notes,
+html[lang="ar"] .lesson-body blockquote {
+  font-style: normal;
+}
+html[lang="ar"] [dir="ltr"] em,
+html[lang="ar"] [dir="ltr"] i,
+html[lang="ar"] [dir="ltr"] blockquote,
+html[lang="ar"] pre i,
+html[lang="ar"] pre em {
+  font-style: italic;
+}
+html[lang="ar"] em { font-weight: 600; }
+
+/* Mermaid measures label widths with its configured Latin font; inheriting the Arabic
+   page font makes the rendered text wider than measured, so cluster titles get clipped. */
+html[lang="ar"] .mermaid-block,
+html[lang="ar"] .mermaid-block * {
+  font-family: Inter, system-ui, sans-serif;
+  letter-spacing: normal;
+}

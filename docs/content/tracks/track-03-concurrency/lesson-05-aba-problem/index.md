@@ -89,6 +89,9 @@ Thread 1's CAS succeeds because the top is `A` — just as expected. But the sta
 
 CAS compares by **value** (or reference equality). It has no concept of **how many times** a value changed. If a memory location goes A → B → A, `compareAndSet(A, C)` succeeds — CAS sees `A` and updates to `C`, unaware that two intervening changes occurred.
 
+> [!NOTE]
+> In Java, garbage collection removes the classic C/C++ form of ABA: a node cannot be freed and its memory reused while another thread still holds a reference to it, and a freshly allocated node is never `==` to an old one. ABA in Java therefore needs the **same object** to come back — a pooled or recycled object, or a node that is pushed again, as in the timeline above.
+
 ## ABA in Financial Systems
 
 The ABA problem is not a theoretical edge case. Financial systems are vulnerable whenever a lock-free algorithm relies on CAS to protect state that can be recycled or reused.
@@ -115,7 +118,7 @@ This produces a **double-allocation**: two payments share the same account objec
 
 ### Duplicate Payment Prevention
 
-A payment idempotency store uses a lock-free map. If a payment ID is processed, removed, and then a new payment with the same ID arrives — without ABA protection, a stale CAS could re-process the original payment.
+An idempotency entry that is removed and later re-created for the same key looks identical to a thread that read it before: a CAS on the entry cannot tell that it was removed and re-created in between. The practical rules: never delete an idempotency entry while retries are still possible (expire it well after the longest retry window), and add a version if entries are ever recycled.
 
 ## AtomicStampedReference
 
@@ -170,7 +173,12 @@ public class StampedBalance {
 
             // CAS on both value AND stamp — ABA is now detectable
             // If balance went 1000 → 800 → 1000 between our read and CAS,
-            // the stamp will have incremented twice — CAS will fail correctly
+            // the stamp will have incremented twice — CAS fails and we retry.
+            // (For a plain number this ABA is harmless — 1000 is 1000 — so this
+            // is a teaching example; stamps matter when an object's identity
+            // stands for more than its value, as in pools and linked nodes.)
+            // Note: compareAndSet compares REFERENCES (==). We pass back the very
+            // Long object we read — re-boxing a long would create a new object.
             if (balance.compareAndSet(current, updated, stamp, stamp + 1)) {
                 return true;
             }
@@ -201,11 +209,14 @@ public class StampedBalance {
 
 ```java21
 // Java 21 — AtomicStampedReference API is unchanged since Java 5
-// No new alternatives were added in Java 17 or 21
 // The pattern is identical across all Java versions
-// Note: for most high-throughput financial counters, database-level
-// optimistic locking (SELECT ... FOR UPDATE + version column) is preferred
-// over lock-free in-memory approaches — provides durability and consistency
+// Note: for financial balances, database-level locking (a version column for
+// optimistic locking, or SELECT ... FOR UPDATE) is preferred over lock-free
+// in-memory approaches — it provides durability and consistency
+//
+// TRAP: keep the Long REFERENCE you read. Unboxing to long and passing it
+// back re-boxes it into a NEW Long object (for values outside -128..127),
+// so compareAndSet's == check would fail forever — an infinite loop.
 public class StampedBalance {
 
     private final AtomicStampedReference<Long> balance;
@@ -217,7 +228,7 @@ public class StampedBalance {
     public boolean debit(long amountPence) {
         int[] stamp = new int[1];
         while (true) {
-            long current = balance.get(stamp);
+            Long current = balance.get(stamp);          // keep the reference
             if (current < amountPence) return false;
             if (balance.compareAndSet(current, current - amountPence, stamp[0], stamp[0] + 1)) {
                 return true;
@@ -228,7 +239,7 @@ public class StampedBalance {
     public void credit(long amountPence) {
         int[] stamp = new int[1];
         while (true) {
-            long current = balance.get(stamp);
+            Long current = balance.get(stamp);
             if (balance.compareAndSet(current, current + amountPence, stamp[0], stamp[0] + 1)) return;
         }
     }
@@ -283,7 +294,7 @@ Not all CAS-based code needs ABA protection. Use `AtomicStampedReference` only w
 |---|---|---|
 | Objects are pooled/reused | High — same reference reappears | Yes |
 | Lock-free linked structures (stack, queue, list) | High — node pointers can cycle | Yes |
-| Simple counter (`AtomicLong`) | None — numeric equality only | No |
+| Simple counter (`AtomicLong`) | None — only the number matters | No |
 | Immutable snapshot replacement | None — new objects, new identity | No |
 | Reference to singleton (config, latest rate) | Low — usually single writer | Usually No |
 | Multi-step financial state machine | Medium — depends on transitions | Yes |
@@ -318,7 +329,7 @@ public class AccountBalance {
 > 2. Database transactions survive JVM restarts; in-memory state does not
 > 3. `OptimisticLockException` is well-understood and easily handled in Spring applications
 >
-> Use `AtomicStampedReference` for truly in-memory lock-free data structures where database access is too slow or unnecessary.
+> Use `AtomicStampedReference` for truly in-memory lock-free data structures where database access is too slow or unnecessary. (Its `int` stamp wraps around after about 4 billion updates — rarely a practical issue, but it is why a stamp is not a perfect proof.)
 
 ---
 
@@ -345,7 +356,7 @@ public class AccountBalance {
       "Always — AtomicLong has built-in ABA protection"
     ],
     "correct": 0,
-    "explanation": "ABA occurs when a value can return to a previously seen state between a read and CAS. For a monotonically increasing counter (increment only), the value never returns to a previous value, so ABA cannot occur. AtomicLong counters that only increment are ABA-safe. ABA becomes a concern for structures where the same identity (object reference or value) can recur — particularly object pools and lock-free linked structures."
+    "explanation": "ABA occurs when a value can return to a previously seen state between a read and a CAS. A counter that only increments never returns to an earlier value, so ABA cannot occur. (Even for counters that go up and down, A→B→A is harmless: for a plain number, only the value matters.) ABA is a real concern where the same identity (object reference) can recur — object pools and lock-free linked structures."
   },
   {
     "id": "kc-aba-03",
@@ -368,8 +379,8 @@ public class AccountBalance {
       "Both provide ABA protection through different mechanisms",
       "Neither — only AtomicStampedReference provides ABA protection"
     ],
-    "correct": 2,
-    "explanation": "Both provide ABA protection. The @Version column is the database equivalent of AtomicStampedReference — it increments on every UPDATE, so a stale read plus UPDATE fails with OptimisticLockException. AtomicLong with CAS also prevents lost updates (though not full ABA for object pointers). The database @Version is preferred for durability; the in-memory cache is used for fast read access only and should be treated as eventually consistent."
+    "correct": 1,
+    "explanation": "Only the @Version column provides ABA protection: it increments on every UPDATE, so a stale read followed by an UPDATE fails with OptimisticLockException, even if the balance has returned to its old value. An AtomicLong CAS compares only the value — it prevents lost updates but cannot detect A→B→A (harmless for a number, but not ABA protection). The database is the source of truth; the in-memory cache is for fast reads only and is eventually consistent."
   }
 ] -->
 
@@ -386,7 +397,7 @@ public class AccountBalance {
     },
     {
       "id": "pc-aba-02",
-      "description": "Fix the lock-free stack from task 1 using `AtomicStampedReference<Node>` for the top. Ensure pop() increments the stamp on every successful operation. Show that the same Thread 1/Thread 2 test from task 1 now behaves correctly."
+      "description": "Fix the lock-free stack from task 1 using `AtomicStampedReference<Node>` for the top. Increment the stamp on every successful push AND pop. Show that the same Thread 1/Thread 2 test from task 1 now behaves correctly."
     },
     {
       "id": "pc-aba-03",

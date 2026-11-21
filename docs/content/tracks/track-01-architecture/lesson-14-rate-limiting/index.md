@@ -3,7 +3,7 @@ id: track-01-lesson-14
 title: "Rate Limiting, Throttling, and Back Pressure"
 slug: rate-limiting
 track: track-01
-trackName: "Financial Services Architecture"
+trackName: "Advanced Software Architecture"
 sequence: 14
 difficulty: advanced
 estimatedMinutes: 75
@@ -267,8 +267,10 @@ public class SlidingWindowCounterRateLimiter {
         long currentWindowStart = nowMs - (nowMs % windowMs);
         long previousWindowStart = currentWindowStart - windowMs;
 
-        String currentKey  = "rl:counter:" + apiKey + ":" + currentWindowStart;
-        String previousKey = "rl:counter:" + apiKey + ":" + previousWindowStart;
+        // {apiKey} is a hash tag: both keys land in the same Redis Cluster slot,
+        // which a multi-key Lua script requires
+        String currentKey  = "rl:counter:{" + apiKey + "}:" + currentWindowStart;
+        String previousKey = "rl:counter:{" + apiKey + "}:" + previousWindowStart;
 
         List<Long> result = redisTemplate.execute(
             counterScript,
@@ -335,9 +337,10 @@ public class RateLimitFilter extends OncePerRequestFilter {
                                .orElse(RateLimitPolicy.STANDARD)
             : new RateLimitPolicy(10, 2.0, "ANONYMOUS");
 
+        // Never use a raw secret as a Redis key: hash it
         String limitKey = (apiKey != null)
-            ? apiKey
-            : "anon:" + getClientIp(request);
+            ? "key:" + sha256Hex(apiKey)
+            : "anon:" + request.getRemoteAddr();
 
         RateLimitResult result = rateLimiter.checkLimit(limitKey, policy);
 
@@ -345,15 +348,14 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
         if (!result.allowed()) {
             response.setStatus(429);
-            response.setContentType("application/json");
+            response.setContentType("application/problem+json");   // RFC 9457
             response.setHeader(HDR_RETRY_AFTER,
                                String.valueOf(result.retryAfterSeconds()));
             response.getWriter().write("""
-                {"errorCode":"RATE_LIMIT_EXCEEDED",
-                 "message":"Too many requests. Retry after %d seconds.",
-                 "retryAfterSeconds":%d}
-                """.formatted(result.retryAfterSeconds(),
-                              result.retryAfterSeconds()));
+                {"type":"https://api.bank.com/problems/rate-limit-exceeded",
+                 "title":"Too Many Requests","status":429,
+                 "detail":"Too many requests. Retry after %d seconds."}
+                """.formatted(result.retryAfterSeconds()));
             return;
         }
 
@@ -373,19 +375,15 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
     private String extractApiKey(HttpServletRequest request) {
-        String auth = request.getHeader("Authorization");
-        if (auth != null && auth.startsWith("Bearer ")) {
-            return auth.substring(7);
-        }
+        // OAuth2 clients: rate-limit on the verified client id AFTER authentication
+        // (e.g. in a filter placed after Spring Security), never on the raw token —
+        // tokens rotate, so each new token would get a fresh bucket.
         return request.getHeader("X-API-Key");
     }
 
-    private String getClientIp(HttpServletRequest request) {
-        String xff = request.getHeader("X-Forwarded-For");
-        return (xff != null && !xff.isBlank())
-            ? xff.split(",")[0].trim()
-            : request.getRemoteAddr();
-    }
+    // getRemoteAddr(): with server.forward-headers-strategy=native, Spring derives it
+    // from X-Forwarded-For set by YOUR load balancer. Never read the first
+    // X-Forwarded-For value yourself — clients can put anything there.
 }
 ```
 
@@ -476,32 +474,17 @@ When a downstream service is slow, rate limiting at the entry point is insuffici
 public class ReactivePaymentProcessor {
 
     private final CardNetworkClient cardNetworkClient;
+    private final RateLimiter       cardNetworkLimiter;   // Resilience4j: 100 calls/s
     private final MeterRegistry     meterRegistry;
 
     /**
-     * Process payment stream with back pressure and rate limiting.
-     * Card network can handle 100 rps; we enforce this via concatMap+delay.
+     * Process a payment stream with back pressure and a rate limit.
+     * flatMap(..., 20) keeps at most 20 authorisations in flight and only requests
+     * more from upstream when one completes — that is the back pressure.
      */
     public Flux<PaymentResult> processPayments(Flux<PaymentRequest> payments) {
         return payments
-            // Serialise + rate-limit: one every 10 ms = 100/s
-            .concatMap(payment ->
-                Mono.delay(Duration.ofMillis(10))
-                    .then(processOne(payment))
-            )
-            // Bounded retry for transient card network failures
-            .retryWhen(
-                Retry.backoff(3, Duration.ofMillis(100))
-                     .maxBackoff(Duration.ofSeconds(2))
-                     .filter(ex -> ex instanceof TransientNetworkException)
-            )
-            .timeout(Duration.ofSeconds(30))
-            // Bounded elastic pool — rejects new work instead of unbounded growth
-            .subscribeOn(Schedulers.newBoundedElastic(
-                50,    // max threads
-                1000,  // max queued tasks
-                "payment-processor"
-            ))
+            .flatMap(this::processOne, 20)
             .doOnNext(r -> meterRegistry
                 .counter("payments.processed", "status", r.status().name())
                 .increment()
@@ -513,7 +496,14 @@ public class ReactivePaymentProcessor {
     }
 
     private Mono<PaymentResult> processOne(PaymentRequest payment) {
-        return cardNetworkClient.authorise(payment)
+        return cardNetworkClient.authorise(payment)   // carries payment.id() as idempotency key
+            .transformDeferred(RateLimiterOperator.of(cardNetworkLimiter))
+            .timeout(Duration.ofSeconds(5))
+            // Retry ONLY this payment and only transient failures. A retry on the whole
+            // Flux would re-subscribe the stream and resubmit every payment.
+            .retryWhen(Retry.backoff(3, Duration.ofMillis(100))
+                .maxBackoff(Duration.ofSeconds(2))
+                .filter(ex -> ex instanceof TransientNetworkException))
             .map(auth -> PaymentResult.from(payment, auth));
     }
 }
@@ -549,6 +539,8 @@ public class CardNetworkGateway {
             .bodyToMono(AuthorisationResponse.class);
     }
 
+    // Queuing suits asynchronous flows (payouts, batch collections). A card
+    // authorisation with a customer at the till cannot be queued — decline it instead.
     private Mono<AuthorisationResponse> queueForRetry(
             AuthorisationRequest request,
             RequestNotPermitted ex) {
@@ -623,6 +615,8 @@ public class PaymentVelocityService {
     /**
      * Multi-window velocity check on payment submission.
      * Checks multiple time horizons to detect both burst and sustained fraud.
+     * Uses the sliding-window-log limiter from Algorithm 2, generalised to take a
+     * window; checkUniqueCount applies the same idea to a sorted set of merchant ids.
      */
     public VelocityCheckResult checkVelocity(String customerId,
                                                PaymentRequest payment) {
@@ -709,7 +703,7 @@ CREATE INDEX idx_violations_client_time
 
 ## Kong API Gateway Rate Limiting
 
-For production deployments, enforce a first line of rate limiting at the gateway before requests reach application services:
+For production deployments, enforce a first line of rate limiting at the gateway before requests reach application services. (`rate-limiting-advanced` is a Kong Enterprise plugin; the open-source `rate-limiting` plugin offers fixed windows with a simpler configuration.)
 
 ```yaml
 # Kong declarative config (deck format)
@@ -762,7 +756,7 @@ Internal service-to-service calls (e.g., payment-service calling account-service
 Clients that do not receive `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` are forced to implement blind exponential backoff. All three headers on every response (not just 429s) enable proactive client-side throttling.
 
 **Warn Before the Hard Limit**
-Add a `Warning: 299 - "Rate limit at 80% capacity"` response header when remaining tokens drop below 20% of burst capacity. Good client libraries can throttle themselves before hitting the wall.
+Expose the remaining quota on every response so good client libraries can slow down before they hit the wall. Consider the IETF `RateLimit` and `RateLimit-Policy` header fields (still a draft) for a standard format; do not use the old `Warning` header, which RFC 9111 deprecated.
 
 **Use Separate Redis Keyspace Prefixes per Environment**
 Prefix all keys with `prod:`, `staging:`, or `dev:` to prevent load tests in a shared Redis cluster from consuming production quota.
@@ -807,7 +801,7 @@ Every 429 response from a payment API endpoint should be logged to the `rate_lim
         "Queue all incoming requests and replay them in order when Redis recovers, maintaining FIFO ordering."
       ],
       "correct": 1,
-      "explanation": "Payment APIs should fail open when the rate limiter is unavailable. Failing closed (blocking all payments) due to a Redis outage means 100% of payment traffic is rejected — a revenue-destroying, customer-harming failure caused by an infrastructure dependency, not fraud. The per-instance fallback limiter provides a degraded but functional rate limit. Failing open is the correct trade-off when the alternative is complete payment downtime."
+      "explanation": "Payment APIs should fail open when the rate limiter is unavailable. Failing closed (blocking all payments) due to a Redis outage means 100% of payment traffic is rejected — a revenue-destroying, customer-harming failure caused by an infrastructure dependency, not fraud. The per-instance fallback limiter provides a degraded but functional rate limit. Failing open is the correct trade-off for throughput and fairness limits; velocity limits that act as fraud controls should instead fall back to a conservative rule (for example, lower amounts allowed while Redis is down)."
     }
   ]
 }

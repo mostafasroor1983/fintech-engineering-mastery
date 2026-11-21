@@ -50,6 +50,8 @@ references:
   - "Sam Newman — Building Microservices (2nd ed., 2021)"
 ---
 
+## Overview
+
 A payment service calls three downstream dependencies: a fraud-scoring API, an account-lookup service, and a notification gateway. The fraud API degrades under load, responding in 8 seconds instead of 200ms. Within two minutes every thread in the shared pool is blocked waiting for fraud responses. Account lookups — which were healthy — now queue indefinitely. Notifications never fire. The entire payment flow collapses because of a single slow dependency.
 
 The **bulkhead pattern** prevents this. Named after the watertight compartments in a ship's hull — where flooding one compartment does not sink the vessel — a bulkhead in software isolates resource pools per dependency. If the fraud API consumes all threads allocated to it, it cannot touch the threads reserved for account lookups or notifications. The rest of the system keeps working.
@@ -93,7 +95,7 @@ A semaphore bulkhead uses a counting semaphore to limit the number of concurrent
                     (blocks or rejects when 5 slots taken)
 ```
 
-Use this when the downstream call is inherently async or uses non-blocking I/O (WebClient, R2DBC). You want low overhead without spawning additional threads.
+Use this when the downstream call is inherently async or uses non-blocking I/O (WebClient, R2DBC) — or when callers run on virtual threads (Java 21+), where blocking a caller thread is cheap and limiting *concurrency* is what matters. You want low overhead without spawning additional threads.
 
 ### Thread Pool Bulkhead
 
@@ -216,7 +218,7 @@ resilience4j:
         max-concurrent-calls: 20
         max-wait-duration: 0ms          # Fail fast — never queue on semaphore
 
-  circuit-breaker:
+  circuitbreaker:                       # NOT "circuit-breaker": that key does not bind
     instances:
       fraud-check:
         register-health-indicator: true
@@ -226,14 +228,22 @@ resilience4j:
         permitted-number-of-calls-in-half-open-state: 3
         slow-call-duration-threshold: 1s
         slow-call-rate-threshold: 70
+        # Our own pool being full is not a fraud-service failure (see "Order Matters")
+        ignore-exceptions:
+          - io.github.resilience4j.bulkhead.BulkheadFullException
       account-lookup:
         register-health-indicator: true
         sliding-window-size: 10
         failure-rate-threshold: 50
         wait-duration-in-open-state: 10s
+        ignore-exceptions:
+          - io.github.resilience4j.bulkhead.BulkheadFullException
 ```
 
 ## Full Payment Service Implementation
+
+> [!IMPORTANT]
+> With `Bulkhead.Type.THREADPOOL`, Resilience4j already runs the **method body** on a bulkhead thread and hands the caller a `CompletableFuture`. So the body must make the call directly and return `CompletableFuture.completedFuture(...)`. Wrapping the call in `CompletableFuture.supplyAsync(...)` would move it to the common ForkJoin pool — and the bulkhead would isolate nothing. The time limit comes from the HTTP client's connect and read timeouts, which are the only thing that actually frees a blocked thread.
 
 ### Domain Model
 
@@ -274,7 +284,6 @@ import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 @Component
 public class FraudCheckClient {
@@ -286,9 +295,10 @@ public class FraudCheckClient {
     }
 
     /**
-     * Thread pool bulkhead isolates fraud-check threads.
-     * Circuit breaker is the inner decorator (closer to the HTTP call).
-     * Returns CompletableFuture because ThreadPoolBulkhead is async.
+     * Thread pool bulkhead isolates fraud-check threads: this method body
+     * runs on a fraud-check pool thread. Returns CompletableFuture because
+     * ThreadPoolBulkhead is async. The RestTemplate's 500ms read timeout
+     * bounds how long the pool thread can be held.
      */
     @Bulkhead(name = "fraud-check", type = Bulkhead.Type.THREADPOOL,
               fallbackMethod = "fraudCheckBulkheadFallback")
@@ -296,16 +306,17 @@ public class FraudCheckClient {
     public CompletableFuture<FraudAssessment> assessFraud(
             String paymentId, String merchantId, BigDecimal amount) {
 
-        return CompletableFuture.supplyAsync(() -> {
-            String url = "http://fraud-service/api/v1/assess";
-            FraudRequest request = new FraudRequest(paymentId, merchantId, amount);
-            return restTemplate.postForObject(url, request, FraudAssessment.class);
-        }).orTimeout(500, TimeUnit.MILLISECONDS);
+        String url = "http://fraud-service/api/v1/assess";
+        FraudRequest request = new FraudRequest(paymentId, merchantId, amount);
+        return CompletableFuture.completedFuture(
+            restTemplate.postForObject(url, request, FraudAssessment.class));
     }
 
     /**
      * Fallback invoked when bulkhead is full (BulkheadFullException).
-     * Degrade gracefully: allow low-risk transactions under $500.
+     * Degrade gracefully: allow low-risk transactions under 500.
+     * This is a documented RISK decision (agreed with the fraud team),
+     * and every degraded approval is flagged for later review.
      */
     public CompletableFuture<FraudAssessment> fraudCheckBulkheadFallback(
             String paymentId,
@@ -351,7 +362,6 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
 
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 @Component
 public class AccountLookupClient {
@@ -366,10 +376,10 @@ public class AccountLookupClient {
               fallbackMethod = "accountLookupFallback")
     @CircuitBreaker(name = "account-lookup", fallbackMethod = "accountCircuitFallback")
     public CompletableFuture<AccountDetails> lookupAccount(String accountId) {
-        return CompletableFuture.supplyAsync(() -> {
-            String url = "http://account-service/api/v1/accounts/" + accountId;
-            return restTemplate.getForObject(url, AccountDetails.class);
-        }).orTimeout(300, TimeUnit.MILLISECONDS);
+        // Runs on an account-lookup pool thread; bounded by the client's timeouts
+        String url = "http://account-service/api/v1/accounts/" + accountId;
+        return CompletableFuture.completedFuture(
+            restTemplate.getForObject(url, AccountDetails.class));
     }
 
     // Account lookup is mandatory — bulkhead full means payment must pend
@@ -420,18 +430,19 @@ public class NotificationClient {
     }
 
     /**
-     * Notifications are non-critical: bulkhead full means silent discard.
+     * Notifications are non-critical: bulkhead full means the notification is
+     * dropped here (a real system would write it to an outbox for later delivery).
      * No circuit breaker — notification failure must NEVER affect payment outcomes.
      */
     @Bulkhead(name = "notification", type = Bulkhead.Type.THREADPOOL,
               fallbackMethod = "notificationFallback")
     public CompletableFuture<Void> sendNotification(
             String paymentId, String accountId, String status) {
-        return CompletableFuture.runAsync(() -> {
-            String url = "http://notification-service/api/v1/notify";
-            restTemplate.postForObject(url,
-                new NotificationRequest(paymentId, accountId, status), Void.class);
-        });
+        // Runs on a notification pool thread
+        String url = "http://notification-service/api/v1/notify";
+        restTemplate.postForObject(url,
+            new NotificationRequest(paymentId, accountId, status), Void.class);
+        return CompletableFuture.completedFuture(null);
     }
 
     // Best-effort: bulkhead full means silently drop the notification
@@ -460,7 +471,9 @@ import com.fintech.payment.domain.PaymentStatus;
 import org.springframework.stereotype.Service;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @Service
 public class PaymentOrchestrator {
@@ -510,22 +523,31 @@ public class PaymentOrchestrator {
                 .sendNotification(request.paymentId(), request.accountId(), "APPROVED")
                 .exceptionally(ex -> null); // notification failure never blocks payment
 
+            // notificationSent = false: it has only been QUEUED at this point
             return new PaymentResult(request.paymentId(), PaymentStatus.APPROVED,
-                "Payment approved", true, true, true);
+                "Payment approved", true, true, false);
 
-        } catch (AccountLookupClient.AccountLookupUnavailableException e) {
+        } catch (ExecutionException e) {
+            // get() wraps failures from the futures: inspect the CAUSE
+            if (e.getCause() instanceof AccountLookupClient.AccountLookupUnavailableException) {
+                return new PaymentResult(request.paymentId(), PaymentStatus.PENDING,
+                    "Account lookup unavailable, queued for retry", false, false, false);
+            }
             return new PaymentResult(request.paymentId(), PaymentStatus.PENDING,
-                "Account lookup unavailable, queued for retry", false, false, false);
+                "Dependency error, queued for retry", false, false, false);
 
-        } catch (java.util.concurrent.TimeoutException e) {
+        } catch (TimeoutException e) {
+            // cancel() stops us waiting; it does not interrupt the pool threads,
+            // which are bounded by the HTTP client timeouts
             fraudFuture.cancel(true);
             accountFuture.cancel(true);
             return new PaymentResult(request.paymentId(), PaymentStatus.PENDING,
                 "Processing timeout, queued for retry", false, false, false);
 
-        } catch (Exception e) {
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             return new PaymentResult(request.paymentId(), PaymentStatus.PENDING,
-                "Unexpected error: " + e.getMessage(), false, false, false);
+                "Interrupted, queued for retry", false, false, false);
         }
     }
 }
@@ -533,7 +555,14 @@ public class PaymentOrchestrator {
 
 ## Combining Bulkhead with Circuit Breaker — Order Matters
 
-**Correct order:** Bulkhead (outer) wraps Circuit Breaker (inner) wraps the actual call.
+First, a fact that surprises many teams: with Spring annotations, the order of `@Bulkhead` and `@CircuitBreaker` **in the source code does not matter**. Resilience4j applies its aspects in a fixed default order — `Retry ( CircuitBreaker ( RateLimiter ( TimeLimiter ( Bulkhead ( call ) ) ) ) )` — so by default the circuit breaker is *outside* the bulkhead.
+
+That default has one trap: a `BulkheadFullException` (our own pool is full) reaches the circuit breaker and is counted as a failure, so local saturation can open the circuit against a perfectly healthy dependency. Two fixes:
+
+- keep the default order and add `BulkheadFullException` to the circuit breaker's `ignore-exceptions` (as in the configuration above), or
+- make the bulkhead the outer layer — with programmatic decoration (below) or by changing Resilience4j's aspect-order properties.
+
+The layered picture with the bulkhead outside:
 
 ```
 Request
@@ -577,9 +606,9 @@ sequenceDiagram
     end
 ```
 
-**Why bulkhead outside circuit breaker?**
+**Why put the bulkhead outside?**
 
-If the circuit breaker is the outer decorator, a CLOSED circuit allows unlimited threads into the bulkhead. The circuit breaker sees failures and trips — but thread exhaustion can happen before enough failures accumulate. Bulkhead outermost means resource limits are enforced unconditionally.
+With the bulkhead outermost, the circuit breaker only ever sees real outcomes of calls to the dependency — never our own capacity rejections — so it opens only when the *dependency* is unhealthy. The bulkhead limits resources in both arrangements.
 
 ### Programmatic Decoration for Explicit Control
 
@@ -619,7 +648,8 @@ public class ResilienceConfig {
                 () -> callFraudService(paymentId)
             );
             // Outer: bulkhead wraps the circuit-breaker-decorated supplier
-            return bulkhead.executeSupplier(fraudCall);
+            // (executeSupplier returns a CompletionStage)
+            return bulkhead.executeSupplier(fraudCall).toCompletableFuture();
         };
     }
 
@@ -669,6 +699,11 @@ public class BulkheadEventListener {
     public void registerListeners() {
         threadPoolRegistry.getAllBulkheads().forEach(this::attachThreadPoolListeners);
         semaphoreRegistry.getAllBulkheads().forEach(this::attachSemaphoreListeners);
+        // Bulkheads created later (lazily, on first use) need listeners too
+        threadPoolRegistry.getEventPublisher()
+            .onEntryAdded(e -> attachThreadPoolListeners(e.getAddedEntry()));
+        semaphoreRegistry.getEventPublisher()
+            .onEntryAdded(e -> attachSemaphoreListeners(e.getAddedEntry()));
     }
 
     private void attachThreadPoolListeners(ThreadPoolBulkhead bulkhead) {
@@ -681,8 +716,8 @@ public class BulkheadEventListener {
             .register(meterRegistry);
 
         bulkhead.getEventPublisher()
-            // BulkheadOnCallPermitAcquiredEvent
-            .onCallPermitAcquired(event ->
+            // BulkheadOnCallPermittedEvent
+            .onCallPermitted(event ->
                 log.debug("[BULKHEAD] {} permit acquired — queue: {}",
                     name, bulkhead.getMetrics().getQueueDepth()))
             // BulkheadOnCallRejectedEvent
@@ -707,7 +742,7 @@ public class BulkheadEventListener {
             .register(meterRegistry);
 
         bulkhead.getEventPublisher()
-            .onCallPermitAcquired(event ->
+            .onCallPermitted(event ->
                 log.debug("[SEM BULKHEAD] {} permit acquired", name))
             .onCallRejected(event -> {
                 rejectedCounter.increment();
@@ -723,24 +758,29 @@ public class BulkheadEventListener {
 ## Micrometer Metrics and Alerting
 
 ```yaml
-# application.yml
+# application.yml (Spring Boot 3 property names)
 management:
   health:
     bulkheads:
       enabled: true
   endpoint:
     health:
-      show-details: always
-  metrics:
-    export:
-      prometheus:
+      show-details: when-authorized   # never "always" on a payment service
+  prometheus:
+    metrics:
+      export:
         enabled: true
 ```
 
 ```
-# Key metrics exposed automatically via /actuator/metrics:
-resilience4j.bulkhead.available.concurrent.calls{bulkhead="fraud-check"}
-resilience4j.bulkhead.max.allowed.concurrent.calls{bulkhead="fraud-check"}
+# Key metrics exposed automatically (tag: name="<bulkhead>"):
+# semaphore bulkhead
+resilience4j.bulkhead.available.concurrent.calls{name="fraud-check-reactive"}
+resilience4j.bulkhead.max.allowed.concurrent.calls{name="fraud-check-reactive"}
+# thread-pool bulkhead
+resilience4j.bulkhead.thread.pool.size{name="fraud-check"}
+resilience4j.bulkhead.queue.depth{name="fraud-check"}
+resilience4j.bulkhead.queue.capacity{name="fraud-check"}
 
 # Custom rejection counter (registered above):
 bulkhead.rejected.calls{bulkhead="fraud-check",type="thread-pool"}
@@ -764,7 +804,10 @@ groups:
             using Little's Law with current P99 latency metrics.
 
       - alert: BulkheadPoolExhausted
-        expr: resilience4j_bulkhead_available_concurrent_calls{bulkhead="fraud-check"} == 0
+        # thread-pool bulkhead: the queue is full
+        expr: >
+          resilience4j_bulkhead_queue_depth{name="fraud-check"}
+            >= resilience4j_bulkhead_queue_capacity{name="fraud-check"}
         for: 30s
         labels:
           severity: critical
@@ -802,7 +845,7 @@ Payment Request
 
 Fraud pool full  --> fraudCheckBulkheadFallback (allow <$500 through)
 Account pool full --> PENDING  (mandatory check, cannot skip)
-Notification full --> silent discard (best-effort only)
+Notification full --> dropped here; real systems use an outbox
 ```
 
 ## Production Pitfalls
@@ -819,27 +862,34 @@ Giving every bulkhead the same thread count is a common mistake. It eliminates t
 //   account-lookup: max-thread-pool-size: 50
 //   notification:   max-thread-pool-size: 50
 //
-// At 150 total threads, you are likely near OS thread limits.
-// When fraud degrades to 2000ms response time:
-//   50 threads fill in: 50 / (1/2.0) = 25 seconds
-//   But account-lookup still holds 50 idle threads, wasting memory.
-//   The JVM scheduler becomes unfair under saturation.
+// 150 threads is not an OS problem — but each pool is now so large that it
+// no longer limits the damage. When fraud degrades to 2000ms, the fraud pool
+// lets 50 calls pile up on the failing service (making its recovery harder),
+// holds 50 threads and 50 HTTP connections, and still does not protect the
+// caller: at 50 req/s x 2s, Little's Law needs 100 threads, so callers queue
+// anyway. Meanwhile the other pools hold idle threads.
 
 // CORRECT: size each pool independently with Little's Law
 //   fraud-check:    20  (lambda=50, W=300ms)
 //   account-lookup: 10  (lambda=50, W=120ms)
 //   notification:    5  (lambda=10, W=400ms)
-//   Total:          35 threads — 76% reduction with proper isolation
+//   Total:          35 threads, each pool limiting its own blast radius
 
-// Diagnostic: validate sizing on startup
+// Diagnostic: log sizing on startup
 @Component
 public class BulkheadSizingValidator {
 
     private static final Logger log =
         LoggerFactory.getLogger(BulkheadSizingValidator.class);
 
-    @PostConstruct
-    public void validate(ThreadPoolBulkheadRegistry registry) {
+    private final ThreadPoolBulkheadRegistry registry;
+
+    public BulkheadSizingValidator(ThreadPoolBulkheadRegistry registry) {
+        this.registry = registry;
+    }
+
+    @PostConstruct   // @PostConstruct methods take no parameters
+    public void validate() {
         registry.getAllBulkheads().forEach(bh -> {
             int pool  = bh.getBulkheadConfig().getCoreThreadPoolSize();
             int queue = bh.getBulkheadConfig().getQueueCapacity();
@@ -855,32 +905,24 @@ public class BulkheadSizingValidator {
 A thread pool bulkhead limits **concurrency** but not **duration**. A downstream call that hangs indefinitely holds its thread forever. The pool appears full to new callers — but it is not busy processing, just waiting for a dead connection.
 
 ```java
-// WRONG: no timeout; threads block forever on a hung dependency
+// WRONG: no HTTP timeout; pool threads block forever on a hung dependency
 @Bulkhead(name = "fraud-check", type = Bulkhead.Type.THREADPOOL)
 public CompletableFuture<FraudAssessment> assessFraud(String paymentId) {
-    return CompletableFuture.supplyAsync(() ->
-        // If fraud-service TCP connection hangs:
-        //   - thread blocks indefinitely
-        //   - all 20 pool threads fill up over 20 successive requests
-        //   - bulkhead shows "full" but dependency is dead, not busy
-        restTemplate.postForObject("http://fraud-service/assess",
-            new FraudRequest(paymentId), FraudAssessment.class)
-    );
+    // If fraud-service's TCP connection hangs:
+    //   - this pool thread blocks indefinitely
+    //   - all 20 pool threads fill up over 20 successive requests
+    //   - bulkhead shows "full" but the dependency is dead, not busy
+    return CompletableFuture.completedFuture(
+        restTemplateWithoutTimeouts.postForObject("http://fraud-service/assess",
+            new FraudRequest(paymentId), FraudAssessment.class));
 }
 
-// CORRECT: timeout at both HTTP client AND CompletableFuture level
-@Bulkhead(name = "fraud-check", type = Bulkhead.Type.THREADPOOL,
-          fallbackMethod = "fraudCheckBulkheadFallback")
-public CompletableFuture<FraudAssessment> assessFraud(String paymentId) {
-    return CompletableFuture.supplyAsync(() ->
-        restTemplate.postForObject("http://fraud-service/assess",
-            new FraudRequest(paymentId), FraudAssessment.class)
-    ).orTimeout(500, java.util.concurrent.TimeUnit.MILLISECONDS);
-    // orTimeout() cancels the future after 500ms and throws TimeoutException
-    // The circuit breaker records this as a slow/failed call
-}
+// ALSO WRONG: orTimeout() stops the CALLER waiting, but the pool thread
+// stays blocked on the socket — the bulkhead still fills up
+//   CompletableFuture.supplyAsync(...).orTimeout(500, MILLISECONDS)
 
-// Also configure RestTemplate timeouts (defense-in-depth):
+// CORRECT: connect + read timeouts on the HTTP client — the only thing
+// that actually frees a blocked thread
 @Bean
 public RestTemplate restTemplate() {
     var factory = new org.springframework.http.client.SimpleClientHttpRequestFactory();
@@ -888,6 +930,18 @@ public RestTemplate restTemplate() {
     factory.setReadTimeout(500);       // 500ms read timeout
     return new RestTemplate(factory);
 }
+
+@Bulkhead(name = "fraud-check", type = Bulkhead.Type.THREADPOOL,
+          fallbackMethod = "fraudCheckBulkheadFallback")
+public CompletableFuture<FraudAssessment> assessFraud(String paymentId) {
+    // A read timeout throws after 500ms and frees the thread;
+    // the circuit breaker records it as a failed call
+    return CompletableFuture.completedFuture(
+        restTemplate.postForObject("http://fraud-service/assess",
+            new FraudRequest(paymentId), FraudAssessment.class));
+}
+// Optional: @TimeLimiter bounds how long the caller waits for the future,
+// but it cannot release a thread that is blocked in I/O
 ```
 
 ### Pitfall 3: Bulkhead Without Circuit Breaker Allows Slow Degradation
@@ -920,7 +974,8 @@ public CompletableFuture<FraudAssessment> assessFraud(String id) { ... }
           fallbackMethod = "fraudCheckBulkheadFallback")
 @CircuitBreaker(name = "fraud-check", fallbackMethod = "fraudCheckCircuitFallback")
 public CompletableFuture<FraudAssessment> assessFraud(String id) { ... }
-// Annotation execution: bulkhead (outer) -> circuit breaker (inner) -> HTTP call
+// Default aspect order: circuit breaker (outer) -> bulkhead (inner) -> HTTP call,
+// whatever the annotation order — so ignore BulkheadFullException in the CB
 ```
 
 ## Checklist
@@ -928,8 +983,8 @@ public CompletableFuture<FraudAssessment> assessFraud(String id) { ... }
 - [ ] Sized each bulkhead independently using Little's Law (N = lambda x W x 1.3 safety buffer)
 - [ ] Used `ThreadPoolBulkhead` for all blocking I/O calls (RestTemplate, JDBC)
 - [ ] Used semaphore `Bulkhead` only for non-blocking / reactive calls
-- [ ] Applied bulkhead decorator outside (wrapping) circuit breaker decorator
-- [ ] Set timeouts at HTTP client level (connect + read) AND CompletableFuture level
+- [ ] Checked the real decorator order (default: circuit breaker outside bulkhead) and made `BulkheadFullException` ignored by the circuit breaker — or put the bulkhead outside explicitly
+- [ ] Set timeouts at HTTP client level (connect + read) — the only timeout that frees a blocked thread
 - [ ] Implemented meaningful fallback for each bulkhead (not just re-throwing)
 - [ ] Registered bulkhead event listeners with Micrometer rejection counters
 - [ ] Added Prometheus alert for rejection rate above threshold
@@ -940,9 +995,9 @@ public CompletableFuture<FraudAssessment> assessFraud(String id) { ... }
 - [ ] Set up Grafana dashboards showing queue depth and rejection rates per bulkhead
 
 <!-- KNOWLEDGE-CHECK
-{"questions":[{"text":"You have a fraud-check service with an arrival rate of 100 requests/second and a P99 response time of 200ms. Using Little's Law with a 30% safety buffer, what is the correct thread pool size?","options":["a) 10 threads","b) 20 threads","c) 26 threads","d) 40 threads"],"correct":2,"explanation":"Little's Law: N = lambda x W = 100 x 0.200 = 20 threads. With 30% safety buffer: ceil(20 x 1.3) = 26 threads. Option c is correct."},{"text":"What happens when you apply @Bulkhead (outer) and @CircuitBreaker (inner) to the same method in Resilience4j Spring AOP?","options":["a) The circuit breaker checks OPEN state first, then the bulkhead checks thread availability","b) The bulkhead checks thread pool availability first; if accepted, the circuit breaker then checks if calls are permitted","c) Both checks happen simultaneously on separate threads","d) The annotations conflict and throw a configuration exception at startup"],"correct":1,"explanation":"With bulkhead as outer decorator, it executes first. If the thread pool has capacity, the call proceeds to the circuit breaker. If the circuit is OPEN, the call is rejected fast. If CLOSED or HALF_OPEN, the actual downstream call executes. Bulkhead outside enforces resource limits unconditionally; circuit breaker inside enforces dependency health."},{"text":"A thread pool bulkhead for an account service is configured with 10 threads and 20 queue capacity. The account service starts hanging (no HTTP response). What is the failure mode without an additional safeguard?","options":["a) The circuit breaker trips immediately and all calls are rejected in under 1ms","b) Threads fill up over time; without a timeout, callers queue and wait indefinitely for threads that never release","c) The bulkhead automatically reduces its pool size to free threads","d) Spring Boot restarts the account service via health check integration"],"correct":1,"explanation":"Without a timeout, threads filling the pool never release because the downstream is hung. New callers queue in the 20-slot queue. Each eventually exhausts the queue depth and gets BulkheadFullException, but only after all 10 threads are permanently stuck. The fix is orTimeout() on the CompletableFuture plus RestTemplate read timeout, ensuring threads are released after a bounded wait."}]}
+{"questions": [{"text": "You have a fraud-check service with an arrival rate of 100 requests/second and a P99 response time of 200ms. Using Little's Law with a 30% safety buffer, what is the correct thread pool size?", "options": ["a) 10 threads", "b) 20 threads", "c) 26 threads", "d) 40 threads"], "correct": 2, "explanation": "Little's Law: N = lambda x W = 100 x 0.200 = 20 threads. With 30% safety buffer: ceil(20 x 1.3) = 26 threads. Option c is correct."}, {"text": "You annotate a method with @Bulkhead and @CircuitBreaker in Resilience4j Spring AOP, using the default aspect order. Which check happens first for an incoming call?", "options": ["a) The circuit breaker checks whether calls are permitted first; if so, the bulkhead then checks thread/permit availability", "b) The bulkhead always runs first because its annotation is written above @CircuitBreaker", "c) Both checks happen simultaneously on separate threads", "d) The annotations conflict and throw a configuration exception at startup"], "correct": 0, "explanation": "Resilience4j applies its Spring aspects in a fixed default order, independent of how the annotations are written: Retry ( CircuitBreaker ( RateLimiter ( TimeLimiter ( Bulkhead ( call ) ) ) ) ). So the circuit breaker is the outer layer and checks first; the bulkhead is inner. Because a BulkheadFullException then reaches the circuit breaker, add it to the circuit breaker's ignoreExceptions — or make the bulkhead outer with programmatic decoration or the aspect-order properties."}, {"text": "A thread pool bulkhead for an account service is configured with 10 threads and 20 queue capacity. The account service starts hanging (no HTTP response). What is the failure mode without an additional safeguard?", "options": ["a) The circuit breaker trips immediately and all calls are rejected in under 1ms", "b) Threads fill up over time; without a timeout, callers queue and wait indefinitely for threads that never release", "c) The bulkhead automatically reduces its pool size to free threads", "d) Spring Boot restarts the account service via health check integration"], "correct": 1, "explanation": "Without an HTTP client timeout, threads filling the pool never release because the downstream is hung. New callers queue in the 20-slot queue, and once all 10 threads are stuck and the queue is full, further calls get BulkheadFullException. The fix is the RestTemplate connect and read timeouts, which make the blocked call fail and free the thread after a bounded wait. orTimeout() on a CompletableFuture alone only stops the caller waiting — the pool thread stays blocked."}]}
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{"title":"Implement Bulkhead Isolation for a Multi-Dependency Payment Service","difficulty":"advanced","estimatedMinutes":70,"tasks":[{"id":"1","description":"Using Little's Law, calculate thread pool sizes for three services: (a) card-network API: 200 req/s, P99=150ms; (b) risk-scoring API: 80 req/s, P99=400ms; (c) ledger-service: 200 req/s, P99=50ms. Apply a 25% safety buffer. Write your calculations as comments in application.yml, then configure Resilience4j ThreadPoolBulkhead for each. Queue depth should be 2x the calculated thread count."},{"id":"2","description":"Implement a PaymentProcessingService that calls all three dependencies in parallel using CompletableFuture. The card-network and ledger calls are mandatory (return PENDING if unavailable). The risk-scoring call is optional (approve transactions under 1000 currency units if the risk service is unavailable). Write a fallback for each bulkhead: BulkheadFullException for card-network returns PENDING, for risk-scoring degrades gracefully by amount threshold, and for ledger returns PENDING."},{"id":"3","description":"Add circuit breakers to card-network and ledger-service (not risk-scoring). Configure: failure rate threshold 40%, slow call threshold 500ms, slow call rate 60%, open state wait 15 seconds. Verify the decorator order: bulkhead annotation wrapping circuit breaker annotation. Write an integration test using WireMock that (a) stubs the card-network to return 503 repeatedly, (b) verifies the circuit opens after the failure threshold, (c) verifies the ledger-service continues to operate normally throughout."},{"id":"4","description":"Implement a BulkheadMetricsCollector that listens to all bulkhead events and publishes metrics to Micrometer: rejection counter per bulkhead name, current queue depth gauge, and thread pool utilisation gauge (threads in use divided by max threads). Write a Prometheus alerting rule that fires when rejection rate exceeds 2 per second for any single bulkhead over a 3-minute window. Expose bulkhead health via Spring Boot Actuator and verify the health endpoint shows all three bulkheads."}]}
+{"title": "Implement Bulkhead Isolation for a Multi-Dependency Payment Service", "difficulty": "advanced", "estimatedMinutes": 70, "tasks": [{"id": "1", "description": "Using Little's Law, calculate thread pool sizes for three services: (a) card-network API: 200 req/s, P99=150ms; (b) risk-scoring API: 80 req/s, P99=400ms; (c) ledger-service: 200 req/s, P99=50ms. Apply a 25% safety buffer. Write your calculations as comments in application.yml, then configure Resilience4j ThreadPoolBulkhead for each. Queue depth should be 2x the calculated thread count."}, {"id": "2", "description": "Implement a PaymentProcessingService that calls all three dependencies in parallel using CompletableFuture. The card-network and ledger calls are mandatory (return PENDING if unavailable). The risk-scoring call is optional (approve transactions under 1000 currency units if the risk service is unavailable). Write a fallback for each bulkhead: BulkheadFullException for card-network returns PENDING, for risk-scoring degrades gracefully by amount threshold, and for ledger returns PENDING."}, {"id": "3", "description": "Add circuit breakers to card-network and ledger-service (not risk-scoring). Configure: failure rate threshold 40%, slow call threshold 500ms, slow call rate 60%, open state wait 15 seconds, and BulkheadFullException in ignoreExceptions. Explain the default Resilience4j aspect order (circuit breaker outside bulkhead) and how you would put the bulkhead outside if you wanted to. Write an integration test using WireMock that (a) stubs the card-network to return 503 repeatedly, (b) verifies the circuit opens after the failure threshold, (c) verifies the ledger-service continues to operate normally throughout."}, {"id": "4", "description": "Implement a BulkheadMetricsCollector that listens to all bulkhead events and publishes metrics to Micrometer: rejection counter per bulkhead name, current queue depth gauge, and thread pool utilisation gauge (threads in use divided by max threads). Write a Prometheus alerting rule that fires when rejection rate exceeds 2 per second for any single bulkhead over a 3-minute window. Expose bulkhead health via Spring Boot Actuator and verify the health endpoint shows all three bulkheads."}]}
 -->

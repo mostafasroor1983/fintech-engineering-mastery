@@ -47,41 +47,39 @@ The W3C TraceContext specification standardises how trace context is propagated 
 
 ```
 traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-              ^^ version ^^ traceId (32 hex)         ^^ spanId (16 hex) ^^ flags
+             version  trace-id (32 hex)                parent-id (16 hex)  flags (01 = sampled)
 ```
 
 ```java
-// Spring Boot auto-configures W3C propagation with Micrometer Tracing
-// No manual header extraction needed for HTTP calls via WebClient or RestTemplate
-
-// For manual propagation (e.g., gRPC, messaging):
+// Spring Boot auto-configures W3C propagation with Micrometer Tracing.
+// HTTP calls via RestTemplate/RestClient/WebClient built from Spring's
+// builders are propagated automatically, and so is Kafka when observation
+// is enabled (KafkaTemplate.setObservationEnabled(true) and the listener
+// container's observationEnabled). Manual propagation, e.g. for a custom
+// transport, uses the Micrometer Propagator:
 @Component
 @RequiredArgsConstructor
 public class TracePropagator {
 
-    private final Tracer     tracer;
-    private final Propagator propagator;
+    private final Tracer     tracer;       // io.micrometer.tracing.Tracer
+    private final Propagator propagator;   // io.micrometer.tracing.propagation.Propagator
 
-    // Inject trace context into outgoing message headers
+    // Inject the current trace context into outgoing message headers
     public void injectIntoKafkaHeaders(Headers kafkaHeaders) {
-        propagator.inject(
-            Context.current(),
-            kafkaHeaders,
+        TraceContext current = tracer.currentTraceContext().context();
+        if (current == null) return;   // no active trace
+        propagator.inject(current, kafkaHeaders,
             (carrier, key, value) ->
-                carrier.add(key, value.getBytes(StandardCharsets.UTF_8))
-        );
+                carrier.add(key, value.getBytes(StandardCharsets.UTF_8)));
     }
 
-    // Extract trace context from incoming message headers
-    public Context extractFromKafkaHeaders(Headers kafkaHeaders) {
-        return propagator.extract(
-            Context.current(),
-            kafkaHeaders,
-            (carrier, key) -> {
-                Header h = carrier.lastHeader(key);
-                return h == null ? null : new String(h.value(), StandardCharsets.UTF_8);
-            }
-        );
+    // Extract trace context from incoming headers: returns a span builder
+    // whose parent is the producer's span
+    public Span.Builder extractFromKafkaHeaders(Headers kafkaHeaders) {
+        return propagator.extract(kafkaHeaders, (carrier, key) -> {
+            Header h = carrier.lastHeader(key);
+            return h == null ? null : new String(h.value(), StandardCharsets.UTF_8);
+        });
     }
 }
 ```
@@ -109,7 +107,9 @@ Spring Boot 3 uses Micrometer Tracing as the tracing facade, with OpenTelemetry 
 management:
   tracing:
     sampling:
-      probability: 1.0   # 100% in dev; use 0.01-0.1 in production
+      probability: 1.0   # 100% in dev. In production either sample 1-10% here
+                         # (head-based), OR keep 1.0 and let the collector's
+                         # tail sampling decide — not both
   otlp:
     tracing:
       endpoint: http://jaeger-collector:4318/v1/traces
@@ -119,7 +119,7 @@ management:
 
 ## `@WithSpan` Annotation in Spring
 
-The `@WithSpan` annotation (from `opentelemetry-instrumentation-annotations`) creates a span for a method automatically:
+The `@WithSpan` annotation (from `opentelemetry-instrumentation-annotations`) creates a span for a method automatically — when the OpenTelemetry Java agent or the OpenTelemetry Spring Boot starter is in use. With the Micrometer Tracing setup above, the equivalents are `@Observed` or `@NewSpan` (with the AOP aspect enabled); Spring ignores `@WithSpan` on its own.
 
 ```java
 @Service
@@ -186,22 +186,23 @@ Baggage carries key-value pairs alongside the trace context. Unlike span attribu
 @RequiredArgsConstructor
 public class TenantBaggageFilter implements Filter {
 
-    private final BaggageManager baggageManager;
+    private final Tracer tracer;   // Micrometer Tracer (also a BaggageManager)
 
     @Override
     public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
             throws IOException, ServletException {
         HttpServletRequest httpReq = (HttpServletRequest) req;
 
-        String tenantId       = httpReq.getHeader("X-Tenant-Id");
-        String correlationId  = httpReq.getHeader("X-Correlation-Id");
+        // In production take the tenant from the authenticated principal,
+        // not from a header the caller controls
+        String tenantId       = resolveTenant(httpReq);
+        String correlationId  = Optional.ofNullable(httpReq.getHeader("X-Correlation-Id"))
+                                    .orElseGet(() -> UUID.randomUUID().toString());
 
-        // Baggage propagates through all downstream service calls automatically
-        try (BaggageInScope t = baggageManager.createBaggageEntry("tenantId", tenantId);
-             BaggageInScope c = baggageManager.createBaggageEntry("correlationId",
-                                     correlationId != null
-                                         ? correlationId
-                                         : UUID.randomUUID().toString())) {
+        // Propagated downstream only for fields listed in
+        // management.tracing.baggage.remote-fields (see below)
+        try (BaggageInScope t = tracer.createBaggageInScope("tenantId", tenantId);
+             BaggageInScope c = tracer.createBaggageInScope("correlationId", correlationId)) {
             chain.doFilter(req, res);
         }
     }
@@ -209,13 +210,18 @@ public class TenantBaggageFilter implements Filter {
 ```
 
 ```java
+// application.yml — which baggage fields cross service boundaries,
+// and which are copied into the logging MDC:
+//   management.tracing.baggage.remote-fields: tenantId, correlationId
+//   management.tracing.baggage.correlation.fields: tenantId, correlationId
+
 // In any downstream service, read baggage without having it passed explicitly:
-String tenantId = Baggage.current().getEntryValue("tenantId");
+String tenantId = tracer.getBaggage("tenantId").get();
 log.info("Processing for tenant={}", tenantId);
 ```
 
 > [!WARNING]
-> Baggage has overhead: every byte of baggage is included in every HTTP header and Kafka record header throughout the trace. Keep baggage small — IDs only, never PII.
+> Baggage has overhead: every byte of baggage is included in every HTTP header and Kafka record header throughout the trace. Keep baggage small — IDs only, never PII — and strip it from calls that leave your organisation (to card schemes, partners, or third-party APIs).
 
 ---
 
@@ -232,6 +238,8 @@ public class TracedPaymentProducer {
     private final TracePropagator               propagator;
     private final Tracer                        tracer;
 
+    // Shown by hand for clarity; with Kafka observation enabled, Spring Kafka
+    // creates this span and injects the headers itself
     @WithSpan("kafka.publish.payment-events")
     public void publish(PaymentEvent event) {
         ProducerRecord<String, String> record =
@@ -252,9 +260,7 @@ public class TracedPaymentProducer {
 @KafkaListener(topics = "payment-events", groupId = "ledger-processor")
 public void consume(ConsumerRecord<String, PaymentEvent> record) {
     // Restore trace context from Kafka headers — links this span to the producer span
-    Context parentContext = propagator.extractFromKafkaHeaders(record.headers());
-
-    Span span = tracer.nextSpan(parentContext)
+    Span span = propagator.extractFromKafkaHeaders(record.headers())
         .name("kafka.consume.payment-events")
         .tag("messaging.message_id", record.key())
         .start();
@@ -309,7 +315,9 @@ Storing every trace at high throughput is expensive. Sampling reduces storage wh
 | Rate-limited | Fixed traces/second regardless of load | Burst protection |
 
 ```yaml
-# Tail-based sampling with OpenTelemetry Collector
+# Tail-based sampling with OpenTelemetry Collector.
+# Every span of a trace must reach the SAME collector instance — put a
+# load-balancing exporter (routing by trace ID) in front of these collectors.
 processors:
   tail_sampling:
     decision_wait: 10s
@@ -348,11 +356,12 @@ Min Duration: 500ms
 Tags: fraud.decision=REVIEW  AND  service: fraud-service
 Min Duration: 200ms
 
-# Audit trail for a specific customer
+# Investigation for one customer — only if customer.id is recorded as a tag
+# (mind cardinality and PII rules; a pseudonymous ID is safer)
 Tags: customer.id=CUST-99887766
 ```
 
-The trace view shows the full call tree with timing. For financial audit purposes, this gives you an immutable record of exactly what happened, in what order, and how long each step took — complementing application logs.
+The trace view shows the full call tree with timing — invaluable for investigating an incident or a disputed payment. But traces are sampled and usually kept for days, so they are never a substitute for the audit log: audit records belong in durable, complete storage.
 
 ---
 
@@ -417,15 +426,15 @@ span.setAttribute("payment.outcome",  "AUTHORISED");               // 4 values
     },
     {
       "id": "q3",
-      "text": "Head-based 1% sampling is in use. A production incident occurs affecting 2% of payments. How many traces are retained?",
+      "text": "Head-based 1% sampling is in use. A production incident affects 2% of payments. Which traces of the incident do you have?",
       "options": [
         "2% of payments × 1% sampling = 0.02% of all traces",
         "All traces for the 2% of affected payments",
         "No traces — head-based sampling cannot retroactively retain traces for incidents",
         "It depends on whether the error traces are tagged as errors before sampling"
       ],
-      "correct": 2,
-      "explanation": "Head-based sampling makes the keep/drop decision at the start of the trace, before the outcome is known. If 1% of all traces are kept, only ~1% of the incident traces are retained — the other 99% are gone. Tail-based sampling solves this by deferring the decision until after the trace completes, allowing error and slow traces to be kept regardless of the base rate."
+      "correct": 0,
+      "explanation": "Head-based sampling makes the keep/drop decision at the start of the trace, before the outcome is known. So only about 1% of the affected payments are traced — 2% × 1% = 0.02% of all traces — and the other 99% of incident traces are gone. Tail-based sampling solves this by deferring the decision until after the trace completes, so error and slow traces are kept regardless of the base rate."
     }
   ]
 }
@@ -433,25 +442,25 @@ span.setAttribute("payment.outcome",  "AUTHORISED");               // 4 values
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Distributed Tracing \u2014 Production Implementation",
+  "title": "End-to-End Tracing for a Payment Pipeline",
   "difficulty": "advanced",
   "estimatedMinutes": 75,
   "tasks": [
     {
       "id": "1",
-      "description": "Configure OpenTelemetry + Jaeger for the payment-service and fraud-service. Include: OTLP exporter config, sampling strategy (tail-based: keep all >500"
+      "description": "Configure OpenTelemetry export (OTLP) from payment-service and fraud-service to Jaeger through an OpenTelemetry Collector, with tail-based sampling that keeps all traces slower than 500ms, all error traces, all SWIFT and SEPA Instant traces, and 1% of the rest."
     },
     {
       "id": "2",
-      "description": "Implement `@WithSpan` instrumentation for the payment orchestration pipeline with meaningful span names and attributes. Add timing events for: validati"
+      "description": "Instrument the payment orchestration pipeline with meaningful span names and low-cardinality attributes (@Observed/@NewSpan with Micrometer, or @WithSpan with the OpenTelemetry agent), and add span events for validation, fraud check, and ledger posting."
     },
     {
       "id": "3",
-      "description": "Implement Kafka trace propagation so that the notification service spans appear as children of the payment service span in the same trace"
+      "description": "Propagate trace context through Kafka so that notification-service spans appear as children of the payment-service span in the same trace — first with Spring Kafka observation, then by hand with the Micrometer Propagator."
     },
     {
       "id": "4",
-      "description": "Set up a Jaeger query to find the top 10 slowest payment authorisations in the last hour. What span attributes would you index to make this query effic"
+      "description": "Write the Jaeger query that finds the 10 slowest payment authorisations of the last hour, and decide which span attributes to record as searchable tags without causing cardinality or PII problems."
     }
   ]
 }

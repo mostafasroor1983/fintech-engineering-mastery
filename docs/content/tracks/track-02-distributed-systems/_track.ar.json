@@ -1,0 +1,401 @@
+{
+  "id": "track-02",
+  "sequence": 2,
+  "title": "هندسة الأنظمة الموزعة",
+  "shortTitle": "الأنظمة الموزعة",
+  "slug": "distributed-systems",
+  "color": "#0ea5e9",
+  "colorMuted": "rgba(14, 165, 233, 0.15)",
+  "description": "نظرية CAP، والإجماع الموزع، ونماذج الاتساق، ومزامنة الساعات، والتعامل مع انقسام الشبكة، وتصميم أنظمة مالية موزعة تتحمل الأعطال.",
+  "difficulty": "advanced",
+  "estimatedHours": 33,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-02-lesson-01",
+      "sequence": 1,
+      "title": "نظرية CAP — الاتساق والإتاحة وتحمّل الانقسام",
+      "slug": "cap-theorem",
+      "path": "content/tracks/track-02-distributed-systems/lesson-01-cap-theorem/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "CAP",
+        "consistency",
+        "availability",
+        "partition-tolerance",
+        "PACELC"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-02-lesson-02",
+      "sequence": 2,
+      "title": "نماذج الاتساق — القوي والنهائي والسببي",
+      "slug": "consistency-models",
+      "path": "content/tracks/track-02-distributed-systems/lesson-02-consistency-models/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "consistency",
+        "linearisability",
+        "eventual-consistency",
+        "causal-consistency"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-02-lesson-03",
+      "sequence": 3,
+      "title": "الساعات الموزعة — ساعات Lamport والساعات المتجهة وTrueTime",
+      "slug": "distributed-clocks",
+      "path": "content/tracks/track-02-distributed-systems/lesson-03-distributed-clocks/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Lamport-clock",
+        "vector-clock",
+        "TrueTime",
+        "clock-sync",
+        "NTP"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-04",
+      "sequence": 4,
+      "title": "انتخاب القائد — Paxos وRaft وZooKeeper",
+      "slug": "leader-election",
+      "path": "content/tracks/track-02-distributed-systems/lesson-04-leader-election/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "Paxos",
+        "Raft",
+        "ZooKeeper",
+        "leader-election",
+        "consensus"
+      ],
+      "tier": "supporting"
+    },
+    {
+      "id": "track-02-lesson-05",
+      "sequence": 5,
+      "title": "الإجماع في الأنظمة المالية — تطبيقات عملية",
+      "slug": "consensus-financial",
+      "path": "content/tracks/track-02-distributed-systems/lesson-05-consensus-financial/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "consensus",
+        "financial-systems",
+        "etcd",
+        "distributed-commit"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-06",
+      "sequence": 6,
+      "title": "الالتزام على مرحلتين ومعاملات XA",
+      "slug": "two-phase-commit",
+      "path": "content/tracks/track-02-distributed-systems/lesson-06-two-phase-commit/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "2PC",
+        "XA",
+        "distributed-transaction",
+        "coordinator",
+        "blocking"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-02-lesson-07",
+      "sequence": 7,
+      "title": "استراتيجيات النسخ المتماثل — قائد وتابع، وعدة قادة، وبدون قائد",
+      "slug": "replication-strategies",
+      "path": "content/tracks/track-02-distributed-systems/lesson-07-replication-strategies/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "replication",
+        "leader-follower",
+        "multi-leader",
+        "leaderless",
+        "quorum"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-08",
+      "sequence": 8,
+      "title": "التخزين المؤقت الموزع — بنية Redis Cluster",
+      "slug": "distributed-caching",
+      "path": "content/tracks/track-02-distributed-systems/lesson-08-distributed-caching/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Redis",
+        "distributed-cache",
+        "cache-coherence",
+        "cluster",
+        "consistent-hashing"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-09",
+      "sequence": 9,
+      "title": "الأقفال الموزعة — Redlock والأقفال الاستشارية",
+      "slug": "distributed-locks",
+      "path": "content/tracks/track-02-distributed-systems/lesson-09-distributed-locks/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "distributed-lock",
+        "Redlock",
+        "advisory-lock",
+        "fencing-token"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-02-lesson-10",
+      "sequence": 10,
+      "title": "الدماغ المنقسم (Split-Brain) والتعامل مع انقسام الشبكة",
+      "slug": "split-brain-partitions",
+      "path": "content/tracks/track-02-distributed-systems/lesson-10-split-brain/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "split-brain",
+        "network-partition",
+        "fencing",
+        "STONITH"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-02-lesson-11",
+      "sequence": 11,
+      "title": "اكتشاف الخدمات وفحص سلامتها",
+      "slug": "service-discovery",
+      "path": "content/tracks/track-02-distributed-systems/lesson-11-service-discovery/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "service-discovery",
+        "Consul",
+        "Eureka",
+        "health-check",
+        "DNS"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-12",
+      "sequence": 12,
+      "title": "بروتوكولات Gossip والخوارزميات الوبائية",
+      "slug": "gossip-protocols",
+      "path": "content/tracks/track-02-distributed-systems/lesson-12-gossip-protocols/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "gossip",
+        "epidemic-algorithm",
+        "Cassandra",
+        "membership"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-13",
+      "sequence": 13,
+      "title": "الأنظمة القائمة على النصاب ونصاب القراءة والكتابة",
+      "slug": "quorum-systems",
+      "path": "content/tracks/track-02-distributed-systems/lesson-13-quorum-systems/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "quorum",
+        "read-quorum",
+        "write-quorum",
+        "ROWA",
+        "replication"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-14",
+      "sequence": 14,
+      "title": "منع التكرار (Idempotency) في الأنظمة المالية الموزعة",
+      "slug": "distributed-idempotency",
+      "path": "content/tracks/track-02-distributed-systems/lesson-14-distributed-idempotency/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "idempotency",
+        "distributed",
+        "at-least-once",
+        "exactly-once"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-02-lesson-15",
+      "sequence": 15,
+      "title": "Event Sourcing في الأنظمة الموزعة",
+      "slug": "distributed-event-sourcing",
+      "path": "content/tracks/track-02-distributed-systems/lesson-15-event-sourcing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "event-sourcing",
+        "append-only",
+        "event-store",
+        "snapshot"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-16",
+      "sequence": 16,
+      "title": "المعالجة مرة واحدة فقط (Exactly-Once) في الأنظمة الموزعة",
+      "slug": "exactly-once-semantics",
+      "path": "content/tracks/track-02-distributed-systems/lesson-16-exactly-once/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "exactly-once",
+        "idempotency",
+        "deduplication",
+        "transactional-outbox"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-02-lesson-17",
+      "sequence": 17,
+      "title": "بنيات تحديد المعدّل الموزعة",
+      "slug": "distributed-rate-limiting",
+      "path": "content/tracks/track-02-distributed-systems/lesson-17-distributed-rate-limiting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "rate-limiting",
+        "token-bucket",
+        "sliding-window",
+        "Redis",
+        "distributed"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-18",
+      "sequence": 18,
+      "title": "البنية النشطة-النشطة عبر المناطق",
+      "slug": "active-active-multi-region",
+      "path": "content/tracks/track-02-distributed-systems/lesson-18-active-active/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "active-active",
+        "multi-region",
+        "geo-replication",
+        "conflict-resolution"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-19",
+      "sequence": 19,
+      "title": "التتبع الموزع — السببية والربط",
+      "slug": "distributed-tracing",
+      "path": "content/tracks/track-02-distributed-systems/lesson-19-distributed-tracing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "distributed-tracing",
+        "OpenTelemetry",
+        "Jaeger",
+        "correlation-id"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-20",
+      "sequence": 20,
+      "title": "هندسة الفوضى للأنظمة المالية الموزعة",
+      "slug": "chaos-engineering",
+      "path": "content/tracks/track-02-distributed-systems/lesson-20-chaos-engineering/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "chaos-engineering",
+        "fault-injection",
+        "resilience-testing",
+        "GameDay"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-21",
+      "sequence": 21,
+      "title": "مسألة الجنرالات البيزنطيين في الأنظمة المالية",
+      "slug": "byzantine-fault-tolerance",
+      "path": "content/tracks/track-02-distributed-systems/lesson-21-byzantine-fault-tolerance/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "Byzantine",
+        "BFT",
+        "fault-tolerance",
+        "trust"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-02-lesson-22",
+      "sequence": 22,
+      "title": "إطار المهندس الرئيسي لقرارات الأنظمة الموزعة",
+      "slug": "distributed-systems-decision-framework",
+      "path": "content/tracks/track-02-distributed-systems/lesson-22-distributed-systems-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "distributed-systems",
+        "trade-offs",
+        "staff-engineer"
+      ],
+      "tier": "optional"
+    }
+  ],
+  "mainPathMinutes": 675,
+  "optionalLessonCount": 14
+}

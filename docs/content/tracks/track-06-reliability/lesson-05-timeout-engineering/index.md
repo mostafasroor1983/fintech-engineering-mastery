@@ -34,7 +34,7 @@ Modern financial services make calls across multiple layers: HTTP clients, datab
 │  └───────────────────────────────────┘  │
 │  ┌───────────────────────────────────┐  │
 │  │  Read Timeout                     │  │  e.g., 8s
-│  │  (time to receive first byte)     │  │
+│  │  (max silence between bytes)      │  │
 │  └───────────────────────────────────┘  │
 └─────────────────────────────────────────┘
 ```
@@ -43,7 +43,7 @@ Modern financial services make calls across multiple layers: HTTP clients, datab
 |---|---|---|
 | Connect Timeout | TCP handshake + TLS negotiation | 1–3s |
 | Write Timeout | Sending the request payload | 1–2s |
-| Read Timeout | Waiting for first byte of response | 3–10s |
+| Read (socket) Timeout | Maximum silence while waiting for data — reset by every byte received | 3–10s |
 | Call Timeout | Total end-to-end time | 10–30s |
 | Response Timeout | WebFlux: time between response chunks | 5–15s |
 
@@ -53,34 +53,34 @@ Connect timeouts and read timeouts fail in entirely different ways.
 
 A **connect timeout** fires when the network is unreachable or the server is not listening. It fails fast — typically within seconds. It tells you the host is down.
 
-A **read timeout** fires when the server accepted the connection but stopped sending data. This is the dangerous one: the server is alive enough to accept your connection but is overloaded, deadlocked, or processing for longer than expected. Without a read timeout, your thread blocks indefinitely.
+A **read timeout** fires when the server accepted the connection but stopped sending data. This is the dangerous one: the server is alive enough to accept your connection but is overloaded, deadlocked, or processing for longer than expected. Without a read timeout, your thread blocks indefinitely. Note that most clients implement the read timeout as *inactivity* between bytes: a server that trickles one byte every few seconds never trips it. That is why you also need an overall **call timeout** (deadline).
 
 ```java
 // WRONG: No timeouts configured — silent thread leak risk
 RestTemplate badClient = new RestTemplate();
 
 // CORRECT: Explicit timeout configuration for payment gateway
+// (Apache HttpClient 5 — the client used by Spring 6's HttpComponents factory)
 @Bean
 public RestTemplate paymentGatewayRestTemplate() {
-    HttpComponentsClientHttpRequestFactory factory =
-        new HttpComponentsClientHttpRequestFactory();
-
-    factory.setConnectTimeout(2_000);            // 2s to establish TCP+TLS
-    factory.setReadTimeout(10_000);              // 10s to read response
-    factory.setConnectionRequestTimeout(1_000);  // 1s to get conn from pool
+    PoolingHttpClientConnectionManager connectionManager =
+        PoolingHttpClientConnectionManagerBuilder.create()
+            .setMaxConnTotal(200)
+            .setMaxConnPerRoute(50)
+            .setDefaultConnectionConfig(ConnectionConfig.custom()
+                .setConnectTimeout(Timeout.ofSeconds(2))    // TCP connect
+                .setSocketTimeout(Timeout.ofSeconds(10))    // read inactivity
+                .build())
+            .build();
 
     CloseableHttpClient httpClient = HttpClients.custom()
-        .setMaxConnTotal(200)
-        .setMaxConnPerRoute(50)
-        .setDefaultSocketConfig(
-            SocketConfig.custom()
-                .setSoTimeout(10_000)  // Socket-level read timeout (belt+suspenders)
-                .build()
-        )
+        .setConnectionManager(connectionManager)
+        .setDefaultRequestConfig(RequestConfig.custom()
+            .setConnectionRequestTimeout(Timeout.ofSeconds(1))  // wait for a pooled connection
+            .build())
         .build();
 
-    factory.setHttpClient(httpClient);
-    return new RestTemplate(factory);
+    return new RestTemplate(new HttpComponentsClientHttpRequestFactory(httpClient));
 }
 ```
 
@@ -93,9 +93,11 @@ public class WebClientConfig {
     /**
      * Configure Netty HttpClient with layered timeouts.
      * - CONNECT_TIMEOUT_MILLIS: Netty channel option, fires before TCP established
-     * - responseTimeout: overall time from request sent to response complete
+     * - responseTimeout: max time between network-level reads while receiving
+     *   a response (an inactivity limit, NOT a total deadline)
      * - ReadTimeoutHandler: idle read timeout (fires if no bytes received for N seconds)
      * - WriteTimeoutHandler: idle write timeout (fires if no bytes sent for N seconds)
+     * - The overall deadline per call comes from Mono.timeout() (below)
      */
     @Bean
     public WebClient paymentGatewayWebClient() {
@@ -153,7 +155,10 @@ Without deadline propagation, timeouts become meaningless. Each service waits it
 ```java
 /**
  * Deadline context — thread-local deadline for the current request scope.
- * Propagated via HTTP header X-Request-Deadline (absolute epoch ms).
+ * Propagated via HTTP header X-Request-Timeout-Ms: the REMAINING budget in
+ * milliseconds. (An absolute epoch timestamp would depend on every server's
+ * clock agreeing — clock skew of a few hundred ms breaks it. gRPC also sends
+ * a relative timeout for this reason.)
  */
 public class DeadlineContext {
 
@@ -174,10 +179,8 @@ public class DeadlineContext {
         return ctx;
     }
 
-    public static DeadlineContext fromAbsoluteEpochMs(long absoluteDeadlineMs) {
-        long nowMs = System.currentTimeMillis();
-        long remainingMs = absoluteDeadlineMs - nowMs;
-        DeadlineContext ctx = new DeadlineContext(nowMs, remainingMs);
+    public static DeadlineContext fromRemainingMs(long remainingMs) {
+        DeadlineContext ctx = new DeadlineContext(System.currentTimeMillis(), remainingMs);
         CURRENT.set(ctx);
         return ctx;
     }
@@ -213,7 +216,7 @@ public class DeadlineContext {
 @Component
 public class DeadlinePropagationInterceptor implements ClientHttpRequestInterceptor {
 
-    private static final String DEADLINE_HEADER = "X-Request-Deadline";
+    private static final String DEADLINE_HEADER = "X-Request-Timeout-Ms";
 
     @Override
     public ClientHttpResponse intercept(HttpRequest request,
@@ -227,9 +230,13 @@ public class DeadlinePropagationInterceptor implements ClientHttpRequestIntercep
                     "Deadline already exceeded before making call to "
                     + request.getURI().getHost());
             }
+            // Send the REMAINING budget, not a clock time
             request.getHeaders().set(
                 DEADLINE_HEADER,
-                String.valueOf(deadline.getAbsoluteDeadlineEpochMs()));
+                String.valueOf(deadline.remainingMillis()));
+            // Note: this tells the callee its budget. To also stop OUR wait at
+            // the deadline, the client's per-call timeout must be
+            // min(configured timeout, remaining) — e.g. WebClient + Mono.timeout().
         }
         return execution.execute(request, body);
     }
@@ -247,11 +254,16 @@ public class InboundDeadlineFilter extends OncePerRequestFilter {
                                      HttpServletResponse response,
                                      FilterChain filterChain)
             throws ServletException, IOException {
-        String deadlineHeader = request.getHeader("X-Request-Deadline");
+        String deadlineHeader = request.getHeader("X-Request-Timeout-Ms");
         DeadlineContext ctx = null;
         if (deadlineHeader != null) {
-            long absoluteDeadlineMs = Long.parseLong(deadlineHeader);
-            long remainingMs = absoluteDeadlineMs - System.currentTimeMillis();
+            long remainingMs;
+            try {
+                remainingMs = Long.parseLong(deadlineHeader);
+            } catch (NumberFormatException e) {
+                response.sendError(HttpServletResponse.SC_BAD_REQUEST, "Invalid X-Request-Timeout-Ms");
+                return;
+            }
             if (remainingMs <= 0) {
                 log.warn("Request arrived after deadline expired path={}",
                     request.getRequestURI());
@@ -261,7 +273,7 @@ public class InboundDeadlineFilter extends OncePerRequestFilter {
                     "{\"error\":\"deadline_exceeded\",\"message\":\"Request deadline expired\"}");
                 return;
             }
-            ctx = DeadlineContext.fromAbsoluteEpochMs(absoluteDeadlineMs);
+            ctx = DeadlineContext.fromRemainingMs(remainingMs);
         }
         try {
             filterChain.doFilter(request, response);
@@ -281,10 +293,14 @@ public class TimeLimiterConfiguration {
     @Bean
     public TimeLimiterRegistry timeLimiterRegistry() {
         Map<String, TimeLimiterConfig> configs = Map.of(
-            // Payment gateway: 8s limit (gateway SLA is p99 < 3s, 8s gives buffer)
+            // Payment gateway: 2.5s limit — just above the 2s HTTP read budget,
+            // so the HTTP client's own timeout normally fires first
             "payment-gateway", TimeLimiterConfig.custom()
-                .timeoutDuration(Duration.ofSeconds(8))
-                .cancelRunningFuture(true)  // Cancel thread on timeout, don't just abandon
+                .timeoutDuration(Duration.ofMillis(2_500))
+                // cancel(true) on a CompletableFuture does NOT interrupt the
+                // thread doing the I/O — the HTTP client's timeouts must still
+                // bound the call. This only stops the caller waiting.
+                .cancelRunningFuture(true)
                 .build(),
             // Fraud check: 500ms limit (on critical path, must be fast)
             "fraud-check", TimeLimiterConfig.custom()
@@ -297,7 +313,12 @@ public class TimeLimiterConfiguration {
                 .cancelRunningFuture(true)
                 .build()
         );
-        return TimeLimiterRegistry.of(configs);
+        TimeLimiterRegistry registry = TimeLimiterRegistry.of(configs);
+        // TimeLimiterRegistry.of(Map) registers named CONFIGS only. Create the
+        // instances with the matching config — otherwise @TimeLimiter(name =
+        // "payment-gateway") would silently get the default 1s config.
+        configs.keySet().forEach(name -> registry.timeLimiter(name, name));
+        return registry;
     }
 }
 
@@ -306,22 +327,25 @@ public class TimeLimiterConfiguration {
 @Slf4j
 public class TimeLimitedPaymentService {
 
-    private final TimeLimiterRegistry timeLimiterRegistry;
-    private final ScheduledExecutorService scheduler;
+    // ONE shared executor — not a new executor per call
+    private static final ExecutorService GATEWAY_EXECUTOR =
+        Executors.newVirtualThreadPerTaskExecutor();
+
     private final PaymentGatewayClient gatewayClient;
 
     @TimeLimiter(name = "payment-gateway", fallbackMethod = "gatewayTimeoutFallback")
     @CircuitBreaker(name = "payment-gateway")
     public CompletableFuture<PaymentResponse> submitPayment(PaymentRequest request) {
         return CompletableFuture.supplyAsync(
-            () -> gatewayClient.submit(request),
-            Executors.newVirtualThreadPerTaskExecutor()
+            () -> gatewayClient.submit(request),   // carries the idempotency key
+            GATEWAY_EXECUTOR
         );
     }
 
     /**
      * Fallback invoked when TimeLimiter fires.
-     * Log, alert if high-value, return a pending response for async resolution.
+     * The gateway may STILL process the payment: the outcome is unknown.
+     * Return PENDING; the status job queries the gateway by idempotency key.
      */
     public CompletableFuture<PaymentResponse> gatewayTimeoutFallback(
             PaymentRequest request,
@@ -385,10 +409,11 @@ public interface PaymentRepository extends JpaRepository<Payment, UUID> {
     /**
      * Balance check query must complete in 5s.
      * Any slower indicates missing index or table lock contention.
-     * javax.persistence.query.timeout is in milliseconds.
+     * jakarta.persistence.query.timeout is in milliseconds
+     * (javax.* in Spring Boot 2 / Hibernate 5).
      */
     @QueryHints({
-        @QueryHint(name = "javax.persistence.query.timeout", value = "5000"),
+        @QueryHint(name = "jakarta.persistence.query.timeout", value = "5000"),
         @QueryHint(name = "org.hibernate.timeout", value = "5")
     })
     @Query("SELECT p FROM Payment p WHERE p.accountId = :accountId " +
@@ -406,7 +431,9 @@ public class PaymentJdbcRepository {
 
     /**
      * Direct JDBC timeout control for time-critical fraud check queries.
-     * setQueryTimeout is in seconds (JDBC spec); overrides statement_timeout.
+     * setQueryTimeout is in seconds (JDBC spec). The PostgreSQL driver
+     * enforces it from the client (it sends a cancel request); the server's
+     * statement_timeout still applies too — whichever is shorter wins.
      */
     public Optional<FraudRecord> findFraudRecordWithTimeout(String accountId) {
         return jdbcTemplate.execute((Connection conn) -> {
@@ -428,13 +455,14 @@ public class PaymentJdbcRepository {
 These two timeouts are frequently confused. Getting them wrong causes subtle failures.
 
 ```
-HikariCP connectionTimeout (3s default):
+HikariCP connectionTimeout (default 30s; we set 3s):
   "How long to wait for a connection to become AVAILABLE FROM THE POOL"
   - If all 50 pool connections are in use, you wait up to this duration
-  - Fires: HikariPool.PoolTimeoutException
+  - Fires: SQLTransientConnectionException
+    ("Connection is not available, request timed out after 3000ms")
   - Signals: pool size too small, queries too slow, or N+1 query problem
 
-PostgreSQL statement_timeout (30s default):
+PostgreSQL statement_timeout (default 0 = no limit; we set 30s):
   "How long a single SQL statement may execute before the SERVER cancels it"
   - Enforced server-side — more reliable than client-side timeouts
   - Fires: PSQLException: ERROR: canceling statement due to statement timeout
@@ -451,26 +479,27 @@ Application query timeout (@QueryHint or setQueryTimeout):
 @Slf4j
 public class ConnectionPoolMonitoring {
 
+    // Note: Spring Boot already publishes HikariCP metrics (hikaricp_connections_active,
+    // hikaricp_connections_pending, ...). Only the utilisation ratio below is extra.
+
+    private final DataSource dataSource;
+    private final MeterRegistry registry;
+
+    // Constructor injection: an @EventListener method only receives the event
+    public ConnectionPoolMonitoring(DataSource dataSource, MeterRegistry registry) {
+        this.dataSource = dataSource;
+        this.registry = registry;
+    }
+
     /**
      * Monitor connection pool saturation.
      * Alert when pending threads > 5 — a leading indicator of
-     * PoolTimeoutException storm about to happen.
+     * a storm of pool timeouts about to happen.
      */
     @EventListener(ApplicationReadyEvent.class)
-    public void startPoolMonitoring(@Autowired DataSource dataSource,
-                                     @Autowired MeterRegistry registry) {
+    public void startPoolMonitoring() {
         if (dataSource instanceof HikariDataSource hikari) {
             HikariPoolMXBean pool = hikari.getHikariPoolMXBean();
-
-            Gauge.builder("hikari.connections.active",
-                pool, HikariPoolMXBean::getActiveConnections)
-                .description("Active (in-use) connections")
-                .register(registry);
-
-            Gauge.builder("hikari.connections.pending",
-                pool, HikariPoolMXBean::getThreadsAwaitingConnection)
-                .description("Threads waiting for a free connection — alert if > 5")
-                .register(registry);
 
             Gauge.builder("hikari.connections.utilization",
                 pool, p -> (double) p.getActiveConnections() / hikari.getMaximumPoolSize())
@@ -526,19 +555,22 @@ public class PaymentTimeoutProperties {
     /**
      * Fraud check timeout: 500ms.
      * Rationale: Fraud model p99 is 180ms. 500ms gives 2.7x headroom.
-     * Failure mode: FAIL OPEN (default to ALLOW on timeout).
+     * Failure mode (a documented RISK decision): fail open only below a low
+     * amount threshold; above it, fail closed (PENDING / manual review).
      * Alert: Page on-call if fraud timeout rate exceeds 0.1%.
      */
     @NotNull
     private Duration fraudCheck = Duration.ofMillis(500);
 
     /**
-     * Payment gateway read timeout: 8s.
-     * Rationale: Gateway SLA is p99 < 3s. 8s handles settlement windows.
+     * Payment gateway read timeout: 2s — our budget slice above.
+     * Rationale: Gateway p99 is 800ms. A call that runs past 2s is marked
+     * PENDING and resolved by a status query (by idempotency key) — the
+     * customer is not kept waiting and the payment is not resent blindly.
      * Note: Connect timeout is separate at 2s.
      */
     @NotNull
-    private Duration gatewayRead = Duration.ofSeconds(8);
+    private Duration gatewayRead = Duration.ofSeconds(2);
 
     /**
      * Database query timeout: 3s.
@@ -581,23 +613,24 @@ public class CascadeProtectedPaymentService {
      * 1. @CircuitBreaker: open if error rate > 50% in last 20 calls
      *    → prevents calls to known-broken downstream
      *
-     * 2. @TimeLimiter: abort if call takes > 8s
-     *    → prevents thread exhaustion from slow gateway
+     * 2. @TimeLimiter: stop waiting if the call takes > 2.5s
+     *    → the caller is released quickly (the thread itself is freed by
+     *      the HTTP client's read timeout)
      *
-     * 3. @Bulkhead(THREADPOOL): max 20 concurrent gateway calls
-     *    → prevents gateway slowness from consuming all threads
+     * 3. @Bulkhead(THREADPOOL): max 20 concurrent gateway calls, on the
+     *    bulkhead's OWN thread pool
+     *    → isolates gateway calls from all other service operations
      *
-     * 4. Dedicated ThreadPoolTaskExecutor
-     *    → isolates gateway calls from other service operations
+     * 4. HTTP client connect + read timeouts
+     *    → the only layer that actually frees a blocked thread
      */
     @CircuitBreaker(name = "payment-gateway", fallbackMethod = "circuitBreakerFallback")
     @TimeLimiter(name = "payment-gateway", fallbackMethod = "timeoutFallback")
     @Bulkhead(name = "payment-gateway", type = Bulkhead.Type.THREADPOOL)
     public CompletableFuture<PaymentResponse> submitPayment(PaymentRequest request) {
-        return CompletableFuture.supplyAsync(
-            () -> gatewayClient.submit(request),
-            paymentGatewayExecutor
-        );
+        // The body already runs on a bulkhead thread: call directly. Wrapping
+        // it in supplyAsync(otherExecutor) would bypass the bulkhead.
+        return CompletableFuture.completedFuture(gatewayClient.submit(request));
     }
 
     public CompletableFuture<PaymentResponse> timeoutFallback(
@@ -628,15 +661,17 @@ public class CascadeProtectedPaymentService {
 public class GatewayTimeoutProfiles {
 
     /**
-     * Card Networks (Visa/Mastercard):
+     * Card authorisation (via acquirer / card network connection):
      * - Connect: 3s (geo-distributed entry points, DNS-based routing)
-     * - Read: 30s (authorization can take up to 25s in edge cases)
-     * - Recommendation: Set overall deadline at 35s, alert at 5s
+     * - Read: set from the processor's documented response time and YOUR
+     *   budget — not "as long as it might ever take". Past it, mark the
+     *   authorisation PENDING and follow the processor's timeout rules
+     *   (status query or automatic reversal of a late approval).
      */
     @Bean("cardNetworkWebClient")
     public WebClient cardNetworkWebClient() {
         return buildWebClient("https://card-network.example.com",
-            Duration.ofSeconds(3), Duration.ofSeconds(30));
+            Duration.ofSeconds(3), Duration.ofSeconds(10));
     }
 
     /**
@@ -665,7 +700,8 @@ public class GatewayTimeoutProfiles {
     /**
      * Internal Fraud Engine:
      * - Connect: 1s (same datacenter), Read: 500ms (on critical path)
-     * - FAIL OPEN: return ALLOW on timeout, alert ops
+     * - On timeout: fail open only for low amounts (documented risk decision),
+     *   otherwise PENDING / review; alert ops either way
      */
     @Bean("fraudEngineWebClient")
     public WebClient fraudEngineWebClient() {
@@ -697,11 +733,15 @@ groups:
   - name: payment-timeouts
     rules:
       - alert: GatewayTimeoutRateHigh
+        # Spring's http.client.requests has no outcome="TIMEOUT": a timeout
+        # shows up in the "exception" tag (outcome is UNKNOWN). Alert on the
+        # timeout RATIO, not on a per-second rate.
         expr: |
-          rate(http_client_requests_seconds_count{
-            outcome="TIMEOUT",
-            uri=~"/gateway/.*"
-          }[5m]) > 0.01
+          sum(rate(http_client_requests_seconds_count{
+                exception=~".*Timeout.*", uri=~"/gateway/.*"}[5m]))
+          /
+          sum(rate(http_client_requests_seconds_count{uri=~"/gateway/.*"}[5m]))
+          > 0.01
         for: 2m
         labels:
           severity: warning
@@ -745,7 +785,7 @@ Before deploying any service that calls external payment infrastructure:
 - [ ] Deadline propagation header sent on all outbound calls
 - [ ] Deadline extracted from inbound requests and enforced
 - [ ] Timeout exceptions increment circuit breaker failure count
-- [ ] Timeout metrics exported to Prometheus (`outcome="TIMEOUT"`)
+- [ ] Timeout metrics exported to Prometheus (timeouts visible in the `exception` tag)
 - [ ] Alerts on timeout rate > 1% for payment gateway calls
 - [ ] Alerts on connection pool pending threads > 10
 - [ ] Runbook documents what to do when each timeout fires
@@ -784,10 +824,22 @@ Before deploying any service that calls external payment infrastructure:
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Design a timeout budget from an SLO of p99 < 5s end-to-end, allocating time slices to: API gateway, auth service, fraud check, database balance read, and payment gateway HTTP call. Document the rationale for each allocation."},
-    {"id": "2", "description": "Implement DeadlineContext using ThreadLocal with propagation via X-Request-Deadline header — including an inbound servlet filter that rejects already-expired requests with 504 and an outbound RestTemplate interceptor that attaches the remaining deadline."},
-    {"id": "3", "description": "Configure WebClient for the payment gateway with layered timeouts (CONNECT_TIMEOUT_MILLIS, responseTimeout, ReadTimeoutHandler, WriteTimeoutHandler) and add a per-request override for the fraud check path using Mono.timeout()."},
-    {"id": "4", "description": "Add Prometheus alert rules that fire when gateway timeout rate exceeds 1%, when HikariCP pending threads exceed 10, and when database query timeouts spike above 5 in a 10-minute window."}
+    {
+      "id": "1",
+      "description": "Design a timeout budget from an SLO of p99 < 5s end-to-end, allocating time slices to: API gateway, auth service, fraud check, database balance read, and payment gateway HTTP call. Document the rationale for each allocation."
+    },
+    {
+      "id": "2",
+      "description": "Implement DeadlineContext using ThreadLocal with propagation via an X-Request-Timeout-Ms header carrying the REMAINING budget (not an absolute clock time, which breaks under clock skew) — including an inbound servlet filter that rejects already-expired requests with 504 and an outbound RestTemplate interceptor that attaches the remaining deadline."
+    },
+    {
+      "id": "3",
+      "description": "Configure WebClient for the payment gateway with layered timeouts (CONNECT_TIMEOUT_MILLIS, responseTimeout, ReadTimeoutHandler, WriteTimeoutHandler) and add a per-request override for the fraud check path using Mono.timeout()."
+    },
+    {
+      "id": "4",
+      "description": "Add Prometheus alert rules that fire when gateway timeout rate exceeds 1%, when HikariCP pending threads exceed 10, and when database query timeouts spike above 5 in a 10-minute window."
+    }
   ]
 }
 -->

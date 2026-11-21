@@ -92,6 +92,8 @@ A payment processor with one global lock protecting balance updates. 20% of exec
 
 The serial fraction $(1-p) = 0.20$ creates a ceiling of $1/0.20 = 5×$, regardless of thread count. Adding threads beyond 8 provides diminishing returns. The fix is not more threads — it is **reducing the serial fraction**.
 
+Amdahl's Law is the optimistic case: it ignores the cost of the contention itself (cache-line transfers, context switches, lock hand-offs). In real systems, throughput behind a hot lock often **falls** as threads are added — the Universal Scalability Law models this extra cost.
+
 > [!IMPORTANT]
 > Amdahl's Law explains why a single highly contended lock is catastrophic for throughput. A lock held for 10% of execution time ($p = 0.90$) caps maximum speedup at 10×. A lock held for 50% caps it at 2×. Reducing the serial fraction — not adding threads — is the path to throughput improvement.
 
@@ -103,15 +105,13 @@ async-profiler is a low-overhead sampling profiler that can profile lock content
 
 ```bash
 # Profile lock contention for 30 seconds
-# Output: flamegraph showing which code paths are waiting for locks
+# Output: flame graph of code paths that WAITED to acquire contended locks
 ./asprof -e lock -d 30 -f contention.html <pid>
 
-# Or using jattach (async-profiler CLI)
-asprof -e lock --lock-threshold 1ms -f locks.svg <pid>
-# --lock-threshold 1ms: only record locks held > 1ms (reduces noise)
+# Record only lock waits longer than 1ms (reduces noise)
+./asprof -e lock --lock 1ms -d 30 -f locks.html <pid>
 
-# Output: flamegraph with hot lock paths highlighted
-# The widest frames at the top of "waiting for lock" stacks are the contention hotspots
+# The widest frames in the flame graph are the contention hotspots
 ```
 
 ### JFR Lock Contention Events
@@ -125,8 +125,10 @@ public class LockContentionProfiler {
 
     public static void profileFor(Duration duration, Path outputFile) throws Exception {
         try (Recording recording = new Recording()) {
-            // Enable lock contention events with 10ms threshold
-            recording.enable("jdk.JavaMonitorWait").withThreshold(Duration.ofMillis(10));
+            // jdk.JavaMonitorEnter: waits to ENTER synchronized — real contention
+            // jdk.ThreadPark: parking — includes ReentrantLock waits, but also
+            //                 idle pool workers, so filter by stack trace
+            // (jdk.JavaMonitorWait = Object.wait(): waiting for a signal, not contention)
             recording.enable("jdk.JavaMonitorEnter").withThreshold(Duration.ofMillis(10));
             recording.enable("jdk.ThreadPark").withThreshold(Duration.ofMillis(10));
             recording.setDestination(outputFile);
@@ -159,7 +161,8 @@ public List<LockContentionEvent> parseTopContendedLocks(Path jfrFile) throws IOE
             }
         }
     }
-    // Sort by total time blocked — longest contention first
+    // Longest individual waits first. (To find the most contended LOCK,
+    // also group by monitor class + top frame and sum the durations)
     return events.stream()
         .sorted(Comparator.comparingLong(LockContentionEvent::durationMs).reversed())
         .limit(20)
@@ -225,8 +228,9 @@ public class StripedBalanceStore {
     }
 
     private int stripe(String accountId) {
-        // Hash to stripe — accounts with different hashes go to different stripes
-        return Math.abs(accountId.hashCode() % STRIPES);
+        // Hash to stripe — floorMod keeps the result in 0..STRIPES-1
+        // even for negative hash codes
+        return Math.floorMod(accountId.hashCode(), STRIPES);
     }
 
     public void updateBalance(String accountId, long delta) {
@@ -243,7 +247,8 @@ public class StripedBalanceStore {
         }
     }
 }
-// Contention reduced by factor of STRIPES=16 for uniformly distributed account IDs
+// Contention reduced by up to a factor of STRIPES=16 for evenly spread account IDs.
+// A single hot account is still serialised — striping cannot split one key
 ```
 
 ```java17
@@ -319,6 +324,8 @@ public void recordLatency(String endpoint, long ms) {
     latencySums.computeIfAbsent(endpoint, k -> new LongAdder()).add(ms);
     latencyCounts.computeIfAbsent(endpoint, k -> new LongAdder()).increment();
 }
+// (A reader may see the sum and count from slightly different moments —
+//  fine for metrics, not for money)
 ```
 
 ### 3. Operation Batching
@@ -332,6 +339,10 @@ public void recordEvent(PaymentEvent event) {
 }
 
 // AFTER: buffer events, flush with a single lock acquisition
+// WARNING: events in the in-memory buffer are LOST if the process crashes.
+// Use this only for data you can afford to lose (metrics, telemetry) — or
+// do not acknowledge an event until its batch is durably stored.
+// Payment and ledger events must never sit only in memory.
 public class BatchingEventRecorder {
     private final Queue<PaymentEvent> buffer = new ConcurrentLinkedQueue<>();
     private final Object flushLock = new Object();
@@ -362,7 +373,7 @@ public class BatchingEventRecorder {
 Lock contention is not limited to Java-level locks. Database row-level and table-level locks are equally significant in payment systems.
 
 ```java17
-// High contention: sequential account ID → hot row in DB
+// High contention: one busy account → hot row in DB
 // All payments to the same account contend for the same row lock
 @Transactional
 public void debit(String accountId, long amount) {
@@ -382,10 +393,16 @@ public void debit(String accountId, long amount) {
     account.debit(amount);
     // Don't call fraud service, audit service, notification service inside the transaction
     repository.save(account);
-    // Publish audit event AFTER transaction commits
+    // Record the audit/notification event in an OUTBOX table here (a fast
+    // INSERT in the same transaction); a relay publishes it after commit
+    outboxRepository.save(OutboxEvent.debited(accountId, amount));
 }
 
-// MITIGATION 2: Partitioning hot accounts
+// MITIGATION 2: One atomic UPDATE — the row lock lasts only for this statement
+// UPDATE accounts SET balance = balance - :amount
+//  WHERE id = :id AND balance >= :amount        -- 0 rows updated = insufficient funds
+
+// MITIGATION 3: Partitioning hot accounts
 // If one account receives 10,000 payments/hour (e.g., a corporate settlement account),
 // consider partitioned balance shards with periodic reconciliation
 ```
@@ -415,7 +432,7 @@ public void debit(String accountId, long amount) {
       "Split the method into two synchronized methods"
     ],
     "correct": 0,
-    "explanation": "ConcurrentHashMap.merge() performs an atomic read-modify-write at the bucket level — no external synchronization needed. This eliminates the global synchronized block entirely, replacing serialized single-lock access with per-bucket CAS operations. Throughput scales with the number of buckets (default 16+). This is the standard fix for HashMap-with-lock patterns."
+    "explanation": "ConcurrentHashMap.merge() performs an atomic read-modify-write on a single bin — a CAS when the bin is empty, otherwise a short lock on that bin only. No external synchronization is needed, so the global synchronized block disappears and updates to different accounts proceed in parallel. Throughput scales with the number of distinct keys being updated; a single hot account is still serialised. This is the standard fix for HashMap-with-lock patterns."
   },
   {
     "id": "kc-lc-03",
@@ -427,7 +444,7 @@ public void debit(String accountId, long amount) {
       "Overflow: more than 16 accounts cannot be stored"
     ],
     "correct": 1,
-    "explanation": "Lock striping assumes uniform distribution of keys across stripes. If 90% of traffic hashes to stripe 0 (or a few stripes), those stripes are as contended as a single global lock — the other 15 stripes are idle. This is the hot stripe problem. Mitigation: use a better hash function that distributes hot accounts more evenly, or use ConcurrentHashMap which has much finer granularity (per-bucket locks at power-of-2 scale)."
+    "explanation": "Lock striping assumes keys spread evenly across stripes. If 90% of traffic hashes to stripe 0 (or a few stripes), those stripes are as contended as a single global lock while the other 15 are idle — the hot stripe problem. Mitigation: more stripes or a better spreading hash, or ConcurrentHashMap, whose per-bin locking gives different hot accounts their own bins in practice. Note that no striping scheme helps if ONE account is hot — that needs a design change (e.g. sharded sub-balances)."
   },
   {
     "id": "kc-lc-04",

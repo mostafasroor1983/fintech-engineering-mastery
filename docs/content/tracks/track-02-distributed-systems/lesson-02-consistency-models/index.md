@@ -72,62 +72,38 @@ If B sees £400, the system is NOT linearisable.
 ```
 
 ```java
-// Linearisability in a payment system: balance updates
-// PostgreSQL with SERIALIZABLE isolation provides linearisability
-// for the operations within a transaction
+// Strong consistency for a balance debit in PostgreSQL.
+// All reads and writes go to the single primary, and the row lock makes the
+// read-check-write sequence atomic. READ COMMITTED + FOR UPDATE is enough;
+// SERIALIZABLE would also work but then the caller must retry on SQLSTATE 40001.
 
 @Service
 public class BalanceService {
 
-    private final DataSource dataSource;
+    private final JdbcTemplate jdbc;   // joins the Spring-managed transaction
 
-    /**
-     * Read the current balance and debit atomically.
-     * With SERIALIZABLE isolation, this is linearisable:
-     * no other transaction can modify the balance between
-     * our read and write.
-     */
-    @Transactional(isolation = Isolation.SERIALIZABLE)
+    @Transactional   // primary only; READ COMMITTED (PostgreSQL default)
     public DebitResult debit(String accountId, BigDecimal amount) {
-        try (Connection conn = dataSource.getConnection()) {
-            // Lock the row to prevent concurrent modifications
-            PreparedStatement lock = conn.prepareStatement(
+        // Lock the row: concurrent debits of the same account queue here
+        Account account = jdbc.query(
                 "SELECT balance, currency FROM accounts " +
-                "WHERE account_id = ? FOR UPDATE NOWAIT"
-            );
-            lock.setString(1, accountId);
-            ResultSet rs = lock.executeQuery();
+                "WHERE account_id = ? FOR UPDATE",
+                (rs, n) -> new Account(rs.getBigDecimal("balance"), rs.getString("currency")),
+                accountId)
+            .stream().findFirst()
+            .orElseThrow(() -> new AccountNotFoundException(accountId));
 
-            if (!rs.next()) {
-                throw new AccountNotFoundException(accountId);
-            }
-
-            BigDecimal currentBalance = rs.getBigDecimal("balance");
-            String currency = rs.getString("currency");
-
-            if (currentBalance.compareTo(amount) < 0) {
-                return DebitResult.insufficientFunds(currentBalance, amount);
-            }
-
-            BigDecimal newBalance = currentBalance.subtract(amount);
-
-            PreparedStatement update = conn.prepareStatement(
-                "UPDATE accounts SET balance = ?, " +
-                "version = version + 1, updated_at = NOW() " +
-                "WHERE account_id = ?"
-            );
-            update.setBigDecimal(1, newBalance);
-            update.setString(2, accountId);
-            int rows = update.executeUpdate();
-
-            if (rows != 1) {
-                throw new OptimisticLockException(
-                    "Account modified concurrently: " + accountId
-                );
-            }
-
-            return DebitResult.success(newBalance, currency);
+        if (account.balance().compareTo(amount) < 0) {
+            return DebitResult.insufficientFunds(account.balance(), amount);
         }
+
+        BigDecimal newBalance = account.balance().subtract(amount);
+        jdbc.update(
+            "UPDATE accounts SET balance = ?, version = version + 1, updated_at = NOW() " +
+            "WHERE account_id = ?",
+            newBalance, accountId);
+
+        return DebitResult.success(newBalance, account.currency());
     }
 }
 ```
@@ -206,16 +182,16 @@ public record CausalEvent(
     Instant wallClock
 ) {
     /**
-     * Check if this event causally depends on another event.
-     * this -> other means: this event cannot have caused other.
+     * this happens-before other when every entry of this clock is <= the
+     * matching entry of other (a missing entry counts as 0) and the clocks differ.
      */
     public boolean happensBefore(CausalEvent other) {
-        return other.vectorClock().entrySet().stream()
-            .allMatch(entry ->
-                this.vectorClock.getOrDefault(entry.getKey(), 0L)
-                    <= entry.getValue()
-            )
-            && !this.vectorClock.equals(other.vectorClock());
+        Set<String> keys = new HashSet<>(this.vectorClock.keySet());
+        keys.addAll(other.vectorClock().keySet());
+        boolean allLessOrEqual = keys.stream().allMatch(k ->
+            this.vectorClock.getOrDefault(k, 0L)
+                <= other.vectorClock().getOrDefault(k, 0L));
+        return allLessOrEqual && !this.vectorClock.equals(other.vectorClock());
     }
 
     public boolean isConcurrentWith(CausalEvent other) {
@@ -238,10 +214,11 @@ public class CausalEventProcessor {
         // In production, this would use a proper causal barrier implementation
         waitForCausalDependencies(event);
 
-        // Merge vector clock
+        // Merge vector clock, then count the receive as a local event
         event.vectorClock().forEach((svcId, ts) ->
             localClock.merge(svcId, ts, Math::max)
         );
+        localClock.merge(serviceId, 1L, Long::sum);
 
         applyToLocalState(event);
     }
@@ -263,7 +240,7 @@ public class CausalEventProcessor {
 
 ### Practical Causal Consistency in Financial Event Streams
 
-Kafka partitioning provides a form of causal consistency: events for the same account (same partition key) are always processed in order. Events across accounts may be processed concurrently.
+Kafka partitioning gives per-key ordering, which covers the most important causal chains: events for the same account (same partition key) are processed in order. Events for different accounts have no ordering between them — if a flow spans two accounts, carry a sequence number or vector clock in the event.
 
 ```java
 @Component
@@ -473,16 +450,18 @@ BEGIN ISOLATION LEVEL READ COMMITTED;
 COMMIT;
 
 -- REPEATABLE READ: protects against dirty and non-repeatable reads
--- A snapshot is taken at transaction start; all reads see that snapshot
+-- A snapshot is taken at the first statement; all reads see that snapshot
 -- Suitable for: balance reports that must be internally consistent
 BEGIN ISOLATION LEVEL REPEATABLE READ;
     SELECT SUM(balance) FROM accounts WHERE customer_id = 'CUST-001';
     -- Even if another transaction updates a balance here, we see the original
 COMMIT;
 
--- SERIALIZABLE: strongest isolation, full linearisability within transactions
--- Serialises all concurrent transactions as if they ran one at a time
--- Required for: balance debits, payment processing, any read-modify-write
+-- SERIALIZABLE: strongest isolation — the result equals SOME one-at-a-time order
+-- of the transactions (serializability is about transactions; linearisability is
+-- about single objects in real time — they are different guarantees).
+-- Conflicting transactions fail with SQLSTATE 40001 and must be retried.
+-- A read-modify-write of one row is also safe under READ COMMITTED with FOR UPDATE.
 BEGIN ISOLATION LEVEL SERIALIZABLE;
     SELECT balance FROM accounts WHERE account_id = 'ACC-001' FOR UPDATE;
     UPDATE accounts SET balance = balance - 500 WHERE account_id = 'ACC-001';
@@ -557,6 +536,7 @@ SELECT
     EXTRACT(EPOCH FROM replay_lag) AS replay_lag_seconds
 FROM pg_stat_replication
 ORDER BY replay_lag DESC;
+```
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -604,11 +584,22 @@ ORDER BY replay_lag DESC;
   "difficulty": "advanced",
   "estimatedMinutes": 55,
   "tasks": [
-    {"id": "1", "description": "Implement a BalanceService that performs linearisable account debits using SERIALIZABLE isolation with SELECT FOR UPDATE NOWAIT. Write a concurrent test using two threads that simultaneously attempt to debit the same account where only one debit can succeed (insufficient funds for both). Verify that exactly one debit succeeds and the other receives an InsufficientFundsException, with no partial state left in the database."},
-    {"id": "2", "description": "Implement a SessionConsistentAccountService that provides read-your-writes guarantees. After submitting a payment, the service must record the primary database write position in a SessionReadVersionStore. Subsequent transaction history reads must route to the primary if the replica has not yet caught up, and to the replica once the replica's sequence number meets or exceeds the recorded position. Write tests simulating replica lag and verifying that the payment appears in the history read immediately after submission."},
-    {"id": "3", "description": "Create a @ConsistencyLevel annotation and annotate the following repository interfaces with the appropriate model from the financial system consistency map: AccountBalanceRepository (LINEARISABLE), PaymentStatusRepository (LINEARISABLE), TransactionHistoryReadModelRepository (EVENTUAL), and MerchantAnalyticsRepository (EVENTUAL). Write an ArchUnit test that verifies all repository interfaces in the persistence.primary package are annotated @ConsistencyLevel(LINEARISABLE) and all in persistence.replica are annotated @ConsistencyLevel(EVENTUAL)."},
-    {"id": "4", "description": "Write a PostgreSQL monitoring query that checks replication lag for all connected replicas. Configure a Spring Boot @Scheduled job that runs every 30 seconds, reads the replication lag from pg_stat_replication, and publishes a Micrometer gauge metric for each replica. Write a Prometheus alerting rule that fires when any replica's replay_lag_seconds exceeds 5 seconds, and document which read operations in your service must be rerouted to the primary when this alert is active."}
+    {
+      "id": "1",
+      "description": "Implement a BalanceService that performs strongly consistent account debits on the primary using SELECT ... FOR UPDATE inside a transaction. Write a concurrent test using two threads that simultaneously attempt to debit the same account where only one debit can succeed (insufficient funds for both). Verify that exactly one debit succeeds and the other receives an insufficient-funds result, with no partial state left in the database."
+    },
+    {
+      "id": "2",
+      "description": "Implement a SessionConsistentAccountService that provides read-your-writes guarantees. After submitting a payment, the service must record the primary database write position in a SessionReadVersionStore. Subsequent transaction history reads must route to the primary if the replica has not yet caught up, and to the replica once the replica's sequence number meets or exceeds the recorded position. Write tests simulating replica lag and verifying that the payment appears in the history read immediately after submission."
+    },
+    {
+      "id": "3",
+      "description": "Create a @ConsistencyLevel annotation and annotate the following repository interfaces with the appropriate model from the financial system consistency map: AccountBalanceRepository (LINEARISABLE), PaymentStatusRepository (LINEARISABLE), TransactionHistoryReadModelRepository (EVENTUAL), and MerchantAnalyticsRepository (EVENTUAL). Write an ArchUnit test that verifies all repository interfaces in the persistence.primary package are annotated @ConsistencyLevel(LINEARISABLE) and all in persistence.replica are annotated @ConsistencyLevel(EVENTUAL)."
+    },
+    {
+      "id": "4",
+      "description": "Write a PostgreSQL monitoring query that checks replication lag for all connected replicas. Configure a Spring Boot @Scheduled job that runs every 30 seconds, reads the replication lag from pg_stat_replication, and publishes a Micrometer gauge metric for each replica. Write a Prometheus alerting rule that fires when any replica's replay_lag_seconds exceeds 5 seconds, and document which read operations in your service must be rerouted to the primary when this alert is active."
+    }
   ]
 }
 -->
-```

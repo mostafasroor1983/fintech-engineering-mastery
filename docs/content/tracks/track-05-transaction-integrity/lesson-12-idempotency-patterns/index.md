@@ -11,6 +11,8 @@ tags: [idempotency, idempotency-key, UNIQUE-constraint, Redis, distributed-idemp
 java-versions: [17, 21]
 ---
 
+## Overview
+
 Idempotency is the contractual guarantee that submitting an identical operation multiple times produces exactly the same result as submitting it once. For payment systems, this guarantee is not a convenience feature — it is a correctness requirement. Every retry path, every network timeout, and every Kafka redelivery is a potential duplicate, and without idempotency the customer pays twice. This lesson covers idempotency rigorously: the mathematical definition, the three layers at which it must be enforced (HTTP, database, messaging), how a distributed Redis store handles race conditions, and how to test idempotency under concurrency.
 
 ## Learning Objectives
@@ -21,25 +23,25 @@ By the end of this lesson you will be able to:
 - Implement an HTTP-layer `IdempotencyFilter` using Redis `SET NX` with TTL, and explain what happens on a cache miss versus a cache hit.
 - Design a database-layer idempotency guard using a `UNIQUE` constraint and `INSERT … ON CONFLICT DO NOTHING RETURNING`.
 - Configure Kafka producer idempotence (`enable.idempotence=true`) and implement consumer-side deduplication via a `processed_events` table.
-- Identify the race condition introduced by Redis Cluster key-slot distribution and explain why it matters for `NX` semantics.
+- Explain why a Redis `SET NX` claim can be lost on failover (asynchronous replication), and why the database must stay the final arbiter.
 - Write a concurrent integration test that submits the same payment three times simultaneously and asserts the side effect occurred exactly once.
 
 ## Business Context
 
-**The $1.2 million duplicate-transfer incident — a real pattern**
+**A duplicate-transfer incident (composite example, based on a common pattern)**
 
-A major European neobank suffered a production incident in which a client-side retry storm — triggered by a 30-second network timeout — caused 847 payment transfer requests to be processed twice. The duplicate payments totalled EUR 1.2 million. Recovery required manual reversal, three days of reconciliation work, and regulatory notification under PSD2 Article 96.
+A European neobank suffers a production incident in which a client-side retry storm — triggered by a 30-second network timeout — caused 847 payment transfer requests to be processed twice. The duplicate payments totalled EUR 1.2 million. Recovery required manual reversal, three days of reconciliation work, and an incident report to the regulator.
 
 Root cause analysis identified three missing controls:
 
 1. No idempotency key on the `/transfers` endpoint. Each HTTP retry was treated as a new request.
 2. No `UNIQUE` constraint on the `payment_requests` table. The application relied solely on application-level deduplication, which failed under concurrent retries.
-3. Kafka consumer had `enable.auto.commit=true` without consumer-side dedup. A broker failover caused message redelivery, which the consumer processed a second time.
+3. The Kafka consumer had no consumer-side dedup. A broker failover caused message redelivery (which at-least-once delivery always allows), and the consumer processed the messages a second time.
 
 All three gaps were independently exploitable. This lesson covers all three fixes.
 
 > [!IMPORTANT]
-> Industry benchmarks suggest that 0.3–0.8 % of payment API calls are retries under normal load, rising to 15–20 % during infrastructure incidents. Your idempotency layer must handle both the steady-state case and the spike case without degrading latency.
+> Under normal load retries are a small fraction of payment API calls, but during infrastructure incidents they can spike sharply — exactly when systems are already stressed. Your idempotency layer must handle both the steady-state case and the spike case without degrading latency.
 
 ## 1. The Precise Definition
 
@@ -49,14 +51,14 @@ A function `f` is idempotent if and only if:
 f(f(x)) = f(x)   for all x in the domain of f
 ```
 
-HTTP `GET` and `DELETE` are idempotent by definition. `POST` is not. For payment operations, we make `POST /payments` behave idempotently by keying on a client-supplied idempotency key. The contract is:
+For HTTP, idempotent means that repeating a request has the same effect on the server as sending it once. `GET`, `PUT` and `DELETE` are defined as idempotent; `POST` is not. For payment operations, we make `POST /payments` behave idempotently by keying on a client-supplied idempotency key. The contract is:
 
 - Same idempotency key + same request body → same response, side effect executed at most once.
 - Same idempotency key + different request body → `422 Unprocessable Entity` (conflict detection).
 - Different idempotency key → new execution.
 
 > [!NOTE]
-> RFC 7231 defines idempotency for HTTP methods but provides no mechanism for making `POST` idempotent. The `Idempotency-Key` header pattern was popularised by Stripe and is now a proposed IETF standard (draft-ietf-httpapi-idempotency-key-header).
+> RFC 9110 (which replaced RFC 7231 in 2022) defines idempotency for HTTP methods but provides no mechanism for making `POST` idempotent. The `Idempotency-Key` header pattern was popularised by Stripe and is now a proposed IETF standard (draft-ietf-httpapi-idempotency-key-header).
 
 ## 2. The Idempotency Key
 
@@ -94,10 +96,12 @@ public final class IdempotencyKeyGenerator {
     /**
      * Deterministic key for a business operation — useful when the client
      * cannot persist state (e.g. a batch job replaying after a crash).
-     * The key is stable for the same operationId within the same calendar day.
+     * Derived ONLY from the stable business identity of the operation.
+     * Never mix in the current date or time: a retry that runs after
+     * midnight would get a new key and pay a second time.
      */
-    public static String deterministicDaily(String operationId) {
-        String seed = operationId + ":" + LocalDate.now(ZoneOffset.UTC);
+    public static String deterministic(String operationType, String businessId) {
+        String seed = operationType + ":" + businessId;   // e.g. "payroll-line:2026-11-batch7:row42"
         return UUID.nameUUIDFromBytes(seed.getBytes(StandardCharsets.UTF_8)).toString();
     }
 }
@@ -144,9 +148,17 @@ public class IdempotencyFilter extends OncePerRequestFilter {
             return;
         }
 
-        validateKeyFormat(idempotencyKey, response);
+        if (!isValidUuid(idempotencyKey)) {
+            // RETURN after sending the error — otherwise the request would
+            // still be processed
+            response.sendError(HttpServletResponse.SC_BAD_REQUEST,
+                    "Idempotency-Key must be a valid UUID");
+            return;
+        }
 
-        String redisKey = PREFIX + idempotencyKey;
+        // Scope the key to the authenticated client: two clients that happen to
+        // send the same key must never see each other's stored responses
+        String redisKey = PREFIX + clientId(request) + ":" + idempotencyKey;
 
         // Try to claim the key — NX means "only if not exists"
         Boolean claimed = redis.opsForValue()
@@ -176,6 +188,13 @@ public class IdempotencyFilter extends OncePerRequestFilter {
             chain.doFilter(request, wrapper);
             wrapper.copyBodyToResponse();
 
+            if (wrapper.getStatus() >= 500) {
+                // Server error: the outcome may be unknown — do not cache it as
+                // final. Release the key; the database layer still prevents a
+                // second execution if the first one actually committed.
+                redis.delete(redisKey);
+                return;
+            }
             // Serialise and store the completed response, replacing PROCESSING
             byte[] body    = wrapper.getContentAsByteArray();
             CachedResponse cached = new CachedResponse(
@@ -202,13 +221,12 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                 || "PATCH".equalsIgnoreCase(method);
     }
 
-    private void validateKeyFormat(String key, HttpServletResponse response)
-            throws IOException {
+    private boolean isValidUuid(String key) {
         try {
             UUID.fromString(key);
+            return true;
         } catch (IllegalArgumentException e) {
-            response.sendError(HttpServletResponse.SC_BAD_REQUEST,
-                    "Idempotency-Key must be a valid UUID");
+            return false;
         }
     }
 
@@ -240,7 +258,7 @@ CREATE TABLE payment_requests (
 CREATE INDEX idx_payment_requests_created ON payment_requests (created_at);
 ```
 
-The service layer uses `INSERT … ON CONFLICT DO NOTHING RETURNING`:
+The service layer uses `INSERT … ON CONFLICT DO NOTHING RETURNING`. If a concurrent request with the same key has inserted but not yet committed, PostgreSQL makes the second INSERT wait for it — so the duplicate path always sees the committed row. Store the response in the same transaction as the business work, so a committed row always has its response:
 
 ```java
 // PaymentRequestRepository.java
@@ -336,7 +354,9 @@ public class PaymentService {
 
     private String sha256(Object obj) {
         try {
-            byte[] bytes = objectMapper.writeValueAsBytes(obj);
+            // Canonical JSON (fixed field order, e.g. ORDER_MAP_ENTRIES_BY_KEYS /
+            // SORT_PROPERTIES_ALPHABETICALLY) — otherwise identical requests can hash differently
+            byte[] bytes = canonicalMapper.writeValueAsBytes(obj);
             return Hex.encodeHexString(
                 MessageDigest.getInstance("SHA-256").digest(bytes));
         } catch (Exception e) {
@@ -386,10 +406,11 @@ CREATE TABLE processed_events (
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Partial index — only keep recent events (archival job purges older rows)
-CREATE INDEX idx_processed_events_recent
-    ON processed_events (processed_at)
-    WHERE processed_at > NOW() - INTERVAL '48 hours';
+-- Index for the archival job that purges old rows.
+-- (A partial index "WHERE processed_at > NOW() - ..." is not allowed:
+--  index predicates may only use IMMUTABLE functions, and NOW() is not.)
+CREATE INDEX idx_processed_events_processed_at
+    ON processed_events (processed_at);
 ```
 
 ```java
@@ -404,7 +425,10 @@ public class IdempotentPaymentEventConsumer {
     private final PaymentService paymentService;
 
     @KafkaListener(topics = "payment-commands", groupId = "payment-processor")
-    @Transactional("kafkaTransactionManager")  // consume + DB in same TX
+    // The DATABASE transaction manager: the dedup insert and the payment commit
+    // together. (A KafkaTransactionManager does not cover JDBC.) The container
+    // commits the offset after this method returns, i.e. after the DB commit.
+    @Transactional
     public void consume(ConsumerRecord<String, String> record) {
         UUID eventId = extractEventId(record);
 
@@ -442,9 +466,9 @@ public class IdempotentPaymentEventConsumer {
 
 ## 6. Distributed Idempotency Store and Race Conditions
 
-The Redis `SET key value EX seconds NX` command is atomic on a single Redis node. Under Redis Cluster, keys are distributed across hash slots. Two different idempotency keys will almost certainly land on different slots on different nodes — but `NX` atomicity is per-key, not per-cluster operation, so this is fine.
+The Redis `SET key value EX seconds NX` command is atomic on a single Redis node, and in Redis Cluster each key lives on exactly one primary at a time, so `NX` stays per-key atomic.
 
-The subtle problem is a **single key crossing a slot migration**. During a slot migration, a key may temporarily be accessible on two nodes. If two replicas of your payment service both issue `SET idmp:abc PROCESSING EX 86400 NX` at the exact moment the key's slot is migrating, both may receive `OK`. This window is milliseconds wide but non-zero.
+The real gap is **failover**. Redis replicates to its replicas **asynchronously**. If the primary acknowledges `SET idmp:abc PROCESSING NX` and crashes before that write reaches a replica, the promoted replica has never seen the key — and a retry's `SET NX` succeeds again. The window is small but real (`WAIT` can narrow it, not close it). That is why Redis can only be the fast first layer; the database `UNIQUE` constraint must be the final arbiter.
 
 ```java
 // RedisIdempotencyStore.java
@@ -494,7 +518,7 @@ public class RedisIdempotencyStore {
 ```
 
 > [!WARNING]
-> For extreme consistency requirements (central bank settlement systems), replace Redis with a database-backed idempotency store. A `UNIQUE` constraint on a PostgreSQL table with `SERIALIZABLE` isolation provides stronger guarantees than Redis Cluster, at the cost of higher latency.
+> For extreme consistency requirements (central bank settlement systems), replace Redis with a database-backed idempotency store. A `UNIQUE` constraint on a PostgreSQL table gives a durable, transactional guarantee at any isolation level — stronger than Redis, at the cost of higher latency.
 
 ## 7. Idempotency for Operations with External Side Effects
 
@@ -520,14 +544,15 @@ public class ExternalProcessorClient {
 
 **When the external API does not support idempotency keys:**
 
-1. Store the external call's outcome in your own database immediately after receiving the response, keyed on your idempotency key.
-2. Before calling out, check if you already have a stored result for this key.
-3. Accept that the external system may execute the operation twice if your process crashes between the external call and your DB write. Design your compensation to handle this (e.g. query the external system for the transaction and reconcile).
+1. **Claim first:** insert a `PENDING` record keyed on your idempotency key (`ON CONFLICT DO NOTHING`) and commit it *before* calling out. Only the request that wins the claim may call the external system.
+2. Call out, then store the outcome against that record.
+3. If you find a record still `PENDING` (a crash or timeout happened after the call), the outcome is **unknown**: query the external system for the transaction before doing anything else — never call it again blindly.
 
 ```java
 // ExternalCallGuard.java — wraps non-idempotent external APIs
+// NOT @Transactional around the HTTP call: each step commits on its own
 @Component
-@Transactional
+@RequiredArgsConstructor
 public class ExternalCallGuard {
 
     private final ExternalCallRecordRepository records;
@@ -535,20 +560,25 @@ public class ExternalCallGuard {
 
     public ProcessorResponse submitOnce(PaymentOrder order, UUID idempotencyKey) {
 
-        // Check if we already called out successfully
-        Optional<ExternalCallRecord> existing =
-                records.findByIdempotencyKey(idempotencyKey);
-
-        if (existing.isPresent()) {
-            return existing.get().response();
+        // 1. Claim (own short transaction): INSERT ... ON CONFLICT DO NOTHING
+        boolean claimed = records.claimPending(idempotencyKey);
+        if (!claimed) {
+            ExternalCallRecord existing = records.findByIdempotencyKey(idempotencyKey).orElseThrow();
+            if (existing.isCompleted()) {
+                return existing.response();
+            }
+            // PENDING: another attempt is in flight or crashed mid-call —
+            // the outcome is unknown, so ask the external system first
+            throw new OutcomeUnknownException(idempotencyKey);
         }
 
+        // 2. Only the claim winner calls out
         ProcessorResponse response = client.submit(order, idempotencyKey);
 
-        // Persist before returning — if this crashes, we have a gap.
-        // A reconciliation job will close it.
-        records.save(new ExternalCallRecord(idempotencyKey, response, Instant.now()));
-
+        // 3. Record the outcome (own short transaction). If we crash before this,
+        //    the record stays PENDING and the reconciliation job queries the
+        //    external system to find out what happened.
+        records.complete(idempotencyKey, response);
         return response;
     }
 }
@@ -614,15 +644,22 @@ class IdempotencyIntegrationTest {
         latch.await(10, TimeUnit.SECONDS);
         pool.shutdown();
 
-        // All three responses must be identical (same status, same body)
+        // Requests that overlapped the first one may get 409 "in progress";
+        // every other response must be the ORIGINAL response
         assertThat(responses).hasSize(concurrency);
-        HttpStatus firstStatus = responses.get(0).getStatusCode();
-        String firstBody       = responses.get(0).getBody();
-
-        for (ResponseEntity<String> r : responses) {
-            assertThat(r.getStatusCode()).isEqualTo(firstStatus);
-            assertThat(r.getBody()).isEqualTo(firstBody);
+        List<ResponseEntity<String>> completed = responses.stream()
+                .filter(r -> r.getStatusCode() != HttpStatus.CONFLICT).toList();
+        assertThat(completed).isNotEmpty();
+        String originalBody = completed.get(0).getBody();
+        for (ResponseEntity<String> r : completed) {
+            assertThat(r.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+            assertThat(r.getBody()).isEqualTo(originalBody);
         }
+
+        // A retry now (after completion) replays the original response
+        ResponseEntity<String> retry = http.exchange(
+                "/api/v1/payments", HttpMethod.POST, entity, String.class);
+        assertThat(retry.getBody()).isEqualTo(originalBody);
 
         // The payment must have been created exactly once
         long paymentCount = paymentRepository
@@ -640,7 +677,7 @@ A: The Redis lookup misses (`null`). The filter proceeds as if it were a new req
 
 **Q2: `enable.idempotence=true` is set on your Kafka producer. A network partition causes the producer to restart. After restart, it retries the last batch of messages. Are the duplicates filtered by the broker?**
 
-A: No. `enable.idempotence=true` deduplicates within a single producer epoch (identified by a Producer ID assigned at startup). After a restart, the broker assigns a new PID with epoch 0. The broker has no way to match the new PID against the previous epoch's sequence numbers. Consumer-side deduplication using a `processed_events` table is mandatory to handle cross-session duplicates.
+A: No. `enable.idempotence=true` deduplicates within a single producer session (identified by a Producer ID assigned at startup). After a restart, a non-transactional producer gets a new PID. (A transactional producer that reuses its `transactional.id` keeps its identity, but that still only covers Kafka writes.) The broker has no way to match the new PID against the previous epoch's sequence numbers. Consumer-side deduplication using a `processed_events` table is mandatory to handle cross-session duplicates.
 
 ## Practical Challenge
 
@@ -655,8 +692,8 @@ A: No. `enable.idempotence=true` deduplicates within a single producer epoch (id
 4. **Chaos test**: Write a JUnit 5 test that:
    - Submits the same payment 50 times concurrently using a `CompletableFuture` pool.
    - Asserts that exactly one payment row exists in the database.
-   - Asserts that all 50 HTTP responses have the same status code and body.
-   - Asserts that `idempotency.hits` Micrometer counter equals 49 (one miss for the first request, 49 hits for the rest).
+   - Asserts that every HTTP response is either the original response or a `409 request_in_progress`, and that retrying the 409s after completion returns the original response.
+   - Asserts that `idempotency.misses` equals 1 (only one request ever claims the key).
 
 5. **Stretch goal**: Implement a nightly cleanup job (`@Scheduled(cron = "0 2 * * *")`) that deletes `payment_requests` rows older than 24 hours and purges the corresponding Redis keys.
 
@@ -683,18 +720,18 @@ A: No. `enable.idempotence=true` deduplicates within a single producer epoch (id
         "No — deduplication is only possible with acks=0 configured"
       ],
       "correct": 1,
-      "explanation": "enable.idempotence=true assigns a Producer ID (PID) at startup and uses per-partition sequence numbers for deduplication within that session. After a restart, the broker assigns a new PID with epoch 0 — it has no way to correlate new sequences against the previous epoch's. Consumer-side deduplication using a processed_events table is mandatory to handle cross-session duplicates."
+      "explanation": "enable.idempotence=true assigns a Producer ID (PID) at startup and uses per-partition sequence numbers for deduplication within that session. After a restart, a non-transactional producer gets a new PID — the broker cannot correlate its sequences with the previous session. Consumer-side deduplication using a processed_events table is mandatory to handle cross-session duplicates."
     },
     {
-      "text": "During a Redis Cluster slot migration, two replicas of the payment service both issue SET idmp:abc PROCESSING EX 86400 NX simultaneously for the same key. What is the risk and what is the most durable mitigation?",
+      "text": "A payment service claims idempotency keys with Redis SET NX. The Redis primary acknowledges SET idmp:abc PROCESSING NX, then crashes before replicating the write, and a replica is promoted. What is the risk and what is the most durable mitigation?",
       "options": [
-        "Both may receive OK, allowing two concurrent executions of the same payment — mitigated by using the database UNIQUE constraint as the final arbiter of idempotency",
-        "Both will receive an error because NX operations are blocked during slot migrations",
-        "The key will be lost during migration, so the payment will fail — mitigated by increasing the Redis TTL",
-        "Only one will receive OK because Redis Cluster guarantees atomic NX across all nodes"
+        "A retry's SET NX can succeed on the new primary, allowing two executions of the same payment — mitigated by keeping the database UNIQUE constraint as the final arbiter of idempotency",
+        "Both requests receive an error because NX operations are blocked during failover",
+        "The key is replicated synchronously, so there is no risk",
+        "Only one request can succeed because Redis Cluster guarantees atomic NX across all nodes"
       ],
       "correct": 0,
-      "explanation": "During slot migration, a key may temporarily be accessible on two nodes. Both NX operations can return OK within that millisecond-wide window, allowing two simultaneous executions. The database UNIQUE(idempotency_key) constraint is the correct mitigation: even if two requests pass the Redis layer, only one INSERT will succeed. For extreme consistency requirements, replace Redis entirely with a PostgreSQL-backed idempotency store with SERIALIZABLE isolation."
+      "explanation": "Redis replicates asynchronously. A write acknowledged by the old primary but not yet replicated is lost when a replica is promoted, so a retry's SET NX succeeds again and a second execution can start. The database UNIQUE(idempotency_key) constraint is the durable mitigation: even if two requests pass the Redis layer, only one INSERT succeeds."
     }
   ]
 }
@@ -706,10 +743,22 @@ A: No. `enable.idempotence=true` deduplicates within a single producer epoch (id
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Deploy the IdempotencyFilter backed by Redis with SET NX. Instrument it with two Micrometer counters: idempotency.hits (incremented when a cached response is replayed) and idempotency.misses (incremented when the key is claimed fresh). Add a third counter idempotency.in_progress_conflicts for 409 responses when PROCESSING sentinel is encountered."},
-    {"id": "2", "description": "Add the payment_requests table with UNIQUE(idempotency_key) and a request_hash CHAR(64) column. Implement PaymentRequestRepository.upsertRequest using INSERT ... ON CONFLICT DO NOTHING RETURNING id. Add body-mismatch detection: if the conflicting row has a different request_hash, throw IdempotencyConflictException with a 422 status."},
-    {"id": "3", "description": "Configure the Kafka consumer to INSERT into processed_events before processing each message, using ON CONFLICT (event_id) DO NOTHING. Write an integration test that publishes a payment-commands message, manually re-publishes the same event_id, and asserts that the payment is processed exactly once and processed_events contains exactly one row for that event_id."},
-    {"id": "4", "description": "Write a JUnit 5 chaos test that submits the same payment 50 times concurrently using CompletableFuture.allOf with a fixed thread pool of 50. Assert: exactly one payment row in the database, all 50 HTTP responses have identical status codes and bodies, and the idempotency.hits counter equals 49. Run the test with Redis artificially evicting the key after the first request to verify the database layer catches the remaining 49 retries correctly."}
+    {
+      "id": "1",
+      "description": "Deploy the IdempotencyFilter backed by Redis with SET NX. Instrument it with two Micrometer counters: idempotency.hits (incremented when a cached response is replayed) and idempotency.misses (incremented when the key is claimed fresh). Add a third counter idempotency.in_progress_conflicts for 409 responses when PROCESSING sentinel is encountered."
+    },
+    {
+      "id": "2",
+      "description": "Add the payment_requests table with UNIQUE(idempotency_key) and a request_hash CHAR(64) column. Implement PaymentRequestRepository.upsertRequest using INSERT ... ON CONFLICT DO NOTHING RETURNING id. Add body-mismatch detection: if the conflicting row has a different request_hash, throw IdempotencyConflictException with a 422 status."
+    },
+    {
+      "id": "3",
+      "description": "Configure the Kafka consumer to INSERT into processed_events before processing each message, using ON CONFLICT (event_id) DO NOTHING. Write an integration test that publishes a payment-commands message, manually re-publishes the same event_id, and asserts that the payment is processed exactly once and processed_events contains exactly one row for that event_id."
+    },
+    {
+      "id": "4",
+      "description": "Write a JUnit 5 chaos test that submits the same payment 50 times concurrently using CompletableFuture.allOf with a fixed thread pool of 50. Assert: exactly one payment row in the database; every HTTP response is either the original response or a 409 request_in_progress; retrying after completion returns the original response; idempotency.misses equals 1. Then evict the Redis key after the first request and verify the database layer still prevents any second payment."
+    }
   ]
 }
 -->

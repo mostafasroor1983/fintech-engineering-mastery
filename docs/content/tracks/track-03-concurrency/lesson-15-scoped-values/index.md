@@ -51,14 +51,14 @@ references:
 
 ## Overview
 
-`ThreadLocal` has been Java's mechanism for thread-scoped context since Java 1.2. It works by associating a value with the current platform thread — each thread has its own independent copy. With the arrival of virtual threads in Java 21, `ThreadLocal` has critical shortcomings: virtual threads are cheap and numerous, `ThreadLocal` values accumulate in heap memory without cleanup, and mutable `ThreadLocal` state can be inadvertently shared when thread pools reuse threads.
+`ThreadLocal` has been Java's mechanism for thread-scoped context since Java 1.2. It works by associating a value with the current platform thread — each thread has its own independent copy. With the arrival of virtual threads in Java 21, `ThreadLocal` shows its weaknesses: virtual threads are cheap and numerous, so per-thread copies of values multiply; a value lives as long as its thread unless someone calls `remove()`; any code can change it with `set()`; and on pooled threads a forgotten value leaks into the next request.
 
-**Scoped Values** (JEP 446, Java 21 Preview) provide a better model: immutable, inheritable context that is bound for the duration of a scope and automatically released when the scope exits. No cleanup required. No mutation. No inheritance of stale values.
+**Scoped Values** (JEP 446, Preview in Java 21; final in Java 25 via JEP 506) provide a better model: immutable, inheritable context that is bound for the duration of a scope and automatically released when the scope exits. No cleanup required. No mutation. No inheritance of stale values.
 
 For payment processing, scoped values are the correct mechanism to propagate request context — correlation IDs, user identity, tenant ID — through a call stack of virtual threads without the pitfalls of `ThreadLocal`.
 
 > [!NOTE]
-> `ScopedValue` was **Preview** in Java 21 (requires `--enable-preview`). It is expected to be finalised in a future Java release. The API may change before GA. `ThreadLocal` remains the stable production-ready alternative.
+> `ScopedValue` was **Preview** in Java 21–24 (requires `--enable-preview`) and became **final in Java 25** (JEP 506). The basic `ScopedValue.where(key, value).run(...)` form shown here works in both. On Java 21 LTS without preview features, `ThreadLocal` remains the stable alternative. Note that `StructuredTaskScope`, used below for propagation, is still a preview API.
 
 ## Learning Objectives
 
@@ -75,10 +75,12 @@ By the end of this lesson you will be able to:
 ## ThreadLocal Limitations with Virtual Threads
 
 ```java21
-// PROBLEM 1: Memory leak risk with virtual threads
-// Virtual threads are created per-task (millions per hour in a busy service)
-// ThreadLocal values survive until the thread is GC'd — if threads are pooled,
-// stale values persist across requests
+// PROBLEM 1: Footprint and leak risk
+// Virtual threads are created per task (millions per hour in a busy service).
+// Each thread gets its OWN copy of every ThreadLocal value — an expensive
+// object cached in a ThreadLocal is now created millions of times.
+// Values live until the thread ends (or remove() is called); if threads are
+// pooled, stale values persist across requests
 
 // PROBLEM 2: Inheritance surprises
 ThreadLocal<String> correlationId = new ThreadLocal<>();
@@ -125,7 +127,9 @@ ScopedValue.where(PaymentContext.CORRELATION_ID, "TXN-001")
                processPayment(request);
                // Any method in the call stack can read these values
            });
-// Outside the scope: CORRELATION_ID.isBound() == false
+// Outside the scope: CORRELATION_ID.isBound() == false,
+// and CORRELATION_ID.get() throws NoSuchElementException.
+// Use isBound() or orElse(default) where a binding may be missing
 ```
 
 ```java21
@@ -166,9 +170,10 @@ graph LR
 | Mutation | Mutable (set/get/remove) | Immutable within scope |
 | Lifetime | Explicit remove() required | Auto-released on scope exit |
 | Child thread inheritance | InheritableThreadLocal only | Automatic in StructuredTaskScope |
-| Virtual thread safety | Leaks on un-pooled VTs | Reclaimed when scope exits |
+| Footprint with virtual threads | One copy per thread; lives until thread ends or remove() | Binding lives only while the scope runs |
 | Rebinding | set() anywhere | where().run() creates new scope |
-| Access | O(1) hash lookup | O(depth) scope stack traversal |
+| Read cost | Fast hash lookup | Designed to be fast (small per-thread cache); comparable to ThreadLocal |
+| Visible to | Only the thread (copies to children with InheritableThreadLocal) | The binding thread + StructuredTaskScope subtasks — NOT plain executors or CompletableFuture.runAsync |
 
 ## Request Context Propagation
 
@@ -184,22 +189,33 @@ public class RequestContextFilter implements Filter {
                           FilterChain chain) throws IOException, ServletException {
 
         HttpServletRequest httpRequest = (HttpServletRequest) request;
-        String correlationId = httpRequest.getHeader("X-Correlation-Id");
+        String correlationId = Optional.ofNullable(httpRequest.getHeader("X-Correlation-Id"))
+                                       .orElseGet(() -> UUID.randomUUID().toString());
         String userId        = extractUserId(httpRequest);
         String tenantId      = extractTenantId(httpRequest);
 
-        // Establish scoped values for the duration of this request
-        ScopedValue.where(PaymentContext.CORRELATION_ID, correlationId)
-                   .where(PaymentContext.USER_ID,        userId)
-                   .where(PaymentContext.TENANT_ID,      tenantId)
-                   .run(() -> {
-                       try {
-                           chain.doFilter(request, response);
-                       } catch (Exception e) {
-                           throw new RuntimeException(e);
-                       }
-                   });
-        // Scope exits here — all bindings are released automatically
+        // Establish scoped values for the duration of this request.
+        // run(Runnable) cannot throw checked exceptions, so wrap them and
+        // unwrap afterwards to keep IOException / ServletException intact
+        try {
+            ScopedValue.where(PaymentContext.CORRELATION_ID, correlationId)
+                       .where(PaymentContext.USER_ID,        userId)
+                       .where(PaymentContext.TENANT_ID,      tenantId)
+                       .run(() -> {
+                           try {
+                               chain.doFilter(request, response);
+                           } catch (IOException | ServletException e) {
+                               throw new WrappedFilterException(e);
+                           }
+                       });
+        } catch (WrappedFilterException w) {
+            if (w.getCause() instanceof IOException io) throw io;
+            throw (ServletException) w.getCause();
+        }
+        // Scope has exited — all bindings are released automatically
+        // NOTE: the bindings are visible only on this request thread. Work
+        // handed to a plain executor, @Async or CompletableFuture.runAsync
+        // does NOT see them — only StructuredTaskScope subtasks do.
     }
 }
 
@@ -245,10 +261,13 @@ ScopedValue.where(PaymentContext.TENANT_ID, "tenant-A").run(() -> {
 Scoped values propagate automatically to child threads created within a `StructuredTaskScope`:
 
 ```java21
-// Scoped values propagate to all forked subtasks automatically
+// Scoped values propagate to all forked subtasks automatically.
+// The scope must be opened INSIDE the binding (otherwise fork() throws
+// StructureViolationException). call() is used instead of run() because
+// join() / throwIfFailed() throw checked exceptions.
 ScopedValue.where(PaymentContext.CORRELATION_ID, "TXN-001")
            .where(PaymentContext.USER_ID, "user-42")
-           .run(() -> {
+           .call(() -> {
                try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
 
                    scope.fork(() -> {
@@ -265,12 +284,13 @@ ScopedValue.where(PaymentContext.CORRELATION_ID, "TXN-001")
 
                    scope.join().throwIfFailed();
                }
+               return null;
            });
 ```
 
 ## Replacing MDC with ScopedValue
 
-Mapped Diagnostic Context (MDC) in SLF4J/Logback uses `ThreadLocal` to attach context to log statements. With virtual threads, MDC requires explicit propagation. `ScopedValue` provides a cleaner alternative:
+Mapped Diagnostic Context (MDC) in SLF4J/Logback uses `ThreadLocal` to attach context to log statements, and MDC must be copied explicitly to every new thread. `ScopedValue` is a cleaner way to carry the context — but logging frameworks still read the MDC, so a common bridge is to copy the scoped value into the MDC at the start of each task:
 
 ```java21
 // Traditional MDC with ThreadLocal — requires explicit MDC.put/MDC.clear
@@ -287,18 +307,22 @@ try {
 }
 
 // ScopedValue approach — automatic propagation and cleanup
-ScopedValue.where(PaymentContext.CORRELATION_ID, "TXN-001").run(() -> {
+ScopedValue.where(PaymentContext.CORRELATION_ID, "TXN-001").call(() -> {
     log.info("Processing payment [{}]", PaymentContext.CORRELATION_ID.get());
 
     try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
         scope.fork(() -> {
-            // Automatically sees CORRELATION_ID = "TXN-001"
-            log.info("Async step [{}]", PaymentContext.CORRELATION_ID.get());
+            // Automatically sees CORRELATION_ID = "TXN-001".
+            // Bridge to the MDC so the log pattern %X{correlationId} works:
+            try (var ignored = MDC.putCloseable("correlationId",
+                                    PaymentContext.CORRELATION_ID.get())) {
+                log.info("Async step");
+            }
             return null;
         });
-        scope.join();
+        scope.join().throwIfFailed();
     }
-    // No cleanup needed — scope handles it
+    return null;   // No context cleanup needed — the binding ends with the scope
 });
 ```
 
@@ -315,7 +339,7 @@ ScopedValue.where(PaymentContext.CORRELATION_ID, "TXN-001").run(() -> {
       "No impact — ThreadLocal is per-thread and does not leak between requests"
     ],
     "correct": 1,
-    "explanation": "If virtual threads are pooled (e.g., via ThreadPoolExecutor with virtual thread factory — an anti-pattern), ThreadLocal values persist on the reused thread. Request A's correlation ID is visible to Request B. Even with non-pooled virtual threads, forgetting remove() means the value lives until the virtual thread is GC'd — with millions of virtual threads created per hour, GC pressure increases. ScopedValue eliminates both problems: values are automatically released when the scope exits, and there is no mutation possible."
+    "explanation": "If virtual threads are pooled (e.g. a ThreadPoolExecutor with a virtual thread factory — an anti-pattern), ThreadLocal values persist on the reused thread, so Request A's correlation ID is visible to Request B. Even with non-pooled virtual threads, each thread holds its own copy until it ends, and with millions of threads per hour the per-thread copies add memory and GC work. ScopedValue avoids both problems: the binding ends when the scope exits, and it cannot be changed with set()."
   },
   {
     "id": "kc-sv-02",
@@ -343,15 +367,15 @@ ScopedValue.where(PaymentContext.CORRELATION_ID, "TXN-001").run(() -> {
   },
   {
     "id": "kc-sv-04",
-    "question": "Why is `ScopedValue` read access described as O(depth) rather than O(1) like `ThreadLocal`?",
+    "question": "A helper method calls `PaymentContext.CORRELATION_ID.get()`. It is called from a scheduled batch job that never binds CORRELATION_ID. What happens, and what is the fix?",
     "options": [
-      "ScopedValue uses a linked list of scopes; reading traverses the list to find the innermost binding",
-      "ScopedValue is stored in a database that requires a network call",
-      "ScopedValue read involves a lock acquisition",
-      "ScopedValue is O(1) — the O(depth) claim is incorrect"
+      "get() returns null, so the log line shows \"null\"",
+      "get() throws NoSuchElementException — use isBound() or orElse(\"batch\") where a binding may be missing",
+      "get() returns the value from the last HTTP request handled by any thread",
+      "The JVM binds a random UUID automatically"
     ],
-    "correct": 0,
-    "explanation": "ThreadLocal uses a per-thread hash map — O(1) lookup by key. ScopedValue bindings are stored in a scope stack (linked structure on the call stack). Reading a ScopedValue traverses the scope stack from innermost to outermost to find the most recent binding — O(depth of nested scopes). In practice, nesting depth is small (2-5 levels) so this is negligible. The trade-off is O(depth) reads for O(0) cleanup vs ThreadLocal's O(1) reads with O(n) cleanup risk."
+    "correct": 1,
+    "explanation": "ScopedValue.get() throws NoSuchElementException when the value is not bound in the current thread. Unlike ThreadLocal, there is no hidden leftover value from an earlier request — which is safer, but code that can run outside a request (batch jobs, schedulers, startup code) must check isBound() or use orElse(default). Better still, have the batch job establish its own binding (e.g. a generated batch correlation ID) with ScopedValue.where(...).run(...)."
   }
 ] -->
 
@@ -376,7 +400,7 @@ ScopedValue.where(PaymentContext.CORRELATION_ID, "TXN-001").run(() -> {
     },
     {
       "id": "pc-sv-04",
-      "description": "Migrate an existing `ThreadLocal<String>` MDC correlation ID to ScopedValue. Show: (a) the old code with ThreadLocal, explicit set/remove, and the propagation failure in async calls, (b) the new code with ScopedValue and StructuredTaskScope showing automatic propagation. Write a test that verifies no correlation ID leaks between requests."
+      "description": "Migrate an existing `ThreadLocal<String>` MDC correlation ID to ScopedValue. Show: (a) the old code with ThreadLocal, explicit set/remove, and the propagation failure in async calls, (b) the new code with ScopedValue and StructuredTaskScope showing automatic propagation, with the value copied into the MDC inside each subtask for logging. Write a test that verifies no correlation ID leaks between requests."
     }
   ]
 } -->

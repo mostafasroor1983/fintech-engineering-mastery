@@ -46,6 +46,8 @@ references:
   - "Spring Boot Actuator — Resilience4j Metrics"
 ---
 
+## Overview
+
 In distributed payment systems, remote dependencies fail. Card network APIs return 504s. Fraud-scoring services go into garbage collection pauses. Core banking connectors time out during batch windows. Without protective patterns, one slow dependency cascades into full service unavailability — the classic thread starvation failure. The **circuit breaker** is the first line of defence: it detects repeated failures on a dependency, stops sending requests while the dependency recovers, and re-admits traffic cautiously once conditions improve. Understanding exactly when and how to open a circuit is the difference between a five-minute incident and a three-hour outage.
 
 ## Learning Objectives
@@ -63,7 +65,7 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-In October 2021, a major European payment processor experienced a cascading failure that took their hosted checkout service offline for 4 hours and 20 minutes. The post-incident report revealed a familiar pattern: a card scheme authorisation API began returning intermittent 503 responses due to a database connection exhaustion on their side. The payment processor's checkout service had no circuit breaker — every incoming payment attempt created a new thread that blocked on the failing authorisation call until the 30-second read timeout expired. Within 90 seconds, all 800 available Tomcat threads were occupied waiting on a dead upstream. New checkout requests received connection refused errors from the load balancer, translating directly to lost authorisations. Estimated revenue impact: €2.3 million. The fix — a circuit breaker with a 50% failure threshold opening after 10 requests — was deployed in a two-line configuration change. The same failure mode two weeks later resulted in a 23-second customer impact rather than a 260-minute one.
+*Composite example:* a European payment processor experiences a cascading failure that took their hosted checkout service offline for 4 hours and 20 minutes. The post-incident report revealed a familiar pattern: a card scheme authorisation API began returning intermittent 503 responses due to a database connection exhaustion on their side. The payment processor's checkout service had no circuit breaker — every incoming payment attempt created a new thread that blocked on the failing authorisation call until the 30-second read timeout expired. Within 90 seconds, all 800 available Tomcat threads were occupied waiting on a dead upstream. New checkout requests received connection refused errors from the load balancer, translating directly to lost authorisations. The revenue impact ran into millions of euros. The fix — a circuit breaker with a 50% failure threshold opening after 10 requests — was deployed in a two-line configuration change. The same failure mode two weeks later resulted in a 23-second customer impact rather than a 260-minute one.
 
 ## Circuit Breaker State Machine
 
@@ -75,19 +77,19 @@ stateDiagram-v2
 
     CLOSED --> OPEN : failure rate ≥ threshold\n(after minimum calls)
     OPEN --> HALF_OPEN : wait duration elapsed
-    HALF_OPEN --> CLOSED : probe calls succeed\n(≥ permittedNumberOfCalls)
-    HALF_OPEN --> OPEN : probe call fails
+    HALF_OPEN --> CLOSED : probe failure rate\nbelow threshold
+    HALF_OPEN --> OPEN : probe failure rate\n≥ threshold
 
     CLOSED : CLOSED\nAll calls pass through\nFailures tracked in sliding window
     OPEN : OPEN\nAll calls rejected immediately\n(CallNotPermittedException)\nFallback executed
-    HALF_OPEN : HALF_OPEN\nLimited probe calls allowed\nOne failure re-opens circuit
+    HALF_OPEN : HALF_OPEN\nLimited probe calls allowed\nRates evaluated after all probes
 ```
 
 | State | Behaviour | Transition Trigger |
 |---|---|---|
 | **CLOSED** | Normal operation; all calls pass through | Failure rate ≥ `failureRateThreshold` after `minimumNumberOfCalls` |
 | **OPEN** | All calls fail immediately with `CallNotPermittedException`; fallback runs | `waitDurationInOpenState` elapses |
-| **HALF_OPEN** | `permittedNumberOfCallsInHalfOpenState` probe calls admitted | All probes succeed → CLOSED; any probe fails → OPEN |
+| **HALF_OPEN** | `permittedNumberOfCallsInHalfOpenState` probe calls admitted | After all probes complete, the failure (and slow-call) rate is evaluated: below the threshold → CLOSED; at or above → OPEN |
 
 The sliding window can be **count-based** (last N calls) or **time-based** (calls in last N seconds). Count-based is simpler to reason about for most payment services.
 
@@ -121,11 +123,14 @@ resilience4j:
         # Automatically transition OPEN → HALF_OPEN after wait (no trigger needed)
         automaticTransitionFromOpenToHalfOpenEnabled: true
 
-        # 4xx errors (bad request, unauthorized) are NOT failures — don't count them
+        # 4xx errors (bad request, unauthorized) are NOT failures — don't count them.
+        # Careful: once recordExceptions is set, any exception NOT listed counts
+        # as a SUCCESS — so map 5xx responses to an exception that is listed.
         recordExceptions:
           - java.io.IOException
           - java.util.concurrent.TimeoutException
           - feign.RetryableException
+          - com.example.payments.exception.GatewayServerErrorException   # 5xx
         ignoreExceptions:
           - com.example.payments.exception.ValidationException
           - com.example.payments.exception.AuthenticationException
@@ -180,8 +185,17 @@ public class PaymentGatewayService {
      */
     private AuthorisationResult authoriseFallback(AuthorisationRequest request,
                                                     Throwable cause) {
+        // The fallback runs for EVERY exception — including ignored ones.
+        // A validation error is not a gateway outage: do not queue it for retry.
+        if (cause instanceof ValidationException ve) {
+            throw ve;
+        }
         log.warn("Circuit open or gateway failure for payment {}: {}",
                  request.paymentId(), cause.getMessage());
+
+        // A timeout is an UNKNOWN outcome — the authorisation may have
+        // succeeded. The retry job must re-send with the SAME idempotency key
+        // (or query the gateway for the payment) so it is never authorised twice.
 
         // Persist PENDING state so batch retry job picks it up
         paymentRepository.markPending(
@@ -197,7 +211,8 @@ public class PaymentGatewayService {
 
     /**
      * Batch retry: called by a scheduled job every 60 seconds.
-     * No circuit breaker here — the circuit will reject if still open.
+     * Guarded by the SAME circuit breaker: while it is OPEN the retry fails
+     * fast and is deferred, instead of hammering a dependency that is down.
      */
     @CircuitBreaker(name = "paymentGateway", fallbackMethod = "retryFallback")
     public AuthorisationResult retryPending(UUID paymentId) {
@@ -236,7 +251,7 @@ public class PaymentGatewayService {
     }
 
     public AuthorisationResult authorise(AuthorisationRequest request) {
-        // Decorate the call — Java 21 lambda + var inference
+        // Decorate the call (Try is from the Vavr library)
         var decorated = CircuitBreaker.decorateSupplier(
             circuitBreaker,
             () -> gatewayClient.authorise(request)
@@ -245,7 +260,7 @@ public class PaymentGatewayService {
         return Try.ofSupplier(decorated)
             .recover(CallNotPermittedException.class,
                      ex -> handleOpenCircuit(request, ex))
-            .recover(IOException.class,
+            .recover(GatewayUnavailableException.class,   // unchecked: a Supplier cannot throw IOException
                      ex -> handleGatewayError(request, ex))
             .get();
     }
@@ -257,7 +272,7 @@ public class PaymentGatewayService {
     }
 
     private AuthorisationResult handleGatewayError(AuthorisationRequest request,
-                                                     IOException ex) {
+                                                     GatewayUnavailableException ex) {
         log.error("Gateway IO error for payment {}: {}", request.paymentId(),
                   ex.getMessage());
         return AuthorisationResult.pending(request.paymentId(), "GATEWAY_ERROR");
@@ -275,6 +290,9 @@ public class PaymentGatewayService {
 
 ## Exposing Circuit State via Actuator
 
+> [!WARNING]
+> Do **not** let a dependency's circuit breaker drive the pod's *readiness* probe. When the gateway's circuit opens, every pod would report not-ready at the same moment, Kubernetes would remove them all from the load balancer, and a degraded service (payments queued as PENDING) becomes a total outage. Report circuit state for dashboards and alerts; keep readiness for "can *this* pod serve traffic?".
+
 ```java
 // Custom HealthIndicator publishing circuit state to /actuator/health
 @Component
@@ -291,12 +309,9 @@ public class PaymentGatewayCircuitHealthIndicator implements HealthIndicator {
         CircuitBreaker cb = registry.circuitBreaker("paymentGateway");
         CircuitBreakerMetrics metrics = cb.getMetrics();
 
-        Health.Builder builder = switch (cb.getState()) {
-            case CLOSED     -> Health.up();
-            case HALF_OPEN  -> Health.unknown();
-            case OPEN       -> Health.down();
-            default         -> Health.unknown();
-        };
+        // Informational: the service still works (fallback queues payments),
+        // so an open circuit is reported as a detail, not as DOWN
+        Health.Builder builder = Health.up();
 
         return builder
             .withDetail("state",            cb.getState())
@@ -311,7 +326,7 @@ public class PaymentGatewayCircuitHealthIndicator implements HealthIndicator {
 ```
 
 ```yaml
-# application.yml — expose circuit breaker in readiness health group
+# application.yml — circuit breakers visible in health details, NOT in readiness
 management:
   health:
     circuitbreakers:
@@ -320,9 +335,11 @@ management:
     health:
       group:
         readiness:
-          include: "db,kafka,circuitBreakers"
+          include: "readinessState"          # this pod's own ability to serve
         liveness:
-          include: "ping"
+          include: "livenessState"
+        dependencies:                        # for dashboards and humans
+          include: "circuitBreakers,paymentGatewayCircuit"
       show-details: when-authorized
 ```
 
@@ -332,10 +349,11 @@ Resilience4j exposes Micrometer metrics automatically when `spring-boot-starter-
 
 | Metric | Description | Alert Threshold |
 |---|---|---|
-| `resilience4j.circuitbreaker.state` | Current state (0=CLOSED, 1=OPEN, 2=HALF_OPEN) | Alert when state = 1 (OPEN) |
+| `resilience4j.circuitbreaker.state` | One gauge per state (tag `state` = closed, open, half_open, …); the current state has value 1 | Alert when `state="open"` is 1 |
 | `resilience4j.circuitbreaker.failure.rate` | Failure rate (%) in sliding window | Alert when > 40% |
 | `resilience4j.circuitbreaker.slow.call.rate` | Slow call rate (%) | Alert when > 25% |
-| `resilience4j.circuitbreaker.calls` | Tagged by kind: successful, failed, ignored, not_permitted | — |
+| `resilience4j.circuitbreaker.calls` | Tagged by kind: successful, failed, ignored | — |
+| `resilience4j.circuitbreaker.not.permitted.calls` | Calls rejected while OPEN | Rising = customers hitting the fallback |
 | `resilience4j.circuitbreaker.buffered.calls` | Calls in the current sliding window | — |
 
 ```yaml
@@ -344,15 +362,15 @@ groups:
   - name: circuit-breaker-alerts
     rules:
       - alert: PaymentGatewayCircuitOpen
-        expr: resilience4j_circuitbreaker_state{name="paymentGateway"} == 1
-        for: 10s
+        expr: resilience4j_circuitbreaker_state{name="paymentGateway", state="open"} == 1
+        for: 1m
         labels:
           severity: critical
           team: payments
         annotations:
           summary: "Payment gateway circuit breaker OPEN"
           description: >
-            Circuit breaker 'paymentGateway' has been OPEN for > 10s.
+            Circuit breaker 'paymentGateway' has been OPEN for > 1m.
             All authorisations are returning PENDING and queuing for retry.
             Check {{ $labels.instance }} gateway health.
 
@@ -368,7 +386,7 @@ groups:
 
 ## Bulkhead + Circuit Breaker Combination
 
-Circuit breakers detect failure patterns. Bulkheads limit resource consumption. Used together, they provide defence-in-depth: the bulkhead stops thread exhaustion before the circuit breaker even needs to open.
+Circuit breakers detect failure patterns. Bulkheads limit resource consumption. Used together, they provide defence-in-depth: the bulkhead stops thread exhaustion before the circuit breaker even needs to open. (The order in which Resilience4j applies its aspects is fixed by configuration — by default Retry wraps CircuitBreaker, which wraps RateLimiter, TimeLimiter and finally Bulkhead — not by the order of the annotations in the source.)
 
 ```java
 // Stacked annotations: bulkhead isolates threads, circuit breaker trips on failures
@@ -382,9 +400,10 @@ public class PaymentGatewayService {
                     fallbackMethod = "authoriseFallback")
     public CompletableFuture<AuthorisationResult> authoriseAsync(
             AuthorisationRequest request) {
-        return CompletableFuture.supplyAsync(
-            () -> gatewayClient.authorise(request)
-        );
+        // This method body ALREADY runs on a bulkhead thread. Do not wrap the
+        // call in supplyAsync(): that would run it on the common pool and the
+        // bulkhead would isolate nothing.
+        return CompletableFuture.completedFuture(gatewayClient.authorise(request));
     }
 
     private CompletableFuture<AuthorisationResult> bulkheadFallback(
@@ -440,7 +459,7 @@ resilience4j:
 | `slowCallDurationThreshold` | p99 of downstream × 1.5 | Catch degraded (not just failed) dependencies |
 
 > [!TIP]
-> Run a week of load testing or shadow traffic analysis before setting thresholds. Measure the p99 latency and error rate of your downstream. Set `slowCallDurationThreshold` at 1.5× the p99 latency. Set `failureRateThreshold` at 2× the baseline error rate. This ensures the circuit opens on genuine degradation, not normal variance.
+> Run a week of load testing or shadow traffic analysis before setting thresholds. Measure the p99 latency and error rate of your downstream. Set `slowCallDurationThreshold` at 1.5× the p99 latency. Set `failureRateThreshold` well above the baseline error rate — with a 20-call window, one or two failures are 5–10%, so a baseline of 1% still needs a threshold of 20–50%. This ensures the circuit opens on genuine degradation, not normal variance.
 
 ---
 
@@ -461,13 +480,13 @@ resilience4j:
     "id": "kc-cb-02",
     "question": "Your circuit breaker transitioned to HALF_OPEN and allowed 5 probe calls. The first 4 succeeded; the 5th threw an IOException. What happens?",
     "options": [
-      "The circuit returns to CLOSED because 80% of probes succeeded",
-      "The circuit returns to OPEN and the waitDurationInOpenState timer resets",
+      "The circuit returns to CLOSED: the probe failure rate (1 of 5 = 20%) is below the 50% failureRateThreshold",
+      "The circuit returns to OPEN because one probe failed, and the waitDurationInOpenState timer resets",
       "The circuit remains in HALF_OPEN and waits for more probes",
-      "The circuit transitions to CLOSED but records the failure in the sliding window"
+      "The circuit stays OPEN until an operator resets it"
     ],
-    "correct": 1,
-    "explanation": "In HALF_OPEN state, Resilience4j uses a strict rule: a single recorded failure during the probe phase immediately transitions the circuit back to OPEN and resets the wait duration timer. The circuit breaker is conservative — it requires all permitted probe calls to succeed before declaring the dependency recovered. This prevents premature recovery that would immediately re-expose the system to a still-failing dependency."
+    "correct": 0,
+    "explanation": "In HALF_OPEN, Resilience4j waits until all permittedNumberOfCallsInHalfOpenState probe calls have completed, then evaluates the failure rate (and slow-call rate) of those probes against the thresholds. Here 1 of 5 probes failed — 20% — which is below the 50% threshold, so the circuit transitions to CLOSED. Only if the probe failure rate reached the threshold would it go back to OPEN and restart the wait duration. (Some other libraries re-open on the first failed probe; do not assume that behaviour in Resilience4j.)"
   }
 ] -->
 
@@ -488,7 +507,7 @@ resilience4j:
     },
     {
       "id": "pc-cb-03",
-      "description": "Implement a custom HealthIndicator that exposes the circuit breaker state, failure rate, and number of failed calls for the 'cardNetwork' circuit. Register it in the readiness health group."
+      "description": "Implement a custom HealthIndicator that exposes the circuit breaker state, failure rate, and number of failed calls for the 'cardNetwork' circuit. Put it in a separate 'dependencies' health group — not in the readiness group — and explain why an open dependency circuit must not make every pod not-ready."
     },
     {
       "id": "pc-cb-04",

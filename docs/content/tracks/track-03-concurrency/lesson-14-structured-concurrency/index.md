@@ -58,7 +58,7 @@ references:
 For a payment processing pipeline that fans out to fraud check, sanctions screening, and balance validation — structured concurrency makes the control flow explicit, predictable, and debuggable.
 
 > [!NOTE]
-> `StructuredTaskScope` was **Preview** in Java 21 and requires `--enable-preview` at compile and runtime. It is expected to be finalised in a future Java release. The API may change before GA. For production use, evaluate whether the preview risk is acceptable or use `CompletableFuture.allOf()` as a stable alternative.
+> `StructuredTaskScope` is a **Preview** API (JEP 453 in Java 21, previewed again in Java 22–24) and requires `--enable-preview` at compile and run time. The API **did change**: Java 25 (JEP 505) replaced the `ShutdownOnFailure` / `ShutdownOnSuccess` subclasses with `StructuredTaskScope.open(...)` and `Joiner` policies. This lesson uses the Java 21 API and shows the Java 25 form at the end of the ShutdownOnFailure section. For production use, evaluate whether the preview risk is acceptable or use `CompletableFuture.allOf()` as a stable alternative.
 
 ## Learning Objectives
 
@@ -100,7 +100,7 @@ public PaymentDecision validatePayment(Payment payment) throws Exception {
 
 ## StructuredTaskScope — The Solution
 
-`StructuredTaskScope` creates a **scope** within which subtasks run. The scope `join()` method waits for all subtasks and enforces the invariant: **no subtask outlives the scope**.
+`StructuredTaskScope` creates a **scope** within which subtasks run. Each `fork()` starts the subtask in a new thread — a **virtual thread** by default. The scope `join()` method waits for the subtasks, and closing the scope enforces the invariant: **no subtask outlives the scope**.
 
 ```mermaid
 graph TD
@@ -153,6 +153,25 @@ public PaymentDecision validatePayment(Payment payment)
 
     } // try-with-resources: scope closes — all subtasks are guaranteed complete here
 }
+```
+
+The same validation with the redesigned API in **Java 25+** (still preview):
+
+```java
+// Java 25+ (JEP 505) — StructuredTaskScope.open() with a Joiner policy
+try (var scope = StructuredTaskScope.open()) {   // default policy: all must succeed
+    var fraudTask     = scope.fork(() -> fraudService.check(payment));
+    var sanctionsTask = scope.fork(() -> sanctionsService.screen(payment));
+    var limitTask     = scope.fork(() -> limitService.check(payment));
+
+    scope.join();   // if any subtask fails: cancels the others and throws FailedException
+
+    return new PaymentDecision(fraudTask.get(), sanctionsTask.get(), limitTask.get());
+}
+// First success (the old ShutdownOnSuccess):
+//   StructuredTaskScope.open(Joiner.<FraudDecision>anySuccessfulResultOrThrow())
+// Timeout (the old joinUntil):
+//   StructuredTaskScope.open(joiner, cf -> cf.withTimeout(Duration.ofMillis(500)))
 ```
 
 **What happens when sanctions screening throws:**
@@ -217,11 +236,14 @@ public PaymentDecision validateWithTimeout(Payment payment)
         var fraudTask    = scope.fork(() -> fraudService.check(payment));
         var sanctionsTask = scope.fork(() -> sanctionsService.screen(payment));
 
-        // Deadline: all subtasks must complete within 500ms
+        // Deadline: all subtasks must complete within 500ms.
+        // On timeout, joinUntil throws TimeoutException; leaving the
+        // try block closes the scope, which cancels the unfinished subtasks
         scope.joinUntil(Instant.now().plusMillis(500));
 
+        // Reached only if no timeout: rethrow a subtask failure, if any
         scope.throwIfFailed(e -> new PaymentValidationException(
-            "Validation timed out or failed", e));
+            "Validation check failed", e));
 
         return new PaymentDecision(fraudTask.get(), sanctionsTask.get());
     }
@@ -234,15 +256,15 @@ public PaymentDecision validateWithTimeout(Payment payment)
 |---|---|---|
 | Failure propagation | Manual (`exceptionally`) | Automatic (ShutdownOnFailure) |
 | Cancellation on failure | Manual (cancel each future) | Automatic |
-| Parent-subtask link | None — invisible in thread dump | Visible — subtasks shown under parent |
+| Parent-subtask link | None — invisible in thread dump | Visible — the JSON thread dump groups subtasks under their scope |
 | Exception handling style | Callback-based | Sequential (try/catch) |
 | Timeout | `orTimeout()` per stage | `joinUntil()` on the scope |
-| Availability | GA (all Java versions) | Preview (Java 21, enable-preview) |
+| Availability | GA (Java 8+) | Preview (Java 21+, `--enable-preview`; API redesigned in Java 25) |
 | Code style | Functional / reactive | Sequential / imperative |
 
 ## Observability: Thread Dumps
 
-One of the most valuable properties of structured concurrency is thread dump readability:
+One of the most valuable properties of structured concurrency is thread dump readability. The JSON thread dump (`jcmd <pid> Thread.dump_to_file -format=json`) shows each scope as a **thread container** with a link to its parent, and lists the subtask threads inside it. A simplified illustration:
 
 ```
 // Unstructured (CompletableFuture) thread dump:
@@ -254,10 +276,11 @@ Thread "payment-processor-7": waiting
     CompletableFuture.get(CompletableFuture.java:1908)
     // No indication which subtasks it's waiting for
 
-// Structured concurrency thread dump:
-Thread "payment-processor-7": waiting on StructuredTaskScope
-    Subtask "fraud-executor-1": running FraudService.check
-    Subtask "sanctions-executor-3": running SanctionsService.screen
+// Structured concurrency (simplified view of the JSON dump):
+Container: StructuredTaskScope$ShutdownOnFailure@1a2b  (owner: "payment-processor-7")
+    parent: <root>
+    virtual thread #91: FraudService.check
+    virtual thread #92: SanctionsService.screen
     // Parent-subtask relationship is explicit
 ```
 
@@ -343,7 +366,7 @@ public class PaymentValidationService {
       "It only works on Linux, not on Windows or macOS"
     ],
     "correct": 1,
-    "explanation": "Preview APIs in Java are complete, working implementations but the API design is not yet finalised. The JDK team gathers feedback from real-world usage before stabilising the API. StructuredTaskScope may change between Java 21 preview and its eventual GA release. For production use, assess whether your team can absorb a potential API migration when it GAs, or use CompletableFuture.allOf() as the stable alternative in the meantime."
+    "explanation": "Preview APIs in Java are complete, working implementations, but the API design is not yet final. The JDK team gathers feedback from real-world usage before stabilising it. And StructuredTaskScope did change: Java 25 (JEP 505) replaced the ShutdownOnFailure / ShutdownOnSuccess subclasses with StructuredTaskScope.open() and Joiner policies. For production use, assess whether your team can absorb such API migrations, or use CompletableFuture.allOf() as the stable alternative in the meantime."
   },
   {
     "id": "kc-sc-04",
@@ -372,11 +395,11 @@ public class PaymentValidationService {
     },
     {
       "id": "pc-scc-02",
-      "description": "Add a 300ms overall deadline via `joinUntil()`. If the deadline expires, throw `ValidationTimeoutException` identifying which checks were still running. Test with simulated 400ms fraud check to confirm the timeout fires correctly and all subtasks are cancelled."
+      "description": "Add a 300ms overall deadline via `joinUntil()`. If the deadline expires (TimeoutException), throw `ValidationTimeoutException` identifying which checks were still running (use `Subtask.state()`). Test with a simulated 400ms fraud check to confirm the timeout fires and all subtasks are cancelled when the scope closes."
     },
     {
       "id": "pc-scc-03",
-      "description": "Implement `FraudDecisionService.check(Payment)` using `ShutdownOnSuccess` to contact two fraud providers in parallel and use the first response. Add a fallback: if both providers fail, return `FraudDecision.defaultAllow()` with a warning log rather than throwing. Measure the 99th-percentile latency improvement over calling providers sequentially."
+      "description": "Implement `FraudDecisionService.check(Payment)` using `ShutdownOnSuccess` to contact two fraud providers in parallel and use the first successful response. If both providers fail, do not silently allow the payment: return `FraudDecision.referToManualReview()` (or decline, per the bank's risk policy) and log a warning. Measure the 99th-percentile latency improvement over calling the providers sequentially."
     },
     {
       "id": "pc-scc-04",

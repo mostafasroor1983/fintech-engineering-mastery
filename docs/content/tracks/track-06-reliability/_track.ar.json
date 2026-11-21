@@ -1,0 +1,340 @@
+{
+  "id": "track-06",
+  "sequence": 6,
+  "title": "الإتاحة العالية والموثوقية والمرونة",
+  "shortTitle": "هندسة الموثوقية",
+  "slug": "reliability",
+  "color": "#14b8a6",
+  "colorMuted": "rgba(20, 184, 166, 0.15)",
+  "description": "قاطع الدائرة (Circuit Breaker)، والعزل (Bulkhead)، وهندسة الفوضى، والبنية متعددة المناطق، والتعافي من الكوارث، وتصميم SLO/SLA، وإدارة ميزانية الأخطاء.",
+  "difficulty": "advanced",
+  "estimatedHours": 27,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-06-lesson-01",
+      "sequence": 1,
+      "title": "أهداف مستوى الخدمة (SLO) وميزانيات الأخطاء — هندسة الموثوقية للقطاع المالي",
+      "slug": "slo-error-budgets",
+      "path": "content/tracks/track-06-reliability/lesson-01-slo-error-budgets/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "SLO",
+        "SLA",
+        "error-budget",
+        "SLI",
+        "reliability"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-06-lesson-02",
+      "sequence": 2,
+      "title": "نمط قاطع الدائرة — الفشل السريع والتعافي",
+      "slug": "circuit-breaker",
+      "path": "content/tracks/track-06-reliability/lesson-02-circuit-breaker/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "circuit-breaker",
+        "Resilience4j",
+        "CLOSED",
+        "OPEN",
+        "HALF_OPEN"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-06-lesson-03",
+      "sequence": 3,
+      "title": "نمط العزل (Bulkhead) — عزل الأعطال بمجمّعات الخيوط",
+      "slug": "bulkhead-pattern",
+      "path": "content/tracks/track-06-reliability/lesson-03-bulkhead/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "bulkhead",
+        "thread-pool",
+        "semaphore",
+        "isolation",
+        "Resilience4j"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-06-lesson-04",
+      "sequence": 4,
+      "title": "أنماط إعادة المحاولة — التراجع الأسي والعشوائية (Jitter)",
+      "slug": "retry-patterns",
+      "path": "content/tracks/track-06-reliability/lesson-04-retry-patterns/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "retry",
+        "exponential-backoff",
+        "jitter",
+        "idempotency",
+        "Resilience4j"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-06-lesson-05",
+      "sequence": 5,
+      "title": "هندسة المهلات الزمنية — منع الأعطال المتتالية",
+      "slug": "timeout-engineering",
+      "path": "content/tracks/track-06-reliability/lesson-05-timeout-engineering/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "timeout",
+        "cascading-failure",
+        "deadline",
+        "read-timeout",
+        "connect-timeout"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-06-lesson-06",
+      "sequence": 6,
+      "title": "هندسة الفوضى — أيام الاختبار (GameDay) وحقن الأعطال",
+      "slug": "chaos-engineering",
+      "path": "content/tracks/track-06-reliability/lesson-06-chaos-engineering/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "chaos-engineering",
+        "GameDay",
+        "Chaos-Monkey",
+        "failure-injection",
+        "resilience-testing"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-07",
+      "sequence": 7,
+      "title": "البنية النشطة-النشطة متعددة المناطق",
+      "slug": "multi-region-active-active",
+      "path": "content/tracks/track-06-reliability/lesson-07-multi-region/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "active-active",
+        "multi-region",
+        "geo-replication",
+        "conflict-resolution",
+        "latency"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-08",
+      "sequence": 8,
+      "title": "التعافي من الكوارث — RTO وRPO واستمرارية الأعمال المالية",
+      "slug": "disaster-recovery",
+      "path": "content/tracks/track-06-reliability/lesson-08-disaster-recovery/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "disaster-recovery",
+        "RTO",
+        "RPO",
+        "failover",
+        "BCP"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-09",
+      "sequence": 9,
+      "title": "التخلّص من الحمل — التراجع المنظَّم تحت الضغط",
+      "slug": "load-shedding",
+      "path": "content/tracks/track-06-reliability/lesson-09-load-shedding/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "load-shedding",
+        "graceful-degradation",
+        "priority-queue",
+        "admission-control"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-10",
+      "sequence": 10,
+      "title": "فحوصات السلامة — Liveness وReadiness وStartup",
+      "slug": "health-checks",
+      "path": "content/tracks/track-06-reliability/lesson-10-health-checks/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "health-check",
+        "liveness",
+        "readiness",
+        "startup-probe",
+        "Actuator"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-11",
+      "sequence": 11,
+      "title": "الإتاحة العالية لقواعد البيانات — أنماط PostgreSQL HA",
+      "slug": "database-ha",
+      "path": "content/tracks/track-06-reliability/lesson-11-database-ha/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "PostgreSQL",
+        "HA",
+        "Patroni",
+        "replication",
+        "failover"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-12",
+      "sequence": 12,
+      "title": "الإتاحة العالية في Kafka — النسخ المتماثل وقيادة الأقسام",
+      "slug": "kafka-ha",
+      "path": "content/tracks/track-06-reliability/lesson-12-kafka-ha/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "HA",
+        "replication-factor",
+        "ISR",
+        "leader-election"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-13",
+      "sequence": 13,
+      "title": "تحديد المعدّل من أجل الموثوقية — حماية الخدمات اللاحقة",
+      "slug": "rate-limiting-reliability",
+      "path": "content/tracks/track-06-reliability/lesson-13-rate-limiting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "rate-limiting",
+        "token-bucket",
+        "sliding-window",
+        "downstream-protection"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-14",
+      "sequence": 14,
+      "title": "أنماط البدائل — الاستجابات الثابتة والمخزّنة والمخفّضة",
+      "slug": "fallback-patterns",
+      "path": "content/tracks/track-06-reliability/lesson-14-fallback-patterns/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "fallback",
+        "cache",
+        "static-response",
+        "degraded-mode",
+        "Resilience4j"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-15",
+      "sequence": 15,
+      "title": "إدارة الحوادث — المناوبة الهندسية في القطاع المالي",
+      "slug": "incident-management",
+      "path": "content/tracks/track-06-reliability/lesson-15-incident-management/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "incident-management",
+        "on-call",
+        "PagerDuty",
+        "runbook",
+        "escalation"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-16",
+      "sequence": 16,
+      "title": "مراجعات ما بعد الحوادث — ثقافة عدم اللوم وتحليل السبب الجذري",
+      "slug": "post-incident-review",
+      "path": "content/tracks/track-06-reliability/lesson-16-post-incident-review/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "post-incident",
+        "blameless",
+        "RCA",
+        "five-whys",
+        "action-items"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-17",
+      "sequence": 17,
+      "title": "اختبار الموثوقية — اختبارات الحمل والتحمّل والذروة",
+      "slug": "reliability-testing",
+      "path": "content/tracks/track-06-reliability/lesson-17-reliability-testing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "load-testing",
+        "soak-testing",
+        "spike-testing",
+        "Gatling",
+        "k6"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-06-lesson-18",
+      "sequence": 18,
+      "title": "إطار المهندس الرئيسي لقرارات الموثوقية",
+      "slug": "reliability-decision-framework",
+      "path": "content/tracks/track-06-reliability/lesson-18-reliability-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "reliability",
+        "trade-offs",
+        "staff-engineer",
+        "SLO"
+      ],
+      "tier": "optional"
+    }
+  ],
+  "mainPathMinutes": 390,
+  "optionalLessonCount": 13
+}

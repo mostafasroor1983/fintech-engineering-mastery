@@ -21,7 +21,7 @@ prerequisites: []
 
 In 2000, Eric Brewer conjectured, and Gilbert and Lynch later proved, that a distributed data store can provide **at most two** of the following three guarantees simultaneously:
 
-- **Consistency (C)** — Every read receives the most recent write or an error. All nodes see the same data at the same time.
+- **Consistency (C)** — Every read receives the most recent write or an error (formally, linearizability). The system behaves as if there were a single copy of the data.
 - **Availability (A)** — Every request receives a response (not an error), though the response may not contain the most recent write.
 - **Partition Tolerance (P)** — The system continues operating even when network messages between nodes are lost or delayed.
 
@@ -36,7 +36,7 @@ graph TD
     CAP --> A
     CAP --> P
     
-    C --- CA[CA Systems\nRelational DBs\nNo partition tolerance]
+    C --- CA[CA\nOnly without partitions\ne.g. a single-node DB]
     A --- CA
     C --- CP[CP Systems\nMongoDB, HBase\nMay refuse requests]
     P --- CP
@@ -99,20 +99,22 @@ CP systems refuse to respond when they cannot guarantee the response is current.
 - Atomic multi-account balance transfer
 
 ```java
-// etcd CP write — requires majority acknowledgement
-// If partition prevents quorum, write fails rather than succeeding without consensus
-CompletableFuture<PutResponse> response = etcdClient.getKVClient()
-    .put(
-        ByteSequence.from("payment-lock/txn-abc123", UTF_8),
-        ByteSequence.from(nodeId, UTF_8),
-        PutOption.newBuilder()
-            .withLeaseId(leaseId)  // TTL-based lock
-            .build()
-    );
+// etcd CP lock — a transaction that creates the key only if it does not exist yet.
+// The write needs a Raft majority: during a partition the minority side cannot
+// take the lock — it fails instead of granting the lock twice.
+ByteSequence key = ByteSequence.from("payment-lock/txn-abc123", UTF_8);
+CompletableFuture<TxnResponse> response = etcdClient.getKVClient().txn()
+    .If(new Cmp(key, Cmp.Op.EQUAL, CmpTarget.createRevision(0)))      // key absent
+    .Then(Op.put(key, ByteSequence.from(nodeId, UTF_8),
+                 PutOption.newBuilder().withLeaseId(leaseId).build()))  // TTL-based lock
+    .commit();
 
 try {
-    PutResponse result = response.get(500, TimeUnit.MILLISECONDS);
-    // Lock acquired — safe to proceed
+    TxnResponse result = response.get(500, TimeUnit.MILLISECONDS);
+    if (!result.isSucceeded()) {
+        throw new LockHeldException("Another node holds the lock");
+    }
+    // Lock acquired — safe to proceed (still protect the write with a DB constraint)
 } catch (TimeoutException | ExecutionException e) {
     // Partition or quorum loss — cannot proceed safely
     throw new DistributedLockException("Cannot acquire lock during partition", e);
@@ -146,12 +148,14 @@ Row exchangeRate = session.execute(
         .setConsistencyLevel(ConsistencyLevel.ONE)  // AP: respond even during partition
 ).one();
 
-// CP: require quorum for balance-affecting operations
+// Stronger: QUORUM reads see the latest QUORUM write. But a read-modify-write of a
+// balance still needs a lightweight transaction (IF ... with SERIAL consistency)
+// to avoid lost updates — most teams keep balances in a relational database.
 Row accountBalance = session.execute(
     QueryBuilder.select().all()
         .from("accounts")
         .where(QueryBuilder.eq("account_id", accountId))
-        .setConsistencyLevel(ConsistencyLevel.QUORUM)  // CP: must have majority
+        .setConsistencyLevel(ConsistencyLevel.QUORUM)  // needs a majority of replicas
 ).one();
 ```
 
@@ -288,7 +292,7 @@ When selecting a data store or designing a distributed data architecture:
         "ConsistencyLevel.ONE only affects read latency, not consistency guarantees"
       ],
       "correct": 1,
-      "explanation": "ConsistencyLevel.ONE means a write succeeds if any single replica acknowledges it. During a partition, different replicas may accept different writes, creating diverged state. This is AP behaviour. For account balances, QUORUM or ALL should be used to ensure reads can detect the most recent write."
+      "explanation": "ConsistencyLevel.ONE means a write succeeds if any single replica acknowledges it. During a partition, different replicas may accept different writes, creating diverged state. This is AP behaviour. For account balances, QUORUM is the minimum, and read-modify-write updates also need lightweight transactions (SERIAL) to avoid lost updates — which is why balances usually live in a relational database."
     }
   ]
 }
@@ -296,25 +300,25 @@ When selecting a data store or designing a distributed data architecture:
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "The CAP Theorem \u2014 Consistency, Availability, Partition Tolerance \u2014 Production Implementation",
+  "title": "CAP in Practice — Partition Behaviour of a Payment Balance Service",
   "difficulty": "advanced",
   "estimatedMinutes": 85,
   "tasks": [
     {
       "id": "1",
-      "description": "Implement the core the cap theorem \u2014 consistency, availability, partition tolerance mechanism in a Java Spring Boot service with proper error handling"
+      "description": "Run a 3-node etcd (or CockroachDB) cluster and a 3-node Cassandra cluster in Testcontainers. Use Toxiproxy to cut one node off and record, for each store, whether reads and writes on the minority side fail or return stale data."
     },
     {
       "id": "2",
-      "description": "Write integration tests using Testcontainers to validate the the cap theorem \u2014 consistency, availability, partition tolerance behaviour under concurrent load"
+      "description": "Implement the payment-authorisation flowchart from this lesson in a Spring Boot service: during a partition, approve from a cached balance only when the cache age and the amount are within configured limits; otherwise decline. Write a test for each branch."
     },
     {
       "id": "3",
-      "description": "Add observability: expose Micrometer metrics and structured log entries for key operations"
+      "description": "Add Micrometer metrics for authorisations decided from the cache versus the authoritative source, the cache age at decision time, and declines caused by partitions. Add an alert on the cache-based approval rate."
     },
     {
       "id": "4",
-      "description": "Document architectural decisions: write an ADR and a production runbook covering rollout and rollback"
+      "description": "Write an ADR that classifies your payment data into the five consistency tiers from this lesson, names the store and consistency level used for each, and documents what the system does during a partition."
     }
   ]
 }

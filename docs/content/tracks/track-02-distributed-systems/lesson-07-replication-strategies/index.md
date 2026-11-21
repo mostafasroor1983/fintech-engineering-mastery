@@ -42,7 +42,7 @@ Data replication is the act of maintaining copies of the same data on multiple m
 
 ## Business Context
 
-In April 2021, a retail bank in the UK performed a planned failover of its primary PostgreSQL instance to a synchronous replica. The failover itself completed in 11 seconds. The incident that followed lasted 4 hours. The problem was replication lag on 14 async read replicas serving the mobile banking application. When the new primary came up, the read replicas had not yet caught up: they lagged between 3 and 47 seconds of write-ahead log. During this window, customers could successfully transfer money on the write primary, then immediately check their balance on a stale read replica and see the pre-transfer amount. 8,400 customers called support reporting incorrect balances. The bank's routing logic sent all reads to the nearest replica without any read-your-writes awareness. The fix required changing the mobile API to track per-user write timestamps and route reads to the primary for 5 seconds after any write by that user. Post-incident, they also set `synchronous_commit = on` for balance-critical write paths, accepting 2ms of additional latency to avoid stale reads for account balance queries.
+Consider a composite example drawn from typical incidents. A retail bank performs a planned failover of its primary PostgreSQL instance to a synchronous replica. The failover itself completes in 11 seconds; the incident that follows lasts hours. The problem is replication lag on more than a dozen async read replicas serving the mobile banking app. After the switch the read replicas lag between 3 and 47 seconds of write-ahead log. During this window, customers transfer money on the primary, then immediately check their balance on a stale replica and see the pre-transfer amount. Thousands of customers call support about incorrect balances. The routing logic sent all reads to the nearest replica with no read-your-writes awareness. The fix: track each user's last write position and route that user's reads to the primary until the replica has caught up. For the standby that serves balance reads, the bank also sets `synchronous_commit = remote_apply`, so a commit returns only after that standby has applied it — accepting one extra network round trip per balance-changing write.
 
 ## Single-Leader Replication
 
@@ -75,28 +75,30 @@ sequenceDiagram
 | Durability | Write confirmed on 2+ nodes | Write confirmed on leader only |
 | Write latency | Leader latency + follower RTT | Leader latency only |
 | Availability | Write stalls if sync follower is unreachable | Writes continue regardless of follower state |
-| Stale reads | Sync follower always current | Followers may be seconds to minutes behind |
+| Stale reads | Sync follower has the WAL; its reads see the write only with `remote_apply` | Followers may be seconds to minutes behind |
 | Typical use | Balance updates, payment state | Reporting, analytics, search indexing |
 
 > [!WARNING]
-> For payment ledger writes, always use synchronous replication to at least one follower. Async-only replication means you can lose committed transactions if the leader crashes before the WAL reaches any follower. The 2ms latency overhead of synchronous commit is worth the durability guarantee.
+> For payment ledger writes, always use synchronous replication to at least one follower. Async-only replication means you can lose committed transactions if the leader crashes before the WAL reaches any follower. The extra network round trip per commit (about 1-2ms within one region) is worth the durability guarantee.
 
 ### PostgreSQL Streaming Replication Configuration
 
-```sql
--- postgresql.conf on PRIMARY
-wal_level = replica           -- Enables streaming replication WAL format
-max_wal_senders = 10          -- Max concurrent follower connections
+```ini
+# postgresql.conf on PRIMARY
+wal_level = replica           # Enables streaming replication WAL format
+max_wal_senders = 10          # Max concurrent follower connections
 synchronous_standby_names = 'FIRST 1 (standby1, standby2)'
-                              -- At least one must ack before commit returns
-synchronous_commit = on       -- Default: wait for sync standbys to flush
+                              # At least one must ack before commit returns
+synchronous_commit = on       # Default: wait for the sync standby to flush WAL
 
--- For balance updates (strict durability): synchronous_commit = on
--- For audit log inserts (can tolerate lag): synchronous_commit = local
+# synchronous_commit can also be set per transaction (SET LOCAL ...):
+#   remote_apply  balance updates whose result is read on the standby
+#   on            ledger writes (durable on 2 nodes)
+#   local         audit log inserts that can tolerate standby lag
 ```
 
-```sql
--- pg_hba.conf on PRIMARY — allow replication connections
+```text
+# pg_hba.conf on PRIMARY — allow replication connections
 host replication replicator 10.0.1.0/24 scram-sha-256
 ```
 
@@ -127,6 +129,12 @@ ORDER BY replay_lag DESC NULLS LAST;
 Routing reads to replicas improves throughput but requires care to avoid showing users stale data after their own writes.
 
 ```java
+// Simple time-window version. Two limits to know:
+//  - the cache is per instance: behind a load balancer, store last-write info
+//    in a shared store (e.g. Redis) or the user's session/token
+//  - a fixed window fails when lag exceeds it; the precise version records the
+//    primary's LSN after the write (pg_current_wal_lsn()) and reads from the
+//    replica only once pg_last_wal_replay_lsn() has passed it
 @Component
 public class ReplicaAwareRoutingDataSource extends AbstractRoutingDataSource {
 
@@ -270,19 +278,23 @@ public class CassandraPaymentRepository {
 
     private final CqlSession session;
 
-    // QUORUM write: majority of replicas must acknowledge before success
+    // LOCAL_QUORUM write + LOCAL_QUORUM read overlap within the local DC
+    // (W + R > N per DC), so a client reads its own writes in that DC.
+    // Mixing QUORUM writes with LOCAL_QUORUM reads does NOT guarantee overlap
+    // across DCs (2 DCs x 3 replicas: 4 + 2 = 6, not > 6).
     public void savePayment(Payment payment) {
         SimpleStatement stmt = SimpleStatement.newInstance(
             "INSERT INTO payments (id, account_id, amount, status, created_at) " +
-            "VALUES (?, ?, ?, ?, ?) USING TTL 7776000", // 90-day TTL
+            "VALUES (?, ?, ?, ?, ?)",   // no TTL: payment records must be retained for years
             payment.id(), payment.accountId(), payment.amount(),
             payment.status().name(), payment.createdAt()
-        ).setConsistencyLevel(ConsistencyLevel.QUORUM);
+        ).setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
 
         session.execute(stmt);
     }
 
-    // LOCAL_QUORUM read: quorum within the local DC — lower latency than QUORUM
+    // LOCAL_QUORUM read: quorum within the local DC — lower latency than QUORUM;
+    // the other DC sees the write eventually
     public Optional<Payment> findById(UUID paymentId) {
         SimpleStatement stmt = SimpleStatement.newInstance(
             "SELECT * FROM payments WHERE id = ?", paymentId
@@ -309,7 +321,7 @@ public class CassandraPaymentRepository {
 | Level | Writes required | Reads required | Use case in fintech |
 |---|---|---|---|
 | `ONE` | 1 replica | 1 replica | High-volume audit events where stale read is acceptable |
-| `QUORUM` | ceil(N/2)+1 | ceil(N/2)+1 | Payment status reads requiring strong consistency |
+| `QUORUM` | floor(N/2)+1 | floor(N/2)+1 | Payment status reads requiring strong consistency |
 | `LOCAL_QUORUM` | Quorum in local DC | Quorum in local DC | Multi-DC deployment with low-latency requirement |
 | `EACH_QUORUM` | Quorum in every DC | — | Multi-DC writes where all DCs must confirm |
 | `ALL` | All N replicas | All N replicas | Highest durability — not recommended for high availability |
@@ -338,7 +350,7 @@ public class KafkaDurableProducerConfig {
         config.put(ProducerConfig.ACKS_CONFIG, "all");
 
         // Idempotent producer: prevents duplicate messages on retry
-        // Required when acks=all and retries > 0
+        // (on by default since Kafka 3.0; set explicitly so it is never lost)
         config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
         config.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
         config.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
@@ -424,7 +436,7 @@ bootstrap:
       max_wal_senders: 10
       max_replication_slots: 10
       synchronous_commit: "on"
-      synchronous_standby_names: "ANY 1 (*)"
+      # synchronous_standby_names is managed by Patroni in synchronous_mode
 
 postgresql:
   listen: 0.0.0.0:5432
@@ -432,22 +444,22 @@ postgresql:
   data_dir: /var/lib/postgresql/15/main
   pgpass: /tmp/pgpass
   authentication:
+    # Passwords come from the environment, never from this file:
+    # PATRONI_REPLICATION_PASSWORD and PATRONI_SUPERUSER_PASSWORD
     replication:
       username: replicator
-      password: "${REPLICATOR_PASSWORD}"
     superuser:
       username: postgres
-      password: "${POSTGRES_PASSWORD}"
 ```
 
 > [!NOTE]
-> Patroni's `maximum_lag_on_failover` setting is critical for financial correctness. If a standby is promoted while lagging significantly, it will be missing recent writes that were committed on the old primary but not yet replicated. Set this conservatively — 1 MB is a reasonable upper bound for most payment workloads.
+> Patroni's `maximum_lag_on_failover` setting is critical for financial correctness. If a standby is promoted while lagging significantly, it will be missing recent writes that were committed on the old primary but not yet replicated. Set this conservatively — 1 MB is a reasonable upper bound for most payment workloads. With `synchronous_mode: true`, Patroni promotes only a synchronous standby, which already has every committed transaction; the lag limit then protects the async fallback cases.
 
 ## Knowledge Check
 
 **Q1: Your read replica reports `replay_lag = 00:00:08` in `pg_stat_replication`. A customer just transferred money on the primary. The mobile app immediately queries the account balance on this replica. What balance will the customer see, and what should your routing logic do?**
 
-A: The customer will see the pre-transfer balance — the replica is 8 seconds behind and has not yet applied the write-ahead log entries for the transfer. The routing logic should detect that this user made a write (via a write timestamp cache) and route balance queries for this user to the primary for a window of at least 10–15 seconds after the write. After the window, reads can safely return to the async replica. This is the read-your-writes consistency guarantee implemented at the application layer.
+A: The customer will see the pre-transfer balance — the replica is 8 seconds behind and has not yet applied the write-ahead log entries for the transfer. The routing logic should detect that this user made a write and route this user's balance queries to the primary until the replica has caught up — either for a window longer than the worst replica lag, or better, until the replica's replay LSN has passed the LSN of the user's write. After the window, reads can safely return to the async replica. This is the read-your-writes consistency guarantee implemented at the application layer.
 
 **Q2: Kafka has 3 brokers with `min.insync.replicas=2` and `acks=all`. Brokers 2 and 3 fall out of the ISR set, leaving only Broker 1 in ISR. A producer sends a payment event. What happens?**
 
@@ -461,7 +473,7 @@ A: The producer receives `NotEnoughReplicasException`. The partition will not ac
 
 1. **Lag-aware replica routing:** Write a Spring `AbstractRoutingDataSource` that queries `pg_stat_replication` on the primary every 5 seconds and routes balance reads to the synchronous `replica-1` when any async replica's `replay_lag` exceeds 2 seconds. Include the monitoring query and the routing decision logic.
 
-2. **Write-your-reads routing:** Extend the router so that for 10 seconds after any write by a specific `userId`, all reads from that user are directed to `replica-1`, using a Caffeine cache keyed by `userId`. Write the cache configuration and the routing decision method.
+2. **Read-your-writes routing:** Extend the router so that for 10 seconds after any write by a specific `userId`, all reads from that user are directed to `replica-1` (configured with `synchronous_commit = remote_apply`), using a cache keyed by `userId` that all API instances share. Write the cache configuration and the routing decision method.
 
 3. **Multi-DC conflict resolution:** Your bank is opening a second datacenter. Write an `OverdraftLimitConflictResolver` that handles simultaneous updates to `overdraft_limit` on both leaders. Apply the financial-safety rule (preserve the lower limit), log both values, and record a `conflict_resolution_audit` entry.
 
@@ -500,25 +512,25 @@ A: The producer receives `NotEnoughReplicasException`. The partition will not ac
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Replication Strategies \u2014 Production Implementation",
+  "title": "Replica Routing, Conflict Resolution, and Failover for a Core Banking Database",
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
     {
       "id": "1",
-      "description": "Write a lag-aware `AbstractRoutingDataSource` that queries `pg_stat_replication` and routes to the synchronous replica when async replica lag exceeds 2"
+      "description": "Write a lag-aware AbstractRoutingDataSource that queries pg_stat_replication on the primary every 5 seconds and routes balance reads to the synchronous replica-1 when any async replica's replay_lag exceeds 2 seconds."
     },
     {
       "id": "2",
-      "description": "Add write-your-reads routing using a Caffeine cache keyed by `userId` with 10-second TTL"
+      "description": "Add read-your-writes routing: for 10 seconds after a write by a userId (or until the replica's replay LSN passes the write's LSN), send that user's reads to replica-1 configured with synchronous_commit = remote_apply, using a cache shared by all API instances."
     },
     {
       "id": "3",
-      "description": "Write an `OverdraftLimitConflictResolver` for multi-leader conflict resolution that preserves the lower value and logs both"
+      "description": "Write an OverdraftLimitConflictResolver for multi-leader replication that keeps the lower overdraft limit, logs both values, and records a conflict_resolution_audit entry."
     },
     {
       "id": "4",
-      "description": "Write a Patroni failover test runbook including kill command, API verification, connection pool reconnect check, and data-loss verification query"
+      "description": "Write a Patroni failover test runbook: the command to kill the leader, the Patroni REST API call that verifies the new leader, the application health check that confirms the connection pool reconnects, and the query that verifies no committed transactions were lost."
     }
   ]
 }

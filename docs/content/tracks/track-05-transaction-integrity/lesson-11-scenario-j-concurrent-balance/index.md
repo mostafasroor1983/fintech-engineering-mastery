@@ -11,6 +11,8 @@ tags: [concurrent-balance, hot-account, queue-serialization, partitioning, CRDT]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 A merchant account receiving 800 concurrent debits per second broke one of the most common assumptions in banking system design: that `SELECT FOR UPDATE` is a sufficient concurrency primitive. At 800 req/s with each database lock held for 10 ms, the queue grew faster than it was drained, p99 latency climbed to 8 seconds, and payment terminals across three retail chains began timing out. This lesson traces the physics of the hot-account problem, then implements four progressively more scalable solutions — from queue serialisation through micro-batching to a CRDT-inspired reserved balance architecture that eliminates the centralised lock entirely.
 
 ## Learning Objectives
@@ -24,7 +26,7 @@ A merchant account receiving 800 concurrent debits per second broke one of the m
 
 ## Business Context
 
-Apex Retail, a UK omnichannel retailer, operates 1,400 payment terminals across 180 stores. All terminals debit a single pooled merchant account managed by their acquiring bank integration. On the Saturday before Christmas, a flash sale drove terminal throughput from a typical 120 req/s to 820 req/s sustained for 47 minutes. The acquiring bank's payment service used `SELECT FOR UPDATE` on the merchant account row for every debit. Each debit held the lock for approximately 11 ms (round-trip to the payment network authorisation service).
+*Composite example:* "Apex Retail", a fictional UK omnichannel retailer, operates 1,400 payment terminals across 180 stores. All terminals debit a single pooled merchant account managed by their acquiring bank integration. On the Saturday before Christmas, a flash sale drove terminal throughput from a typical 120 req/s to 820 req/s sustained for 47 minutes. The acquiring bank's payment service used `SELECT FOR UPDATE` on the merchant account row for every debit. Each debit held the lock for approximately 11 ms — because the code called the payment network's authorisation service *while holding the row lock*, itself an anti-pattern: never hold a database lock across a remote call.
 
 At 820 req/s, with 1 debit every 1.22 ms, but only 1 debit able to hold the lock at a time with an 11 ms hold, the queue grew at 820 − (1000/11) = 820 − 91 = **729 items per second**. Within 2 minutes the queue held over 87,000 pending debits. Database connection pool exhaustion followed at minute 3. The service began rejecting connections at minute 4. By minute 7, 23% of terminal payment attempts were failing with timeout errors. The acquiring bank's on-call team manually rate-limited the merchant to 150 req/s to stabilise the system, leaving 670 req/s of legitimate sales unprocessed and routing them to a competitor's terminal network. Estimated lost revenue: £340,000 in that 47-minute window. The root cause was a seven-line code path that had worked correctly at 120 req/s for two years.
 
@@ -71,7 +73,9 @@ xychart-beta
 
 ## Fix 1: Queue Serialisation per Account
 
-Move the serialisation point from the database to the application. Each account gets a dedicated `LinkedBlockingQueue` processed by a single thread. Database writes are non-contended because only one thread ever writes for a given account at a time.
+Move the serialisation point from the database to the application. Each account gets a dedicated `LinkedBlockingQueue` processed by a single thread. Database writes do not wait on each other because only one thread writes for a given account at a time.
+
+Two caveats. First, this only holds **within one service instance**: with several instances, requests for the same account must be routed to the same instance (e.g. by partitioning on account ID), or the queues no longer serialise anything. Correctness must therefore still come from the database — the conditional `UPDATE ... WHERE balance_cents >= ?` below — while the queue only removes the *waiting*. Second, a platform thread per account does not scale to many accounts; use this for a known set of hot accounts, or use the virtual-thread variant.
 
 ### AccountSerializerService
 
@@ -120,7 +124,8 @@ public class AccountSerializerService {
         if (request == null) return;
 
         try {
-            // No SELECT FOR UPDATE needed — only one thread writes per account
+            // No SELECT FOR UPDATE needed in this instance — but the conditional
+            // UPDATE still guarantees no overdraft if another instance writes too
             DebitResult result = accountRepository.applyDebitNoLock(
                     request.accountId(),
                     request.amountCents(),
@@ -158,8 +163,9 @@ public record DebitRequest(
 ### applyDebitNoLock SQL
 
 ```sql
--- No SELECT FOR UPDATE — only one thread calls this for a given account at a time.
--- Optimistic balance check in the WHERE clause prevents overdraft.
+-- No SELECT FOR UPDATE — the queue means this rarely waits on another writer.
+-- The balance check in the WHERE clause is what actually prevents overdraft.
+-- (The ledger entry and idempotency record are written in the same transaction.)
 UPDATE accounts
 SET    balance_cents   = balance_cents - ?,   -- amountCents
        last_updated_at = now(),
@@ -179,6 +185,9 @@ public class VirtualThreadAccountSerializer {
     // One semaphore per account — permits=1 means only one virtual thread writes at a time
     private final ConcurrentHashMap<UUID, Semaphore> accountSemaphores =
             new ConcurrentHashMap<>();
+    // ONE shared executor. Creating newVirtualThreadPerTaskExecutor() per call
+    // would leak an executor (never closed) on every request.
+    private final ExecutorService virtualThreads = Executors.newVirtualThreadPerTaskExecutor();
     private final AccountRepository accountRepository;
 
     public VirtualThreadAccountSerializer(AccountRepository accountRepository) {
@@ -188,7 +197,6 @@ public class VirtualThreadAccountSerializer {
     /**
      * Virtual threads allow massive concurrency without platform thread exhaustion.
      * The Semaphore(1) ensures only one virtual thread writes per account at a time.
-     * 50,000 parked virtual threads consume roughly 50 MB — equivalent to 50 platform threads.
      */
     public CompletableFuture<DebitResult> submitDebit(UUID accountId, long amountCents,
                                                        String idempotencyKey) {
@@ -197,24 +205,28 @@ public class VirtualThreadAccountSerializer {
                     k -> new Semaphore(1));
             try {
                 semaphore.acquire();   // virtual thread parks here if another write is in flight
-                return accountRepository.applyDebitNoLock(accountId, amountCents, idempotencyKey);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new DebitInterruptedException(accountId, e);
+            }
+            // release() ONLY after a successful acquire(): releasing in a finally
+            // that also covers a failed acquire would hand out a second permit
+            try {
+                return accountRepository.applyDebitNoLock(accountId, amountCents, idempotencyKey);
             } finally {
                 semaphore.release();
             }
-        }, Executors.newVirtualThreadPerTaskExecutor());
+        }, virtualThreads);
     }
 }
 ```
 
 > [!NOTE]
-> Virtual threads (Java 21) park cheaply on blocking operations and are created at near-zero cost. For a service with 50,000 hot accounts each needing serialisation, 50,000 parked virtual threads consume roughly 50 MB of heap — equivalent to 50 platform threads. The `Semaphore(1)` per account ensures serialisation without a dedicated thread pool per account, making this approach far more memory-efficient than platform-thread-per-account queues.
+> Virtual threads (Java 21) park cheaply on blocking operations and are created at near-zero cost. (On Java 21–23 a virtual thread blocked inside a `synchronized` block — common in older JDBC drivers — pins its carrier thread; JDK 24 removed that limitation, JEP 491.) For a service with 50,000 hot accounts each needing serialisation, 50,000 parked virtual threads consume roughly 50 MB of heap — equivalent to 50 platform threads. The `Semaphore(1)` per account ensures serialisation without a dedicated thread pool per account, making this approach far more memory-efficient than platform-thread-per-account queues.
 
 ## Fix 2: Micro-Batching
 
-Queue serialisation reduces lock contention but still issues one database UPDATE per debit. Micro-batching collects all debits that arrive within a short window (10 ms) and applies them as a single UPDATE, reducing database write amplification by the batch size.
+Queue serialisation reduces lock contention but still issues one database UPDATE per debit. Micro-batching collects all debits that arrive within a short window (10 ms) and applies them as a single balance UPDATE, reducing lock acquisitions on the hot row by the batch size. Each debit still gets its own ledger entry and idempotency record — written in the **same** transaction as the batch update — so the batch never hides individual payments and a retried debit is not applied twice.
 
 ### BatchingDebitAccumulator
 
@@ -286,9 +298,9 @@ public class BatchingDebitAccumulator {
                 .sum();
 
         try {
-            // Single UPDATE applies all debits in this 10 ms window in one lock acquisition
-            DebitResult result = accountRepository.applyBatchDebit(
-                    accountId, totalDebitCents, debits.size());
+            // One transaction: a single balance UPDATE for the whole window PLUS one
+            // ledger entry and one idempotency claim per debit (duplicates skipped)
+            DebitResult result = accountRepository.applyBatchDebit(accountId, debits);
 
             futures.forEach(f -> f.complete(result));
             log.debug("Micro-batch flushed: accountId={} debits={} totalCents={}",
@@ -330,7 +342,7 @@ At 800 req/s and a 10 ms batch window, each batch contains approximately 8 debit
 
 ## Fix 3: CRDT-Inspired Terminal Credits
 
-For the highest throughput requirements, eliminate the centralised balance lock entirely. Each payment terminal maintains its own `terminal_credits` row. The main balance is computed as `main_balance - SUM(terminal_credits.debited_cents)`. Terminals write to their own row without contention on the main account row. Settlement consolidates the terminal rows into the main balance nightly.
+For the highest throughput requirements, eliminate the centralised balance lock entirely. Each payment terminal maintains its own `terminal_credits` row (a sharded counter). The main balance is computed as `main_balance - SUM(terminal_credits.debited_cents)`. Terminals write to their own row without contention on the main account row. Settlement consolidates the terminal rows into the main balance. The counters are only a fast aggregate: every individual transaction is still recorded in the ledger.
 
 ### Schema
 
@@ -422,25 +434,36 @@ public class TerminalSettlementJob {
     @Scheduled(cron = "0 0 1 * * *")   // 01:00 UTC nightly
     @Transactional
     public void settle() {
-        // 1. Subtract all terminal debits from each account's main balance
+        // Two separate statements ("subtract the SUM", then "reset to 0") would
+        // LOSE every debit a terminal writes between them: the reset wipes amounts
+        // the subtraction never saw. Instead: lock the terminal rows, subtract
+        // exactly the amounts read, and move those same amounts to the main balance.
         int accountsSettled = jdbc.update("""
+                WITH old AS (
+                    SELECT id, account_id, debited_cents
+                    FROM   terminal_credits
+                    WHERE  debited_cents <> 0
+                    FOR UPDATE
+                ),
+                reset AS (
+                    UPDATE terminal_credits tc
+                    SET    debited_cents   = tc.debited_cents - old.debited_cents,
+                           last_updated_at = now()
+                    FROM   old
+                    WHERE  tc.id = old.id
+                    RETURNING old.account_id, old.debited_cents
+                )
                 UPDATE accounts a
-                SET    main_balance_cents = a.main_balance_cents
-                                           - (SELECT COALESCE(SUM(tc.debited_cents), 0)
-                                              FROM   terminal_credits tc
-                                              WHERE  tc.account_id = a.id),
-                       last_settled_at = now()
+                SET    main_balance_cents = a.main_balance_cents - s.total,
+                       last_settled_at    = now()
+                FROM   (SELECT account_id, SUM(debited_cents) AS total
+                        FROM reset GROUP BY account_id) s
+                WHERE  a.id = s.account_id
                 """);
 
-        // 2. Reset all terminal credit accumulators to zero for the new day
-        int terminalsReset = jdbc.update("""
-                UPDATE terminal_credits
-                SET    debited_cents   = 0,
-                       last_updated_at = now()
-                """);
-
-        log.info("Settlement complete: {} accounts settled, {} terminal rows reset",
-                accountsSettled, terminalsReset);
+        log.info("Settlement complete: {} accounts settled", accountsSettled);
+        // (For large volumes, settle account by account in small transactions
+        //  so terminals are blocked only for milliseconds.)
     }
 }
 ```
@@ -509,15 +532,15 @@ Your team is tasked with redesigning the balance update path for a prepaid card 
       "explanation": "max_throughput = 1000 ms / 12 ms = 83 TPS. At 200 req/s arrival: queue_growth_rate = 200 − 83 = 117 items/second. The queue grows without bound from the moment arrival exceeds the service rate. Connection pool exhaustion follows when queue depth equals the pool size."
     },
     {
-      "text": "Why does the queue serialisation approach use Propagation.REQUIRES_NEW (or a Semaphore per account for virtual threads) rather than simply retrying failed optimistic lock attempts?",
+      "text": "Why does queue serialisation (a single writer per account, or a Semaphore per account with virtual threads) work better under heavy contention than simply retrying failed optimistic lock attempts?",
       "options": [
         "Because optimistic locking requires a version column which is expensive to maintain",
         "Because the serialisation point is moved to the application layer: only one thread writes per account at a time, eliminating database lock contention entirely rather than merely retrying it",
-        "Because REQUIRES_NEW provides better performance than retries under any load level",
+        "Because a single writer is faster than retries under any load level, even with no contention",
         "Because retries are not idempotent and will double-charge customers"
       ],
       "correct": 1,
-      "explanation": "Queue serialisation moves the serialisation point from the database row lock to an in-memory queue or semaphore. The database UPDATE runs without any locking predicate because only one thread ever writes for a given account at a time — contention is prevented, not retried. Optimistic lock retries still hit the database on every conflict; queue serialisation eliminates the conflicts themselves."
+      "explanation": "Queue serialisation moves the waiting from the database row lock to an in-memory queue or semaphore: only one thread writes for a given account at a time (within an instance), so writers do not collide — contention is prevented, not retried. Optimistic lock retries still hit the database on every conflict. Correctness still comes from the conditional UPDATE in the database, which also protects against writers in other instances."
     },
     {
       "text": "What is the main consistency trade-off introduced by the CRDT terminal credits model, and which prepaid card scenario makes this trade-off unacceptable without additional controls?",

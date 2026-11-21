@@ -38,11 +38,11 @@ API design in financial services is not merely a technical concern — it is a c
 - Define a gRPC protobuf service for real-time payment streaming and understand when gRPC outperforms REST
 - Implement a Spring `@RestController` returning RFC 9457 `ProblemDetail` for structured, machine-readable error responses
 - Design cursor-based pagination for large transaction history lists and explain why offset pagination fails at scale
-- Apply PSD2-required rate limiting headers and understand TPP throttling obligations under Open Banking standards
+- Apply rate-limiting headers and understand the PSD2 limit on how often TPPs may access an account without the customer present
 
 ## Business Context
 
-In 2023, a UK open banking aggregator's payment initiation API had been in production for two years with no versioning strategy. When the team needed to add a mandatory `creditorAgent` (BIC) field for SEPA payments under new EBA guidance, they faced a dilemma: break existing integrations silently or maintain two parallel implementations indefinitely. They chose the silent breaking change, reasoning that "most clients wouldn't be affected." Forty-three TPP integrations broke over the following weekend. The FCA opened a supervisory review. The remediation cost — developer time, TPP re-testing, regulatory correspondence, and customer compensation — exceeded £800k. The technical debt of "no versioning strategy" had a precise monetary value.
+Consider an open banking aggregator (a composite example) whose payment initiation API has been in production for two years with no versioning strategy. The team must add a mandatory structured creditor address, because cross-border ISO 20022 payment messages stop accepting unstructured addresses from November 2026. They face a dilemma: break existing integrations silently or maintain two parallel implementations. They choose the silent breaking change, reasoning that "most clients won't be affected." Forty-three TPP integrations break over the following weekend, the regulator asks questions, and the remediation cost — developer time, TPP re-testing, regulatory correspondence, and customer compensation — runs to hundreds of thousands of pounds. The technical debt of "no versioning strategy" had a precise monetary value.
 
 ## RESTful Resource Design for Payments
 
@@ -74,7 +74,7 @@ DELETE /payment-consents/{consentId}       # Revoke consent
 | PATCH | No | No* | Partial amendment — update payment reference |
 | DELETE | No | Yes | Cancel/revoke consent |
 
-POST is not naturally idempotent, but payment initiation must be. The solution is a client-generated `Idempotency-Key` header. The server stores the response for the first request and returns the stored response verbatim for any retry with the same key — without reprocessing.
+POST is not naturally idempotent, but payment initiation must be. The solution is a client-generated `Idempotency-Key` header. The server stores the response for the first request and returns the stored response verbatim (same status code and body) for any retry with the same key — without reprocessing — adding an `Idempotent-Replayed: true` header so the client can tell. A duplicate that arrives while the first request is still being processed gets `409 Conflict`.
 
 ```java
 @RestController
@@ -90,9 +90,12 @@ public class PaymentController {
             @RequestHeader("Idempotency-Key") UUID idempotencyKey,
             @Valid @RequestBody PaymentInitiationRequest request) {
 
+        // Production: store the key and response in the payment's own database
+        // transaction (ADR-0017, lesson 02) — a cache alone can lose them.
         return idempotencyCache.get(idempotencyKey, PaymentInitiationResponse.class)
-            .map(cached -> ResponseEntity.ok()
-                .header("X-Idempotency-Replayed", "true")
+            .map(cached -> ResponseEntity.status(HttpStatus.CREATED)   // same as the original
+                .header("Location", "/v2/payments/" + cached.paymentId())
+                .header("Idempotent-Replayed", "true")
                 .body(cached))
             .orElseGet(() -> {
                 ProcessPaymentCommand command = mapToCommand(idempotencyKey, request);
@@ -195,7 +198,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ProblemDetail'
         '429':
-          description: Rate limit exceeded (PSD2 TPP throttling)
+          description: Rate limit exceeded (TPP throttling)
           headers:
             Retry-After:
               schema:
@@ -224,7 +227,7 @@ components:
           $ref: '#/components/schemas/AccountReference'
         creditorAgent:
           type: string
-          description: BIC of creditor institution (required for SEPA CT)
+          description: BIC of creditor institution (optional for SEPA — IBAN-only since 2016)
           pattern: '^[A-Z]{6}[A-Z2-9][A-NP-Z0-9]([A-Z0-9]{3})?$'
         amount:
           type: string
@@ -255,8 +258,8 @@ For regulated APIs, URL path versioning is strongly recommended because regulato
 @GetMapping("/{paymentId}")
 public ResponseEntity<PaymentResponseV1> getPaymentV1(@PathVariable UUID paymentId) {
     return ResponseEntity.ok()
-        .header("Deprecation", "true")
-        .header("Sunset", "Sat, 31 Dec 2026 23:59:59 GMT")
+        .header("Deprecation", "@1767225600")                // RFC 9745: deprecated since 2026-01-01
+        .header("Sunset", "Sat, 31 Dec 2026 23:59:59 GMT")   // RFC 8594: removal date
         .header("Link", "</v2/payments/" + paymentId + ">; rel=\"successor-version\"")
         .body(paymentServiceV1.find(paymentId));
 }
@@ -264,7 +267,7 @@ public ResponseEntity<PaymentResponseV1> getPaymentV1(@PathVariable UUID payment
 
 ## gRPC for Real-Time Payment Streaming
 
-Where REST excels for public, cacheable, human-readable APIs, gRPC excels for high-throughput internal services requiring streaming or sub-millisecond serialisation overhead. Protocol Buffers serialise 3-10x smaller than JSON and 5-10x faster.
+Where REST excels for public, cacheable, human-readable APIs, gRPC excels for high-throughput internal services requiring streaming or sub-millisecond serialisation overhead. Protocol Buffers messages are typically several times smaller than the equivalent JSON and faster to parse.
 
 ```protobuf
 syntax = "proto3";
@@ -300,11 +303,11 @@ message PaymentStatusUpdate {
 
 enum PaymentStatus {
   PAYMENT_STATUS_UNSPECIFIED = 0;
-  PENDING = 1;
-  PROCESSING = 2;
-  COMPLETED = 3;
-  FAILED = 4;
-  CANCELLED = 5;
+  PAYMENT_STATUS_PENDING = 1;
+  PAYMENT_STATUS_PROCESSING = 2;
+  PAYMENT_STATUS_COMPLETED = 3;
+  PAYMENT_STATUS_FAILED = 4;
+  PAYMENT_STATUS_CANCELLED = 5;
 }
 ```
 
@@ -326,13 +329,20 @@ public class PaymentStreamServiceImpl
             public void onNext(PaymentRequest request) {
                 try {
                     commandBus.dispatch(mapToCommand(request));
-                    statusObservable.subscribe(request.getIdempotencyKey(),
-                        update -> responseObserver.onNext(update));
+                    // StreamObserver is not thread-safe: serialise onNext calls
+                    statusObservable.subscribe(request.getIdempotencyKey(), update -> {
+                        synchronized (responseObserver) { responseObserver.onNext(update); }
+                    });
                 } catch (InsufficientFundsException ex) {
-                    responseObserver.onError(
-                        Status.FAILED_PRECONDITION
-                            .withDescription("Insufficient funds: " + ex.getMessage())
-                            .asRuntimeException());
+                    // A business rejection is a status update, not a stream error:
+                    // onError() would close the stream for every other payment in it
+                    synchronized (responseObserver) {
+                        responseObserver.onNext(PaymentStatusUpdate.newBuilder()
+                            .setIdempotencyKey(request.getIdempotencyKey())
+                            .setStatus(PaymentStatus.PAYMENT_STATUS_FAILED)
+                            .setFailureReason("INSUFFICIENT_FUNDS")
+                            .build());
+                    }
                 }
             }
 
@@ -370,7 +380,7 @@ public class PaymentStreamServiceImpl
 | Versioning | URL path versioning | Schema evolution (additive only) |
 
 > [!WARNING]
-> PSD2 Article 32 requires PSPs to log all API access with the resource and operation accessed. With GraphQL, determining "what resource was accessed" requires parsing the POST body, not reading the URL. This is achievable but adds audit tooling complexity that most compliance and SIEM teams are not prepared for. Use REST for all regulated endpoints; GraphQL is appropriate for unregulated internal tooling.
+> Open banking supervisors and auditors expect a clear trail of which TPP accessed which account and operation. With GraphQL, determining "what resource was accessed" requires parsing the POST body, not reading the URL. This is achievable but adds audit tooling complexity that most compliance and SIEM teams are not prepared for. Use REST for all regulated endpoints; GraphQL is appropriate for unregulated internal tooling.
 
 ## API Gateway Routing Diagram
 
@@ -481,15 +491,15 @@ LIMIT :limit;
 
 **Q1: A TPP integration with your payment API triggers a network retry storm, sending the same `POST /payments` request three times in quick succession. The first request was processed successfully and debited the customer's account. What prevents duplicate debits, and what HTTP response should requests two and three return?**
 
-A: The `Idempotency-Key` header prevents duplicate processing. On first receipt the server processes the payment and caches the response keyed by the client-generated UUID. On subsequent requests with the same key, the server returns the cached response immediately — without re-executing the command. The correct response for the replay is `200 OK` (not `201 Created`, since no new resource is created) with `X-Idempotency-Replayed: true` header. The debit occurs exactly once regardless of retry count. Idempotency keys should be stored alongside the payment record for auditability and dispute resolution.
+A: The `Idempotency-Key` header prevents duplicate processing. On first receipt the server processes the payment and caches the response keyed by the client-generated UUID. On subsequent requests with the same key, the server returns the cached response immediately — without re-executing the command. The correct response for the replay is the stored original response — `201 Created` with the same body and `Location` — plus an `Idempotent-Replayed: true` header, so a client that lost the first response sees exactly what it would have seen. (A duplicate that arrives while the first is still in progress gets `409 Conflict` and retries.) The debit occurs exactly once regardless of retry count. Idempotency keys should be stored alongside the payment record for auditability and dispute resolution.
 
-**Q2: You need to add a mandatory `creditorAgent` (BIC) field to your payment API for SEPA compliance. Existing integrations do not send this field. What versioning approach do you take, and what response headers do you add to v1 to signal the upcoming change?**
+**Q2: You need to add a mandatory structured `creditorAddress` field to your payment API for cross-border ISO 20022 compliance. Existing integrations do not send this field. What versioning approach do you take, and what response headers do you add to v1 to signal the upcoming change?**
 
-A: Introduce the field as optional in v1 immediately — this is backward compatible. Make it mandatory only in `/v2/payments`. Add `Deprecation: true`, `Sunset: <date 12 months out>`, and `Link: </v2/payments>; rel="successor-version"` headers to all v1 responses to signal the migration path. Notify TPPs via the Berlin Group directory and publish a migration guide. Run v1 and v2 in parallel for the sunset period. Never silently add mandatory fields to an existing API version — this is a breaking change regardless of how minor it appears internally.
+A: Introduce the field as optional in v1 immediately — this is backward compatible. Make it mandatory only in `/v2/payments`. Add `Deprecation: @<unix time>` (RFC 9745), `Sunset: <date 12 months out>` (RFC 8594), and `Link: </v2/payments>; rel="successor-version"` headers to all v1 responses to signal the migration path. Notify TPPs through your developer portal and publish a migration guide. Run v1 and v2 in parallel for the sunset period. Never silently add mandatory fields to an existing API version — this is a breaking change regardless of how minor it appears internally.
 
 ## Practical Challenge
 
-**Scenario:** You are designing the external-facing API for a new UK Open Banking payment initiation service that must comply with PSD2 and the Open Banking Implementation Entity (OBIE) specification.
+**Scenario:** You are designing the external-facing API for a new UK Open Banking payment initiation service that must comply with PSD2 and the UK Open Banking Standard (originally published by the OBIE).
 
 **Task 1 — Resource Design:** Define the full URL structure for: initiating a domestic payment, checking payment status, listing an account's transactions (paginated), and revoking a payment consent. For each endpoint, list HTTP methods, success status codes, and the two most likely error status codes.
 
@@ -497,22 +507,22 @@ A: Introduce the field as optional in v1 immediately — this is backward compat
 
 **Task 3 — Pagination:** Implement a `TransactionHistoryController` endpoint `GET /v2/accounts/{id}/transactions` using cursor-based pagination. The cursor must encode account ID, timestamp, and transaction UUID. Write a unit test verifying that a request with a valid cursor returns transactions older than the cursor timestamp in descending order.
 
-**Task 4 — Deprecation Interceptor:** Implement a Spring `HandlerInterceptor` that adds `Deprecation`, `Sunset`, and `Link` (successor version) headers to all responses from controllers annotated with a custom `@Deprecated("v2")` annotation. Write a test that verifies these headers are present on v1 endpoints and absent on v2 endpoints.
+**Task 4 — Deprecation Interceptor:** Implement a Spring `HandlerInterceptor` that adds `Deprecation`, `Sunset`, and `Link` (successor version) headers to all responses from controllers annotated with a custom `@DeprecatedApi(successor = "v2")` annotation (not `java.lang.Deprecated`, which takes no value). Write a test that verifies these headers are present on v1 endpoints and absent on v2 endpoints.
 
 <!-- KNOWLEDGE-CHECK
 {
   "questions": [
     {
       "id": "q1",
-      "text": "A TPP sends the same POST /payments request three times with the same Idempotency-Key. The first request succeeded. What HTTP status code should requests 2 and 3 return?",
+      "text": "A TPP sends the same POST /payments request three times with the same Idempotency-Key. The first request succeeded. What should requests 2 and 3 return?",
       "options": [
-        "201 Created — the payment exists",
-        "200 OK with X-Idempotency-Replayed: true header",
+        "The stored original response — 201 Created with the same body and Location — plus an Idempotent-Replayed: true header",
+        "200 OK with a freshly built response, because no new resource is created",
         "409 Conflict — a resource with this key already exists",
         "204 No Content — the duplicate was silently ignored"
       ],
-      "correct": 1,
-      "explanation": "200 OK with X-Idempotency-Replayed: true signals the response is served from cache without reprocessing. 201 is incorrect because no new resource was created. 409 implies an error condition, but idempotent replay is correct behaviour by design. 204 omits the payment response body the client needs to confirm the original outcome."
+      "correct": 0,
+      "explanation": "Idempotent replay means the client gets exactly what the first request returned, so a client that lost the first response can carry on as if it had received it. The Idempotent-Replayed header tells it this was a replay. 409 is for a duplicate that arrives while the first request is still being processed, not after it finished; 204 drops the body the client needs to confirm the original outcome."
     },
     {
       "id": "q2",
@@ -550,7 +560,7 @@ A: Introduce the field as optional in v1 immediately — this is backward compat
     },
     {
       "id": "4",
-      "description": "Implement a Spring HandlerInterceptor adding Deprecation, Sunset, and Link headers to v1 endpoints only, verified by unit test"
+      "description": "Implement a Spring HandlerInterceptor adding Deprecation, Sunset, and Link headers to endpoints annotated with a custom @DeprecatedApi annotation (v1 only), verified by unit test"
     }
   ]
 }

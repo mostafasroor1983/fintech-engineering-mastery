@@ -53,7 +53,7 @@ references:
 
 The Java Memory Model governs thread visibility at the language level. But there is a hardware-level visibility cost that the JMM does not expose: **false sharing**. Two threads updating entirely separate variables can destroy each other's performance if those variables happen to occupy the same CPU cache line — without any shared data at all.
 
-In a high-throughput payment gateway with per-thread counters, false sharing can reduce throughput by 10–40x. The fix is padding or the `@Contended` annotation — changes invisible to the JMM but critical to real-world performance.
+In a high-throughput payment gateway with per-thread counters, false sharing can cut throughput by an order of magnitude. The fix is padding or the `@Contended` annotation — changes invisible to the JMM but critical to real-world performance.
 
 ## Learning Objectives
 
@@ -127,25 +127,29 @@ public class FalseSharingCounters {
     }
 }
 
-// Fixed version: pad each counter to its own cache line
-// Each counter occupies 64 bytes → no two counters share a line
+// Fixed version: one array, each counter 8 longs (64 bytes) apart
+// (index 0, 8, 16, 24) → no two counters share a cache line.
+// A single array is laid out contiguously, so the spacing is guaranteed —
+// unlike separate objects, whose placement the JVM decides
 public class PaddedCounters {
 
-    // 7 padding longs + 1 counter long = 8 × 8 = 64 bytes per slot
-    private long[][] paddedCounters = new long[4][8]; // [threadIndex][0=counter, 1-7=padding]
+    private static final int STRIDE = 8;                    // 8 × 8 bytes = 64 bytes
+    private final long[] counters = new long[4 * STRIDE + STRIDE];
 
     public void increment(int threadIndex) {
-        paddedCounters[threadIndex][0]++;
+        counters[(threadIndex + 1) * STRIDE]++;              // +1: keep away from the array header
     }
 
     public long get(int threadIndex) {
-        return paddedCounters[threadIndex][0];
+        return counters[(threadIndex + 1) * STRIDE];
     }
 }
 ```
 
 ```java17
 // JMH benchmark showing the performance difference
+// Each thread must use its OWN index — if all threads incremented index 0,
+// they would share the same variable (true sharing), not just the cache line
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @State(Scope.Benchmark)
@@ -156,27 +160,28 @@ public class FalseSharingBenchmark {
     PaddedCounters        padded  = new PaddedCounters();
 
     @Benchmark
-    public void withFalseSharing(Blackhole bh) {
-        shared.increment(0); // All 4 threads → false sharing
+    public void withFalseSharing(ThreadParams tp) {
+        shared.increment(tp.getThreadIndex());   // neighbours on one cache line
     }
 
     @Benchmark
-    public void withPadding(Blackhole bh) {
-        padded.increment(0); // Each thread → isolated cache line
+    public void withPadding(ThreadParams tp) {
+        padded.increment(tp.getThreadIndex());   // each thread on its own line
     }
 }
-// Typical result:
-// withFalseSharing:  ~12,000 ops/ms  (severe cache line bouncing)
-// withPadding:      ~180,000 ops/ms  (15× improvement)
+// Illustrative result (varies widely by CPU):
+// withFalseSharing:  ~12,000 ops/ms  (cache line bouncing between cores)
+// withPadding:      ~180,000 ops/ms
 ```
 
 ## @Contended — JVM-Managed Padding
 
-Manual padding works but is fragile — different JVM versions or object layouts could invalidate it. Java 8 introduced `@jdk.internal.vm.annotation.Contended` (and its public equivalent in some JDKs) to let the JVM insert padding automatically.
+Manual padding works but is fragile — different JVM versions or object layouts could invalidate it. Java 8 introduced `@sun.misc.Contended`, moved in Java 9 to `@jdk.internal.vm.annotation.Contended`, to let the JVM insert padding automatically.
 
 ```java17
-// Using @Contended requires: -XX:-RestrictContended JVM flag
-// (or run as JDK internal code)
+// Using @Contended outside the JDK requires:
+//   compile:  --add-exports java.base/jdk.internal.vm.annotation=ALL-UNNAMED
+//   run:      -XX:-RestrictContended (otherwise the annotation is ignored)
 import jdk.internal.vm.annotation.Contended;
 
 public class ContendedCounters {
@@ -249,7 +254,10 @@ public class PaymentMetricsCollector {
 // CORRECT: each thread's metrics are padded to their own cache line
 public class PaddedMetricsCollector {
 
-    // Each MetricsSlot is aligned to its own cache line
+    // Each MetricsSlot is padded to (at least) a cache line.
+    // Caveats: the JVM may reorder fields, so check the real layout with
+    // JOL (Java Object Layout); and the fields are plain longs, so another
+    // thread reading them may see slightly stale values — fine for metrics
     static final class MetricsSlot {
         // Actual data (16 bytes)
         long totalLatencyNs;
@@ -282,7 +290,8 @@ public class PaddedMetricsCollector {
 ```java21
 // Java 21 — same pattern; @Contended is still the preferred JVM approach
 // For application-level per-thread accumulators, prefer LongAdder or ThreadLocal
-// ThreadLocal completely eliminates sharing (not just false sharing)
+// ThreadLocal completely eliminates sharing (not just false sharing) — but with
+// virtual threads every task gets its own copy, which defeats accumulation
 public class ThreadLocalMetrics {
 
     private final ThreadLocal<long[]> metrics = ThreadLocal.withInitial(() -> new long[2]);
@@ -309,7 +318,8 @@ False sharing is invisible in code review — it is a hardware-level artefact of
 | **Linux `perf`** | `perf stat -e cache-misses,cache-references ./java-app` — high cache miss rate |
 | **Intel VTune** | Memory access analysis shows false sharing hotspots |
 | **async-profiler** | Perf events mode: `asprof -e cache-misses -d 30 <pid>` |
-| **JVM flags** | `-XX:+PrintCompilation -XX:+PrintAssembly` — see JIT output for memory access patterns |
+| **Linux `perf c2c`** | `perf c2c record` / `perf c2c report` — finds cache lines bouncing between cores (HITM events): the direct false-sharing detector |
+| **JOL** | Java Object Layout prints field offsets, so you can see which fields share a line |
 
 ```java17
 // Quick code-level false sharing audit:

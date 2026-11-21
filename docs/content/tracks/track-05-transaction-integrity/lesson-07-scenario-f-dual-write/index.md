@@ -57,6 +57,8 @@ references:
   - "Chris Richardson — Pattern: Transactional Outbox (microservices.io)"
 ---
 
+## Overview
+
 There is no distributed transaction that spans a relational database and Apache Kafka. This is not a limitation that will be fixed in the next version of either system. It is a fundamental property of how they are architected. Any code that writes to a database and then publishes to Kafka in two separate operations has a failure window — a moment in time where the application can crash and leave the two systems inconsistent. In financial systems, that inconsistency means downstream services — ledger, notifications, fraud replay, audit — never see events they need. This lesson teaches two production-grade patterns that eliminate the failure window entirely.
 
 ## Learning Objectives
@@ -73,7 +75,7 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-Apex Clearing operates a payment processing backend that serves 14 downstream consumer services: a double-entry ledger, a real-time fraud scoring engine, a notifications service (SMS/email), a regulatory reporting pipeline, an audit trail aggregator, a customer-facing mobile API, and eight additional internal consumers. All of these services receive payment events via Kafka topics.
+*Composite example:* "Apex Clearing", a fictional company, operates a payment processing backend that serves 14 downstream consumer services: a double-entry ledger, a real-time fraud scoring engine, a notifications service (SMS/email), a regulatory reporting pipeline, an audit trail aggregator, a customer-facing mobile API, and eight additional internal consumers. All of these services receive payment events via Kafka topics.
 
 After a production incident caused by a datacenter network partition, the engineering team reviews their payment completion flow. The service writes the payment record to Postgres and then publishes a `PaymentCompleted` event to Kafka. During the partition, Kafka was unreachable for 4 minutes. In that window, 2,841 payments were committed to the database but no Kafka events were published. All 14 downstream services missed these payments.
 
@@ -177,7 +179,9 @@ CREATE TABLE outbox_events (
     payload         JSONB           NOT NULL,
     -- Full event payload. Include all fields needed by consumers.
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    published_at    TIMESTAMPTZ     -- NULL = not yet published
+    published_at    TIMESTAMPTZ,    -- NULL = not yet published
+    failed_at       TIMESTAMPTZ,    -- set when an event can never be published (poison)
+    failure_reason  TEXT
 );
 
 -- Index for the relay: efficiently find unpublished events in creation order
@@ -191,7 +195,7 @@ CREATE INDEX idx_outbox_events_unpublished
 ```
 
 > [!NOTE]
-> The `FOR UPDATE SKIP LOCKED` clause in the relay's SELECT query is essential when running multiple relay instances. It prevents two relay processes from picking up the same outbox record simultaneously. The `SKIP LOCKED` qualifier (available in PostgreSQL 9.5+) makes rows locked by one relay invisible to others, rather than causing them to block and wait.
+> The `FOR UPDATE SKIP LOCKED` clause in the relay's SELECT query is essential when running multiple relay instances. It prevents two relay processes from picking up the same outbox record simultaneously. The `SKIP LOCKED` qualifier (available in PostgreSQL 9.5+) makes rows locked by one relay invisible to others, rather than causing them to block and wait. **The locks only last as long as the transaction** — so the select, the Kafka sends and the `published_at` update must run inside one transaction. Without it (auto-commit), the lock is released the moment the SELECT returns and two relays can still publish the same rows.
 
 ## Payment Service Implementation
 
@@ -219,7 +223,7 @@ public class OutboxEvent {
     @Column(nullable = false, length = 100)
     private String eventType;
 
-    @Type(JsonType.class)
+    @JdbcTypeCode(SqlTypes.JSON)   // Hibernate 6: native JSON mapping
     @Column(nullable = false, columnDefinition = "jsonb")
     private Map<String, Object> payload;
 
@@ -313,36 +317,41 @@ public class OutboxRelay {
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final ObjectMapper objectMapper;
     private final MeterRegistry meterRegistry;
+    private final TransactionTemplate tx;
 
     private static final int BATCH_SIZE = 100;
-    private static final String TOPIC_PREFIX = "payments.";
 
     /**
      * Runs every 100ms. Publishes up to BATCH_SIZE unpublished outbox events
      * to Kafka. Marks each event published only after Kafka acknowledges it.
+     *
+     * The whole batch runs in ONE transaction: FOR UPDATE SKIP LOCKED only
+     * protects rows while the transaction that locked them is open.
      */
     @Scheduled(fixedDelay = 100)
     public void relay() {
-        List<OutboxEvent> unpublished = outboxEventRepository
-                .findUnpublishedBatch(BATCH_SIZE);
+        tx.executeWithoutResult(status -> {
+            List<OutboxEvent> unpublished = outboxEventRepository.findUnpublishedBatch(BATCH_SIZE);
+            if (unpublished.isEmpty()) return;
 
-        if (unpublished.isEmpty()) return;
+            log.debug("OutboxRelay: processing {} events", unpublished.size());
 
-        log.debug("OutboxRelay: processing {} events", unpublished.size());
-
-        for (OutboxEvent event : unpublished) {
-            publishAndMark(event);
-        }
+            // If one event of an aggregate fails, later events of the SAME aggregate
+            // must wait — publishing them would deliver that aggregate out of order
+            Set<String> blockedAggregates = new HashSet<>();
+            for (OutboxEvent event : unpublished) {
+                if (blockedAggregates.contains(event.getAggregateId())) continue;
+                if (!publishAndMark(event)) {
+                    blockedAggregates.add(event.getAggregateId());
+                }
+            }
+        });
     }
 
-    private void publishAndMark(OutboxEvent event) {
+    /** @return true if published (or skipped as poison), false if it must be retried */
+    private boolean publishAndMark(OutboxEvent event) {
         try {
-            String topic = TOPIC_PREFIX + event.getEventType().toLowerCase()
-                    .replace("payment", "").concat("s");
-            // e.g. PaymentCompleted -> payments.completeds  (adjust per naming convention)
-            // In practice: define topic mapping explicitly
-            String kafkaTopic = resolveKafkaTopic(event);
-
+            String kafkaTopic = resolveKafkaTopic(event);   // explicit mapping, see below
             String payload = objectMapper.writeValueAsString(event.getPayload());
 
             ProducerRecord<String, String> record = new ProducerRecord<>(
@@ -352,15 +361,15 @@ public class OutboxRelay {
                     event.getAggregateId(),         // key: partition by entity ID
                     payload);
 
-            // Add headers for consumer use
+            // Add headers for consumer use (explicit UTF-8, never the platform default)
             record.headers()
-                    .add("event_id",        event.getId().toString().getBytes())
-                    .add("event_type",      event.getEventType().getBytes())
-                    .add("aggregate_type",  event.getAggregateType().getBytes())
-                    .add("aggregate_id",    event.getAggregateId().getBytes());
+                    .add("event_id",       event.getId().toString().getBytes(StandardCharsets.UTF_8))
+                    .add("event_type",     event.getEventType().getBytes(StandardCharsets.UTF_8))
+                    .add("aggregate_type", event.getAggregateType().getBytes(StandardCharsets.UTF_8))
+                    .add("aggregate_id",   event.getAggregateId().getBytes(StandardCharsets.UTF_8));
 
             // Synchronous send: block until Kafka acknowledges (acks=all configured)
-            // This ensures we only mark published after durable Kafka write
+            // This ensures we only mark published after a durable Kafka write
             kafkaTemplate.send(record).get(10, TimeUnit.SECONDS);
 
             // Mark published — only after confirmed Kafka ack
@@ -368,18 +377,25 @@ public class OutboxRelay {
 
             meterRegistry.counter("outbox.relay.published",
                     "event_type", event.getEventType()).increment();
+            return true;
 
-        } catch (TimeoutException | ExecutionException | InterruptedException e) {
-            // Kafka unavailable or slow. Log and continue — event stays unpublished.
-            // Scheduler will retry on next run.
+        } catch (TimeoutException | ExecutionException e) {
+            // Kafka unavailable or slow. Event stays unpublished; the next run retries.
+            // (If Kafka DID store it, the retry creates a duplicate — consumers dedupe.)
             log.warn("OutboxRelay: failed to publish event {} ({}): {}",
                     event.getId(), event.getEventType(), e.getMessage());
             meterRegistry.counter("outbox.relay.failed",
                     "event_type", event.getEventType()).increment();
-        } catch (JsonProcessingException e) {
-            // Payload serialization failure — this is a programming error, not transient
-            log.error("OutboxRelay: serialization failure for event {}. Skipping.", event.getId(), e);
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (JsonProcessingException | IllegalArgumentException e) {
+            // Poison event (bad payload, unmapped type): a programming error, not
+            // transient. Park it and ALERT — skipping silently would lose an event.
+            log.error("OutboxRelay: poison event {}. Parking it.", event.getId(), e);
             outboxEventRepository.markFailed(event.getId(), e.getMessage());
+            return false;
         }
     }
 
@@ -416,7 +432,7 @@ public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> 
     void markPublished(@Param("id") UUID id, @Param("publishedAt") Instant publishedAt);
 
     @Modifying
-    @Query("UPDATE OutboxEvent e SET e.failedAt = NOW(), e.failureReason = :reason WHERE e.id = :id")
+    @Query("UPDATE OutboxEvent e SET e.failedAt = CURRENT_TIMESTAMP, e.failureReason = :reason WHERE e.id = :id")
     void markFailed(@Param("id") UUID id, @Param("reason") String reason);
 }
 ```
@@ -446,11 +462,14 @@ public class KafkaProducerConfig {
         // With enable.idempotence=true, Kafka enforces this is <= 5 automatically.
         config.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
 
-        // RETRIES: Retry indefinitely on transient failures (network blips, leader
-        // elections). The scheduler's 10-second timeout provides the actual outer bound.
-        // Integer.MAX_VALUE combined with a delivery.timeout.ms is the recommended approach.
+        // RETRIES: Retry on transient failures (network blips, leader elections),
+        // bounded by delivery.timeout.ms. Kafka REQUIRES
+        //   delivery.timeout.ms >= linger.ms + request.timeout.ms
+        // (otherwise the producer fails to start), so lower request.timeout.ms
+        // from its 30s default when using a short delivery timeout.
         config.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
-        config.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 9_000);  // < relay's 10s timeout
+        config.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 5_000);
+        config.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 9_000);  // < relay's 10s wait
 
         // Retry backoff: wait 100ms between retries to avoid thundering-herd on broker recovery
         config.put(ProducerConfig.RETRY_BACKOFF_MS_CONFIG, 100);
@@ -488,6 +507,7 @@ spring:
       compression-type: lz4
       properties:
         max.in.flight.requests.per.connection: 5
+        request.timeout.ms: 5000     # must satisfy delivery >= linger + request timeout
         delivery.timeout.ms: 9000
         retry.backoff.ms: 100
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
@@ -537,12 +557,12 @@ sequenceDiagram
         "database.user": "debezium_user",
         "database.password": "${file:/secrets/db-creds.properties:password}",
         "database.dbname": "payments_db",
-        "database.server.name": "payments",
+        "topic.prefix": "payments",
         "plugin.name": "pgoutput",
         "slot.name": "debezium_slot",
         "publication.name": "debezium_publication",
 
-        "table.include.list": "public.payments,public.outbox_events",
+        "table.include.list": "public.outbox_events",
 
         "transforms": "outbox",
         "transforms.outbox.type":
@@ -553,19 +573,22 @@ sequenceDiagram
         "transforms.outbox.table.field.event.payload": "payload",
         "transforms.outbox.route.by.field": "aggregate_type",
         "transforms.outbox.route.topic.replacement": "payments.${routedByValue}.events",
+        "transforms.outbox.table.expand.json.payload": "true",
 
         "heartbeat.interval.ms": "1000",
         "snapshot.mode": "never",
 
         "key.converter": "org.apache.kafka.connect.storage.StringConverter",
-        "value.converter": "io.confluent.kafka.serializers.KafkaJsonSchemaSerializer",
-        "value.converter.schema.registry.url": "http://schema-registry:8081"
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "value.converter.schemas.enable": "false"
     }
 }
 ```
 
 > [!NOTE]
-> Debezium uses PostgreSQL's **logical decoding** feature via a replication slot. The replication slot buffers WAL entries that Debezium has not yet consumed. If Debezium is stopped for a prolonged period, the slot causes WAL to be retained on disk — which can consume significant disk space on the primary. Monitor the `pg_replication_slots` view and set `max_slot_wal_keep_size` to prevent unbounded WAL growth: `ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';`
+> Debezium uses PostgreSQL's **logical decoding** feature via a replication slot. The replication slot buffers WAL entries that Debezium has not yet consumed. If Debezium is stopped for a prolonged period, the slot causes WAL to be retained on disk — which can consume significant disk space on the primary. Monitor the `pg_replication_slots` view and set `max_slot_wal_keep_size` (PostgreSQL 13+) to prevent unbounded WAL growth: `ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';`. If the limit is hit, the slot is invalidated and Debezium must re-snapshot — so alert well before that.
+
+The configuration above combines CDC with an outbox table: Debezium reads only `outbox_events` and its outbox router turns each row into a clean event. Capturing raw business tables (`payments`) instead works without code changes, but then your table layout becomes the public event schema.
 
 **Outbox pattern versus CDC — when to choose each:**
 
@@ -573,11 +596,11 @@ sequenceDiagram
 |-----------|---------------------|----------------|
 | Application changes required | Yes — services write to outbox table | No — zero application code changes |
 | Operational complexity | Low — just a scheduled Spring component | Medium–High — Kafka Connect cluster, connector management |
-| Event schema control | Explicit — developer defines the outbox payload | Implicit — WAL row format becomes the event schema |
+| Event schema control | Explicit — developer defines the outbox payload | Explicit if Debezium reads an outbox table; implicit (table layout = event schema) if it reads business tables |
 | Publishing latency | 100ms–500ms (poll interval) | Near-real-time (ms, WAL-based) |
-| Postgres version requirement | Any version | 9.6+ (logical replication) |
+| Postgres version requirement | Any version | 10+ for the built-in `pgoutput` plugin |
 | Multi-database support | Yes — works with any JDBC datasource | Per-connector — Debezium has connectors for most databases |
-| Table bloat risk | Yes — outbox table grows until cleanup runs | No — no outbox table needed |
+| Table bloat risk | Yes — outbox table grows until cleanup runs | Low — outbox rows can be deleted right after insert (Debezium reads the WAL); WAL retention must be watched instead |
 | Suitable for greenfield services | Yes | Yes |
 | Suitable for legacy services without code changes | No | Yes |
 
@@ -665,7 +688,7 @@ public class LedgerUpdateConsumer {
 ```
 
 > [!WARNING]
-> The Redis deduplication approach has a subtle race condition under concurrent consumer threads: two threads may simultaneously find `isNew = true` for the same event if the first thread's Redis SET completes but the ledger update has not yet committed when the second thread checks. For financial systems, use a **database-level unique constraint on `event_id`** as the primary deduplication mechanism, with Redis as an optional performance optimization that short-circuits the DB check for the common case.
+> The Redis approach is not transactional with the ledger. If the consumer crashes after `SET NX` succeeds but before the ledger commits (or the `delete` in the catch block fails), the key stays in Redis: every redelivery is then skipped as a "duplicate" and the event is **never** processed. And the 7-day TTL means a replay older than that is processed twice. For financial systems, record the processed `event_id` in the **same database transaction** as the ledger update (a unique constraint), with Redis at most as an optional short-circuit in front of it.
 
 **Database-level idempotency (more robust):**
 
@@ -679,14 +702,18 @@ CREATE TABLE processed_payment_events (
 ```java
 @Transactional
 public void processIdempotently(String eventId, Runnable processingLogic) {
-    try {
-        processedEventsRepository.recordProcessed(eventId);  // INSERT — throws on duplicate key
-        processingLogic.run();
-    } catch (DataIntegrityViolationException e) {
-        // UNIQUE constraint violation: this event was already processed
+    // Claim the event id in the SAME transaction as the processing:
+    //   INSERT INTO processed_payment_events (event_id) VALUES (?)
+    //   ON CONFLICT (event_id) DO NOTHING
+    // returns 1 the first time, 0 for a duplicate. No exception, so the
+    // transaction stays usable (catching a duplicate-key exception inside a
+    // PostgreSQL transaction would leave it aborted / rollback-only).
+    int claimed = processedEventsRepository.insertIfAbsent(eventId);
+    if (claimed == 0) {
         log.info("Event {} already processed. Skipping.", eventId);
-        // Return normally — idempotent success
+        return;   // idempotent success
     }
+    processingLogic.run();   // ledger update commits together with the claim
 }
 ```
 
@@ -860,7 +887,7 @@ There are two distinct failure scenarios this approach does not cover. First, th
 
 **Q2: Your outbox relay is running with two instances for high availability. Without `FOR UPDATE SKIP LOCKED`, what failure mode occurs, and how exactly does `SKIP LOCKED` fix it?**
 
-Without `FOR UPDATE SKIP LOCKED`, both relay instances execute `SELECT * FROM outbox_events WHERE published_at IS NULL`. They both see the same set of unpublished rows. Both attempt to publish the same events to Kafka. At best, the event is published twice (at-least-once becomes at-least-twice). At worst, one relay instance's DB update races with the other's, and both mark the row published — which looks correct but means consumers received duplicates that the outbox record does not reflect (no retry if a consumer failed). `FOR UPDATE` causes rows to be locked when first read. `SKIP LOCKED` modifies the behaviour so that rows already locked by one transaction are silently skipped by the other — rather than the second transaction blocking and waiting. The result: each row is processed by exactly one relay instance at a time, eliminating duplicates at the relay level. Consumer idempotency remains necessary for the crash-after-ack-before-markPublished scenario, but `SKIP LOCKED` eliminates concurrent relay duplication.
+Without `FOR UPDATE SKIP LOCKED`, both relay instances execute `SELECT * FROM outbox_events WHERE published_at IS NULL`. They both see the same set of unpublished rows. Both attempt to publish the same events to Kafka. At best, the event is published twice (at-least-once becomes at-least-twice). At worst, one relay instance's DB update races with the other's, and both mark the row published — which looks correct but means consumers received duplicates that the outbox record does not reflect (no retry if a consumer failed). `FOR UPDATE` causes rows to be locked when first read (and held until that transaction ends, so the relay must publish and mark inside the same transaction). `SKIP LOCKED` modifies the behaviour so that rows already locked by one transaction are silently skipped by the other — rather than the second transaction blocking and waiting. The result: each row is processed by exactly one relay instance at a time, eliminating duplicates at the relay level. Consumer idempotency remains necessary for the crash-after-ack-before-markPublished scenario, but `SKIP LOCKED` eliminates concurrent relay duplication.
 
 ## Practical Challenge
 
@@ -870,9 +897,9 @@ Without `FOR UPDATE SKIP LOCKED`, both relay instances execute `SELECT * FROM ou
 
 1. Modify `OutboxEvent.fromPayment()` to use `account_id` as the Kafka message key instead of `payment_id`. Explain the trade-off: partition count directly limits per-account parallelism. With 50 partitions and 2.3M accounts, calculate the average accounts per partition.
 
-2. The outbox relay currently publishes records `ORDER BY created_at ASC`. Demonstrate with a SQL example why this ordering is not sufficient to guarantee per-account ordering when two payments for the same account are inserted in quick succession with the same millisecond `created_at` timestamp. Propose a fix using a monotonically increasing sequence column.
+2. The outbox relay currently publishes records `ORDER BY created_at ASC`. Demonstrate with a SQL example why this ordering is not sufficient to guarantee per-account ordering when two payments for the same account are inserted in quick succession with the same `created_at` timestamp. Propose a fix using a monotonically increasing sequence column — and then show why even a sequence is not enough on its own (next task).
 
-3. Add an `outbox_sequence BIGSERIAL` column to the outbox table. Modify the relay's SELECT query to use `ORDER BY outbox_sequence ASC` instead of `created_at`. Explain why a `BIGSERIAL` sequence guarantees total ordering across concurrent inserts in a way that `TIMESTAMPTZ` does not.
+3. Add an `outbox_sequence BIGSERIAL` column to the outbox table and order the relay's SELECT by it. Then explain its limit: a sequence value is assigned when the row is **inserted**, but transactions **commit** in a different order — the relay can see sequence 11 committed while 10 is still in flight, publish 11, and publish 10 later. To guarantee per-account order, also serialise the writes per account (e.g. lock the account row in the transaction that writes the outbox event), or give each event a per-account version number and have the relay publish an account's events strictly in version order.
 
 4. Implement a **per-partition relay lock** using PostgreSQL advisory locks (`pg_try_advisory_lock(partition_number)`) so that two relay instances never publish to the same Kafka partition concurrently. Show the lock acquisition and release code, and explain what happens if the relay process crashes while holding the advisory lock.
 
@@ -903,10 +930,10 @@ Without `FOR UPDATE SKIP LOCKED`, both relay instances execute `SELECT * FROM ou
         "The outbox table grows unbounded because neither instance can delete processed rows"
       ],
       "correct": 1,
-      "explanation": "Without locking, both relay instances SELECT the same unpublished rows and both publish them to Kafka. FOR UPDATE SKIP LOCKED causes each relay instance to lock rows it reads and skip rows already locked by the other instance, so each row is processed by exactly one instance at a time. Consumer idempotency remains necessary for the crash-before-markPublished scenario."
+      "explanation": "Without locking, both relay instances SELECT the same unpublished rows and both publish them to Kafka. FOR UPDATE SKIP LOCKED makes each relay lock the rows it reads (for the duration of its transaction) and skip rows already locked by the other instance, so each row is processed by one instance at a time. Consumer idempotency remains necessary for the crash-before-markPublished scenario."
     },
     {
-      "text": "Why should ORDER BY created_at ASC be insufficient to guarantee per-account event ordering in the outbox relay?",
+      "text": "Why is ORDER BY created_at ASC insufficient to guarantee per-account event ordering in the outbox relay?",
       "options": [
         "TIMESTAMPTZ has insufficient precision for financial transactions",
         "Two payments for the same account inserted concurrently can have the same millisecond timestamp, making their relative order undefined",
@@ -914,7 +941,7 @@ Without `FOR UPDATE SKIP LOCKED`, both relay instances execute `SELECT * FROM ou
         "PostgreSQL does not preserve insertion order for rows with identical timestamp values"
       ],
       "correct": 1,
-      "explanation": "Two concurrent inserts can receive the same millisecond TIMESTAMPTZ value. Within that millisecond, the relative ordering is undefined. A BIGSERIAL sequence column guarantees strict total ordering because the sequence is allocated atomically by PostgreSQL before each insert, ensuring no two rows share a sequence value."
+      "explanation": "Two inserts can receive the same timestamp, making their relative order undefined. A BIGSERIAL column gives every row a unique, increasing number — but numbers are assigned at insert time while transactions commit in a different order, so the relay can still see a later number before an earlier one is committed. Strict per-account order also needs per-account serialisation of the writes (or a per-account version the relay follows)."
     }
   ]
 }
@@ -926,10 +953,22 @@ Without `FOR UPDATE SKIP LOCKED`, both relay instances execute `SELECT * FROM ou
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
-    {"id": "1", "description": "Modify OutboxEvent.fromPayment() to use account_id as the Kafka message key instead of payment_id. Explain the partition-per-account trade-off and calculate average accounts per partition with 50 partitions and 2.3M accounts."},
-    {"id": "2", "description": "Add an outbox_sequence BIGSERIAL column to the outbox table. Modify the relay SELECT query to ORDER BY outbox_sequence ASC. Explain why BIGSERIAL guarantees total ordering across concurrent inserts in a way that TIMESTAMPTZ does not."},
-    {"id": "3", "description": "Implement per-partition relay locks using PostgreSQL advisory locks (pg_try_advisory_lock) so two relay instances never publish to the same Kafka partition concurrently. Show lock acquisition and release code and explain the lock lifecycle on process crash."},
-    {"id": "4", "description": "Write a test that inserts 10 payments for the same account rapidly, runs the relay, consumes the Kafka messages, and asserts they arrive in correct outbox_sequence order."}
+    {
+      "id": "1",
+      "description": "Modify OutboxEvent.fromPayment() to use account_id as the Kafka message key instead of payment_id. Explain the partition-per-account trade-off and calculate average accounts per partition with 50 partitions and 2.3M accounts."
+    },
+    {
+      "id": "2",
+      "description": "Add an outbox_sequence BIGSERIAL column to the outbox table and order the relay SELECT by it. Explain why a sequence still does not guarantee per-account order on its own (values are assigned at insert, transactions commit in a different order) and add per-account serialisation of the writes or a per-account version number."
+    },
+    {
+      "id": "3",
+      "description": "Implement per-partition relay locks using PostgreSQL advisory locks (pg_try_advisory_lock) so two relay instances never publish to the same Kafka partition concurrently. Show lock acquisition and release code and explain the lock lifecycle on process crash."
+    },
+    {
+      "id": "4",
+      "description": "Write a test that inserts 10 payments for the same account rapidly, runs the relay, consumes the Kafka messages, and asserts they arrive in correct outbox_sequence order."
+    }
   ]
 }
 -->

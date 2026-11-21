@@ -37,22 +37,24 @@ references:
   - "Australian Treasury — Consumer Data Right (CDR) Rules 2020"
 ---
 
-Open banking mandates that financial institutions expose customer account data and payment initiation capabilities to regulated third parties via standardised APIs — fundamentally changing the competitive architecture of retail banking. As of 2024, the UK Open Banking ecosystem processes over 11 million API calls per day, with more than 7 million active users sharing data or making payments via TPP applications. For the engineering teams building both the bank-side API infrastructure (Account Servicing Payment Service Providers — ASPSPs) and the TPP-side integrations, the domain introduces a distinctive set of challenges: consent management as a first-class stateful resource, cryptographic identity via eIDAS certificates rather than symmetric API keys, and the Financial-grade API (FAPI) security profile that extends OAuth2 to meet banking-specific threat models.
+## Overview
+
+Open banking mandates that financial institutions expose customer account data and payment initiation capabilities to regulated third parties via standardised APIs — fundamentally changing the competitive architecture of retail banking. By 2025 the UK ecosystem had more than 10 million users and handled well over a billion API calls a month. For the engineering teams building both the bank-side API infrastructure (Account Servicing Payment Service Providers — ASPSPs) and the TPP-side integrations, the domain introduces a distinctive set of challenges: consent management as a first-class stateful resource, cryptographic identity via certificates (eIDAS in the EU, Open Banking certificates in the UK) rather than shared API keys, and the Financial-grade API (FAPI) security profile that extends OAuth2 to meet banking-specific threat models.
 
 ## Learning Objectives
 
 - Define the three PSD2 TPP roles (AISP, PISP, CBPII) and map their permissions to the specific API endpoints and data scopes each requires
-- Model the consent lifecycle (grant, active, revoked, expired) as a state machine and implement it as a PostgreSQL-backed `ConsentService`
+- Model the consent lifecycle (awaiting authorisation, authorised, rejected, revoked, expired, consumed) as a state machine and implement it as a PostgreSQL-backed `ConsentService`
 - Compare Open Banking UK, Berlin Group NextGenPSD2, and Australian CDR API standards across data model, authorisation flow, and consent semantics
 - Implement an OAuth2 + FAPI 2.0 authorisation flow including PAR (Pushed Authorisation Request) and DPoP-bound access tokens
 - Build an `AccountInformationController` exposing balances and transactions with correct consent scope verification
 - Implement a `PaymentInitiationController` with strict idempotency semantics and domestic/international payment routing
 - Apply SCA exemption logic to reduce unnecessary friction, tracking exemption application rates in Prometheus metrics
-- Configure mTLS client authentication against an eIDAS QWAC certificate and validate it against the scheme's trust store (e.g., Open Banking Directory)
+- Configure mTLS client authentication against an eIDAS QWAC (EU) or Open Banking certificate (UK) and validate it against the scheme's trust store (e.g., the Open Banking Directory)
 
 ## Business Context
 
-In 2023, a UK challenger bank operating as an ASPSP received a £1.4 million fine from the FCA for deficiencies in its open banking API implementation. The specific failures were: consent grants persisting beyond the 90-day maximum permitted by RTS Article 10(5), TPP access not being revoked when customers changed their banking app credentials (password reset), and the account information API returning transactions beyond the consented date range. All three failures shared a common root cause: consent was modelled as a flag on the user account rather than as an independent stateful entity with its own lifecycle. When credentials changed, the flag was not cleared. When 90 days elapsed, nothing expired the flag. When the transaction query ran, it did not validate that the requested date range fell within the consent's coverage period. Modelling consent as a first-class domain entity — with explicit state transitions, TTL enforcement, and scope validation at every API call — would have prevented all three findings.
+*Composite example (based on common open banking implementation defects, not a specific bank):* an ASPSP's internal review finds three problems in its open banking API. Third-party access kept working long past the point where the customer should have re-authenticated; access was not reviewed when the customer reported their credentials compromised and reset their password; and the account information API returned transactions outside the date range the customer had consented to. All three had one root cause: consent was modelled as a flag on the user account rather than as an independent stateful entity with its own lifecycle. When credentials changed, nothing looked at the flag. When the re-authentication interval passed, nothing expired it. When the transaction query ran, it did not check the requested dates against the consent. Modelling consent as a first-class domain entity — with explicit state transitions, expiry enforcement, and scope validation at every API call — prevents all three.
 
 ## PSD2 Roles: AISP, PISP, and CBPII
 
@@ -67,7 +69,7 @@ PSD2 defines three categories of third-party payment service provider, each with
 A single TPP may hold all three licences. The permissions are additive but scope-isolated: an AISP consent does not grant payment initiation rights; a PISP cannot access transaction history unless it also holds AISP consent separately granted.
 
 > [!NOTE]
-> Under PSD2 RTS Article 32, an ASPSP may refuse a TPP access in the event of "objectively justified and evidenced reasons related to unauthorised or fraudulent access" but must notify the competent authority within 24 hours. Building an automated TPP anomaly detection system (unusual request rates, out-of-hours access patterns) with the ability to suspend TPP access and auto-notify the regulator is therefore a compliance requirement, not an optional feature.
+> Under PSD2 Article 68(5), an ASPSP may deny a TPP access for "objectively justified and duly evidenced reasons relating to unauthorised or fraudulent access", but must inform the customer and report the incident to the competent authority immediately. An automated TPP anomaly detection system (unusual request rates, out-of-hours access patterns) that can suspend a TPP's access, record the evidence, and start the regulatory notification is therefore strongly advisable. Note also RTS Article 36(5): without the customer actively requesting it, an AISP may access account data at most four times in 24 hours (unless agreed otherwise).
 
 ## Consent Lifecycle
 
@@ -77,7 +79,7 @@ stateDiagram-v2
     AwaitingAuthorisation --> Authorised : Customer completes SCA
     AwaitingAuthorisation --> Rejected : Customer declines or SCA fails
     Authorised --> Revoked : Customer or TPP revokes
-    Authorised --> Expired : Max 90 days from authorisation\nor consent expiry date reached
+    Authorised --> Expired : Consent expiry date or\nre-authentication interval reached
     Authorised --> Consumed : PISP one-off payment executed\n(single-use consents only)
     Rejected --> [*]
     Revoked --> [*]
@@ -85,7 +87,11 @@ stateDiagram-v2
     Consumed --> [*]
 ```
 
-Each transition must be persisted with a timestamp and actor (customer, TPP, ASPSP system) for audit. The `AwaitingAuthorisation` state has its own timeout (typically 15-30 minutes): if the customer does not complete SCA within the window, the consent intent is abandoned.
+Each transition must be persisted with a timestamp and actor (customer, TPP, ASPSP system) for audit. Security events — such as the customer reporting compromised credentials — should trigger a review of active consents rather than being ignored.
+
+How long access lasts without the customer re-authenticating with the bank depends on the jurisdiction. In the EU, the amended RTS (since 2023) require SCA at the bank for AIS access via an AISP at least every **180 days**. In the UK, since 2022 the **TPP** reconfirms the customer's consent every 90 days and the bank no longer has to apply SCA again. Make this interval configuration, not a hard-coded constant.
+
+The `AwaitingAuthorisation` state has its own timeout (typically 15-30 minutes): if the customer does not complete SCA within the window, the consent intent is abandoned.
 
 ## ConsentService Implementation
 
@@ -138,8 +144,9 @@ public class ConsentService {
             throw new ConsentIntentExpiredException(consentId);
         }
 
-        // Compute actual expiry: min(requested expiry, now + 90 days per RTS Art 10)
-        Instant maxExpiry = clock.instant().plus(Duration.ofDays(90));
+        // Compute actual expiry: min(requested expiry, now + re-authentication
+        // interval for this jurisdiction — e.g. 180 days in the EU since 2023)
+        Instant maxExpiry = clock.instant().plus(jurisdictionPolicy.reauthenticationInterval());
         Instant effectiveExpiry = consent.expirationDateTime() != null
             ? consent.expirationDateTime().isBefore(maxExpiry)
                 ? consent.expirationDateTime() : maxExpiry
@@ -190,9 +197,14 @@ public class ConsentService {
         if (!consent.permissions().contains(requiredPermission)) {
             throw new InsufficientConsentPermissionsException(consentId, requiredPermission);
         }
+        // BOTH ends of the requested range must lie inside the consented range
         if (queryFromDate != null && consent.fromDate() != null
                 && queryFromDate.isBefore(consent.fromDate())) {
             throw new ConsentDateRangeViolationException(consentId, queryFromDate, consent.fromDate());
+        }
+        if (queryToDate != null && consent.toDate() != null
+                && queryToDate.isAfter(consent.toDate())) {
+            throw new ConsentDateRangeViolationException(consentId, queryToDate, consent.toDate());
         }
     }
 
@@ -209,12 +221,12 @@ FAPI (Financial-grade API) is an OpenID Foundation profile that extends OAuth2 w
 
 | Requirement | Vanilla OAuth2 | FAPI 1.0 Advanced | FAPI 2.0 |
 |---|---|---|---|
-| Client authentication | client_secret_post | private_key_jwt | DPoP + private_key_jwt |
-| Authorisation request | Query string | JAR (signed JWT) | PAR + JAR |
-| Token binding | None | MTLS token binding | DPoP (sender-constrained) |
+| Client authentication | client_secret (basic/post) | private_key_jwt or mTLS | private_key_jwt or mTLS |
+| Authorisation request | Query string | JAR (signed request object), or PAR | PAR required (JAR optional) |
+| Token binding | None (bearer) | mTLS-bound tokens | Sender-constrained: mTLS or DPoP |
 | Redirect URI | Pre-registered | Pre-registered + exact match | Pre-registered + exact match |
-| PKCE | Recommended | Required | Required (S256) |
-| State parameter | Recommended | Required | Required |
+| PKCE | Recommended | Required with PAR | Required (S256) |
+| CSRF protection | `state` recommended | `state` required | PKCE (no separate `state` requirement) |
 
 **Pushed Authorisation Requests (PAR):** Instead of sending authorisation parameters in the browser redirect URL (exposing them in browser history, server logs), PAR sends them directly to the authorisation server in a back-channel POST, returning an opaque `request_uri` reference used in the browser redirect.
 
@@ -222,30 +234,35 @@ FAPI (Financial-grade API) is an OpenID Foundation profile that extends OAuth2 w
 // FAPI 2.0 PAR request (back-channel, server-to-server)
 @PostMapping("/as/par")
 public ParResponse pushedAuthorisationRequest(
-        @RequestHeader("Authorization") String dPopHeader,
+        @RequestHeader(value = "DPoP", required = false) String dpopProof,  // if DPoP is used
         @RequestBody MultiValueMap<String, String> params,
         HttpServletRequest httpRequest) {
 
-    // Extract and verify client's mTLS certificate (eIDAS QWAC)
+    // Authenticate the client: mTLS certificate (eIDAS QWAC / OB certificate)
+    // or private_key_jwt client assertion
     X509Certificate clientCert = extractAndVerifyClientCertificate(httpRequest);
-    String tppId = eIDasValidator.extractOrganisationId(clientCert);
+    String tppId = certificateValidator.validateAndExtract(clientCert).organisationId();
 
-    // Validate signed JWT request object (JAR)
+    // Validate signed JWT request object (JAR), if the profile uses one
     JwtClaimsSet claims = jarValidator.validate(params.getFirst("request"),
         tppPublicKeyResolver.resolve(tppId));
 
     String consentId = claims.getClaim("consentId");
-    consentService.getConsentOrThrow(consentId); // Must exist
+    Consent consent = consentService.getConsentOrThrow(consentId);   // must exist...
+    if (!consent.tppId().equals(tppId)) {                            // ...and belong to THIS TPP
+        throw new InvalidRequestObjectException("Consent belongs to another TPP");
+    }
 
-    String requestUri = "urn:openbanking:request:" + UUID.randomUUID();
-    parStore.store(requestUri, claims, Duration.ofMinutes(10));
+    // Short-lived, ONE-TIME request_uri (RFC 9126 format)
+    String requestUri = "urn:ietf:params:oauth:request_uri:" + UUID.randomUUID();
+    parStore.storeOneTime(requestUri, claims, Duration.ofSeconds(60));
 
-    return new ParResponse(requestUri, 600);
+    return new ParResponse(requestUri, 60);
 }
 ```
 
 > [!IMPORTANT]
-> eIDAS QWACs (Qualified Website Authentication Certificates) must be validated against the Open Banking Directory's revocation list at every API call, not just at onboarding. A TPP's licence can be revoked mid-session. Implement OCSP stapling for performance, but fall back to OCSP direct query if the stapled response is stale. Certificate validation failures must respond with HTTP 403 and a `CERTIFICATE_REVOKED` error code, not a generic 401.
+> Client certificates — eIDAS QWACs in the EU; in the UK, Open Banking certificates issued through the Open Banking Directory (eIDAS certificates are no longer recognised there after Brexit) — must be checked for revocation continuously, not just at onboarding, and the TPP's **authorisation status** must be checked against the register too: a TPP's licence can be withdrawn while its certificate is still technically valid. Cache OCSP responses for performance, but never beyond their validity period. Respond to a revoked certificate or deregistered TPP with a clear, specific error rather than a generic 401.
 
 ## AccountInformationController
 
@@ -282,11 +299,15 @@ public class AccountInformationController {
         consentService.verifyActive(consentId, Permission.READ_TRANSACTIONS_DETAIL,
             fromBookingDate, toBookingDate);
 
-        // Verify the account belongs to the consenting customer
+        // Verify the account belongs to the consenting customer AND was one of
+        // the accounts the customer selected when granting this consent
         accountService.verifyOwnership(accountId, customerId);
+        consentService.verifyAccountInConsent(consentId, accountId);
 
+        // No dates given → default to the consented range, never "everything"
+        DateRange range = consentService.clampToConsent(consentId, fromBookingDate, toBookingDate);
         List<Transaction> transactions = transactionService.find(
-            accountId, fromBookingDate, toBookingDate);
+            accountId, range.from(), range.to());
 
         return ResponseEntity.ok(transactionMapper.toOBReadTransaction6(transactions));
     }
@@ -295,7 +316,7 @@ public class AccountInformationController {
 
 ## Strong Customer Authentication and Exemptions
 
-SCA requires at least two factors from: something you know (PIN/password), something you have (device/card), something you are (biometric). PSD2 RTS specifies several exemptions where SCA may be skipped.
+SCA requires at least two independent factors from different categories: something you know (PIN/password), something you have (device/card), something you are (biometric). The RTS specify several exemptions where SCA may be skipped. Note who decides: for a payment initiated through a PISP, it is the **ASPSP** (the payer's bank) that applies or refuses an exemption — the PISP cannot force one. The evaluator below therefore runs on the ASPSP side.
 
 ```java
 public class ScaExemptionEvaluator {
@@ -305,24 +326,30 @@ public class ScaExemptionEvaluator {
     private final ExemptionMetrics metrics;
 
     public ScaExemptionResult evaluate(PaymentInitiationRequest request) {
-        // Low-value exemption: single ≤ €30, cumulative ≤ €100 or 5 consecutive
+        // Low-value (remote) exemption: single ≤ €30, until cumulative > €100
+        // or 5 consecutive transactions since the last SCA
         if (request.amount().compareTo(LOW_VALUE_THRESHOLD) <= 0
                 && !lowValueCumulativeExceeded(request.psuId())) {
             metrics.increment("low_value_exemption_applied");
             return ScaExemptionResult.exempt(ExemptionType.LOW_VALUE);
         }
 
-        // Trusted beneficiary: PSU has pre-whitelisted this payee
+        // Trusted beneficiary: PSU has added this payee to their trusted list
+        // (creating or changing that list itself requires SCA)
         if (trustedBeneficiaries.isTrusted(request.psuId(), request.creditorIban())) {
             metrics.increment("trusted_beneficiary_exemption_applied");
             return ScaExemptionResult.exempt(ExemptionType.TRUSTED_BENEFICIARY);
         }
 
-        // TRA exemption: acquirer fraud rate below threshold
-        // ≤ €100: fraud reference rate ≤ 0.13%; ≤ €250: ≤ 0.06%; ≤ €500: ≤ 0.01%
+        // TRA exemption for CREDIT TRANSFERS: this PSP's fraud rate must be
+        // below the reference rate for the amount band —
+        //   ≤ €100: 0.015%;  ≤ €250: 0.01%;  ≤ €500: 0.005%
+        // (card payments use 0.13% / 0.06% / 0.01%), AND the real-time risk
+        // analysis must find no abnormal signals for this payment
         TransactionRiskScore riskScore = riskAssessor.score(request);
-        if (riskScore.fraudLiability().compareTo(TRA_MAX_AMOUNT) <= 0
-                && fraudRateWithinThreshold(request.amount())) {
+        if (request.amount().compareTo(TRA_MAX_AMOUNT) <= 0       // €500
+                && fraudRateWithinThreshold(request.amount())
+                && riskScore.isLow()) {
             metrics.increment("tra_exemption_applied");
             return ScaExemptionResult.exempt(ExemptionType.TRANSACTION_RISK_ANALYSIS);
         }
@@ -341,24 +368,35 @@ public class PaymentInitiationController {
 
     private final ConsentService consentService;
     private final PaymentInitiationService paymentService;
-    private final IdempotencyStore idempotencyStore;
+    private final IdempotencyRepository idempotencyRepo;
 
     @PostMapping("/domestic-payments")
     public ResponseEntity<OBWriteDomesticResponse5> createDomesticPayment(
             @RequestHeader("x-idempotency-key") String idempotencyKey,
             @RequestBody OBWriteDomestic2 request,
+            @RequestAttribute("tppId") String tppId,
             @RequestAttribute("consentId") String consentId,
             @RequestAttribute("customerId") String customerId) {
 
-        consentService.verifyActive(consentId, Permission.CREATE_DOMESTIC_PAYMENT, null, null);
-
-        // Idempotency: return cached response for duplicate requests
-        OBWriteDomesticResponse5 cached = idempotencyStore.get(idempotencyKey,
-            OBWriteDomesticResponse5.class);
-        if (cached != null) {
+        // Idempotency FIRST — a single-use consent is CONSUMED by the first
+        // payment, so checking the consent first would reject a legitimate retry.
+        // Claim the key atomically with a hash of the payload
+        // (INSERT ... ON CONFLICT DO NOTHING), scoped to this TPP.
+        String payloadHash = sha256(canonicalJson(request));
+        IdempotencyClaim claim = idempotencyRepo.claim(tppId, idempotencyKey, payloadHash);
+        if (claim.isExisting()) {
+            if (!claim.payloadHash().equals(payloadHash)) {
+                // Same key, different payment → never process, never replay
+                throw new IdempotencyPayloadMismatchException(idempotencyKey);   // HTTP 422
+            }
+            if (claim.isInProgress()) {
+                throw new RequestInProgressException(idempotencyKey);           // HTTP 409, retry later
+            }
             log.info("Idempotent response returned: key={}", idempotencyKey);
-            return ResponseEntity.status(200).body(cached);
+            return ResponseEntity.status(201).body(claim.storedResponse(OBWriteDomesticResponse5.class));
         }
+
+        consentService.verifyActive(consentId, Permission.CREATE_DOMESTIC_PAYMENT, null, null);
 
         // Validate that payment data matches the consent
         validatePaymentMatchesConsent(request, consentId);
@@ -368,21 +406,22 @@ public class PaymentInitiationController {
 
         OBWriteDomesticResponse5 response = responseMapper.map(result);
 
-        // Cache response for idempotency window (24 hours per OB spec)
-        idempotencyStore.put(idempotencyKey, response, Duration.ofHours(24));
+        // Store the response against the claimed key (kept for the idempotency window)
+        idempotencyRepo.complete(tppId, idempotencyKey, response);
 
         return ResponseEntity.status(201).body(response);
     }
 
     private void validatePaymentMatchesConsent(OBWriteDomestic2 payment, String consentId) {
-        // The payment data element must exactly match the consent intent
-        // Any deviation — amount, creditor account, reference — is a protocol error
+        // The payment's Initiation block must EXACTLY match the consented one:
+        // amount, currency, creditor account, reference. Any deviation is rejected.
         Consent consent = consentService.getConsentOrThrow(consentId);
         if (!payment.getData().getConsentId().equals(consentId)) {
             throw new PaymentConsentMismatchException("ConsentId mismatch");
         }
-        // Amount, currency, creditor account must match consent intent exactly
-        // (Open Banking UK spec requirement)
+        if (!payment.getData().getInitiation().equals(consent.paymentInitiation())) {
+            throw new PaymentConsentMismatchException("Initiation does not match consent");
+        }
     }
 }
 ```
@@ -399,17 +438,19 @@ public class EidasCertificateValidator {
     private final OpenBankingDirectoryClient directoryClient;
 
     /**
-     * Validates that the client's TLS certificate is:
+     * Validates that the client's TLS certificate is (EU / eIDAS variant):
      * 1. A valid eIDAS QWAC (Qualified Website Authentication Certificate)
-     * 2. Issued by a CA in the Open Banking Directory trust store
+     * 2. Issued by a qualified trust service provider on the EU trusted lists
      * 3. Not revoked (checked via OCSP)
-     * 4. Contains an organisationId matching a registered TPP
+     * 4. Carries an organisationIdentifier matching an authorised TPP, and PSD2
+     *    roles (in the QCStatement) that allow the API being called
      */
     public TppIdentity validateAndExtract(X509Certificate cert) {
         // Check certificate policy OID for QWAC (0.4.0.194112.1.4)
         verifyQwacPolicyOid(cert);
 
-        // Extract organisationId from subject alternate name (OID 2.5.4.97)
+        // Extract organisationIdentifier from the subject DN (OID 2.5.4.97);
+        // PSD2 roles (PSP_AI, PSP_PI, ...) come from the QCStatement
         String orgId = extractOrganisationId(cert);
 
         // OCSP check against issuing CA
@@ -439,17 +480,17 @@ Each TPP's API access must be rate-limited independently to prevent a single mis
 @Component
 public class TppRateLimiter {
 
-    // Open Banking UK specifies minimum thresholds: ASPSPs must support
-    // at least 500 requests per minute per TPP for AIS, 50 per minute for PIS
-    private static final int AIS_RPM = 500;
-    private static final int PIS_RPM = 50;
-
-    private final RateLimiterRegistry registry;  // Resilience4j
+    // Limits are the ASPSP's own fairness and capacity settings — they must
+    // protect availability without obstructing TPPs. Load them from config
+    // (per TPP and per API category), not hard-coded constants.
+    private final RateLimitProperties limits;
+    private final RateLimiterRegistry registry;  // Resilience4j — per node; use a
+                                                 // shared store (e.g. Redis) for a cluster-wide limit
 
     public void checkLimit(String tppId, ApiEndpointType endpointType) {
         String limiterKey = tppId + ":" + endpointType.category();
         RateLimiter limiter = registry.rateLimiter(limiterKey, () ->
-            buildConfig(endpointType));
+            buildConfig(tppId, endpointType));
 
         if (!limiter.acquirePermission()) {
             throw new TppRateLimitExceededException(tppId, endpointType,
@@ -457,8 +498,8 @@ public class TppRateLimiter {
         }
     }
 
-    private RateLimiterConfig buildConfig(ApiEndpointType type) {
-        int rpm = type.isAccountInformation() ? AIS_RPM : PIS_RPM;
+    private RateLimiterConfig buildConfig(String tppId, ApiEndpointType type) {
+        int rpm = limits.requestsPerMinute(tppId, type.category());
         return RateLimiterConfig.custom()
             .limitForPeriod(rpm)
             .limitRefreshPeriod(Duration.ofMinutes(1))
@@ -474,11 +515,11 @@ public class TppRateLimiter {
 |---|---|---|---|
 | Mandate | CMA Order 2017 (9 banks) | PSD2 RTS (all EU banks) | Consumer Data Right Act 2019 |
 | API standard body | Open Banking Ltd | Berlin Group | Data Standards Body (Treasury) |
-| Authorisation | Redirect + embedded (hybrid) | Redirect | Redirect |
+| Authorisation | Redirect (incl. app-to-app) and decoupled | Redirect, embedded, decoupled or OAuth | Redirect |
 | Consent UI | ASPSP-hosted | ASPSP-hosted | ASPSP-hosted |
-| Data model | OB UK schema v3.1 | BIAN/NextGenPSD2 schema | CDR Banking schema |
-| Payment types | FPS domestic + BACS | SEPA CT / SEPA Inst | NPP (New Payments Platform) |
-| Data sharing | 90 days renewable | 90 days renewable | 12 months renewable |
+| Data model | OB UK schema (v3.1 / v4) | NextGenPSD2 schema (ISO 20022-based) | CDR Banking schema |
+| Payment types | Domestic (FPS), scheduled, standing orders, international | SEPA CT / SEPA Instant | Not in the original CDR scope (action initiation came later) |
+| Access renewal | TPP reconfirms consent every 90 days | SCA at the bank at least every 180 days (since 2023) | Consent up to 12 months |
 | Accreditation | FCA register + OB Directory | NCA register + eIDAS | ACCC accreditation |
 
 ## Knowledge Check
@@ -493,7 +534,7 @@ A: In a standard OAuth2 authorisation request, the client embeds authorisation p
 
 ## Practical Challenge
 
-1. **ConsentService with State Machine:** Implement the full `ConsentService` including all five state transitions, the 90-day RTS cap enforcement on `authorise()`, and lazy expiry detection in `verifyActive()`. Use a PostgreSQL-backed repository with a `consents` table and a `consent_audit_log` table that records every state transition with actor, timestamp, and reason. Write integration tests covering: consent created → authorised → expired after 91 days (using a `TestClock`); consent created → revoked by customer → subsequent API call returns `ConsentNotActive`; consent created → intent expires after 15 minutes without authorisation.
+1. **ConsentService with State Machine:** Implement the full `ConsentService` including all state transitions, a configurable re-authentication cap on `authorise()` (180 days for the EU profile), and lazy expiry detection in `verifyActive()`. Use a PostgreSQL-backed repository with a `consents` table and a `consent_audit_log` table that records every state transition with actor, timestamp, and reason. Write integration tests covering: consent created → authorised → expired after 181 days with the EU profile (using a `TestClock`); consent created → revoked by customer → subsequent API call returns `ConsentNotActive`; consent created → intent expires after 15 minutes without authorisation.
 
 2. **FAPI 2.0 PAR Endpoint:** Implement the `/as/par` endpoint with mTLS client authentication, JAR (signed JWT request object) validation, and an in-memory PAR store with 10-minute TTL. The JAR must be validated with the TPP's registered public key (retrieved from a stubbed `TppKeystore`). Write a test using a real RSA key pair that generates a valid signed JAR and asserts a `request_uri` is returned, and another test with a tampered JWT signature that asserts HTTP 400 `INVALID_REQUEST_OBJECT`.
 
@@ -527,15 +568,15 @@ A: In a standard OAuth2 authorisation request, the client embeds authorisation p
       "explanation": "In standard OAuth2, authorisation parameters travel through the browser redirect — visible in browser history, proxy logs, and browser extensions. In FAPI 2.0 PAR, the client POSTs parameters directly to the authorisation server over mTLS (back-channel), receiving only an opaque `request_uri`. The browser redirect contains only this reference, so sensitive parameters (including signed JAR with payment details) never traverse the browser."
     },
     {
-      "text": "Under PSD2, what is the maximum duration that a consent for account information access (AIS) can remain valid after authorisation under the RTS?",
+      "text": "Under the amended EU RTS (in force since 2023), how often must a customer re-authenticate with SCA at their bank for continued account information access through an AISP?",
       "options": [
-        "30 days",
-        "90 days",
-        "180 days",
-        "1 year with strong customer authentication re-required every 90 days"
+        "Every 30 days",
+        "Every 90 days",
+        "At least every 180 days",
+        "Never — consent lasts until revoked"
       ],
-      "correct": 1,
-      "explanation": "Under the PSD2 Regulatory Technical Standards (RTS), AIS consent can remain valid for a maximum of 90 days after the strong customer authentication that authorised it. After 90 days, the customer must re-authenticate with SCA to renew access. This is enforced in the `ConsentService.authorise()` method with a `MAX_CONSENT_DURATION_DAYS` cap."
+      "correct": 2,
+      "explanation": "Delegated Regulation (EU) 2022/2360 extended the re-authentication interval for AIS access via an AISP from 90 to 180 days and made the exemption mandatory for banks. The UK went a different way: since 2022 the TPP reconfirms consent with the customer every 90 days and the bank does not apply SCA again. Make the interval jurisdiction-specific configuration in `ConsentService.authorise()`."
     }
   ]
 }
@@ -549,7 +590,7 @@ A: In a standard OAuth2 authorisation request, the client embeds authorisation p
   "tasks": [
     {
       "id": "1",
-      "description": "Implement the full `ConsentService` including all five state transitions, the 90-day RTS cap enforcement on `authorise()`, and lazy expiry detection in `verifyActive()`. Use PostgreSQL-backed repository with `consents` and `consent_audit_log` tables. Write integration tests covering: 91-day expiry via `TestClock`; customer revocation; 15-minute intent expiry without authorisation."
+      "description": "Implement the full `ConsentService` including all state transitions, a configurable re-authentication cap on `authorise()` (180 days for the EU profile), and lazy expiry detection in `verifyActive()`. Use PostgreSQL-backed repository with `consents` and `consent_audit_log` tables. Write integration tests covering: 181-day expiry via `TestClock`; customer revocation; 15-minute intent expiry without authorisation."
     },
     {
       "id": "2",

@@ -45,6 +45,8 @@ references:
   - "European Payments Council — SEPA Credit Transfer Rulebook v2.0"
 ---
 
+## Overview
+
 The question "which rail do I send this payment on?" sounds simple until you are building the system that must answer it in under 50 milliseconds for 10,000 payments per second, honour cut-off times across five clearing schemes in four time zones, fall back gracefully when a scheme is degraded, and guarantee that the chosen rail's format, value limits, and processing cycle constraints are all satisfied. Payment routing is not a configuration table — it is a decision engine with real-time scheme health awareness, batch orchestration, and netting optimisation built in. This lesson equips senior engineers to design and implement that engine.
 
 ## Learning Objectives
@@ -56,13 +58,13 @@ By the end of this lesson you will be able to:
 - Describe the BACS 3-day cycle (Day 1 input, Day 3 settlement) and its operational implications
 - Explain ACH batch file format conventions and the NACHA 94-character record structure
 - Calculate bilateral net positions between two counterparties and implement the SQL query
-- Distinguish bilateral netting from CHAPS-style real-time gross settlement (RTGS)
+- Distinguish bilateral and multilateral netting from real-time gross settlement (RTGS) such as CHAPS
 - Generate a BACS Standard 18 formatted output file from a list of `BacsPayment` records
 - Implement scheme fallback logic (FPS unavailable → BACS) with cut-off time enforcement
 
 ## Business Context
 
-In November 2019, TSB's payment processing system failed to submit its BACS input file before the 22:30 Day 1 cut-off. As a result, 220,000 salary payments and direct debits that were scheduled for the following Tuesday were delayed by 24 hours. The root cause was not the file generation itself — the file was produced correctly — but a routing state machine that did not distinguish "file generated" from "file submitted and acknowledged by Vocalink." The bank had no alerting on submission acknowledgement, only on file generation. The incident cost TSB £48 million in remediation, compensation, and FCA fines, and exposed a fundamental design flaw: batch payment routing must track submission state through to scheme acknowledgement, not just file creation.
+*Composite example (based on common industry failure patterns, not a specific bank):* a bank's payment platform missed the Bacs Day 1 input deadline (22:30). Salary payments and direct debits for hundreds of thousands of customers were delayed by a full day. The file itself had been generated correctly — but the routing state machine did not distinguish "file generated" from "file submitted and acknowledged by Bacs". There was alerting on file generation, but none on the submission acknowledgement, so nobody noticed until the morning. Remediation, compensation and regulatory attention followed, and the review exposed a basic design flaw: batch payment routing must track submission state all the way to the scheme's acknowledgement, not just file creation.
 
 This incident defines the engineering requirements for this lesson: routing must be stateful, scheme acknowledgement must be tracked, and cut-off enforcement must block new routing decisions once the submission window is closed.
 
@@ -73,26 +75,24 @@ Routing a payment requires evaluating a decision tree across four primary dimens
 ```mermaid
 flowchart TD
     A[Incoming Payment Request] --> B{Currency = GBP?}
-    B -- No --> C{SEPA-eligible?\nEUR + EEA beneficiary}
+    B -- No --> C{SEPA-eligible?\nEUR + SEPA beneficiary}
     C -- Yes --> D[Route → SEPA Credit Transfer]
-    C -- No --> E[Route → SWIFT MT103]
-    B -- Yes --> F{Amount > £250,000?}
-    F -- Yes --> G[Route → CHAPS\nReal-time gross settlement]
+    C -- No --> E[Route → SWIFT cross-border]
+    B -- Yes --> F{Amount above the bank's\nhigh-value threshold?}
+    F -- Yes --> G[Route → CHAPS\nReal-time gross settlement\nduring CHAPS operating hours]
     F -- No --> H{Urgency = IMMEDIATE?}
     H -- Yes --> I{FPS available?\nCheck scheme health}
     I -- Yes --> J[Route → Faster Payments]
-    I -- No --> K{Amount ≤ £10,000?\nFPS fallback limit for BACS same-day}
-    K -- Yes --> L[Route → BACS Same-Day\nif before 15:30 cut-off]
-    K -- No --> M[Route → CHAPS\nFallback for high-value urgent]
-    H -- No --> N{BACS cut-off\npassed for today?}
+    I -- No --> K{Must settle today and\nCHAPS open?}
+    K -- Yes --> M[Route → CHAPS\nwith customer informed of fee]
+    K -- No --> L[Offer BACS\ncustomer informed: slower settlement]
+    H -- No --> N{BACS Day 1 cut-off\npassed for today?}
     N -- No --> O[Route → BACS]
-    N -- Yes --> P{Next BACS input\nwindow opens?}
-    P -- Tomorrow --> Q[Hold: Queue for next\nBACS Day 1 window]
-    P -- Scheme holiday --> R[Route → FPS if amount ≤ £1M\nelse CHAPS]
+    N -- Yes --> Q[Queue for the next\nBACS Day 1 window]
 ```
 
 > [!IMPORTANT]
-> Cut-off times must be evaluated against the scheme's clock, not the payment originator's local time. BACS Day 1 input closes at 22:30 UK time (GMT/BST). A system that uses UTC without BST awareness will submit one hour late during British Summer Time, causing exactly the type of incident TSB experienced.
+> Cut-off times must be evaluated against the scheme's clock, not the payment originator's local time. BACS Day 1 input closes at 22:30 UK time (GMT/BST). A system that uses UTC without BST awareness will submit one hour late during British Summer Time — exactly the kind of missed deadline described above. Note also that CHAPS is not open 24/7: it has daily operating hours and cut-offs, and does not run on weekends or bank holidays.
 
 ## PaymentRouter Strategy Pattern
 
@@ -112,8 +112,8 @@ public record SchemeCapabilities(
     BigDecimal maxAmount,
     Set<String> supportedCurrencies,
     boolean supportsInstantSettlement,
-    LocalTime cutOffTime,          // null = always-on (CHAPS, FPS)
-    int settlementDays             // 0 = immediate, 3 = BACS
+    LocalTime cutOffTime,          // null = always-on (FPS). CHAPS has daily hours
+    int settlementDays             // 0 = immediate; BACS settles on day 3 of its cycle
 ) {}
 
 @Service
@@ -169,7 +169,8 @@ public class PaymentRouter {
 
     private boolean isCutOffSatisfied(SchemeCapabilities cap) {
         if (cap.cutOffTime() == null) return true; // always-on scheme
-        LocalTime now = LocalTime.now(ZoneId.of("Europe/London"));
+        // Use the injected clock (testable) in the SCHEME's time zone
+        LocalTime now = LocalTime.now(clock.withZone(ZoneId.of("Europe/London")));
         return now.isBefore(cap.cutOffTime());
     }
 
@@ -177,7 +178,7 @@ public class PaymentRouter {
         if (payment.urgency() == Urgency.IMMEDIATE &&
             handler.capabilities().supportsInstantSettlement()) return 0;
         if (handler.capabilities().settlementDays() == 0) return 1;
-        if (handler.capabilities().settlementDays() == 3) return 2;
+        if (handler.capabilities().settlementDays() >= 2) return 2;
         return 3;
     }
 }
@@ -194,7 +195,7 @@ public class BacsSchemeHandler implements SchemeHandler {
         Set.of("GBP"),
         false,
         LocalTime.of(22, 30),  // Day 1 cut-off: 22:30 UK time
-        3
+        2                      // input day + 2 business days = entry day
     );
 
     @Override
@@ -238,20 +239,20 @@ BACS (Bankers' Automated Clearing Services) operates on a fixed 3-business-day p
 
 | Day | Activity | Cut-off |
 |---|---|---|
-| **Day 1 (Input day)** | Originating bank submits payment file to Vocalink | 22:30 UK time |
-| **Day 2 (Processing day)** | Vocalink validates, sorts, and distributes to receiving banks | — |
-| **Day 3 (Settlement day)** | Funds credited to beneficiary accounts; settlement via Bank of England | 07:00 |
+| **Day 1 (Input day)** | The service user / bank submits the payment file to Bacs | 22:30 UK time |
+| **Day 2 (Processing day)** | Bacs validates, sorts and distributes the payments to receiving banks | — |
+| **Day 3 (Entry day)** | Payer debited and payee credited; interbank settlement at the Bank of England | Early morning |
 
-The critical engineering constraint is that file submission must be tracked through to Vocalink's acknowledgement (a digitally signed AUDDIS/ARUDD response). File generation is not submission. Submission acknowledgement must update the payment batch state machine before the cut-off monitoring system can consider the batch successfully processed.
+The critical engineering constraint is that file submission must be tracked through to Bacs's acknowledgement (the submission summary / input report returned via Bacstel-IP). File generation is not submission. (Do not confuse this with AUDDIS — direct debit instruction lodgement — or ARUDD — reports of unpaid direct debits.) Submission acknowledgement must update the payment batch state machine before the cut-off monitoring system can consider the batch successfully processed.
 
 ```java
 public enum BacsBatchStatus {
     COLLECTING,         // payments being added to the batch
     FROZEN,             // cut-off reached, no more additions
     FILE_GENERATED,     // Standard 18 file written to disk/SFTP staging
-    SUBMITTED,          // file transferred to Vocalink
-    ACKNOWLEDGED,       // Vocalink returned positive acknowledgement
-    REJECTED,           // Vocalink returned rejection — resubmission required
+    SUBMITTED,          // file transferred to Bacs
+    ACKNOWLEDGED,       // Bacs returned a positive submission report
+    REJECTED,           // Bacs rejected the file — repair and resubmit
     SETTLED             // Day 3: Bank of England confirmed settlement
 }
 ```
@@ -264,6 +265,7 @@ public enum BacsBatchStatus {
 The US ACH network (governed by NACHA) uses a fixed-width 94-character record format organised as a hierarchical file: File Header → Batch Header(s) → Entry Detail records → Batch Control → File Control.
 
 ```
+(simplified — real records are exactly 94 characters, with fixed field positions)
 File Header (Type 1):  101 bank routing ABA   company ID   date  BATCHFILE
 Batch Header (Type 5): 5200Company Name  Company ID SEC CCD  entry descr  date  seq
 Entry Detail (Type 6): 6271123456781234567890     000010000John Smith          0001
@@ -275,7 +277,7 @@ Padding (Type 9):      999999999999999999999999999999999999999999999999999999999
 Each file must end with a number of records that is a multiple of 10 (block factor). Padding records (all 9s) fill the remaining rows to reach the next multiple of 10.
 
 > [!NOTE]
-> The ACH SEC (Standard Entry Class) code determines how the entry detail record is interpreted. `CCD` (Corporate Credit or Debit) is used for B2B payments. `PPD` (Prearranged Payment and Deposit) is used for consumer credits (payroll, government benefits). Using the wrong SEC code causes the receiving bank to reject the entry at settlement.
+> The ACH SEC (Standard Entry Class) code determines how the entry detail record is interpreted. `CCD` (Corporate Credit or Debit) is used for B2B payments. `PPD` (Prearranged Payment and Deposit) is used for consumer credits (payroll, government benefits). Using the wrong SEC code can cause the receiving bank to return the entry.
 
 ## Bilateral and Multilateral Netting
 
@@ -307,17 +309,17 @@ WITH gross_positions AS (
       AND settlement_date  = CURRENT_DATE
       AND status           = 'PENDING'
 )
+-- COALESCE: SUM over no rows is NULL, which would make the result NULL
 SELECT
-    SUM(CASE WHEN direction = 'A_TO_B' THEN gross_amount ELSE 0 END)
-  - SUM(CASE WHEN direction = 'B_TO_A' THEN gross_amount ELSE 0 END)
+    COALESCE(SUM(CASE WHEN direction = 'A_TO_B' THEN gross_amount END), 0)
+  - COALESCE(SUM(CASE WHEN direction = 'B_TO_A' THEN gross_amount END), 0)
         AS net_position_gbp,
-    SUM(CASE WHEN direction = 'A_TO_B' THEN gross_amount ELSE 0 END)
-  + SUM(CASE WHEN direction = 'B_TO_A' THEN gross_amount ELSE 0 END)
+    COALESCE(SUM(gross_amount), 0)
         AS gross_position_gbp
 FROM gross_positions;
 ```
 
-**Multilateral netting** (used in CHAPS RTGS): each participant settles only its net multilateral position against the central clearing house rather than bilateral positions against each counterparty. This further reduces required settlement liquidity.
+**Multilateral netting** (used in deferred net settlement schemes such as Bacs and Faster Payments — **not** in CHAPS, which settles every payment gross): each participant settles only its single net position against all others, rather than bilateral positions against each counterparty. This further reduces required settlement liquidity, at the cost of settlement risk until the cycle settles.
 
 | Method | Gross Settlement | Net Settlement | Liquidity Required |
 |---|---|---|---|
@@ -327,62 +329,67 @@ FROM gross_positions;
 
 ## BACS Standard 18 File Generation
 
-The BACS Standard 18 format is a fixed-width flat file. Each record is exactly 100 characters. The file contains a header record, one record per payment, and a trailer record.
+The BACS Standard 18 format is a fixed-width flat file. Each payment record is 100 characters. The file wraps the payment records in label records (VOL1, HDR1, HDR2, UHL1 at the start; EOF1, EOF2, UTL1 at the end), and the UTL1 trailer carries the credit and debit totals and record counts that Bacs checks.
 
 ```java
 public class BacsStandard18FileGenerator {
 
     private static final int RECORD_LENGTH = 100;
-    private static final DateTimeFormatter BACS_DATE =
-        DateTimeFormatter.ofPattern("ddMMyy");
 
     public byte[] generate(BacsBatch batch) {
         StringBuilder sb = new StringBuilder();
-        sb.append(formatHeader(batch));
-        int hash = 0;
-        BigDecimal total = BigDecimal.ZERO;
+        sb.append(formatLabels(batch));               // VOL1 / HDR1 / HDR2 / UHL1
+        long creditTotalPence = 0;
+        int creditCount = 0;
 
         for (BacsPayment payment : batch.payments()) {
-            sb.append(formatPaymentRecord(payment));
-            hash = (hash + parseAccountNumber(payment.destinationAccountNumber())) % 100_000_000;
-            total = total.add(payment.amount());
+            String record = formatPaymentRecord(payment);
+            if (record.length() != RECORD_LENGTH) {
+                throw new IllegalStateException("Bad record length " + record.length());
+            }
+            sb.append(record).append("\r\n");
+            creditTotalPence = Math.addExact(creditTotalPence, payment.amountPence());
+            creditCount++;
         }
 
-        sb.append(formatTrailer(batch, hash, total));
-        return sb.toString().getBytes(StandardCharsets.ISO_8859_1);
+        // Contra record + EOF1 / EOF2 / UTL1 with totals and counts
+        sb.append(formatTrailers(batch, creditTotalPence, creditCount));
+        return sb.toString().getBytes(StandardCharsets.US_ASCII);  // restricted character set
     }
 
     private String formatPaymentRecord(BacsPayment p) {
-        // Field layout (positions 1-100):
+        // Standard 18 payment record layout (positions 1-100):
         // 1-6:   Destination sort code (no dashes)
         // 7-14:  Destination account number
-        // 15:    Transaction type code (99 = credit, 17 = debit)
-        // 16-23: Originating sort code
+        // 15:    Destination account type (normally 0)
+        // 16-17: Transaction code (99 = credit, 17 = direct debit, ...)
+        // 18-23: Originating sort code
         // 24-31: Originating account number
-        // 32-43: Amount in pence (12 digits, zero-padded)
-        // 44-61: Originating account name (18 chars, space-padded)
-        // 62-79: Destination account name (18 chars, space-padded)
-        // 80-97: Reference (18 chars, space-padded)
-        // 98-99: Transaction code
-        // 100:   Reserved (space)
-        return String.format("%-6s%-8s%2s%-6s%-8s%012d%-18s%-18s%-18s%2s ",
+        // 32-35: Free format (often spaces / RTI field)
+        // 36-46: Amount in pence (11 digits, zero-padded)
+        // 47-64: Service user's name (18 chars, space-padded)
+        // 65-82: Service user's reference (18 chars, space-padded)
+        // 83-100: Destination account name (18 chars, space-padded)
+        return String.format("%-6s%-8s%1s%2s%-6s%-8s%-4s%011d%-18s%-18s%-18s",
             p.destinationSortCode().replace("-", ""),
             p.destinationAccountNumber(),
-            p.transactionType().bacsCode(),
+            "0",
+            p.transactionCode(),
             p.originatingSortCode().replace("-", ""),
             p.originatingAccountNumber(),
+            "",
             p.amountPence(),
             truncatePad(p.originatingName(), 18),
-            truncatePad(p.destinationName(), 18),
             truncatePad(p.reference(), 18),
-            p.transactionCode()
+            truncatePad(p.destinationName(), 18)
         );
     }
 
     private String truncatePad(String value, int length) {
         if (value == null) return " ".repeat(length);
+        String upper = value.toUpperCase(Locale.ROOT);   // Bacs uses upper case
         return String.format("%-" + length + "s",
-            value.length() > length ? value.substring(0, length) : value);
+            upper.length() > length ? upper.substring(0, length) : upper);
     }
 }
 ```
@@ -437,13 +444,13 @@ public class FallbackAwareRouter {
 ```
 
 > [!NOTE]
-> Falling back from FPS to BACS silently changes the settlement date from immediate to T+3. This change must be communicated back to the payment initiator so that the customer can be informed. Never silently downgrade a payment's settlement speed without surfacing the change in the routing decision response.
+> Falling back from FPS to BACS silently changes the settlement from immediate to the third day of the Bacs cycle. This change must be communicated back to the payment initiator so that the customer can be informed. Never silently downgrade a payment's settlement speed without surfacing the change in the routing decision response.
 
 ## Knowledge Check
 
 **Q1: A salary payment for £2,500 arrives at 23:00 UK time on a Monday. FPS is available. BACS is unavailable (past cut-off). CHAPS is available but only for payments above £250,000. What routing decision should the system make and why?**
 
-A: The payment should be routed via FPS (Faster Payments). FPS supports GBP payments up to £1,000,000, operates 24/7 with no cut-off, and is available. Even though it is after the BACS Day 1 cut-off (22:30), FPS is a real-time scheme that is always open. CHAPS is not eligible because the payment is below £250,000 (the minimum threshold for CHAPS in this configuration). The routing decision must record that FPS was selected and that BACS and CHAPS were considered and rejected, with their rejection reasons, in the audit log.
+A: The payment should be routed via FPS (Faster Payments). FPS supports GBP payments up to £1,000,000, operates 24/7 with no cut-off, and is available. Even though it is after the BACS Day 1 cut-off (22:30), FPS is a real-time scheme that is always open. CHAPS is not eligible because the payment is below £250,000 (the bank's own minimum for CHAPS in this configuration — the scheme has no minimum) and because CHAPS is closed at 23:00 anyway. The routing decision must record that FPS was selected and that BACS and CHAPS were considered and rejected, with their rejection reasons, in the audit log.
 
 **Q2: What is the difference between bilateral netting and multilateral netting, and why does multilateral netting dramatically reduce required settlement liquidity?**
 
@@ -451,11 +458,11 @@ A: Bilateral netting offsets obligations between exactly two counterparties, so 
 
 ## Practical Challenge
 
-1. **Strategy pattern completeness:** Implement `ChapsSchemeHandler` and `SepaSchemeHandler` alongside the `BacsSchemeHandler` shown in this lesson. `ChapsSchemeHandler` must enforce a minimum amount of £250,000 and use a `maxAmount` of `Long.MAX_VALUE`. `SepaSchemeHandler` must accept only EUR and validate that the beneficiary IBAN starts with a two-letter EEA country code. Write unit tests for each handler's `validate()` method covering both valid and invalid cases.
+1. **Strategy pattern completeness:** Implement `ChapsSchemeHandler` and `SepaSchemeHandler` alongside the `BacsSchemeHandler` shown in this lesson. `ChapsSchemeHandler` must enforce the bank-policy minimum of £250,000, have no practical maximum, and respect CHAPS operating hours (closed at weekends and on bank holidays). `SepaSchemeHandler` must accept only EUR and validate that the beneficiary IBAN's country is in the SEPA country list. Write unit tests for each handler's `validate()` method covering both valid and invalid cases.
 
 2. **Cut-off time enforcement with BST:** `PaymentRouter.isCutOffSatisfied()` must correctly handle British Summer Time. Write a parameterised test using `java.time.ZoneId.of("Europe/London")` that verifies (a) a payment at 22:29 on a BST day is accepted by BACS, (b) a payment at 22:31 on a BST day is rejected by BACS but accepted by FPS, and (c) the same times with the system clock set to GMT produce the same cut-off boundaries.
 
-3. **BACS file generation and validation:** Extend `BacsStandard18FileGenerator` to compute the destination account number hash (sum of all 8-digit destination account numbers modulo 100,000,000) and write it to the trailer record. Write an integration test that generates a file for 5 known payments, parses the trailer record back, and asserts that the hash and total amount match the expected values computed independently.
+3. **BACS file generation and validation:** Extend `BacsStandard18FileGenerator` to write the contra record and the UTL1 trailer with the credit total (in pence) and the credit record count. Write an integration test that generates a file for 5 known payments, checks every payment record is exactly 100 characters, parses the UTL1 record back, and asserts that the total and count match values computed independently.
 
 4. **Fallback audit trail:** Modify `FallbackAwareRouter.routeWithFallback()` so that every scheme that was considered and rejected (whether for unavailability, cut-off, or validation failure) is recorded in a `RoutingAttempt` list that is persisted alongside the final `RoutingAuditRecord`. Write a test that simulates FPS being unavailable and verifies that the audit record contains a `REJECTED` entry for FPS with reason `SCHEME_UNAVAILABLE` and an `ACCEPTED` entry for BACS.
 
@@ -463,15 +470,15 @@ A: Bilateral netting offsets obligations between exactly two counterparties, so 
 {
   "questions": [
     {
-      "text": "A £2,500 salary payment arrives at 23:00 UK time on a Monday. FPS is available, BACS is past cut-off, CHAPS requires a minimum of £250,000. What routing decision should the system make?",
+      "text": "A £2,500 salary payment arrives at 23:00 UK time on a Monday. FPS is available, BACS is past its Day 1 cut-off, and the bank only uses CHAPS above £250,000 (CHAPS is also closed at that hour). What routing decision should the system make?",
       "options": [
         "Route via BACS — it is the cheapest option regardless of cut-off",
-        "Route via CHAPS — it is available 24/7 and guaranteed",
+        "Route via CHAPS — it is always open and guaranteed",
         "Route via FPS — it is available 24/7, supports up to £1,000,000, and no other eligible scheme is available",
         "Hold the payment until the next BACS processing day"
       ],
       "correct": 2,
-      "explanation": "FPS is the correct choice. It supports GBP payments up to £1,000,000, operates 24/7 with no cut-off, and is available. BACS is ineligible (past cut-off at 22:30). CHAPS is ineligible (minimum £250,000). The routing decision must record that BACS and CHAPS were considered and rejected, with their rejection reasons, in the audit log."
+      "explanation": "FPS is the correct choice. It supports GBP payments up to its scheme limit of £1,000,000, operates 24/7, and is available. BACS is past its 22:30 Day 1 cut-off. CHAPS is excluded by the bank's own £250,000 threshold and is closed at 23:00 in any case. The routing decision must record that BACS and CHAPS were considered and rejected, with their reasons, in the audit log."
     },
     {
       "text": "What is the key difference between bilateral netting and multilateral netting, and why does multilateral netting reduce required settlement liquidity more dramatically?",
@@ -493,7 +500,7 @@ A: Bilateral netting offsets obligations between exactly two counterparties, so 
         "Day 4 — the cycle takes 4 days"
       ],
       "correct": 2,
-      "explanation": "The BACS cycle has three days: Day 1 (submission — files submitted by 22:30), Day 2 (processing — Vocalink validates and distributes to receiving banks), Day 3 (settlement — funds credited to beneficiary accounts and settlement entries posted). Day 1 input cut-off is 22:30, so payments submitted after this are processed on the next Day 1."
+      "explanation": "The Bacs cycle has three days: Day 1 (input — files submitted by 22:30), Day 2 (processing — Bacs validates and distributes to receiving banks), Day 3 (entry day — payer debited, beneficiary credited, interbank settlement). Files submitted after the Day 1 cut-off start their cycle on the next business day."
     }
   ]
 }
@@ -507,7 +514,7 @@ A: Bilateral netting offsets obligations between exactly two counterparties, so 
   "tasks": [
     {
       "id": "1",
-      "description": "Implement `ChapsSchemeHandler` and `SepaSchemeHandler` alongside `BacsSchemeHandler`. `ChapsSchemeHandler` must enforce a minimum amount of £250,000. `SepaSchemeHandler` must accept only EUR and validate the beneficiary IBAN starts with a two-letter EEA country code. Write unit tests for each handler's `validate()` method covering both valid and invalid cases."
+      "description": "Implement `ChapsSchemeHandler` and `SepaSchemeHandler` alongside `BacsSchemeHandler`. `ChapsSchemeHandler` must enforce the bank-policy minimum of £250,000 and respect CHAPS operating hours. `SepaSchemeHandler` must accept only EUR and validate that the beneficiary IBAN's country is in the SEPA country list. Write unit tests for each handler's `validate()` method covering both valid and invalid cases."
     },
     {
       "id": "2",
@@ -515,7 +522,7 @@ A: Bilateral netting offsets obligations between exactly two counterparties, so 
     },
     {
       "id": "3",
-      "description": "Extend `BacsStandard18FileGenerator` to compute the destination account number hash (sum of all 8-digit destination account numbers modulo 100,000,000) and write it to the trailer record. Write an integration test that generates a file for 5 known payments, parses the trailer record back, and asserts the hash and total amount match independently computed expected values."
+      "description": "Extend `BacsStandard18FileGenerator` to write the contra record and the UTL1 trailer with the credit total (in pence) and the credit record count. Write an integration test that generates a file for 5 known payments, checks each payment record is exactly 100 characters, parses the UTL1 record back, and asserts the total and count match independently computed values."
     },
     {
       "id": "4",

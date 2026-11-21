@@ -11,7 +11,9 @@ tags: [saga, choreography, orchestration, compensation, distributed-transactions
 java-versions: [17, 21]
 ---
 
-Distributed systems shattered the ACID transaction boundary. When a payment flows through a fraud-screening service, an external card processor, a ledger-posting service, and a notification gateway, there is no distributed lock that can hold all four systems in a single atomic unit without introducing catastrophic coupling. The Saga pattern replaces the monolithic transaction with a sequence of local transactions — each isolated within a single service — connected by events or an orchestrator, and reversible through compensating transactions when any step fails. For principal engineers in banking, this is not an academic construct: it is the architecture that underpins every modern payment rail, from SEPA Instant to Visa DPS. Understanding exactly when and how to apply it — and where it can silently corrupt your data — is a prerequisite for building financial systems that survive production at scale.
+## Overview
+
+Distributed systems shattered the ACID transaction boundary. When a payment flows through a fraud-screening service, an external card processor, a ledger-posting service, and a notification gateway, there is no distributed lock that can hold all four systems in a single atomic unit without introducing catastrophic coupling. The Saga pattern replaces the monolithic transaction with a sequence of local transactions — each isolated within a single service — connected by events or an orchestrator, and reversible through compensating transactions when any step fails. For principal engineers in banking, this is not an academic construct: it is how most modern multi-service payment platforms coordinate work across their internal services and external providers. Understanding exactly when and how to apply it — and where it can silently corrupt your data — is a prerequisite for building financial systems that survive production at scale.
 
 ## Learning Objectives
 
@@ -24,7 +26,7 @@ Distributed systems shattered the ACID transaction boundary. When a payment flow
 
 ## Business Context
 
-In 2019, a UK challenger bank launched a Buy Now Pay Later integration involving four external services: identity verification, credit bureau, loan origination, and core banking. During the first week of production, a 4-minute credit bureau outage caused 312 loan applications to become permanently stuck. Each application had already passed identity verification and reserved credit capacity in the loan origination system, but the compensating logic had not been implemented — the team had assumed the credit bureau would always recover quickly. When it did not, those 312 applications held reserved credit limits indefinitely. The core banking service had no way to know the applications would never complete. Total frozen credit: £1.4 million. Resolution required a manual database correction script, 48 hours of engineer time, and a written explanation to the FCA. The post-mortem conclusion: "We implemented the happy path of the saga. We did not implement the saga."
+*Composite example:* a UK challenger bank launched a Buy Now Pay Later integration involving four external services: identity verification, credit bureau, loan origination, and core banking. During the first week of production, a 4-minute credit bureau outage caused 312 loan applications to become permanently stuck. Each application had already passed identity verification and reserved credit capacity in the loan origination system, but the compensating logic had not been implemented — the team had assumed the credit bureau would always recover quickly. When it did not, those 312 applications held reserved credit limits indefinitely. The core banking service had no way to know the applications would never complete. Total frozen credit: £1.4 million. Resolution required a manual database correction script, 48 hours of engineer time, and a written explanation to the FCA. The post-mortem conclusion: "We implemented the happy path of the saga. We did not implement the saga."
 
 ## Why 2PC Fails Across HTTP Services
 
@@ -134,8 +136,12 @@ public class PaymentSagaOrchestrator {
     private final FraudCheckClient       fraudClient;
     private final ProcessorClient        processorClient;
     private final LedgerClient           ledgerClient;
+    private final AlertingService        alertingService;
 
-    @Transactional
+    // NOT @Transactional: every sagaRepo.save() must COMMIT immediately so the
+    // saga log survives a crash. One transaction around the HTTP calls would
+    // commit nothing until the very end. (@Transactional on PRIVATE methods
+    // does nothing anyway — Spring's proxy cannot intercept them.)
     public void startSaga(UUID sagaId, PaymentRequest request) {
         PaymentSaga saga = PaymentSaga.builder()
             .sagaId(sagaId)
@@ -147,11 +153,11 @@ public class PaymentSagaOrchestrator {
         sagaRepo.save(saga);              // persist before calling out
 
         try {
+            // Every external call carries the sagaId as its idempotency key
             ReservationResult reservation =
-                fundsClient.reserve(request.getAccountId(),
-                                    request.getAmount());
-            transitionTo(saga, "FRAUD_CHECK",
-                toJson(reservation));
+                fundsClient.reserve(sagaId, request.getAccountId(), request.getAmount());
+            saga.setHoldId(reservation.getHoldId());
+            transitionTo(saga, "FRAUD_CHECK", toJson(reservation));
 
             FraudCheckResult fraud =
                 fraudClient.check(request.getPaymentId(),
@@ -162,92 +168,92 @@ public class PaymentSagaOrchestrator {
                 compensate(saga, "Fraud rejection");
                 return;
             }
-            transitionTo(saga, "SUBMIT_PROCESSOR",
-                toJson(fraud));
+            transitionTo(saga, "SUBMIT_PROCESSOR", toJson(fraud));
 
             ProcessorResult processor =
-                processorClient.submit(request, reservation);
-            transitionTo(saga, "POST_LEDGER",
-                toJson(processor));
+                processorClient.submit(sagaId, request, reservation);
+            transitionTo(saga, "POST_LEDGER", toJson(processor));
 
             ledgerClient.postEntries(request.getPaymentId(),
                                      request.getAmount(),
                                      processor.getAuthorizationCode());
-            transitionTo(saga, "RELEASE_HOLD",
-                null);
+            transitionTo(saga, "RELEASE_HOLD", null);
 
             fundsClient.releaseHold(reservation.getHoldId());
-            transitionTo(saga, "COMPLETED", null);
             saga.setSagaState("COMPLETED");
-            sagaRepo.save(saga);
+            transitionTo(saga, "COMPLETED", null);
 
         } catch (Exception ex) {
+            // Includes timeouts: e.g. a processor submit that timed out may or
+            // may not have authorised. The void below is keyed on sagaId and is
+            // a no-op if no authorisation exists — so it is safe either way.
             log.error("Saga {} failed at step {}: {}",
                 sagaId, saga.getCurrentStep(), ex.getMessage());
             compensate(saga, ex.getMessage());
         }
     }
 
-    @Transactional
     private void compensate(PaymentSaga saga, String reason) {
         saga.setSagaState("COMPENSATING");
         sagaRepo.save(saga);
 
-        switch (saga.getCurrentStep()) {
-            case "RELEASE_HOLD", "POST_LEDGER" -> {
-                safeCompensate(() ->
-                    ledgerClient.reverseEntries(saga.getPaymentId()),
+        // Arrow-style switch cases do NOT fall through, so the reverse-order
+        // cascade is written out explicitly: undo every step that may have run
+        String step = saga.getCurrentStep();
+        boolean ledgerMayHavePosted = step.equals("POST_LEDGER") || step.equals("RELEASE_HOLD");
+        boolean processorMayHaveRun = ledgerMayHavePosted || step.equals("SUBMIT_PROCESSOR");
+
+        boolean ok = true;
+        if (ledgerMayHavePosted) {
+            ok &= safeCompensate(() -> ledgerClient.reverseEntries(saga.getPaymentId()),
                     "reverse_ledger", saga);
-                // fall through to void processor
-            }
-            case "SUBMIT_PROCESSOR" -> {
-                safeCompensate(() ->
-                    processorClient.voidAuthorization(saga.getPaymentId()),
+        }
+        if (processorMayHaveRun) {
+            ok &= safeCompensate(() -> processorClient.voidBySagaId(saga.getSagaId()),
                     "void_authorization", saga);
-                // fall through to release hold
-            }
-            case "FRAUD_CHECK", "RESERVE_FUNDS" -> {
-                safeCompensate(() ->
-                    fundsClient.releaseHold(saga.getPaymentId()),
+        }
+        if (saga.getHoldId() != null) {
+            ok &= safeCompensate(() -> fundsClient.releaseHold(saga.getHoldId()),
                     "release_hold", saga);
-            }
         }
 
-        saga.setSagaState("FAILED");
+        // Only a FULLY compensated saga may be marked FAILED (terminal). If a
+        // compensation could not be completed, the saga stays visible to the
+        // recovery job, which keeps retrying — compensations must eventually succeed.
+        saga.setSagaState(ok ? "FAILED" : "COMPENSATION_PENDING");
         sagaRepo.save(saga);
     }
 
-    private void safeCompensate(Runnable action,
-                                 String compensationName,
-                                 PaymentSaga saga) {
+    /** @return true if the compensation succeeded */
+    private boolean safeCompensate(Runnable action,
+                                   String compensationName,
+                                   PaymentSaga saga) {
         int attempts = 0;
-        while (attempts < 10) {
+        while (attempts < 5) {   // short in-line retries; the recovery job does the rest
             try {
                 action.run();
-                return;
+                return true;
             } catch (Exception ex) {
                 attempts++;
                 log.warn("Compensation {} attempt {} failed for saga {}: {}",
                     compensationName, attempts,
                     saga.getSagaId(), ex.getMessage());
-                if (attempts < 10) {
-                    sleep(Duration.ofSeconds(attempts)); // exponential-ish backoff
+                if (attempts < 5) {
+                    sleep(Duration.ofSeconds(1L << (attempts - 1))); // 1s, 2s, 4s, 8s
                 }
             }
         }
-        // After 10 attempts, raise an alert for manual intervention
-        alertingService.raiseCompensationAlert(saga.getSagaId(),
-                                               compensationName);
+        alertingService.raiseCompensationAlert(saga.getSagaId(), compensationName);
+        return false;
     }
 
-    @Transactional
     private void transitionTo(PaymentSaga saga,
                                String nextStep,
                                String payload) {
         saga.setCurrentStep(nextStep);
         saga.setStepPayload(payload);
         saga.setUpdatedAt(OffsetDateTime.now());
-        sagaRepo.save(saga);              // write-ahead before next external call
+        sagaRepo.save(saga);              // commits NOW — write-ahead before next external call
     }
 }
 ```
@@ -282,13 +288,13 @@ public void compensateProcessor(UUID paymentId) {
 ```
 
 > [!WARNING]
-> Never design a compensation that calls the same external service that just failed. If the processor is down, `void_authorization` must either use a secondary endpoint, queue the void for later execution, or accept that the authorization will expire naturally (after providing an alert). Cascading the original failure into the compensation produces a compensation that also fails — Rule 2 violation.
+> A compensation often has to call the very service that just failed — the void must go to the processor. So never design it to *need* that service immediately: if the processor is down, queue the void for later execution (the recovery job retries it), or — for card authorisations — know that an unvoided authorisation expires on its own, and alert. What a compensation must never do is give up and mark the saga finished while the effect is still in place — that violates Rule 2.
 
 ## Saga Isolation: Dirty Reads and Semantic Locks
 
 Sagas do not hold database locks between steps. This creates an isolation hazard: a second saga can read data that the first saga has modified but not yet committed to a final state.
 
-**Example:** Customer has £1,000. Saga A reserves £800. Saga B reads the account balance before Saga A's ledger posting completes and sees £1,000 — the original balance — because the reservation is a hold, not a debit. Saga B reserves £900. Both sagas succeed. The account has been overdrawn by £700.
+**Example:** Customer has £1,000. Saga A reserves £800. Saga B reads the account balance before Saga A's ledger posting completes and sees £1,000 — the original balance — because the reservation is a hold that B's check ignores, not a debit. Saga B reserves £900. Both sagas succeed. The account has been overdrawn by £700.
 
 The countermeasure is a **semantic lock**: a status field on the entity being modified that signals "in-progress" to concurrent readers.
 
@@ -319,7 +325,9 @@ WHERE a.id = :accountId
 GROUP BY a.balance;
 ```
 
-The `PENDING` status acts as an in-progress marker. Any concurrent saga that reads available balance will correctly see the in-progress hold as already claimed. When the saga completes successfully, the hold transitions from `PENDING` to `RESERVED` and eventually to `RELEASED` or converted to a debit. When the saga compensates, the hold is deleted.
+The `PENDING` status acts as an in-progress marker. Any concurrent saga that reads available balance will correctly see the in-progress hold as already claimed. When the saga completes successfully, the hold transitions from `PENDING` to `RESERVED` and eventually to `RELEASED` or converted to a debit. When the saga compensates, the hold is set to `RELEASED` (not deleted — keep the audit trail).
+
+One more detail: the reserve step itself must still be serialised per account. Two sagas that compute the available balance at the same moment, before either inserts its hold, would both pass the check. So the funds service locks the account row (`SELECT ... FOR UPDATE`) — or uses a conditional update on a held-amount column — while it checks and inserts the hold. The semantic lock protects *between* saga steps; the short row lock protects the reserve step.
 
 ## Knowledge Check
 

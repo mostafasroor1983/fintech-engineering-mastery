@@ -35,7 +35,12 @@ references:
   - "Bank for International Settlements, 'Correspondent Banking' CPMI Report No. 147, 2016"
 ---
 
-SWIFT (Society for Worldwide Interbank Financial Telecommunication) carries over 44 million messages per day across more than 11,500 financial institutions in 200+ countries. Despite ISO 20022 migration underway, the MT (Message Type) format remains the operational backbone of cross-border payments for the foreseeable future. Senior engineers maintaining payment gateways must understand the byte-level structure of MT messages, the correspondent banking topology those messages traverse, and how to parse, validate, and route them reliably in Java.
+## Overview
+
+SWIFT (Society for Worldwide Interbank Financial Telecommunication) carries tens of millions of messages per day between more than 11,000 financial institutions in over 200 countries and territories. For decades the MT (Message Type) format was the operational backbone of cross-border payments.
+
+> [!IMPORTANT]
+> **Status in 2026:** the MT/ISO 20022 coexistence period for cross-border payment instructions on SWIFT ended in November 2025. Payment instructions between banks (formerly MT103, MT202) are now exchanged as ISO 20022 messages (`pacs.008`, `pacs.009` — see Lesson 7). MT knowledge is still essential: many back-office systems and internal interfaces still produce or expect MT, archives and investigations are full of MT, and statement and reporting messages (MT940/MT950) are migrating more slowly. Engineers maintaining payment gateways must understand the byte-level structure of MT messages, the correspondent banking topology those messages traverse, and how to parse, validate, and route them reliably in Java.
 
 ## Learning Objectives
 
@@ -50,7 +55,7 @@ SWIFT (Society for Worldwide Interbank Financial Telecommunication) carries over
 
 ## Business Context
 
-In November 2022, a major European bank's payment operations team discovered that 3,400 cross-border MT103 messages had been silently rejected by SWIFT's FIN service over a 48-hour window due to a malformed Block 2 application header — specifically, a one-character error in the message priority field. The messages were queued internally but never transmitted. The total trapped value was €217 million. The incident was not detected by monitoring because the internal queue counter and the SWIFT confirmation counter were reconciled only at end-of-day. By the time operations identified the discrepancy, 14 beneficiaries in six countries had escalated through their banks, and the institution incurred €480,000 in penalty interest, €120,000 in manual repair costs, and significant reputational damage with two correspondent partners who threatened to review the relationship. The root cause was a 2019 internal serializer that had never been validated against the SWIFT MT standards and had accumulated undocumented drift. This lesson ensures you can build a correct, well-tested MT message pipeline that never silently fails.
+*Composite example (based on common industry failure patterns, not a specific bank):* a bank's payment operations team discovered that thousands of outgoing cross-border MT103 messages had never reached SWIFT over a two-day window. A malformed Block 2 application header — a one-character error in the priority field — made the interface reject them, and they sat in an internal queue. The total trapped value ran into hundreds of millions. Monitoring did not notice, because the internal queue count and the SWIFT acknowledgement count were reconciled only at end-of-day. By the time operations found the gap, beneficiaries in several countries had escalated through their banks; the bank paid penalty interest and repair costs and damaged relationships with correspondent banks. The root cause was an internal serializer that had never been validated against the SWIFT standards. This lesson shows how to build a correct, well-tested MT pipeline that never fails silently.
 
 ## SWIFT Network Architecture
 
@@ -85,22 +90,22 @@ The FIN service (the main SWIFT messaging service) guarantees **store-and-forwar
 
 ## MT Message Block Structure
 
-Every MT message is composed of exactly five blocks, delimited by `{n:` and `}`:
+An MT message is composed of up to five blocks, delimited by `{n:` and `}`:
 
 | Block | Name | Mandatory | Contents |
 |-------|------|-----------|----------|
 | 1 | Basic Header | Yes | LT address, session/sequence |
 | 2 | Application Header | Yes | Message type, receiver BIC, priority |
-| 3 | User Header | No | Bank priority, MUR, service codes |
+| 3 | User Header | Optional in general; required for payments (UETR, tag 121) | Bank priority, MUR, service type, UETR |
 | 4 | Text Block | Yes | The actual MT fields (tagged) |
-| 5 | Trailer | Yes | Checksums, possible encryption indicator |
+| 5 | Trailer | Added by the sending interface / network | Checksum, possible duplicate flag |
 
 A minimal MT103 message on the wire looks like:
 
 ```
 {1:F01DEUTDEDBAXXX0000000001}
 {2:I103CHASUS33XXXXN}
-{3:{108:REF20241101001}}
+{3:{108:REF20241101001}{121:8a562c67-ca16-48ba-b074-65581be6f001}}
 {4:
 :20:TXREF20241101001
 :23B:CRED
@@ -137,10 +142,10 @@ NEW YORK NY USA
 **Block 4** contains tagged fields. Each field starts with `:TAG:` or `:TAG/QUALIFIER:`. Multi-line field values use the continuation convention (lines after the first begin with no colon). Block 4 is terminated with `-}`.
 
 **Block 5 trailers** include:
-- `CHK` — 12-hex-character checksum over Block 4
-- `MAC` — Message Authentication Code (older bilateral key exchange)
-- `PKI` — Public Key Infrastructure signature (SWIFTNet PKI)
-- `PDE` — Possible Duplicate Emission flag
+- `CHK` — 12-hex-character checksum
+- `MAC` — Message Authentication Code (older bilateral key exchange; replaced by PKI-based authentication)
+- `PDE` — Possible Duplicate Emission flag (set by the sender on a resend)
+- `PDM` — Possible Duplicate Message flag (set by SWIFT on a re-delivery)
 
 ## MT103 Field-by-Field Breakdown
 
@@ -152,19 +157,20 @@ MT103 is the workhorse of international customer credit transfers. The following
 | 23B | Bank Operation Code | M | 4!a | `CRED` |
 | 32A | Value Date / Currency / Amount | M | 6!n3!a15d | `241101USD50000,00` |
 | 33B | Currency / Instructed Amount | O | 3!a15d | `EUR46200,00` |
-| 50K | Ordering Customer | M | 35x | ACME EXPORTS GMBH |
+| 50a (A, F or K) | Ordering Customer | M | 50K: account + 4*35x | ACME EXPORTS GMBH |
 | 52A | Ordering Institution | O | BIC | `DEUTDEDBAXXX` |
 | 56A | Intermediary Institution | O | BIC | `IRVTUS3N` |
 | 57A | Account With Institution | O | BIC | `BOFAUS3N` |
-| 59 | Beneficiary Customer | M | 35x | WIDGETS INC |
+| 59a (no letter, A or F) | Beneficiary Customer | M | account + 4*35x | WIDGETS INC |
 | 70 | Remittance Information | O | 4*35x | `INVOICE INV-2024-00891` |
 | 71A | Details of Charges | M | 3!a | `SHA` / `OUR` / `BEN` |
 | 71F | Sender's Charges | O | 3!a15d | `USD25,00` |
 | 72 | Sender to Receiver Information | O | 6*35x | `/INS/CHASUS33` |
-| 121 | UETR (GPI) | O (GPI M) | UUID | `550e8400-e29b-41d4-a716-...` |
 
 > [!IMPORTANT]
-> Field 32A uses a **comma as the decimal separator** (European convention), not a period. `50000,00` means fifty thousand USD. Parsing this with `Double.parseDouble()` without replacing the comma first will silently produce `50000` (or throw a `NumberFormatException` depending on locale). Always use `BigDecimal` for monetary amounts.
+> Field 32A uses a **comma as the decimal separator**, and the comma is **mandatory** even when there are no decimals: `50000,00` and `50000,` are both valid and mean fifty thousand. Parsing with `Double.parseDouble("50000,00")` throws `NumberFormatException`. Always convert to `BigDecimal` (replace the comma first), and check that the number of decimals does not exceed what the currency allows.
+
+The **UETR** (Unique End-to-end Transaction Reference) is not a Block 4 field: it is carried in **Block 3, tag `{121:}`**, and has been mandatory for MT103 and MT202 on FIN since November 2018.
 
 ## Java SwiftMessageParser
 
@@ -175,7 +181,7 @@ The **prowide-core** (formerly WIFE) open-source library is the standard choice 
 <dependency>
     <groupId>com.prowidesoftware</groupId>
     <artifactId>pw-swift-core</artifactId>
-    <version>SRU2024-10.1.0</version>
+    <version>SRU2024-10.1.0</version> <!-- use the release for the current SWIFT standards year -->
 </dependency>
 ```
 
@@ -324,7 +330,7 @@ Key differences from MT103:
 | 50 (Ordering Customer) | Mandatory | Not present |
 | 59 (Beneficiary Customer) | Mandatory | Not present |
 | 58A (Beneficiary Institution) | Not present | Mandatory |
-| 21 (Related Reference) | Optional | Mandatory |
+| 21 (Related Reference) | Not present | Mandatory |
 | 72 (Sender to Receiver) | Optional | Optional |
 
 > [!NOTE]
@@ -332,17 +338,17 @@ Key differences from MT103:
 
 ## MT940 Account Statement and Reconciliation
 
-MT940 is the **customer statement message** sent by a bank to its customer (or correspondent) summarizing account movements. It is the primary feed for nostro reconciliation.
+MT940 is the **customer statement message** sent by a bank to its customer (or correspondent) summarizing account movements. It is the primary feed for nostro reconciliation. (In an output message like the one below, Block 1 holds the **receiver**'s address and Block 2 holds the **sender**'s address inside the Message Input Reference.)
 
 ```
-{1:F01CHASUS33AXXX0000000500}
-{2:O9400900241102DEUTDEDBAXXX00000000012411020900N}
+{1:F01DEUTDEDBAXXX0000000500}
+{2:O9400900241102CHASUS33AXXX00000000012411020900N}
 {4:
 :20:STMT20241102001
 :25:12345678901234
 :28C:00050/001
 :60F:C241101USD1250000,00
-:61:2411021102CD50000,00NTRFREF20241101001//CHREF001
+:61:2411021102C50000,00NTRFREF20241101001//CHREF001
 :86:INCOMING WIRE TRANSFER
 ACME EXPORTS GMBH
 :62F:C241102USD1300000,00
@@ -392,12 +398,13 @@ public class NostroReconciliationService {
     private StatementEntry toStatementEntry(Field61 f61) {
         String dOrC     = f61.getComponent3(); // "D", "C", "RD", "RC"
         BigDecimal amt  = new BigDecimal(f61.getComponent5().replace(",", "."));
-        boolean isDebit = dOrC.startsWith("D");
+        // "RC" = reversal of a credit → a DEBIT; "RD" = reversal of a debit → a CREDIT
+        boolean isDebit = dOrC.equals("D") || dOrC.equals("RC");
         return new StatementEntry(
                 f61.getComponent1(),                     // value date
                 isDebit ? amt.negate() : amt,
-                f61.getComponent9(),                     // customer reference
-                f61.getComponent10()                     // bank reference
+                f61.getComponent8(),                     // reference for the account owner
+                f61.getComponent9()                      // reference of the servicing institution
         );
     }
 
@@ -415,7 +422,7 @@ public class NostroReconciliationService {
 
 SWIFT Global Payments Innovation (GPI) is the overlay service that adds end-to-end tracking, speed SLAs, and fee transparency to the existing MT infrastructure. GPI mandates:
 
-1. A **UETR (Unique End-to-end Transaction Reference)** — a UUID v4 — in Block 3, tag `{121:}` for every payment in the chain
+1. A **UETR (Unique End-to-end Transaction Reference)** — a UUID v4 — in Block 3, tag `{121:}`, kept unchanged by every bank in the chain (plus the gpi service type in tag `{111:}`)
 2. Each bank in the chain must update the GPI Tracker within **hours** (the standard SLA is payment credited same day, with the majority credited within minutes)
 3. Status codes are reported: `ACSP` (accepted, settlement in process), `ACCC` (accepted, credit completed), `RJCT` (rejected)
 
@@ -455,16 +462,14 @@ public class GpiTracker {
 
 ## Error Handling and Rejection Codes
 
-SWIFT FIN can reject messages at the network level (NAK) or the receiving bank can generate a negative acknowledgement (N999 / MT199). Common NAK codes:
+SWIFT FIN validates each message on input and answers with a positive (ACK) or negative (NAK) acknowledgement; a NAK carries an error code. Later, the receiving bank may reject the payment itself (with an MT199/MT299 or, for gpi, a tracker status of `RJCT`). Error codes come in families — look up exact codes in SWIFT's FIN error code documentation:
 
-| Code | Meaning | Java Handling |
+| Family | Meaning | Java Handling |
 |------|---------|---------------|
-| T13 | Invalid currency code in field 32A | Reject at parse time, dead-letter queue |
-| T14 | Amount too large for currency | Reject with business error |
-| T18 | Invalid BIC in field 57A | Validate BIC before sending |
-| T28 | Field 20 contains forbidden characters | Strip/replace at serialization |
-| D97 | Duplicate MUR (block 3 field 108) | Idempotency check before submit |
-| E10 | Block 2 format error | Critical — means serializer is broken |
+| H-codes | Header (Block 1/2/3) errors | Critical — the serializer is broken; stop and fix, do not retry |
+| T-codes | Text block (field) validation errors — e.g. an invalid currency code (T52) or a badly formatted field | Permanent — dead-letter queue and repair |
+| Invalid BIC in a field | A BIC that is not in the SWIFT directory | Permanent — validate BICs before sending |
+| No ACK/NAK (timeout, session aborted) | Outcome unknown | Check the local journal; resend only with the PDE flag |
 
 ```java
 public class SwiftSubmissionService {
@@ -487,55 +492,53 @@ public class SwiftSubmissionService {
             case ACK  -> SubmissionResult.success(response.getMir());
             case NAK  -> handleNak(payment, response);
             case TIMEOUT -> {
-                // PDE (Possible Duplicate Emission) guard: check if already delivered
-                boolean alreadyDelivered = gateway.checkDuplicate(payment.transactionRef());
-                yield alreadyDelivered
-                        ? SubmissionResult.possibleDuplicate(response.getCode())
-                        : SubmissionResult.retry(response.getCode());
+                // Outcome unknown: check the interface journal before any resend.
+                // A resend must carry the PDE (Possible Duplicate Emission) trailer
+                // and the SAME field 20 and UETR, so receivers can detect it
+                boolean alreadyAcked = gateway.journalHasAck(payment.transactionRef());
+                yield alreadyAcked
+                        ? SubmissionResult.success(gateway.journalMir(payment.transactionRef()))
+                        : SubmissionResult.resendWithPde(response.getCode());
             }
         };
     }
 
     private SubmissionResult handleNak(ParsedMt103 payment, GatewayResponse response) {
-        return switch (response.getNakCode()) {
-            case "D97" -> {
-                // Duplicate — safe to discard if idempotent
-                log.warn("Duplicate MUR detected for TRN {}", payment.transactionRef());
-                yield SubmissionResult.duplicate();
-            }
-            case "T13", "T14", "T28" -> {
-                dlq.enqueue(payment, "BUSINESS_VALIDATION", response.getNakCode());
-                yield SubmissionResult.failure(response.getNakCode());
-            }
-            default -> {
-                dlq.enqueue(payment, "SWIFT_REJECTION", response.getNakCode());
-                yield SubmissionResult.failure(response.getNakCode());
-            }
-        };
+        String code = response.getNakCode();
+        if (code.startsWith("H")) {
+            // Header error: every message from this serializer will fail — page someone
+            alerts.critical("SWIFT header NAK " + code + " — serializer broken");
+            dlq.enqueue(payment, "HEADER_ERROR", code);
+            return SubmissionResult.failure(code);
+        }
+        // Field validation and other rejections are permanent for THIS message:
+        // repair the data, never auto-retry the same bytes
+        dlq.enqueue(payment, code.startsWith("T") ? "FIELD_VALIDATION" : "SWIFT_REJECTION", code);
+        return SubmissionResult.failure(code);
     }
 }
 ```
 
 > [!WARNING]
-> Never auto-retry a NAK without first diagnosing the rejection code. Retrying a D97 (duplicate) will generate a second D97. Retrying a T18 (invalid BIC) will fail every time. Build a classification layer that distinguishes retryable network errors from permanent business rejections before any retry logic.
+> Never auto-retry a NAK without first diagnosing the rejection code. A NAK means SWIFT received the message and refused it: resending the same bytes will be refused again. Only a missing acknowledgement (timeout) is a candidate for resending — and then only with the PDE flag. Build a classification layer that distinguishes unknown-outcome network errors from permanent rejections before any retry logic.
 
 ## Knowledge Check
 
-**Q1: An MT103 arrives where field 32A contains `241101EUR1234567,` (note trailing comma, no cents). Your parser calls `new BigDecimal(raw.replace(",", "."))` and receives `1234567.` — which is valid BigDecimal. Should this message be accepted?**
+**Q1: An MT103 arrives where field 32A contains `241101EUR1234567,` (note the trailing comma, no cents). Your parser converts it to `new BigDecimal("1234567.")`. Should this message be accepted?**
 
-A: Technically BigDecimal accepts `1234567.` but the SWIFT format rule for field 32A specifies the amount sub-field as `15d` — meaning up to 15 digits with the comma being mandatory only if decimals are present. A trailing comma with no following digits violates the format specification. The message should be rejected with a format validation error logged against field 32A, and an MT199 negative acknowledgement sent to the originator. Never silently accept a malformed amount field in a payment system — the cents omission could indicate a data corruption issue.
+A: Yes. In SWIFT amount fields the decimal comma is **mandatory**, and the digits after it are optional — so `1234567,` is a valid amount of 1,234,567.00 EUR. The checks that matter are: exactly one comma, at least one digit before it, no more decimals than the currency allows (two for EUR), and the total length within 15 characters. A parser that rejects `1234567,` would wrongly refuse valid payments; a serializer that writes `1234567` (no comma) produces an invalid message.
 
 **Q2: Your SWIFT gateway sends an MT103 and receives no ACK or NAK within the timeout window. How should your system handle the possible duplicate emission scenario?**
 
-A: When a timeout occurs, the message may or may not have been received by SWIFT. If you retransmit without safeguards you risk double-crediting the beneficiary. The correct protocol is: (1) set a PDE (Possible Duplicate Emission) flag in block 5 trailer `{PDE:}` on any retransmit; (2) check the SWIFT Alliance Access local journal for any MIR assigned to the original message, since ACK can sometimes arrive late; (3) query the GPI Tracker by UETR — if status is `ACCC` the payment was delivered and retransmit must be suppressed; (4) if UETR status is absent or `PDNG`, retransmit with PDE and use an idempotency key (MUR in block 3) so the receiving bank can deduplicate.
+A: When a timeout occurs, the message may or may not have been received by SWIFT. If you retransmit without safeguards you risk double-crediting the beneficiary. The correct protocol is: (1) check the interface's local journal (e.g. Alliance Access) for an ACK and MIR for the original message, since the ACK may arrive late; (2) query the gpi Tracker by UETR — if the payment is known there, it was delivered and a resend must be suppressed; (3) only if there is no trace, resend with the PDE (Possible Duplicate Emission) trailer `{PDE:}` and the **same** field 20 and UETR, so receiving banks can recognise a possible duplicate and check before crediting.
 
 ## Practical Challenge
 
 1. **Parser implementation:** Using prowide-core, write a `SwiftMt940Parser` that reads an MT940 message and returns a list of `StatementLine` records containing: value date, booking date, debit/credit indicator, amount as `BigDecimal`, customer reference, and bank reference. Validate that the sum of all debit and credit entries reconciles with the difference between field 60F and field 62F balances. Throw a `ReconciliationException` with the discrepancy amount if they do not match.
 
-2. **MT103 serializer with GPI:** Write an `Mt103Builder` class that constructs a valid MT103 raw string from a `PaymentInstruction` domain object. The builder must: generate a UUID v4 UETR and inject it into Block 3 as tag `{121:}`; format field 32A correctly (comma decimal separator, `yyMMdd` date format); enforce the 16-character limit on field 20; and pad or truncate field 70 remittance info to exactly 4 lines of 35 characters.
+2. **MT103 serializer with GPI:** Write an `Mt103Builder` class that constructs a valid MT103 raw string from a `PaymentInstruction` domain object. The builder must: generate a UUID v4 UETR and inject it into Block 3 as tag `{121:}`; format field 32A correctly (mandatory comma decimal separator, `yyMMdd` date format); enforce the 16-character limit on field 20; and split field 70 remittance info into at most 4 lines of at most 35 characters (rejecting or truncating longer text by an explicit rule).
 
-3. **Error classification service:** Implement a `SwiftNakClassifier` that takes a NAK code string and returns one of four enum values: `RETRYABLE_NETWORK`, `RETRYABLE_BUSINESS`, `PERMANENT_FORMAT`, `PERMANENT_DUPLICATE`. Write unit tests covering codes E10, T13, T18, D97, and Y04. The classifier should read its rules from an injected configuration map to remain extensible without code changes.
+3. **Error classification service:** Implement a `SwiftNakClassifier` that takes a NAK code string and returns one of three enum values: `UNKNOWN_OUTCOME_RESEND_WITH_PDE` (no ACK/NAK), `PERMANENT_HEADER_ERROR` (H-codes), `PERMANENT_FIELD_ERROR` (T-codes and other NAKs). Write unit tests for an H-code, a T-code such as T52, an unknown code, and a timeout. The classifier should read its rules from an injected configuration map to remain extensible without code changes.
 
 4. **GPI status polling job:** Write a Spring `@Scheduled` job that queries the SWIFT GPI Tracker for all in-flight payments (status `ACSP`) older than 4 hours. For each, fetch current status. If still `ACSP`, emit a monitoring alert. If `ACCC`, update the payment record to `CREDITED` and release any downstream holds. If `RJCT`, trigger the payment repair workflow. Ensure the job is idempotent and safe to run on multiple nodes using a database-level advisory lock or a distributed lock via Redis.
 
@@ -543,26 +546,26 @@ A: When a timeout occurs, the message may or may not have been received by SWIFT
 {
   "questions": [
     {
-      "text": "An MT103 field 32A contains `241101EUR1234567,` (trailing comma, no cents). Your parser produces a valid BigDecimal of `1234567.`. Should this message be accepted?",
+      "text": "An MT103 field 32A contains `241101EUR1234567,` (trailing comma, no cents). Your parser produces `new BigDecimal(\"1234567.\")`. Should this message be accepted?",
       "options": [
-        "Yes — BigDecimal accepts it and the amount is unambiguous",
-        "No — the trailing comma violates the SWIFT 15d format specification and must be rejected with an MT199 NAK",
-        "Yes — silently strip the trailing comma and process normally",
-        "No — reject with a T18 (invalid BIC) error code"
+        "Yes — in SWIFT amounts the decimal comma is mandatory and digits after it are optional, so this is a valid amount of 1,234,567.00",
+        "No — a trailing comma with no cents violates the format and must be rejected",
+        "Yes — but only after converting it to 1234567,00 and asking the sender to resend",
+        "No — reject it as an invalid BIC"
       ],
-      "correct": 1,
-      "explanation": "SWIFT field 32A specifies the amount sub-field as `15d`. A trailing comma with no following digits violates the format specification. The message must be rejected with a format validation error logged against field 32A and an MT199 negative acknowledgement sent to the originator. Never silently accept a malformed amount field."
+      "correct": 0,
+      "explanation": "SWIFT amount fields always contain a decimal comma, which is mandatory; the fraction digits are optional. So `1234567,` is valid and means 1,234,567.00 EUR. What must be validated is: exactly one comma, at least one digit before it, no more decimals than the currency allows, and the maximum length (15). Rejecting a trailing comma would refuse valid payments."
     },
     {
       "text": "Your SWIFT gateway sends an MT103 and receives no ACK or NAK within the timeout window. What is the correct protocol for handling the possible duplicate emission scenario?",
       "options": [
         "Immediately retransmit the same message without any changes",
         "Cancel the payment and notify the customer",
-        "Set a PDE flag on retransmit, check GPI Tracker by UETR, and suppress retransmit if status is ACCC",
+        "Check the local journal for an ACK, check the gpi Tracker by UETR, and only if there is no trace resend with the PDE flag and the same field 20 and UETR",
         "Wait 24 hours before taking any action"
       ],
       "correct": 2,
-      "explanation": "On timeout, set a PDE (Possible Duplicate Emission) flag in block 5 trailer `{PDE:}` on any retransmit, check the SWIFT Alliance Access local journal for a MIR, then query the GPI Tracker by UETR. If status is `ACCC` the payment was delivered and retransmit must be suppressed. If status is `PDNG`, retransmit with PDE and use an idempotency key (MUR in block 3)."
+      "explanation": "On timeout the outcome is unknown. First check the interface's local journal for a late ACK/MIR, then the gpi Tracker by UETR — if the payment is known, it was delivered and must not be resent. Only if there is no trace, resend with the PDE (Possible Duplicate Emission) trailer and the same field 20 and UETR, so receivers can detect a possible duplicate before crediting."
     },
     {
       "text": "Which SWIFT block contains the UETR (Unique End-to-end Transaction Reference) used by GPI tracking?",
@@ -573,7 +576,7 @@ A: When a timeout occurs, the message may or may not have been received by SWIFT
         "Block 4 (Text Block), field 20"
       ],
       "correct": 2,
-      "explanation": "The UETR is a UUID v4 placed in Block 3 (User Header) under tag `{121:}`. It enables end-to-end GPI tracking across the entire correspondent chain and must be generated by the originating bank and preserved by all intermediary banks."
+      "explanation": "The UETR is a UUID v4 placed in Block 3 (User Header) under tag `{121:}`. It has been mandatory for MT103 and MT202 on FIN since November 2018; it is generated by the originating bank and must be passed on unchanged by every bank in the chain, which enables end-to-end gpi tracking."
     }
   ]
 }
@@ -591,11 +594,11 @@ A: When a timeout occurs, the message may or may not have been received by SWIFT
     },
     {
       "id": "2",
-      "description": "Write an `Mt103Builder` class that constructs a valid MT103 raw string from a `PaymentInstruction` domain object. Generate a UUID v4 UETR and inject it into Block 3 as tag `{121:}`; format field 32A correctly with comma decimal separator and `yyMMdd` date format; enforce the 16-character limit on field 20."
+      "description": "Write an `Mt103Builder` class that constructs a valid MT103 raw string from a `PaymentInstruction` domain object. Generate a UUID v4 UETR and inject it into Block 3 as tag `{121:}`; format field 32A correctly with the mandatory comma decimal separator and `yyMMdd` date format; enforce the 16-character limit on field 20."
     },
     {
       "id": "3",
-      "description": "Implement a `SwiftNakClassifier` that takes a NAK code string and returns one of four enum values: `RETRYABLE_NETWORK`, `RETRYABLE_BUSINESS`, `PERMANENT_FORMAT`, `PERMANENT_DUPLICATE`. Write unit tests covering codes E10, T13, T18, D97, and Y04. The classifier should read its rules from an injected configuration map."
+      "description": "Implement a `SwiftNakClassifier` that classifies a submission outcome as `UNKNOWN_OUTCOME_RESEND_WITH_PDE` (no ACK/NAK), `PERMANENT_HEADER_ERROR` (H-codes) or `PERMANENT_FIELD_ERROR` (T-codes and other NAKs). Write unit tests for an H-code, a T-code such as T52, an unknown code and a timeout. The classifier should read its rules from an injected configuration map."
     },
     {
       "id": "4",

@@ -19,9 +19,9 @@ prerequisites: []
 
 ## 1. The Core Principle
 
-Netflix coined the term, but the principle is ancient: pre-mortem analysis made executable. The question chaos engineering answers is: "We believe our system handles this failure gracefully — does it actually?"
+Netflix popularised the practice (Chaos Monkey, around 2011), but the principle is old: pre-mortem analysis made executable. The question chaos engineering answers is: "We believe our system handles this failure gracefully — does it actually?"
 
-For financial services, this question carries regulatory weight. Payment processors, clearing houses, and central banks require documented evidence of business continuity capabilities. Chaos engineering generates that evidence systematically, not just on paper.
+For financial services, this question carries regulatory weight. The EU's Digital Operational Resilience Act (DORA, applying since January 2025) requires financial entities to run a digital operational resilience testing programme, and UK firms must show through scenario testing that they can stay within impact tolerances for their important business services. Chaos engineering generates that evidence systematically, not just on paper.
 
 The chaos engineering cycle:
 
@@ -46,7 +46,8 @@ The chaos engineering cycle:
 
 7. Document and act
    "Hypothesis verified — OR — discovered that circuit breaker
-    didn't open fast enough, increasing timeout from 10s to 15s"
+    didn't open fast enough: lowered the slow-call threshold and
+    the gateway timeout from 10s to 3s, then re-ran the experiment"
 ```
 
 ## 2. Chaos Monkey for Spring Boot
@@ -62,8 +63,10 @@ The Chaos Monkey for Spring Boot library injects failures directly into Spring-m
 ```
 
 ```java
+// No annotation is needed: Chaos Monkey for Spring Boot is activated by the
+// "chaos-monkey" Spring profile plus chaos.monkey.enabled=true
+// (e.g. SPRING_PROFILES_ACTIVE=chaos-monkey on a staging deployment)
 @SpringBootApplication
-@EnableChaosMonkey  // Activates Chaos Monkey
 public class PaymentServiceApplication {
     public static void main(String[] args) {
         SpringApplication.run(PaymentServiceApplication.class, args);
@@ -72,7 +75,7 @@ public class PaymentServiceApplication {
 ```
 
 ```yaml
-# application-chaos.yml — only active when chaos profile is enabled
+# application-chaos-monkey.yml — only loaded with the chaos-monkey profile
 chaos:
   monkey:
     enabled: true
@@ -92,42 +95,56 @@ chaos:
         arguments:
           - type: "java.lang.String"
             value: "Chaos Monkey - simulated transient failure"
-    # Only inject chaos on these specific watchers
-    watched-custom-services:
-      - "paymentGatewayService"
-      - "fraudCheckService"
+      # Only attack these specific beans
+      watched-custom-services:
+        - "paymentGatewayService"
+        - "fraudCheckService"
+
+management:
+  endpoint:
+    chaosmonkey:
+      enabled: true     # runtime control — expose ONLY on a secured management port
 ```
 
 ```java
 /**
- * Runtime control via Actuator endpoint.
- * Enable/disable chaos without redeployment.
+ * Runtime control via the Chaos Monkey Actuator endpoint
+ * (/actuator/chaosmonkey/...) — enable/disable chaos without redeployment.
+ * Used by automated GameDay scripts against the target service.
  */
 @Component
-@RequiredArgsConstructor
 @Slf4j
 public class ChaosExperimentController {
 
-    private final ChaosMonkeyRequestScope chaosMonkeyRequestScope;
+    private final RestClient actuator;   // base URL = target service's management port
+    private final ScheduledExecutorService scheduler =
+        Executors.newSingleThreadScheduledExecutor();
+
+    public ChaosExperimentController(RestClient chaosActuatorClient) {
+        this.actuator = chaosActuatorClient;
+    }
 
     /**
-     * Programmatic chaos activation for automated GameDay scripts.
-     * Activate specific assault types for a time-boxed experiment.
+     * Activate a latency assault for a time-boxed experiment.
      */
     public void activateLatencyAssault(int latencyMs, Duration duration) {
-        AssaultPropertiesUpdate update = new AssaultPropertiesUpdate();
-        update.setLatencyActive(true);
-        update.setLatencyRangeStart(latencyMs);
-        update.setLatencyRangeEnd(latencyMs + 500);
-        update.setLevel(5);  // Every 5th call
-
-        chaosMonkeyRequestScope.updateAssaultProperties(update);
+        actuator.post().uri("/actuator/chaosmonkey/assaults")
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(Map.of(
+                "level", 5,                       // every 5th call
+                "latencyActive", true,
+                "latencyRangeStart", latencyMs,
+                "latencyRangeEnd", latencyMs + 500))
+            .retrieve().toBodilessEntity();
+        actuator.post().uri("/actuator/chaosmonkey/enable")
+            .retrieve().toBodilessEntity();
         log.info("Chaos Monkey latency assault activated: {}ms for {}",
             latencyMs, duration);
 
-        // Auto-disable after duration
+        // Auto-disable after duration — never leave an assault running
         scheduler.schedule(() -> {
-            chaosMonkeyRequestScope.disableAssaults();
+            actuator.post().uri("/actuator/chaosmonkey/disable")
+                .retrieve().toBodilessEntity();
             log.info("Chaos Monkey latency assault deactivated");
         }, duration.toMillis(), TimeUnit.MILLISECONDS);
     }
@@ -211,8 +228,10 @@ public class NetworkChaosInjector {
     }
 
     /**
-     * Simulate complete connection timeout — TCP SYN sent, no response.
-     * Verifies connect timeout is correctly configured.
+     * Simulate a dependency that accepts the connection but never answers:
+     * the proxy stops forwarding data. Note the TCP connect TO THE PROXY
+     * succeeds — so this verifies your READ timeout. (To test a connect
+     * timeout, point the client at a black-holed address instead.)
      */
     public AutoCloseable injectTimeout(String proxyName) throws IOException {
         Proxy proxy = toxiproxyClient.getProxy(proxyName);
@@ -260,18 +279,20 @@ public enum PaymentChaosScenario {
 
     /**
      * Hypothesis: Kafka consumer handles broker restart without
-     * message loss or duplicate processing.
+     * message loss; redeliveries are absorbed by the idempotent consumer.
      * Injection: Kill one Kafka broker from 3-broker cluster
-     * Success: Leader election completes; consumer resumes within 15s
+     * Success: Leader election completes; consumer resumes within 15s;
+     *          no lost events and no duplicate side effects
      */
     KAFKA_BROKER_FAILURE,
 
     /**
-     * Hypothesis: Fraud service timeout (500ms) fails open,
-     * allowing payments to proceed while alerting ops.
+     * Hypothesis: Fraud service failure follows the documented policy:
+     * low-value payments proceed (fail open), higher-value ones go to
+     * PENDING / review — and ops are alerted.
      * Injection: Chaos Monkey exception assault on fraud service (100%)
-     * Success: Payments complete; fraud_check_timeout metric increments;
-     *          PagerDuty alert fires within 2m
+     * Success: Policy applied exactly; fraud_check_timeout metric
+     *          increments; PagerDuty alert fires within 2m
      */
     FRAUD_SERVICE_TOTAL_FAILURE,
 
@@ -343,7 +364,7 @@ public class SteadyStateVerifier {
      * 1. Payment success rate >= 99.5%
      * 2. p99 latency <= 2000ms
      * 3. Error rate <= 0.1%
-     * 4. No DLQ growth (backlog unchanged)
+     * 4. No DLQ growth during the window
      */
     public SteadyStateResult verify(String experimentName,
                                      Duration measurementWindow) {
@@ -353,7 +374,7 @@ public class SteadyStateVerifier {
         double successRate = querySuccessRate(start, end);
         double p99Latency = queryP99Latency(start, end);
         double errorRate = queryErrorRate(start, end);
-        long dlqBacklog = queryDlqBacklog();
+        long dlqGrowth = queryDlqGrowth(start, end);   // new DLQ entries in the window
 
         SteadyStateResult result = SteadyStateResult.builder()
             .experimentName(experimentName)
@@ -361,7 +382,7 @@ public class SteadyStateVerifier {
             .successRate(successRate)
             .p99LatencyMs(p99Latency)
             .errorRate(errorRate)
-            .dlqBacklog(dlqBacklog)
+            .dlqGrowth(dlqGrowth)
             // Hypothesis thresholds
             .successRateHypothesis(0.995)
             .p99LatencyHypothesisMs(2000)
@@ -371,14 +392,15 @@ public class SteadyStateVerifier {
                 successRate >= 0.995 &&
                 p99Latency <= 2000 &&
                 errorRate <= 0.001 &&
-                dlqBacklog == 0
+                dlqGrowth == 0
             )
             .build();
 
-        log.info("Steady-state check for {}: {} | successRate={:.2f}% p99={}ms",
+        // SLF4J has no {:.2f} placeholders — format the number first
+        log.info("Steady-state check for {}: {} | successRate={}% p99={}ms",
             experimentName,
             result.isHypothesisMet() ? "HYPOTHESIS MET" : "HYPOTHESIS VIOLATED",
-            successRate * 100, (long) p99Latency);
+            String.format("%.2f", successRate * 100), (long) p99Latency);
 
         return result;
     }
@@ -434,6 +456,7 @@ public class GameDayOrchestrator {
     private final SteadyStateVerifier steadyStateVerifier;
     private final NetworkChaosInjector chaosInjector;
     private final AlertingService alerting;
+    private final ScheduledExecutorService scheduler;
 
     /**
      * Run a time-boxed chaos experiment with auto-termination.
@@ -460,34 +483,40 @@ public class GameDayOrchestrator {
             return ExperimentResult.failed("Injection failed: " + e.getMessage());
         }
 
-        // 3. Observe during experiment (with auto-stop watchdog)
-        ExperimentObservation observation = observe(experiment, injectionHandle);
+        // 3. Observe during experiment (with auto-stop watchdog);
+        //    the injection is removed exactly once, by whoever gets there first
+        StoppableInjection injection = new StoppableInjection(injectionHandle);
+        ExperimentObservation observation = observe(experiment, injection);
 
-        // 4. Remove injection
-        try {
-            injectionHandle.close();
-        } catch (Exception e) {
-            log.error("Failed to remove chaos injection!", e);
-        }
+        // 4. Remove injection (no-op if the watchdog already did)
+        injection.stop();
 
         // 5. Verify steady state after injection removed
         SteadyStateResult postInjection = steadyStateVerifier.verify(
             experiment.getName() + "-post",
             Duration.ofMinutes(5));
 
+        // The hypothesis is about behaviour DURING the failure:
+        // every snapshot must meet it, and the system must recover afterwards
+        boolean metDuringFailure = observation.snapshots().stream()
+            .allMatch(SteadyStateResult::isHypothesisMet);
+
         return ExperimentResult.builder()
             .experimentName(experiment.getName())
             .baseline(baseline)
             .observation(observation)
             .postInjection(postInjection)
-            .hypothesisMet(postInjection.isHypothesisMet())
+            .autoStopped(injection.stoppedEarly())
+            .hypothesisMet(metDuringFailure && postInjection.isHypothesisMet())
             .build();
     }
 
     private ExperimentObservation observe(ChaosExperiment experiment,
-                                           AutoCloseable injectionHandle) {
+                                           StoppableInjection injection) {
         Instant start = Instant.now();
-        List<SteadyStateResult> snapshots = new ArrayList<>();
+        // Written by the watchdog thread, read by this thread
+        List<SteadyStateResult> snapshots = new CopyOnWriteArrayList<>();
+        CountDownLatch autoStopped = new CountDownLatch(1);
 
         // Check every 30s during experiment
         ScheduledFuture<?> watchdog = scheduler.scheduleAtFixedRate(() -> {
@@ -496,29 +525,57 @@ public class GameDayOrchestrator {
             snapshots.add(snapshot);
 
             // Auto-stop if steady state is severely violated
-            if (snapshot.getSuccessRate() < 0.90) {
-                log.error("GAMEDAY AUTO-STOP: success rate {:.1f}% below 90% threshold",
-                    snapshot.getSuccessRate() * 100);
-                try {
-                    injectionHandle.close();
-                } catch (Exception e) {
-                    log.error("Auto-stop injection removal failed!", e);
-                }
+            if (snapshot.getSuccessRate() < 0.90 && injection.stopEarly()) {
+                log.error("GAMEDAY AUTO-STOP: success rate {}% below 90% threshold",
+                    String.format("%.1f", snapshot.getSuccessRate() * 100));
                 alerting.page(PagerDutyAlert.critical(
                     "GameDay auto-stopped: " + experiment.getName()));
+                autoStopped.countDown();
             }
         }, 30, 30, TimeUnit.SECONDS);
 
-        // Run for experiment duration
+        // Run for the experiment duration — or until the watchdog stops it
         try {
-            Thread.sleep(experiment.getDuration().toMillis());
+            autoStopped.await(experiment.getDuration().toMillis(), TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } finally {
             watchdog.cancel(false);
         }
 
-        return new ExperimentObservation(start, Instant.now(), snapshots);
+        return new ExperimentObservation(start, Instant.now(), List.copyOf(snapshots));
+    }
+
+    /** Closes the injection at most once, from any thread. */
+    private static final class StoppableInjection {
+        private final AutoCloseable handle;
+        private final AtomicBoolean stopped = new AtomicBoolean();
+        private volatile boolean early;
+
+        StoppableInjection(AutoCloseable handle) { this.handle = handle; }
+
+        boolean stopEarly() {                    // true if THIS call stopped it
+            if (stopped.compareAndSet(false, true)) {
+                early = true;
+                close();
+                return true;
+            }
+            return false;
+        }
+
+        void stop() {
+            if (stopped.compareAndSet(false, true)) close();
+        }
+
+        boolean stoppedEarly() { return early; }
+
+        private void close() {
+            try {
+                handle.close();
+            } catch (Exception e) {
+                log.error("Failed to remove chaos injection!", e);
+            }
+        }
     }
 }
 ```
@@ -535,12 +592,12 @@ public class BlastRadiusController {
 
     /**
      * Traffic percentage targeting: only inject chaos for N% of requests.
-     * Uses consistent hashing on request ID to ensure stable targeting.
+     * Deterministic hashing on request ID gives a stable decision.
      */
     public boolean shouldInjectChaos(String requestId, double targetPercentage) {
-        // Consistent: same requestId always gets same decision
-        int hash = Math.abs(requestId.hashCode()) % 100;
-        return hash < (int)(targetPercentage * 100);
+        // floorMod, not Math.abs(): Math.abs(Integer.MIN_VALUE) is negative
+        int bucket = Math.floorMod(requestId.hashCode(), 100);
+        return bucket < (int) (targetPercentage * 100);
     }
 
     /**
@@ -605,7 +662,9 @@ public class ResilienceScorecard {
         long hypothesisMet = results.stream()
             .filter(ExperimentResult::isHypothesisMet).count();
 
-        double resilienceScore = (double) hypothesisMet / totalExperiments;
+        // No experiments this month = no evidence, not a perfect (or NaN) score
+        double resilienceScore = totalExperiments == 0 ? 0
+            : (double) hypothesisMet / totalExperiments;
 
         // Compare to previous month
         List<ExperimentResult> lastMonth = resultRepository
@@ -636,7 +695,7 @@ public class ResilienceScorecard {
  * Fail CI if resilience mechanisms don't function correctly.
  */
 @SpringBootTest
-@TestPropertySource(properties = "spring.profiles.active=chaos,test")
+@ActiveProfiles({"chaos", "test"})
 class PaymentServiceResilienceTest {
 
     @Autowired
@@ -651,35 +710,36 @@ class PaymentServiceResilienceTest {
     @Test
     @DisplayName("Circuit breaker opens when gateway latency exceeds threshold")
     void circuitBreakerOpensOnGatewayLatency() throws Exception {
+        int rejectedFast = 0;
+
         // Arrange: inject 10s latency on gateway
         try (AutoCloseable latency = chaosInjector.injectLatency(
                 "payment-gateway", 10_000, 0)) {
 
             // Act: submit payments until circuit breaker opens
-            List<PaymentResponse> responses = new ArrayList<>();
             for (int i = 0; i < 25; i++) {
                 try {
-                    responses.add(paymentService.submitPayment(
-                        buildTestPayment("test-" + i)));
+                    paymentService.submitPayment(buildTestPayment("test-" + i));
                 } catch (PaymentGatewayUnavailableException e) {
-                    // Expected after CB opens
+                    rejectedFast++;   // thrown once the circuit is OPEN
                 }
             }
 
-            // Assert: circuit breaker opened within 20 calls
-            long openCalls = responses.stream()
-                .filter(r -> r.getStatus() == PaymentStatus.GATEWAY_UNAVAILABLE)
-                .count();
-            assertThat(openCalls).isGreaterThan(0);
+            // Assert: the circuit opened within the 25 calls
+            assertThat(rejectedFast).isGreaterThan(0);
 
-            // Assert: metrics recorded correctly
-            Counter cbOpenCount = meterRegistry.find("resilience4j.circuitbreaker.calls")
-                .tag("kind", "not_permitted")
+            // Assert: metrics recorded correctly (rejections have their own metric)
+            Counter notPermitted = meterRegistry
+                .find("resilience4j.circuitbreaker.not.permitted.calls")
+                .tag("name", "payment-gateway")
                 .counter();
-            assertThat(cbOpenCount.count()).isGreaterThan(0);
+            assertThat(notPermitted).isNotNull();
+            assertThat(notPermitted.count()).isGreaterThan(0);
         }
 
-        // After injection removed: circuit breaker should transition to HALF_OPEN
+        // After injection removed: the circuit leaves OPEN after the wait
+        // duration (on its own only if automaticTransitionFromOpenToHalfOpenEnabled
+        // is true; otherwise on the next call)
         await().atMost(60, TimeUnit.SECONDS)
             .until(() -> paymentService.getCircuitBreakerState() != State.OPEN);
     }
@@ -719,10 +779,22 @@ class PaymentServiceResilienceTest {
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Define a SteadyStateHypothesis for a payment service with four measurable thresholds: success rate >= 99.5%, p99 latency <= 2000ms, error rate <= 0.1%, and DLQ backlog growth = 0. Implement a SteadyStateVerifier that queries Prometheus for each metric."},
-    {"id": "2", "description": "Build a Toxiproxy-based NetworkChaosInjector with four injection types: latency with jitter, bandwidth throttling, connection reset, and connection timeout. Each method must return an AutoCloseable that removes the toxic when closed."},
-    {"id": "3", "description": "Implement a GameDayOrchestrator that: verifies steady state before injection, applies the failure, runs a watchdog that samples steady state every 30s and auto-stops if success rate drops below 90%, removes the injection, and verifies recovery."},
-    {"id": "4", "description": "Write an integration test using Toxiproxy that injects 10s latency on the payment gateway, submits 25 payments, asserts that the circuit breaker opened within 20 calls, and verifies that the resilience4j.circuitbreaker.calls{kind=not_permitted} counter incremented."}
+    {
+      "id": "1",
+      "description": "Define a SteadyStateHypothesis for a payment service with four measurable thresholds: success rate >= 99.5%, p99 latency <= 2000ms, error rate <= 0.1%, and DLQ backlog growth = 0. Implement a SteadyStateVerifier that queries Prometheus for each metric."
+    },
+    {
+      "id": "2",
+      "description": "Build a Toxiproxy-based NetworkChaosInjector with four injection types: latency with jitter, bandwidth throttling, connection reset, and connection timeout. Each method must return an AutoCloseable that removes the toxic when closed."
+    },
+    {
+      "id": "3",
+      "description": "Implement a GameDayOrchestrator that: verifies steady state before injection, applies the failure, runs a watchdog that samples steady state every 30s and auto-stops (removing the injection exactly once, thread-safely) if success rate drops below 90%, removes the injection, and verifies recovery. The hypothesis counts as met only if every snapshot during the failure met it and the system recovered afterwards."
+    },
+    {
+      "id": "4",
+      "description": "Write an integration test using Toxiproxy that injects 10s latency on the payment gateway, submits 25 payments, asserts that the circuit breaker opened within those calls, and verifies that the resilience4j.circuitbreaker.not.permitted.calls counter incremented."
+    }
   ]
 }
 -->

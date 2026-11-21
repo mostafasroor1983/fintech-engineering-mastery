@@ -177,7 +177,10 @@ public final class Money {
 
     @Override
     public String toString() {
-        return currency.getSymbol() + String.format("%.2f", amountMinorUnits / 100.0);
+        // Use the currency's own number of decimals (GBP 2, JPY 0, BHD 3)
+        // and BigDecimal — never a double — even for display
+        return currency.getCurrencyCode() + " "
+            + BigDecimal.valueOf(amountMinorUnits, currency.getDefaultFractionDigits());
     }
 }
 ```
@@ -218,7 +221,10 @@ public record Money(long amountMinorUnits, Currency currency) {
 
     @Override
     public String toString() {
-        return currency.getSymbol() + String.format("%.2f", amountMinorUnits / 100.0);
+        // Use the currency's own number of decimals (GBP 2, JPY 0, BHD 3)
+        // and BigDecimal — never a double — even for display
+        return currency.getCurrencyCode() + " "
+            + BigDecimal.valueOf(amountMinorUnits, currency.getDefaultFractionDigits());
     }
 }
 ```
@@ -388,7 +394,9 @@ public class ModernDateParser {
 ```
 
 > [!WARNING]
-> `ThreadLocal` values survive thread reuse. In thread-pool environments (including virtual thread pools), a thread that handled one request may handle another. Always `remove()` the value when done, or use `try-finally` to guarantee cleanup. Failure to do so causes data to bleed between requests — a serious security issue in multi-tenant payment systems.
+> `ThreadLocal` values survive thread reuse. In platform thread pools (Tomcat workers, executor services), a thread that handled one request may handle another. Always `remove()` the value when done, using `try-finally` to guarantee cleanup. Failure to do so causes data to bleed between requests — a serious security issue in multi-tenant payment systems.
+>
+> Virtual threads are different: they are not pooled, so every task gets a fresh thread. A `ThreadLocal` used as a per-thread *cache* (like the `SimpleDateFormat` above) then gives no reuse at all — and with millions of virtual threads it can cost a lot of memory. Prefer immutable alternatives (`DateTimeFormatter`) and, for per-request context, `ScopedValue`.
 
 ## Common Thread-Safety Mistakes in Financial Code
 
@@ -406,6 +414,7 @@ public class DailyRevenueCalculator {
 }
 
 // CORRECT — use AtomicReference for concurrent accumulation
+// (under heavy contention, a LongAdder of minor units scales better)
 public class DailyRevenueCalculator {
     private final AtomicReference<BigDecimal> totalRevenue =
         new AtomicReference<>(BigDecimal.ZERO);
@@ -431,7 +440,8 @@ public class ExchangeRateService {
     }
 
     public static BigDecimal convert(BigDecimal usd) {
-        return usd.multiply(USD_TO_GBP); // May read a partially written value
+        return usd.multiply(USD_TO_GBP); // May keep using an old rate indefinitely:
+                                         // no visibility guarantee without volatile
     }
 }
 
@@ -465,8 +475,10 @@ public class PaymentEventListener {
     public PaymentEventListener(String id, EventBus bus) {
         this.listenerId = id;
         bus.register(this); // ← 'this' escapes BEFORE constructor completes!
-        // Another thread may call an event callback before listenerId is assigned
-        // Despite listenerId being final — the assignment hasn't happened yet
+        // listenerId was assigned on the line above, but the final-field
+        // guarantee only applies once the constructor FINISHES: another thread
+        // that receives 'this' now has no guarantee of seeing it — and any
+        // field assigned after this line is certainly not set yet
     }
 }
 
@@ -511,8 +523,8 @@ public record PaymentEvent(
         Objects.requireNonNull(occurredAt, "occurredAt");
     }
 
-    // Derived computed field — consistent with immutable semantics
-    public boolean isCredit() {
+    // Derived computed value — consistent with immutable semantics
+    public boolean isSettled() {
         return status == PaymentStatus.SETTLED;
     }
 }
@@ -534,21 +546,24 @@ Virtual threads do not change thread-safety rules — if code is not thread-safe
 ```java21
 // Virtual threads — cheap enough to create one per payment
 // But the PaymentProcessor must still be thread-safe
+// (StructuredTaskScope is a preview API in Java 21: compile and run with
+//  --enable-preview. Its API was redesigned in later JDKs.)
 public class VirtualThreadPaymentDispatcher {
 
     private final PaymentProcessor processor; // Must be stateless or thread-safe
 
     public void dispatch(List<PaymentRequest> requests) {
         try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
-            List<Future<PaymentResult>> futures = requests.stream()
+            // In Java 21, fork() returns a Subtask (not a Future)
+            List<StructuredTaskScope.Subtask<PaymentResult>> subtasks = requests.stream()
                 .map(req -> scope.fork(() -> processor.process(req)))
                 .toList();
 
             scope.join().throwIfFailed();
 
-            futures.stream()
-                   .map(Future::resultNow)
-                   .forEach(this::recordResult);
+            subtasks.stream()
+                    .map(StructuredTaskScope.Subtask::get)
+                    .forEach(this::recordResult);
         } catch (Exception e) {
             throw new PaymentDispatchException("Batch processing failed", e);
         }
@@ -598,7 +613,7 @@ public class VirtualThreadPaymentDispatcher {
   },
   {
     "id": "kc-ts-03",
-    "question": "A `ThreadLocal<SimpleDateFormat>` is used in a payment service deployed on a virtual thread pool. What additional step is required that platform thread pools also require?",
+    "question": "A `ThreadLocal<SimpleDateFormat>` is used in a payment service running on a platform thread pool (Tomcat worker threads). What step is required after each request?",
     "options": [
       "Call ThreadLocal.initialValue() before each request",
       "Call ThreadLocal.remove() after each request to prevent values bleeding between requests",
@@ -606,14 +621,14 @@ public class VirtualThreadPaymentDispatcher {
       "Nothing — virtual threads automatically reset ThreadLocal values between tasks"
     ],
     "correct": 1,
-    "explanation": "Thread-pool threads (platform or virtual) are reused across requests. A ThreadLocal value set during request A remains accessible during request B on the same thread. This can cause data to leak between requests — a security issue in multi-tenant systems. Always call remove() in a finally block."
+    "explanation": "Platform pool threads are reused across requests. A ThreadLocal value set during request A remains accessible during request B on the same thread, which can leak data between requests — a security issue in multi-tenant systems. Always call remove() in a finally block. (Virtual threads are not pooled — each task gets a new thread — so there the problem is different: a ThreadLocal cache gives no reuse and can cost a lot of memory.)"
   },
   {
     "id": "kc-ts-04",
     "question": "An immutable `PaymentReference` object is created in Thread 1 and the reference is stored in a plain (non-volatile) field. Thread 2 reads the reference. Is this safe?",
     "options": [
       "Yes — final fields in PaymentReference guarantee Thread 2 sees correct field values once it reads the reference",
-      "No — Thread 2 may see a partially constructed object even if the reference is non-null",
+      "Partly — IF Thread 2 sees the reference, the final fields are correct, but without volatile or a lock Thread 2 may keep seeing null or an older reference",
       "Yes — but only if Thread 1 and Thread 2 share a CPU cache",
       "No — final fields only guarantee visibility within the same thread"
     ],

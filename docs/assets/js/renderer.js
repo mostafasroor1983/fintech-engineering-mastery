@@ -11,7 +11,40 @@ EM.Renderer = (function () {
   /* ----------------------------------------------------------
      State
   ---------------------------------------------------------- */
-  var _trackCache    = {};
+  var _trackCache    = {};   // key: lang + ':' + trackId
+
+  EM.I18n.add({
+    en: {
+      'les.prereqs': 'Prerequisites:', 'les.track': 'TRACK {n} — {t}', 'les.trackLesson': 'TRACK {n} — LESSON {l}',
+      'les.complete': 'Mark as Complete', 'les.completed': 'Completed', 'les.prev': '← Previous', 'les.next': 'Next →',
+      'les.soon': 'Coming Soon', 'les.inDev': 'Lesson In Development',
+      'les.inDevMsg': 'This lesson is part of the published curriculum and will be released in a future update. The lesson outline, prerequisites, and estimated completion time are shown above.',
+      'les.cantLoad': 'Could Not Load Lesson', 'les.backCur': 'Back to Curriculum',
+      'les.trackNotFound': 'Track not found: {id}', 'les.lessonNotFound': 'Lesson not found: {id}',
+      'les.netErr': 'Network error loading lesson: {p}', 'les.loadErr': 'Could not load lesson content from: {p}',
+      'les.note': 'Note', 'les.tip': 'Tip', 'les.important': 'Important', 'les.warning': 'Warning', 'les.danger': 'Danger',
+      'les.copy': 'Copy', 'les.copyCode': 'Copy code', 'les.copied': 'Copied!', 'les.copyErr': 'Error',
+      'les.question': 'Question {n} of {total}', 'les.score': 'Score: {a} / {b}',
+      'les.zoomOut': 'Zoom out', 'les.zoomIn': 'Zoom in', 'les.zoomReset': 'Reset zoom', 'les.full': 'Fullscreen', 'les.close': 'Close',
+      'les.kc': 'Knowledge Check', 'les.kcSub1': '1 question — click an option to answer',
+      'les.kcSubN': '{n} questions — click an option to answer', 'les.challenge': 'Practical Challenge'
+    },
+    ar: {
+      'les.prereqs': 'المتطلبات السابقة:', 'les.track': 'المسار {n} — {t}', 'les.trackLesson': 'المسار {n} — الدرس {l}',
+      'les.complete': 'تحديد كمكتمل', 'les.completed': 'مكتمل', 'les.prev': '→ السابق', 'les.next': 'التالي ←',
+      'les.soon': 'قريبًا', 'les.inDev': 'الدرس قيد الإعداد',
+      'les.inDevMsg': 'هذا الدرس جزء من المنهج المنشور وسيُضاف في تحديث قادم. المخطط والمتطلبات السابقة والوقت المتوقع معروضة في الأعلى.',
+      'les.cantLoad': 'تعذّر تحميل الدرس', 'les.backCur': 'العودة إلى المنهج',
+      'les.trackNotFound': 'المسار غير موجود: {id}', 'les.lessonNotFound': 'الدرس غير موجود: {id}',
+      'les.netErr': 'خطأ في الشبكة أثناء تحميل الدرس: {p}', 'les.loadErr': 'تعذّر تحميل محتوى الدرس من: {p}',
+      'les.note': 'ملاحظة', 'les.tip': 'نصيحة', 'les.important': 'مهم', 'les.warning': 'تحذير', 'les.danger': 'خطر',
+      'les.copy': 'نسخ', 'les.copyCode': 'نسخ الشيفرة', 'les.copied': 'تم النسخ!', 'les.copyErr': 'خطأ',
+      'les.question': 'السؤال {n} من {total}', 'les.score': 'النتيجة: {a} من {b}',
+      'les.zoomOut': 'تصغير', 'les.zoomIn': 'تكبير', 'les.zoomReset': 'إعادة الحجم', 'les.full': 'ملء الشاشة', 'les.close': 'إغلاق',
+      'les.kc': 'اختبر فهمك', 'les.kcSub1': 'سؤال واحد — اختر إجابة',
+      'les.kcSubN': '{n} أسئلة — اختر إجابة لكل سؤال', 'les.challenge': 'تحدٍّ عملي'
+    }
+  });
   var _markedReady   = false;
   var _mermaidReady  = false;
 
@@ -82,6 +115,8 @@ EM.Renderer = (function () {
           var lang = (token.lang || '').trim().toLowerCase();
 
           if (lang === 'mermaid') {
+            // Lessons write line breaks in labels as a literal "\n", which current Mermaid prints as-is
+            if (!/^\s*C4/.test(code)) code = code.replace(/\\n/g, '<br/>');
             return '<div class="mermaid-block"><pre class="mermaid">' + _esc(code) + '</pre></div>\n';
           }
 
@@ -108,7 +143,8 @@ EM.Renderer = (function () {
      Load Track Data
   ---------------------------------------------------------- */
   async function _loadTrack(trackId) {
-    if (_trackCache[trackId]) return _trackCache[trackId];
+    var cacheKey = EM.I18n.lang() + ':' + trackId;
+    if (_trackCache[cacheKey]) return _trackCache[cacheKey];
 
     var appTrack = null;
     for (var i = 0; i < EM.App.tracks.length; i++) {
@@ -118,11 +154,9 @@ EM.Renderer = (function () {
 
     var path = 'content/tracks/' + trackId + '-' + appTrack.slug + '/_track.json';
     try {
-      var resp = await fetch(path);
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      var data = await resp.json();
-      _trackCache[trackId] = data;
-      return data;
+      var res = await EM.I18n.fetchJSON(path);
+      _trackCache[cacheKey] = res.body;
+      return res.body;
     } catch (e) {
       console.error('[EM.Renderer] Failed to load track data for', trackId, e);
       return null;
@@ -135,7 +169,7 @@ EM.Renderer = (function () {
   async function renderLesson(trackId, lessonId) {
     // 1. Track data
     var trackData = await _loadTrack(trackId);
-    if (!trackData) return _errorHtml('Track not found: ' + _esc(trackId));
+    if (!trackData) return _errorHtml(EM.t('les.trackNotFound', { id: trackId }));
 
     // 2. Find lesson in track
     var lesson = null;
@@ -143,14 +177,20 @@ EM.Renderer = (function () {
     for (var i = 0; i < trackData.lessons.length; i++) {
       if (trackData.lessons[i].id === lessonId) { lesson = trackData.lessons[i]; lessonIdx = i; break; }
     }
-    if (!lesson) return _errorHtml('Lesson not found: ' + _esc(lessonId));
+    if (!lesson) return _errorHtml(EM.t('les.lessonNotFound', { id: lessonId }));
 
     // 3. Fetch markdown — 404 means lesson not yet written (show coming soon)
-    var mdResp;
+    var mdResp, mdFallback = false;
     try {
-      mdResp = await fetch(lesson.path);
+      var localPath = EM.I18n.localizedPath(lesson.path);
+      if (localPath !== lesson.path) {
+        mdResp = await fetch(localPath);
+        if (!mdResp.ok) { mdResp = await fetch(lesson.path); mdFallback = true; }
+      } else {
+        mdResp = await fetch(lesson.path);
+      }
     } catch (e) {
-      return _errorHtml('Network error loading lesson: ' + _esc(lesson.path));
+      return _errorHtml(EM.t('les.netErr', { p: lesson.path }));
     }
     if (mdResp.status === 404) {
       var appTrackForSoon = null;
@@ -162,7 +202,7 @@ EM.Renderer = (function () {
       return _lessonComingSoon(lesson, appTrackForSoon, trackData, prevL, nextL);
     }
     if (!mdResp.ok) {
-      return _errorHtml('Could not load lesson content from: ' + _esc(lesson.path));
+      return _errorHtml(EM.t('les.loadErr', { p: lesson.path }));
     }
     var raw = await mdResp.text();
 
@@ -174,6 +214,8 @@ EM.Renderer = (function () {
     var bodyHtml = typeof marked !== 'undefined'
       ? marked.parse(parsed.body)
       : '<pre>' + _esc(parsed.body) + '</pre>';
+    // The page header already shows the lesson title; drop the markdown's own leading H1
+    bodyHtml = bodyHtml.replace(/^\s*<h1\b[^>]*>[\s\S]*?<\/h1>\s*/i, '');
 
     // 6. Prev / next
     var prevLesson = lessonIdx > 0 ? trackData.lessons[lessonIdx - 1] : null;
@@ -189,13 +231,16 @@ EM.Renderer = (function () {
     EM.Progress.setLessonStatus(lessonId, 'in-progress');
 
     // 9. Assemble page HTML
-    return _buildPageHtml(parsed.meta, bodyHtml, appTrack, trackData, lesson, prevLesson, nextLesson);
+    return _buildPageHtml(parsed.meta, bodyHtml, appTrack, trackData, lesson, prevLesson, nextLesson, mdFallback);
   }
 
   /* ----------------------------------------------------------
      Build Lesson Page HTML
   ---------------------------------------------------------- */
-  function _buildPageHtml(meta, bodyHtml, appTrack, trackData, lesson, prevLesson, nextLesson) {
+  function _buildPageHtml(meta, bodyHtml, appTrack, trackData, lesson, prevLesson, nextLesson, mdFallback) {
+    // A translated lesson's frontmatter may still carry the English title; prefer the localised track listing
+    var lessonTitle = EM.I18n.lang() !== 'en' ? (lesson.title || meta.title) : (meta.title || lesson.title);
+    var contentDir  = mdFallback ? ' dir="ltr"' : '';
     var color  = (appTrack && appTrack.color) || '#f97316';
     var num    = trackData ? String(trackData.sequence || '').padStart(2, '0') : '00';
     var status = EM.Progress.getLessonStatus(lesson.id);
@@ -203,15 +248,15 @@ EM.Renderer = (function () {
     // Breadcrumb
     var breadcrumb =
       '<nav class="lesson-breadcrumb" aria-label="Breadcrumb">' +
-        '<button onclick="EM.Router.navigate(\'/\')">Dashboard</button>' +
-        '<span class="lesson-breadcrumb-sep">›</span>' +
-        '<button onclick="EM.Router.navigate(\'/curriculum\')">Curriculum</button>' +
-        '<span class="lesson-breadcrumb-sep">›</span>' +
+        '<button onclick="EM.Router.navigate(\'/\')">' + EM.t('nav.dashboard') + '</button>' +
+        '<span class="lesson-breadcrumb-sep rtl-flip">›</span>' +
+        '<button onclick="EM.Router.navigate(\'/curriculum\')">' + EM.t('nav.curriculum') + '</button>' +
+        '<span class="lesson-breadcrumb-sep rtl-flip">›</span>' +
         '<button onclick="EM.Router.navigate(\'/curriculum/track/' + (appTrack ? appTrack.id : '') + '\')">' +
           _esc(trackData ? trackData.title : '') +
         '</button>' +
-        '<span class="lesson-breadcrumb-sep">›</span>' +
-        '<span>' + _esc(meta.title || lesson.title) + '</span>' +
+        '<span class="lesson-breadcrumb-sep rtl-flip">›</span>' +
+        '<span>' + _esc(lessonTitle) + '</span>' +
       '</nav>';
 
     // Header
@@ -219,7 +264,7 @@ EM.Renderer = (function () {
     var prereqs = '';
     if (meta.prerequisites && meta.prerequisites.length) {
       prereqs = '<div class="lesson-prereqs">' +
-        '<span class="lesson-prereqs-label">Prerequisites:</span>' +
+        '<span class="lesson-prereqs-label">' + EM.t('les.prereqs') + '</span>' +
         meta.prerequisites.map(function (p) {
           return '<button class="prereq-link" onclick="EM.Router.navigate(\'/tracks/' +
             (appTrack ? appTrack.id : '') + '/lessons/' + _esc(p) + '\')">' + _esc(p) + '</button>';
@@ -238,15 +283,15 @@ EM.Renderer = (function () {
       '<div class="lesson-header">' +
         '<div class="lesson-track-label">' +
           '<span class="lesson-track-dot" style="background:' + color + '"></span>' +
-          'TRACK ' + num + ' — ' + _esc(trackData ? trackData.title : '') +
+          _esc(EM.t('les.track', { n: num, t: trackData ? trackData.title : '' })) +
         '</div>' +
-        '<h1 class="lesson-title">' + _esc(meta.title || lesson.title) + '</h1>' +
+        '<h1 class="lesson-title">' + _esc(lessonTitle) + '</h1>' +
         '<div class="lesson-meta-row">' +
           EM.difficultyBadge(meta.difficulty || lesson.difficulty) +
           javaVersions +
           '<span class="lesson-meta-item">' +
             EM.Icons.clock +
-            '<span>' + mins + ' min</span>' +
+            '<span>' + EM.t('common.min', { n: mins }) + '</span>' +
           '</span>' +
         '</div>' +
         prereqs +
@@ -254,7 +299,7 @@ EM.Renderer = (function () {
 
     // Complete button
     var completedClass = status === 'completed' ? ' completed' : '';
-    var completedText  = status === 'completed' ? 'Completed' : 'Mark as Complete';
+    var completedText  = status === 'completed' ? EM.t('les.completed') : EM.t('les.complete');
     var completeBtn =
       '<div class="lesson-complete-wrap">' +
         '<button class="lesson-complete-btn' + completedClass + '" ' +
@@ -270,7 +315,7 @@ EM.Renderer = (function () {
       ? '<button class="lesson-nav-btn prev" ' +
           'onclick="EM.Router.navigate(\'/tracks/' + (appTrack ? appTrack.id : '') +
           '/lessons/' + prevLesson.id + '\')">' +
-          '<span class="lesson-nav-label">← Previous</span>' +
+          '<span class="lesson-nav-label">' + _esc(EM.t('les.prev')) + '</span>' +
           '<span class="lesson-nav-title">' + _esc(prevLesson.title) + '</span>' +
         '</button>'
       : '<div></div>';
@@ -279,7 +324,7 @@ EM.Renderer = (function () {
       ? '<button class="lesson-nav-btn next" ' +
           'onclick="EM.Router.navigate(\'/tracks/' + (appTrack ? appTrack.id : '') +
           '/lessons/' + nextLesson.id + '\')">' +
-          '<span class="lesson-nav-label">Next →</span>' +
+          '<span class="lesson-nav-label">' + _esc(EM.t('les.next')) + '</span>' +
           '<span class="lesson-nav-title">' + _esc(nextLesson.title) + '</span>' +
         '</button>'
       : '<div></div>';
@@ -293,7 +338,8 @@ EM.Renderer = (function () {
       '<div class="lesson-main">' +
         breadcrumb +
         header +
-        '<div class="lesson-body" id="lesson-body">' +
+        (mdFallback ? EM.I18n.fallbackNote() : '') +
+        '<div class="lesson-body" id="lesson-body"' + contentDir + '>' +
           bodyHtml +
         '</div>' +
         completeBtn +
@@ -314,10 +360,10 @@ EM.Renderer = (function () {
     if (btn && label) {
       if (next === 'completed') {
         btn.classList.add('completed');
-        label.textContent = 'Completed';
+        label.textContent = EM.t('les.completed');
       } else {
         btn.classList.remove('completed');
-        label.textContent = 'Mark as Complete';
+        label.textContent = EM.t('les.complete');
       }
     }
   }
@@ -344,11 +390,12 @@ EM.Renderer = (function () {
      To: <div class="callout callout-note">...</div>
   ---------------------------------------------------------- */
   var CALLOUT_TYPES = {
-    'NOTE':      { cls: 'callout-note',      icon: 'ℹ️',  label: 'Note'      },
-    'TIP':       { cls: 'callout-tip',       icon: '💡', label: 'Tip'       },
-    'IMPORTANT': { cls: 'callout-important', icon: '⚡',  label: 'Important' },
-    'WARNING':   { cls: 'callout-warning',   icon: '⚠️',  label: 'Warning'   },
-    'DANGER':    { cls: 'callout-danger',    icon: '🚨', label: 'Danger'    }
+    'NOTE':      { cls: 'callout-note',      icon: 'ℹ️',  label: 'les.note'      },
+    'TIP':       { cls: 'callout-tip',       icon: '💡', label: 'les.tip'       },
+    'IMPORTANT': { cls: 'callout-important', icon: '⚡',  label: 'les.important' },
+    'WARNING':   { cls: 'callout-warning',   icon: '⚠️',  label: 'les.warning'   },
+    'DANGER':    { cls: 'callout-danger',    icon: '🚨', label: 'les.danger'    },
+    'CAUTION':   { cls: 'callout-danger',    icon: '🚨', label: 'les.danger'    }
   };
 
   function _transformCallouts(body) {
@@ -357,14 +404,14 @@ EM.Renderer = (function () {
       var firstP = bq.querySelector('p');
       if (!firstP) return;
       var text = firstP.textContent || '';
-      var match = text.match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|DANGER)\]\s*/i);
+      var match = text.match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|DANGER|CAUTION)\]\s*/i);
       if (!match) return;
       var type = match[1].toUpperCase();
       var def  = CALLOUT_TYPES[type];
       if (!def) return;
 
       // Remove the [!TYPE] marker from text
-      firstP.innerHTML = firstP.innerHTML.replace(/^\[!(NOTE|TIP|IMPORTANT|WARNING|DANGER)\]\s*/i, '');
+      firstP.innerHTML = firstP.innerHTML.replace(/^\[!(NOTE|TIP|IMPORTANT|WARNING|DANGER|CAUTION)\]\s*/i, '');
 
       // Build callout div
       var div = document.createElement('div');
@@ -373,7 +420,7 @@ EM.Renderer = (function () {
       div.innerHTML =
         '<div class="callout-icon">' + def.icon + '</div>' +
         '<div class="callout-body">' +
-          '<div class="callout-title">' + def.label + '</div>' +
+          '<div class="callout-title">' + EM.t(def.label) + '</div>' +
           bq.innerHTML +
         '</div>';
 
@@ -494,20 +541,20 @@ EM.Renderer = (function () {
       pre.style.position = 'relative';
       var btn = document.createElement('button');
       btn.className  = 'code-copy-btn';
-      btn.textContent = 'Copy';
-      btn.setAttribute('aria-label', 'Copy code');
+      btn.textContent = EM.t('les.copy');
+      btn.setAttribute('aria-label', EM.t('les.copyCode'));
       btn.addEventListener('click', function () {
         var code = pre.querySelector('code');
         var text = code ? code.textContent : pre.textContent;
         navigator.clipboard.writeText(text).then(function () {
-          btn.textContent = 'Copied!';
+          btn.textContent = EM.t('les.copied');
           btn.classList.add('copied');
           setTimeout(function () {
-            btn.textContent = 'Copy';
+            btn.textContent = EM.t('les.copy');
             btn.classList.remove('copied');
           }, 2000);
         }).catch(function () {
-          btn.textContent = 'Error';
+          btn.textContent = EM.t('les.copyErr');
         });
       });
       pre.appendChild(btn);
@@ -578,11 +625,11 @@ EM.Renderer = (function () {
       var bar = document.createElement('div');
       bar.className = 'diagram-zoom-bar';
       bar.innerHTML =
-        '<button class="dz-btn dz-out" title="Zoom out">&#8722;</button>' +
+        '<button class="dz-btn dz-out" title="' + EM.t('les.zoomOut') + '">&#8722;</button>' +
         '<span class="dz-label">100%</span>' +
-        '<button class="dz-btn dz-in" title="Zoom in">&#43;</button>' +
-        '<button class="dz-btn dz-reset" title="Reset zoom">&#8635;</button>' +
-        '<button class="dz-btn dz-full" title="Fullscreen">&#x26F6;</button>';
+        '<button class="dz-btn dz-in" title="' + EM.t('les.zoomIn') + '">&#43;</button>' +
+        '<button class="dz-btn dz-reset" title="' + EM.t('les.zoomReset') + '">&#8635;</button>' +
+        '<button class="dz-btn dz-full" title="' + EM.t('les.full') + '">&#x26F6;</button>';
 
       var label = bar.querySelector('.dz-label');
 
@@ -622,11 +669,11 @@ EM.Renderer = (function () {
       '<div class="em-diagram-modal-backdrop"></div>' +
       '<div class="em-diagram-modal-box">' +
         '<div class="em-diagram-modal-toolbar">' +
-          '<button class="dz-btn dz-out" title="Zoom out">&#8722;</button>' +
+          '<button class="dz-btn dz-out" title="' + EM.t('les.zoomOut') + '">&#8722;</button>' +
           '<span class="dz-label">100%</span>' +
-          '<button class="dz-btn dz-in" title="Zoom in">&#43;</button>' +
-          '<button class="dz-btn dz-reset" title="Reset">&#8635;</button>' +
-          '<button class="dz-btn dz-close" title="Close">&#10005;</button>' +
+          '<button class="dz-btn dz-in" title="' + EM.t('les.zoomIn') + '">&#43;</button>' +
+          '<button class="dz-btn dz-reset" title="' + EM.t('les.zoomReset') + '">&#8635;</button>' +
+          '<button class="dz-btn dz-close" title="' + EM.t('les.close') + '">&#10005;</button>' +
         '</div>' +
         '<div class="em-diagram-modal-scroll"></div>' +
       '</div>';
@@ -718,9 +765,9 @@ EM.Renderer = (function () {
     header.innerHTML =
       '<div class="knowledge-check-icon">🧠</div>' +
       '<div>' +
-        '<div class="knowledge-check-title">Knowledge Check</div>' +
-        '<div class="knowledge-check-subtitle">' + questions.length + ' question' +
-          (questions.length !== 1 ? 's' : '') + ' — click an option to answer</div>' +
+        '<div class="knowledge-check-title">' + _esc(EM.t('les.kc')) + '</div>' +
+        '<div class="knowledge-check-subtitle">' +
+          _esc(EM.t(questions.length === 1 ? 'les.kcSub1' : 'les.kcSubN', { n: questions.length })) + '</div>' +
       '</div>';
     wrap.appendChild(header);
 
@@ -733,7 +780,7 @@ EM.Renderer = (function () {
 
       var num = document.createElement('div');
       num.className = 'kc-question-num';
-      num.textContent = 'Question ' + (qi + 1) + ' of ' + questions.length;
+      num.textContent = EM.t('les.question', { n: qi + 1, total: questions.length });
 
       var text = document.createElement('div');
       text.className = 'kc-question-text';
@@ -774,7 +821,7 @@ EM.Renderer = (function () {
             var scoreEl = wrap.querySelector('.kc-score');
             if (scoreEl) {
               scoreEl.classList.add('visible');
-              scoreEl.innerHTML = '✅ Score: ' + score + ' / ' + questions.length;
+              scoreEl.innerHTML = '✅ ' + _esc(EM.t('les.score', { a: score, b: questions.length }));
             }
           }
         });
@@ -830,7 +877,7 @@ EM.Renderer = (function () {
     header.innerHTML =
       '<div class="practical-challenge-icon">⚡</div>' +
       '<div>' +
-        '<div class="practical-challenge-label">Practical Challenge</div>' +
+        '<div class="practical-challenge-label">' + _esc(EM.t('les.challenge')) + '</div>' +
         '<div class="practical-challenge-title">' + _esc(config.title || '') + '</div>' +
       '</div>';
     wrap.appendChild(header);
@@ -898,16 +945,16 @@ EM.Renderer = (function () {
     var color  = (appTrack && appTrack.color) || '#f97316';
     var num    = trackData ? String(trackData.sequence || '').padStart(2, '0') : '00';
     var lNum   = String(lesson.sequence || '').padStart(2, '0');
-    var mins   = lesson.estimatedMinutes ? lesson.estimatedMinutes + ' min' : '';
+    var mins   = lesson.estimatedMinutes ? EM.t('common.min', { n: lesson.estimatedMinutes }) : '';
     var tags   = (lesson.tags || []).map(function (t) {
-      return '<span class="tag-chip">' + _esc(t) + '</span>';
+      return '<span class="tag-chip" dir="ltr">' + _esc(t) + '</span>';
     }).join('');
 
     var prevHtml = prevLesson
       ? '<button class="lesson-nav-btn prev" ' +
           'onclick="EM.Router.navigate(\'/tracks/' + (appTrack ? appTrack.id : '') +
           '/lessons/' + prevLesson.id + '\')">' +
-          '<span class="lesson-nav-label">← Previous</span>' +
+          '<span class="lesson-nav-label">' + _esc(EM.t('les.prev')) + '</span>' +
           '<span class="lesson-nav-title">' + _esc(prevLesson.title) + '</span>' +
         '</button>'
       : '<div></div>';
@@ -916,43 +963,42 @@ EM.Renderer = (function () {
       ? '<button class="lesson-nav-btn next" ' +
           'onclick="EM.Router.navigate(\'/tracks/' + (appTrack ? appTrack.id : '') +
           '/lessons/' + nextLesson.id + '\')">' +
-          '<span class="lesson-nav-label">Next →</span>' +
+          '<span class="lesson-nav-label">' + _esc(EM.t('les.next')) + '</span>' +
           '<span class="lesson-nav-title">' + _esc(nextLesson.title) + '</span>' +
         '</button>'
       : '<div></div>';
 
     return '<div class="lesson-wrap"><div class="lesson-main">' +
       '<nav class="lesson-breadcrumb">' +
-        '<button onclick="EM.Router.navigate(\'/\')">Dashboard</button>' +
-        '<span class="lesson-breadcrumb-sep">›</span>' +
-        '<button onclick="EM.Router.navigate(\'/curriculum\')">Curriculum</button>' +
-        '<span class="lesson-breadcrumb-sep">›</span>' +
+        '<button onclick="EM.Router.navigate(\'/\')">' + EM.t('nav.dashboard') + '</button>' +
+        '<span class="lesson-breadcrumb-sep rtl-flip">›</span>' +
+        '<button onclick="EM.Router.navigate(\'/curriculum\')">' + EM.t('nav.curriculum') + '</button>' +
+        '<span class="lesson-breadcrumb-sep rtl-flip">›</span>' +
         '<button onclick="EM.Router.navigate(\'/curriculum/track/' + (appTrack ? appTrack.id : '') + '\')">' +
           _esc(trackData ? trackData.title : '') +
         '</button>' +
-        '<span class="lesson-breadcrumb-sep">›</span>' +
+        '<span class="lesson-breadcrumb-sep rtl-flip">›</span>' +
         '<span>' + _esc(lesson.title) + '</span>' +
       '</nav>' +
       '<div class="lesson-header">' +
         '<div class="lesson-track-label">' +
           '<span class="lesson-track-dot" style="background:' + color + '"></span>' +
-          'TRACK ' + num + ' — LESSON ' + lNum +
+          _esc(EM.t('les.trackLesson', { n: num, l: lNum })) +
         '</div>' +
         '<h1 class="lesson-title" style="color:var(--text-primary)">' + _esc(lesson.title) + '</h1>' +
         '<div class="lesson-meta-row">' +
           EM.difficultyBadge(lesson.difficulty) +
           (mins ? '<span class="lesson-meta-item">' + EM.Icons.clock + mins + '</span>' : '') +
-          '<span class="badge badge-planned">Coming Soon</span>' +
+          '<span class="badge badge-planned">' + EM.t('les.soon') + '</span>' +
         '</div>' +
         (tags ? '<div style="display:flex;flex-wrap:wrap;gap:var(--sp-1);margin-top:var(--sp-3)">' + tags + '</div>' : '') +
       '</div>' +
       '<div style="text-align:center;padding:var(--sp-10) var(--sp-8);background:var(--bg-surface);' +
         'border:1px solid var(--border);border-radius:var(--r-xl);border-top:3px solid ' + color + '">' +
         '<div style="font-size:2.5rem;margin-bottom:var(--sp-4)">🏗</div>' +
-        '<h2 style="font-size:var(--text-xl);font-weight:600;color:var(--text-primary);margin-bottom:var(--sp-3)">Lesson In Development</h2>' +
+        '<h2 style="font-size:var(--text-xl);font-weight:600;color:var(--text-primary);margin-bottom:var(--sp-3)">' + EM.t('les.inDev') + '</h2>' +
         '<p style="color:var(--text-secondary);max-width:480px;margin:0 auto">' +
-          'This lesson is part of the published curriculum and will be released in a future update. ' +
-          'The lesson outline, prerequisites, and estimated completion time are shown above.' +
+          _esc(EM.t('les.inDevMsg')) +
         '</p>' +
       '</div>' +
       '<div class="lesson-nav" style="margin-top:var(--sp-8)">' + prevHtml + nextHtml + '</div>' +
@@ -965,10 +1011,10 @@ EM.Renderer = (function () {
   function _errorHtml(msg) {
     return '<div class="error-wrap">' +
       '<div class="error-icon">⚠</div>' +
-      '<h2 class="error-title">Could Not Load Lesson</h2>' +
+      '<h2 class="error-title">' + EM.t('les.cantLoad') + '</h2>' +
       '<p class="error-msg">' + _esc(msg) + '</p>' +
       '<button class="btn btn-secondary" onclick="EM.Router.navigate(\'/curriculum\')" style="margin-top:16px">' +
-        'Back to Curriculum' +
+        EM.t('les.backCur') +
       '</button>' +
     '</div>';
   }

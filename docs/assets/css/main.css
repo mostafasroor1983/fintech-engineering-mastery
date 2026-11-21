@@ -5,7 +5,7 @@
 /* ------------------------------------------------------------
    Google Fonts
    ------------------------------------------------------------ */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap');
 
 /* ------------------------------------------------------------
    Design Tokens
@@ -18,6 +18,7 @@
   --sp-4:  16px;
   --sp-5:  20px;
   --sp-6:  24px;
+  --sp-7:  28px;
   --sp-8:  32px;
   --sp-10: 40px;
   --sp-12: 48px;
@@ -32,8 +33,16 @@
   --r-2xl:  20px;
   --r-full: 9999px;
 
+  /* Aliases (older stylesheets use these names) */
+  --radius-sm: var(--r-sm);
+  --radius:    var(--r);
+  --radius-md: var(--r-md);
+  --radius-lg: var(--r-lg);
+  --radius-xl: var(--r-xl);
+
   /* Typography */
   --font-sans: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-arabic: 'IBM Plex Sans Arabic', 'Noto Sans Arabic', 'Segoe UI', Tahoma, sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
 
   --text-xs:   0.875rem;   /* 14px  (+1pt) */
@@ -148,6 +157,16 @@
   color-scheme: light;
 }
 
+/* Colour aliases used by some modules (resolved against the active theme) */
+:root {
+  --bg-code:        var(--bg-inset);
+  --border-default: var(--border);
+  --surface-1:      var(--bg-surface);
+  --surface-2:      var(--bg-elevated);
+  --text-1:         var(--text-primary);
+  --text-2:         var(--text-secondary);
+}
+
 /* ------------------------------------------------------------
    Reset & Base
    ------------------------------------------------------------ */
@@ -199,7 +218,7 @@ img, svg { display: block; }
 .skip-link {
   position: absolute;
   top: -100px;
-  left: var(--sp-4);
+  inset-inline-start: var(--sp-4);
   z-index: 9999;
   padding: var(--sp-2) var(--sp-4);
   background: var(--accent);
@@ -348,7 +367,7 @@ img, svg { display: block; }
   width: var(--sidebar-w);
   flex-shrink: 0;
   background: var(--bg-surface);
-  border-right: 1px solid var(--border);
+  border-inline-end: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   overflow-y: auto;
@@ -362,7 +381,7 @@ img, svg { display: block; }
 #sidebar.collapsed {
   width: 0;
   padding: 0;
-  border-right-color: transparent;
+  border-inline-end-color: transparent;
   overflow: hidden;
 }
 
@@ -373,9 +392,9 @@ img, svg { display: block; }
   justify-content: center;
   width: 24px;
   height: 24px;
-  position: absolute;
-  bottom: var(--sp-4);
-  right: var(--sp-3);
+  position: static;
+  margin: var(--sp-3) var(--sp-3) 0;
+  margin-inline-start: auto;
   background: var(--bg-elevated);
   border: 1px solid var(--border-subtle);
   border-radius: var(--r);
@@ -450,7 +469,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   border: none;
   background: none;
   width: 100%;
-  text-align: left;
+  text-align: start;
   text-decoration: none;
   transition: background var(--ease), color var(--ease);
   position: relative;
@@ -471,13 +490,13 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 .nav-item.active::before {
   content: '';
   position: absolute;
-  left: 0;
+  inset-inline-start: 0;
   top: 50%;
   transform: translateY(-50%);
   width: 3px;
   height: 60%;
   background: var(--accent);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border-radius: 0; border-start-end-radius: var(--r-sm); border-end-end-radius: var(--r-sm);
 }
 
 .nav-item svg {
@@ -494,7 +513,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 }
 
 .nav-badge {
-  margin-left: auto;
+  margin-inline-start: auto;
   font-size: 10px;
   font-weight: 600;
   padding: 1px 6px;
@@ -524,7 +543,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   border: none;
   background: none;
   width: 100%;
-  text-align: left;
+  text-align: start;
   text-decoration: none;
   transition: background var(--ease), color var(--ease);
   position: relative;
@@ -544,13 +563,13 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 .sidebar-track-item.active::before {
   content: '';
   position: absolute;
-  left: 0;
+  inset-inline-start: 0;
   top: 50%;
   transform: translateY(-50%);
   width: 3px;
   height: 60%;
   background: var(--accent);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border-radius: 0; border-start-end-radius: var(--r-sm); border-end-end-radius: var(--r-sm);
 }
 
 .sidebar-track-item.active .sidebar-track-num {
@@ -764,8 +783,8 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   content: '';
   position: absolute;
   top: 0;
-  left: 0;
-  right: 0;
+  inset-inline-start: 0;
+  inset-inline-end: 0;
   height: 3px;
   background: var(--tc, var(--accent));
   border-radius: var(--r-xl) var(--r-xl) 0 0;
@@ -909,6 +928,12 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   background: var(--yellow-muted);
   color: var(--yellow);
   border: 1px solid rgba(210, 153, 34, 0.25);
+}
+
+.badge-intermediate {
+  background: var(--blue-muted);
+  color: var(--blue);
+  border: 1px solid rgba(88, 166, 255, 0.25);
 }
 
 .badge-principal {
@@ -1126,7 +1151,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   flex-direction: column;
   gap: var(--sp-2);
   margin-top: var(--sp-2);
-  text-align: left;
+  text-align: start;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
@@ -1169,6 +1194,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 }
 
 .curriculum-row {
+  text-align: start;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--r-xl);
@@ -1186,12 +1212,12 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 .curriculum-row::before {
   content: '';
   position: absolute;
-  left: 0;
+  inset-inline-start: 0;
   top: 0;
   bottom: 0;
   width: 4px;
   background: var(--tc, var(--accent));
-  border-radius: var(--r-xl) 0 0 var(--r-xl);
+  border-radius: 0; border-start-start-radius: var(--r-xl); border-end-start-radius: var(--r-xl);
 }
 
 .curriculum-row:hover {
@@ -1263,7 +1289,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   font-family: var(--font-mono);
   color: var(--text-muted);
   min-width: 60px;
-  text-align: right;
+  text-align: end;
 }
 
 .curriculum-progress-bar {
@@ -1456,7 +1482,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   color: var(--text-secondary);
   font-family: var(--font-mono);
   min-width: 36px;
-  text-align: right;
+  text-align: end;
 }
 
 /* ------------------------------------------------------------
@@ -1500,7 +1526,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   #sidebar {
     position: fixed;
     top: var(--topbar-h);
-    left: 0;
+    inset-inline-start: 0;
     bottom: 0;
     z-index: 300;
     transform: translateX(-100%);
@@ -1542,9 +1568,10 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 
   .curriculum-row-tags { display: none; }
 
-  .page, .dashboard-hero, .dashboard-body, .about-page {
-    padding-left: var(--sp-4);
-    padding-right: var(--sp-4);
+  .page, .dashboard-hero, .dashboard-body, .about-page,
+  .scenario-page, .clab-index, .clab-experiment {
+    padding-inline-start: var(--sp-4);
+    padding-inline-end: var(--sp-4);
   }
 
   .logo-tagline { display: none; }
@@ -1604,7 +1631,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 
 .search-input-wrap > svg:first-child {
   position: absolute;
-  left: var(--sp-4);
+  inset-inline-start: var(--sp-4);
   width: 18px;
   height: 18px;
   color: var(--text-muted);
@@ -1614,7 +1641,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 
 .search-input {
   width: 100%;
-  padding: var(--sp-3) var(--sp-5) var(--sp-3) calc(var(--sp-4) + 18px + var(--sp-3));
+  padding-block: var(--sp-3); padding-inline: calc(var(--sp-4) + 18px + var(--sp-3)) var(--sp-5);
   font-size: var(--text-lg);
   font-family: var(--font-sans);
   color: var(--text-primary);
@@ -1636,7 +1663,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 /* Cancel/clear button */
 .search-kbd {
   position: absolute;
-  right: var(--sp-4);
+  inset-inline-end: var(--sp-4);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1652,7 +1679,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 
 .search-loading {
   position: absolute;
-  right: var(--sp-4);
+  inset-inline-end: var(--sp-4);
   display: flex;
   align-items: center;
 }
@@ -1710,7 +1737,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   border-radius: var(--r-xl);
   padding: var(--sp-5) var(--sp-6);
   cursor: pointer;
-  text-align: left;
+  text-align: start;
   width: 100%;
   display: flex;
   flex-direction: column;
@@ -1725,7 +1752,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 .result-card::before {
   content: '';
   position: absolute;
-  left: 0; top: 0; bottom: 0;
+  inset-inline-start: 0; top: 0; bottom: 0;
   width: 3px;
   background: var(--accent);
   opacity: 0;
@@ -1996,7 +2023,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 
 .cs-card-objectives {
   margin: 0;
-  padding-left: 1.25rem;
+  padding-inline-start: 1.25rem;
   display: flex;
   flex-direction: column;
   gap: var(--sp-1);
@@ -2088,14 +2115,14 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--text-muted);
-  margin-right: var(--sp-2);
+  margin-inline-end: var(--sp-2);
 }
 
 .cs-track-link {
   display: inline-flex;
   align-items: center;
   gap: var(--sp-1);
-  padding: 3px 10px 3px 6px;
+  padding-block: 3px; padding-inline: 6px 10px;
   background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
   border-radius: 999px;
@@ -2168,4 +2195,30 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   .cs-stats-row { gap: var(--sp-4); }
   .cs-status-btns { flex-direction: column; }
   .cs-status-btn { width: 100%; text-align: center; }
+}
+
+/* Capstone project page header (inside .lesson-wrap/.lesson-main) */
+.cs-project-page .lesson-header-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+.cs-project-page .lesson-header-top .lesson-track-label { margin-bottom: 0; margin-inline-end: var(--sp-2); }
+.cs-project-page .lesson-header .lesson-title { margin-bottom: var(--sp-3); }
+.cs-project-page .lesson-subtitle {
+  font-size: var(--text-md);
+  color: var(--text-secondary);
+  line-height: 1.6;
+  margin-bottom: var(--sp-4);
+}
+.cs-project-page .lesson-header { margin-bottom: var(--sp-4); padding-bottom: var(--sp-6); }
+.cs-project-page .cs-tracks-row { margin-bottom: var(--sp-8); }
+.cs-project-page .lesson-nav { display: flex; margin-top: var(--sp-8); }
+
+/* Show operators exactly as typed (no ">=" → "≥" ligatures) in all code */
+code, pre, kbd, samp, .lab-code, .constraint-chip {
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
 }

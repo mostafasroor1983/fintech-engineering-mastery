@@ -1,0 +1,414 @@
+{
+  "id": "track-07",
+  "sequence": 7,
+  "title": "هندسة الأداء ومكونات JVM الداخلية",
+  "shortTitle": "هندسة الأداء",
+  "slug": "performance",
+  "color": "#84cc16",
+  "colorMuted": "rgba(132, 204, 22, 0.15)",
+  "description": "مكونات JVM الداخلية، وتحليل جمع المهملات (GC)، وقياس الأداء بـ JMH، وتحليل الذاكرة، وتحسين استعلامات قواعد البيانات، وضبط الخدمات المالية عالية الإنتاجية.",
+  "difficulty": "advanced",
+  "estimatedHours": 33,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-07-lesson-01",
+      "sequence": 1,
+      "title": "مكونات JVM الداخلية — نموذج الذاكرة وتحميل الأصناف وJIT",
+      "slug": "jvm-internals",
+      "path": "content/tracks/track-07-performance/lesson-01-jvm-internals/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "JVM",
+        "memory-model",
+        "class-loading",
+        "JIT",
+        "bytecode"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-07-lesson-02",
+      "sequence": 2,
+      "title": "تحليل جمع المهملات — قراءة سجلات GC",
+      "slug": "gc-analysis",
+      "path": "content/tracks/track-07-performance/lesson-02-gc-analysis/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "GC",
+        "G1GC",
+        "ZGC",
+        "GC-log",
+        "pause-time"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-03",
+      "sequence": 3,
+      "title": "ضبط GC — G1GC وZGC للخدمات المالية منخفضة الكمون",
+      "slug": "gc-tuning",
+      "path": "content/tracks/track-07-performance/lesson-03-gc-tuning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "GC-tuning",
+        "G1GC",
+        "ZGC",
+        "heap-sizing",
+        "latency"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-07-lesson-04",
+      "sequence": 4,
+      "title": "قياس الأداء بـ JMH — القياس بالطريقة الصحيحة",
+      "slug": "jmh-benchmarking",
+      "path": "content/tracks/track-07-performance/lesson-04-jmh-benchmarking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "JMH",
+        "benchmarking",
+        "warm-up",
+        "throughput",
+        "latency"
+      ],
+      "tier": "supporting"
+    },
+    {
+      "id": "track-07-lesson-05",
+      "sequence": 5,
+      "title": "تحليل استهلاك المعالج — إيجاد الدوال الساخنة بـ async-profiler",
+      "slug": "cpu-profiling",
+      "path": "content/tracks/track-07-performance/lesson-05-cpu-profiling/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "CPU-profiling",
+        "async-profiler",
+        "flame-graph",
+        "JFR",
+        "hot-method"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-07-lesson-06",
+      "sequence": 6,
+      "title": "تحليل الذاكرة — فحص الكومة واكتشاف التسرّب",
+      "slug": "memory-profiling",
+      "path": "content/tracks/track-07-performance/lesson-06-memory-profiling/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "memory-profiling",
+        "heap-dump",
+        "MAT",
+        "object-retention",
+        "memory-leak"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-07",
+      "sequence": 7,
+      "title": "ضبط JDBC — مجمّعات الاتصالات والعمليات الدفعية",
+      "slug": "jdbc-tuning",
+      "path": "content/tracks/track-07-performance/lesson-07-jdbc-tuning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "JDBC",
+        "HikariCP",
+        "batch-insert",
+        "prepared-statement",
+        "connection-pool"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-07-lesson-08",
+      "sequence": 8,
+      "title": "تحسين الاستعلامات — EXPLAIN ANALYZE واستخدام الفهارس",
+      "slug": "query-optimization",
+      "path": "content/tracks/track-07-performance/lesson-08-query-optimization/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "query-optimization",
+        "EXPLAIN",
+        "index",
+        "sequential-scan",
+        "PostgreSQL"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-07-lesson-09",
+      "sequence": 9,
+      "title": "تصميم الفهارس — B-Tree وHash والفهارس الجزئية",
+      "slug": "index-design",
+      "path": "content/tracks/track-07-performance/lesson-09-index-design/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "index",
+        "B-tree",
+        "hash-index",
+        "partial-index",
+        "covering-index"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-10",
+      "sequence": 10,
+      "title": "التخزين المؤقت في التطبيق — الاستراتيجيات والإبطال وTTL",
+      "slug": "application-caching",
+      "path": "content/tracks/track-07-performance/lesson-10-application-caching/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "caching",
+        "Cache-Aside",
+        "Write-Through",
+        "TTL",
+        "invalidation"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-11",
+      "sequence": 11,
+      "title": "أداء Redis — Pipelining والسكربتات وهياكل البيانات",
+      "slug": "redis-performance",
+      "path": "content/tracks/track-07-performance/lesson-11-redis-performance/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "Redis",
+        "pipelining",
+        "Lua",
+        "data-structures",
+        "latency"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-12",
+      "sequence": 12,
+      "title": "ضبط منتِج Kafka — التجميع والضغط والإنتاجية",
+      "slug": "kafka-tuning",
+      "path": "content/tracks/track-07-performance/lesson-12-kafka-tuning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "producer-tuning",
+        "batching",
+        "compression",
+        "throughput"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-13",
+      "sequence": 13,
+      "title": "أداء HTTP/2 وgRPC — تعدد الإرسال على الاتصال",
+      "slug": "http2-grpc-performance",
+      "path": "content/tracks/track-07-performance/lesson-13-http2-grpc/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "HTTP2",
+        "gRPC",
+        "multiplexing",
+        "stream",
+        "header-compression"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-14",
+      "sequence": 14,
+      "title": "تحديد حجم مجمّعات الخيوط — قانون Little والتزامن الأمثل",
+      "slug": "thread-pool-sizing",
+      "path": "content/tracks/track-07-performance/lesson-14-thread-pool-sizing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "thread-pool",
+        "Little's-law",
+        "queuing-theory",
+        "executor",
+        "sizing"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-07-lesson-15",
+      "sequence": 15,
+      "title": "أداء الخيوط الافتراضية — قياس Java 21",
+      "slug": "virtual-threads-performance",
+      "path": "content/tracks/track-07-performance/lesson-15-virtual-threads-performance/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "virtual-threads",
+        "java-21",
+        "benchmarking",
+        "pinning",
+        "carrier-thread"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-07-lesson-16",
+      "sequence": 16,
+      "title": "اختبار الحمل بـ Gatling — سيناريوهات مالية واقعية",
+      "slug": "gatling-load-testing",
+      "path": "content/tracks/track-07-performance/lesson-16-gatling-load-testing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Gatling",
+        "load-testing",
+        "simulation",
+        "percentiles",
+        "throughput"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-17",
+      "sequence": 17,
+      "title": "مخططات اللهب (Flame Graphs) — تصوير نقاط الضغط في المعالج والذاكرة",
+      "slug": "flame-graphs",
+      "path": "content/tracks/track-07-performance/lesson-17-flame-graphs/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "flame-graph",
+        "async-profiler",
+        "CPU",
+        "allocation",
+        "visualisation"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-18",
+      "sequence": 18,
+      "title": "تخطيط الذاكرة — حشو الكائنات وخطوط الذاكرة والمشاركة الزائفة",
+      "slug": "memory-layout",
+      "path": "content/tracks/track-07-performance/lesson-18-memory-layout/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "memory-layout",
+        "cache-line",
+        "false-sharing",
+        "padding",
+        "jol"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-19",
+      "sequence": 19,
+      "title": "تقسيم قواعد البيانات — استراتيجيات النطاق والتجزئة والقائمة",
+      "slug": "db-partitioning-performance",
+      "path": "content/tracks/track-07-performance/lesson-19-db-partitioning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "partitioning",
+        "range-partition",
+        "hash-partition",
+        "pruning",
+        "PostgreSQL"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-20",
+      "sequence": 20,
+      "title": "التفاعلي أم الحاجب — مقارنة ملامح الأداء",
+      "slug": "reactive-vs-blocking-perf",
+      "path": "content/tracks/track-07-performance/lesson-20-reactive-vs-blocking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "reactive",
+        "blocking",
+        "throughput",
+        "latency",
+        "JMH"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-21",
+      "sequence": 21,
+      "title": "ضبط إدخال/إخراج الشبكة — TCP وKeepalive وأحجام المخازن",
+      "slug": "network-io-tuning",
+      "path": "content/tracks/track-07-performance/lesson-21-network-io-tuning/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "TCP",
+        "keepalive",
+        "buffer-size",
+        "Nagle",
+        "socket-timeout"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-07-lesson-22",
+      "sequence": 22,
+      "title": "إطار المهندس الرئيسي لقرارات الأداء",
+      "slug": "performance-decision-framework",
+      "path": "content/tracks/track-07-performance/lesson-22-performance-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "performance",
+        "trade-offs",
+        "staff-engineer",
+        "bottleneck"
+      ],
+      "tier": "optional"
+    }
+  ],
+  "mainPathMinutes": 655,
+  "optionalLessonCount": 14
+}

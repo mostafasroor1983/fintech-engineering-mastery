@@ -34,16 +34,35 @@ For payment services:
 - Thread deadlock / JVM crash → **Liveness failure** (kill and restart)
 - Application still initializing → **Startup** (Kubernetes waits before checking other probes)
 
+> [!WARNING]
+> Be careful with **shared** dependencies in readiness. If the database (or a third-party gateway) is down, *every* pod fails readiness at the same moment, Kubernetes removes them all from the Service, and clients get connection errors instead of a clear `503` or a degraded answer (for example "payment queued as PENDING"). Put a dependency in readiness only when a pod truly cannot serve anything without it; report the others in a separate health group for dashboards and alerts.
+
 ## 2. Spring Boot Actuator Health Configuration
 
 ```yaml
 management:
   endpoint:
     health:
-      show-details: always
-      show-components: always
+      show-details: when-authorized     # never "always" on a payment service
       probes:
         enabled: true      # Enables /actuator/health/liveness and /actuator/health/readiness
+      # Custom DEGRADED status: where it ranks, and that it still returns HTTP 200
+      status:
+        order: DOWN, OUT_OF_SERVICE, DEGRADED, UP, UNKNOWN
+        http-mapping:
+          DEGRADED: 200
+      # Health GROUPS live under management.endpoint.health.group
+      group:
+        liveness:
+          include: livenessState
+          # Only the liveness state — not DB, not Kafka
+          # DB being down should NOT restart the pod
+        readiness:
+          include: readinessState,paymentsDb
+          # Only what a pod truly cannot serve without
+        dependencies:
+          include: paymentsDb,kafka,redisRoundTrip,paymentGateway,circuitBreakerSummary
+          # Everything else: visible to ops, does not change routing
   endpoints:
     web:
       exposure:
@@ -53,17 +72,6 @@ management:
       enabled: true
     readinessstate:
       enabled: true
-    # Group configuration
-    group:
-      liveness:
-        include: livenessState
-        # Only the liveness indicator — not DB, not Kafka
-        # DB being down should NOT restart the pod
-      readiness:
-        include: readinessState,db,kafka,redis,paymentGateway
-        # All dependencies must be reachable before accepting traffic
-      startup:
-        include: db,kafka
 ```
 
 ```java
@@ -71,31 +79,30 @@ management:
 public class PaymentServiceApplication {
 
     public static void main(String[] args) {
-        SpringApplication app = new SpringApplication(PaymentServiceApplication.class);
-        app.run(args);
+        SpringApplication.run(PaymentServiceApplication.class, args);
     }
+}
 
-    /**
-     * Mark application as ACCEPTING_TRAFFIC only after all initialization is complete.
-     * This prevents Kubernetes from sending traffic before the app is truly ready.
-     */
+/**
+ * Spring Boot manages readiness itself: it reports ACCEPTING_TRAFFIC once the
+ * application is ready, and switches to REFUSING_TRAFFIC as soon as graceful
+ * shutdown starts. Publish the state yourself only for EXTRA conditions —
+ * here, a reference-data cache that must be loaded before taking traffic.
+ */
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class ReferenceDataWarmup {
+
+    private final ApplicationEventPublisher publisher;
+    private final ReferenceDataCache cache;
+
     @EventListener(ApplicationReadyEvent.class)
-    public void onApplicationReady(ApplicationReadyEvent event,
-                                    AvailabilityChangeEvent.Publisher publisher) {
-        publisher.publishEvent(ReadinessState.ACCEPTING_TRAFFIC);
+    public void warmUp() {
+        AvailabilityChangeEvent.publish(publisher, this, ReadinessState.REFUSING_TRAFFIC);
+        cache.loadAll();   // e.g. currency rules, BIC directory
+        AvailabilityChangeEvent.publish(publisher, this, ReadinessState.ACCEPTING_TRAFFIC);
         log.info("Payment service is ready to accept traffic");
-    }
-
-    /**
-     * During graceful shutdown, mark REFUSING_TRAFFIC first.
-     * This removes the pod from the load balancer before the JVM shuts down.
-     * Kubernetes sends SIGTERM → readiness → REFUSING_TRAFFIC → 30s drain → SIGKILL
-     */
-    @EventListener(ContextClosedEvent.class)
-    public void onContextClosed(ContextClosedEvent event,
-                                 AvailabilityChangeEvent.Publisher publisher) {
-        publisher.publishEvent(ReadinessState.REFUSING_TRAFFIC);
-        log.info("Payment service refusing traffic — shutting down gracefully");
     }
 }
 ```
@@ -108,8 +115,10 @@ public class PaymentServiceApplication {
  * Uses a lightweight query to verify connectivity.
  * Result affects READINESS (not liveness) — DB being down
  * should remove pod from load balancer, not restart it.
+ * Bean name "paymentsDb": the names "db" and "redis" are already used by
+ * Spring Boot's built-in indicators — reusing them causes a name clash.
  */
-@Component("db")
+@Component("paymentsDb")
 @RequiredArgsConstructor
 public class DatabaseHealthIndicator implements HealthIndicator {
 
@@ -150,7 +159,8 @@ public class DatabaseHealthIndicator implements HealthIndicator {
 @RequiredArgsConstructor
 public class KafkaHealthIndicator implements HealthIndicator {
 
-    private final KafkaAdmin kafkaAdmin;
+    // One AdminClient, created once (e.g. from KafkaAdmin's configuration)
+    private final AdminClient adminClient;
     private final KafkaConsumerLagMonitor lagMonitor;
 
     private static final long MAX_ACCEPTABLE_LAG = 1000;
@@ -166,6 +176,8 @@ public class KafkaHealthIndicator implements HealthIndicator {
             boolean lagExcessive = consumerLags.values().stream()
                 .anyMatch(lag -> lag > MAX_ACCEPTABLE_LAG);
 
+            // Consumer lag says nothing about serving HTTP: report it in the
+            // dependencies group, never use it to pull a pod out of rotation
             if (lagExcessive) {
                 return Health.status("DEGRADED")
                     .withDetails(brokerDetails)
@@ -188,12 +200,12 @@ public class KafkaHealthIndicator implements HealthIndicator {
     }
 
     private Map<String, Object> verifyBrokerConnectivity() {
-        DescribeClusterResult cluster = kafkaAdmin.describeCluster();
+        DescribeClusterResult cluster = adminClient.describeCluster();
         try {
             Collection<Node> nodes = cluster.nodes().get(2, TimeUnit.SECONDS);
             return Map.of(
                 "brokers", nodes.size(),
-                "controller", cluster.controller().get().idString()
+                "controller", cluster.controller().get(2, TimeUnit.SECONDS).idString()
             );
         } catch (Exception e) {
             throw new RuntimeException("Kafka connectivity check failed", e);
@@ -205,12 +217,15 @@ public class KafkaHealthIndicator implements HealthIndicator {
  * Redis health indicator.
  * Tests read and write to verify Redis is functional.
  */
-@Component("redis")
+@Component("redisRoundTrip")
 @RequiredArgsConstructor
 public class RedisHealthIndicator implements HealthIndicator {
 
-    private final RedisTemplate<String, String> redisTemplate;
-    private static final String HEALTH_CHECK_KEY = "health:check:token";
+    private final StringRedisTemplate redisTemplate;
+    // One key PER POD: with a shared key, another pod's write could land
+    // between our set and get and look like a mismatch
+    private static final String HEALTH_CHECK_KEY =
+        "health:check:" + System.getenv().getOrDefault("HOSTNAME", "local");
 
     @Override
     public Health health() {
@@ -226,9 +241,11 @@ public class RedisHealthIndicator implements HealthIndicator {
                     .build();
             }
 
+            // execute() borrows AND releases the connection.
+            // (getConnectionFactory().getConnection().ping() leaks a connection.)
+            String pong = redisTemplate.execute((RedisCallback<String>) RedisConnection::ping);
             return Health.up()
-                .withDetail("pingResponse", redisTemplate.getConnectionFactory()
-                    .getConnection().ping())
+                .withDetail("pingResponse", pong)
                 .build();
 
         } catch (Exception e) {
@@ -242,6 +259,8 @@ public class RedisHealthIndicator implements HealthIndicator {
 /**
  * External payment gateway health indicator.
  * Tests the gateway's health endpoint with a strict timeout.
+ * Informational ("dependencies" group) — a third-party outage must not take
+ * every pod out of the load balancer.
  */
 @Component("paymentGateway")
 @RequiredArgsConstructor
@@ -293,55 +312,39 @@ public class PaymentGatewayHealthIndicator implements HealthIndicator {
  *   - Should NOT include database, Kafka, or external APIs
  *   - Response time: < 100ms
  *
- * DEEP (for readiness):
+ * DEEP (for readiness — only what this pod cannot serve without):
  *   - Can we reach the database?
- *   - Can we reach Kafka?
- *   - Can we reach the payment gateway?
- *   - Is our internal state consistent?
+ *   - Is our internal state consistent (caches loaded)?
  *   - Response time: < 2s (or health check timeouts fail)
+ *
+ * DEPENDENCIES (informational group):
+ *   - Kafka, Redis, the payment gateway, circuit breaker states
+ *   - Visible to ops and alerting; does not change routing
  *
  * Example: During a Kafka broker restart:
  *   - Shallow (liveness): UP — JVM is fine
- *   - Deep (readiness): DOWN — Kafka temporarily unreachable
- *   → Pod is removed from load balancer (no traffic)
- *   → Pod is NOT killed (no restart needed)
- *   → When Kafka recovers, readiness returns UP, pod gets traffic back
+ *   - Dependencies group: DEGRADED/DOWN — Kafka temporarily unreachable
+ *   - Readiness: UP — the pod can still accept payments (events wait in the
+ *     outbox until Kafka is back)
+ *   → Pod is NOT killed and keeps serving
  */
 
-@Configuration
-public class HealthGroupConfig {
-
-    /**
-     * Custom health group for infrastructure checks.
-     * Useful for ops tools that need to check specific components.
-     */
-    @Bean
-    public HealthEndpointGroups healthEndpointGroups() {
-        return HealthEndpointGroups.of(
-            new DefaultHealthEndpointGroup(
-                Set.of("livenessState"),
-                StatusAggregator.getDefault(),
-                HttpCodeStatusMapper.DEFAULT,
-                null
-            )
-        );
-    }
-}
-
-// application.yml groups
+// No Java bean is needed for groups: they are pure configuration.
+// application.yml
 /*
 management:
-  health:
-    group:
-      liveness:
-        include: livenessState
-        show-details: never         # Minimal response — Kubernetes reads this
-      readiness:
-        include: readinessState,db,kafka,redis
-        show-details: when-authorized
-      infrastructure:
-        include: db,kafka,redis,paymentGateway
-        show-details: always        # Ops visibility endpoint
+  endpoint:
+    health:
+      group:
+        liveness:
+          include: livenessState
+          show-details: never         # Minimal response — Kubernetes reads this
+        readiness:
+          include: readinessState,paymentsDb
+          show-details: when-authorized
+        dependencies:
+          include: paymentsDb,kafka,redisRoundTrip,paymentGateway,circuitBreakerSummary
+          show-details: when-authorized   # Ops visibility endpoint
 */
 ```
 
@@ -362,9 +365,11 @@ spec:
 
           # Startup probe: allow up to 5 minutes for JVM warmup
           # (initialDelaySeconds + periodSeconds * failureThreshold = max startup time)
+          # Uses the LIVENESS endpoint (Spring Boot has no "startup" group):
+          # a database outage at boot must not turn into a restart loop
           startupProbe:
             httpGet:
-              path: /actuator/health/startup
+              path: /actuator/health/liveness
               port: 8080
             initialDelaySeconds: 10    # Wait 10s before first check
             periodSeconds: 10          # Check every 10s
@@ -395,12 +400,15 @@ spec:
             successThreshold: 2        # Require 2 successes before returning to service
             timeoutSeconds: 5
 
-          # Graceful shutdown: wait for in-flight requests to complete
+          # Graceful shutdown: keep serving while the pod is removed from
+          # Service endpoints, then drain in-flight requests
           lifecycle:
             preStop:
               exec:
-                command: ["/bin/sh", "-c", "sleep 15"]  # Allow readiness to propagate
-          terminationGracePeriodSeconds: 60
+                command: ["/bin/sh", "-c", "sleep 15"]  # endpoint removal propagates
+      # A POD-level field (spec.template.spec), not a container field:
+      # must cover preStop (15s) + Spring's shutdown phase (30s) + margin
+      terminationGracePeriodSeconds: 60
 ```
 
 ## 6. Health Check Integration with Circuit Breakers
@@ -409,9 +417,11 @@ spec:
 /**
  * Expose circuit breaker states in health checks.
  * When a circuit breaker is OPEN, the service is degraded.
- * This surfaces to ops teams via the health endpoint.
+ * This surfaces to ops teams via the health endpoint — in the "dependencies"
+ * group, never in readiness (see lesson 2). Bean name "circuitBreakerSummary":
+ * Resilience4j already registers an indicator named "circuitBreakers".
  */
-@Component("circuitBreakers")
+@Component("circuitBreakerSummary")
 @RequiredArgsConstructor
 public class CircuitBreakerHealthIndicator implements HealthIndicator {
 
@@ -479,7 +489,12 @@ public class TimeoutEnforcingHealthIndicator implements HealthIndicator {
                     return Health.down().withException(e).build();
                 }
             });
-            return future.get(500, TimeUnit.MILLISECONDS);
+            try {
+                return future.get(500, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException e) {
+                future.cancel(true);   // don't leave the probe task running
+                throw e;
+            }
         } catch (TimeoutException e) {
             log.warn("Health check timed out for slowClient");
             return Health.down()
@@ -549,9 +564,11 @@ spring:
 groups:
   - name: payment-health
     rules:
+      # Pod readiness as Kubernetes sees it (kube-state-metrics);
+      # Spring Boot does not export a readiness metric by default
       - alert: PaymentServiceReadinessDown
         expr: |
-          spring_boot_readiness_state{state="REFUSING_TRAFFIC"} > 0
+          kube_pod_status_ready{condition="false", pod=~"payment-service-.*"} == 1
         for: 2m
         labels:
           severity: warning
@@ -559,9 +576,11 @@ groups:
           summary: "Payment service pod is refusing traffic"
           description: "Pod {{ $labels.pod }} is refusing traffic for 2+ minutes"
 
+      # health_check_status is a CUSTOM gauge (1 = UP, 0 = DOWN) that you
+      # publish from your health indicators — it is not built in
       - alert: DatabaseHealthCheckFailing
         expr: |
-          health_check_status{name="db"} == 0
+          health_check_status{name="paymentsDb"} == 0
         for: 1m
         labels:
           severity: critical
@@ -569,7 +588,8 @@ groups:
           summary: "Payment service cannot reach database"
           runbook: "https://wiki.example.com/runbooks/db-health"
 
-      - alert: AllPaymentPodsUnhealthy
+      - alert: AllPaymentPodsUnreachable
+        # "up" = Prometheus could scrape the target (not the health status)
         expr: |
           sum(up{job="payment-service"}) == 0
         for: 30s
@@ -577,7 +597,7 @@ groups:
           severity: critical
           page: "true"
         annotations:
-          summary: "ALL payment service pods are unhealthy — service is down"
+          summary: "No payment service pod can be scraped — service is likely down"
 ```
 
 ---
@@ -587,21 +607,36 @@ groups:
   "questions": [
     {
       "text": "A payment service pod's database becomes temporarily unavailable. Which Kubernetes probe should fail and what action will Kubernetes take?",
-      "options": ["Liveness probe fails — Kubernetes kills and restarts the pod", "Readiness probe fails — Kubernetes removes the pod from the load balancer without restarting it", "Startup probe fails — Kubernetes prevents pod from starting", "Both liveness and readiness fail — Kubernetes kills the pod"],
+      "options": [
+        "Liveness probe fails — Kubernetes kills and restarts the pod",
+        "Readiness probe fails — Kubernetes removes the pod from the load balancer without restarting it",
+        "Startup probe fails — Kubernetes prevents pod from starting",
+        "Both liveness and readiness fail — Kubernetes kills the pod"
+      ],
       "correct": 1,
-      "explanation": "Database unavailability means the pod cannot serve traffic but is otherwise healthy. The readiness probe should include database connectivity; it fails and Kubernetes removes the pod from the Service (stops routing traffic), but does NOT restart it. The pod recovers automatically when the database comes back."
+      "explanation": "Database unavailability means the pod cannot serve traffic but is otherwise healthy. If the database is in the readiness probe, it fails and Kubernetes removes the pod from the Service (stops routing traffic), but does NOT restart it; the pod recovers automatically when the database comes back. One caution: a shared dependency fails readiness on ALL pods at once, so include it only if a pod genuinely cannot serve anything without it."
     },
     {
       "text": "Why should external dependencies (database, Kafka) NOT be included in a liveness probe?",
-      "options": ["They are too slow to query", "Including them causes unnecessary pod restarts when dependencies are temporarily unavailable", "Kubernetes cannot connect to external services", "Liveness probes only support TCP socket checks"],
+      "options": [
+        "They are too slow to query",
+        "Including them causes unnecessary pod restarts when dependencies are temporarily unavailable",
+        "Kubernetes cannot connect to external services",
+        "Liveness probes only support TCP socket checks"
+      ],
       "correct": 1,
       "explanation": "If database or Kafka connectivity is in the liveness probe, every temporary dependency outage triggers a pod restart — which doesn't fix the problem and causes unnecessary disruption. These checks belong in readiness probes, which gracefully remove the pod from load balancing without restarting it."
     },
     {
       "text": "What is the purpose of the preStop lifecycle hook with a sleep in a Kubernetes pod spec?",
-      "options": ["To run database migrations before shutdown", "To allow the readiness probe failure to propagate to the load balancer before the pod stops receiving traffic", "To back up in-memory state to disk", "To flush Kafka producer batches"],
+      "options": [
+        "To run database migrations before shutdown",
+        "To allow the readiness probe failure to propagate to the load balancer before the pod stops receiving traffic",
+        "To back up in-memory state to disk",
+        "To flush Kafka producer batches"
+      ],
       "correct": 1,
-      "explanation": "When Kubernetes sends SIGTERM, it simultaneously removes the pod from the Service endpoints AND triggers preStop. The sleep gives time for the endpoint removal to propagate through kube-proxy to all load balancers before the application begins shutting down, preventing 'connection refused' errors on in-flight requests."
+      "explanation": "When a pod is deleted, Kubernetes marks it Terminating, starts removing it from the Service endpoints, and runs the preStop hook; only after preStop finishes does the container receive SIGTERM. The sleep keeps the application serving while the endpoint removal propagates through kube-proxy and the load balancers, so no new request is sent to a pod that is already shutting down — preventing 'connection refused' errors."
     }
   ]
 }
@@ -613,10 +648,22 @@ groups:
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Implement four HealthIndicators for: database (schema accessibility query), Kafka (broker connectivity + consumer lag threshold of 1000), Redis (write-read round-trip test), and payment gateway (HTTP ping with 3s timeout). Configure each for readiness only, not liveness."},
-    {"id": "2", "description": "Configure Spring Boot Actuator health groups: liveness (livenessState only), readiness (readinessState + all four indicators), infrastructure (all indicators with full details). Write Kubernetes probe YAML with startup (5 min budget), liveness (30s period, 3 failures), and readiness (10s period, 2 successes to restore) probes."},
-    {"id": "3", "description": "Build a CircuitBreakerHealthIndicator that returns DEGRADED (not DOWN) when any circuit breaker is OPEN, listing all circuit breaker names and states. Ensure this contributes to readiness but does NOT contribute to liveness."},
-    {"id": "4", "description": "Implement graceful shutdown: on ContextClosedEvent, stop Kafka consumers first, then set readiness to REFUSING_TRAFFIC. Configure server.shutdown=graceful with 30s timeout-per-shutdown-phase and a preStop sleep of 15s in the pod spec."}
+    {
+      "id": "1",
+      "description": "Implement four HealthIndicators for: database (schema accessibility query), Kafka (broker connectivity + consumer lag threshold of 1000), Redis (write-read round-trip test with a per-pod key), and payment gateway (HTTP ping with 3s timeout). Use bean names that do not clash with Spring Boot's built-in indicators. Put only the database in readiness; the others go into a 'dependencies' group — none of them in liveness."
+    },
+    {
+      "id": "2",
+      "description": "Configure Spring Boot Actuator health groups under management.endpoint.health.group: liveness (livenessState only), readiness (readinessState + database), dependencies (all indicators with details for authorised users). Write Kubernetes probe YAML with startup (5 min budget, on the liveness endpoint), liveness (30s period, 3 failures), and readiness (10s period, 2 successes to restore) probes, with terminationGracePeriodSeconds at pod level."
+    },
+    {
+      "id": "3",
+      "description": "Build a CircuitBreakerHealthIndicator that returns DEGRADED (not DOWN) when any circuit breaker is OPEN, listing all circuit breaker names and states. Configure the DEGRADED status order and its HTTP 200 mapping, and put the indicator in the dependencies group — explain why it must contribute to neither readiness nor liveness."
+    },
+    {
+      "id": "4",
+      "description": "Implement graceful shutdown: on ContextClosedEvent, stop Kafka consumers first, then set readiness to REFUSING_TRAFFIC. Configure server.shutdown=graceful with 30s timeout-per-shutdown-phase and a preStop sleep of 15s in the pod spec."
+    }
   ]
 }
 -->

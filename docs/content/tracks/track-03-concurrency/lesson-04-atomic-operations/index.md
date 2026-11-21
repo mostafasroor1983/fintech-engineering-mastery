@@ -87,7 +87,7 @@ Under 400 threads at 20,000 transactions/second, 90% of CPU time is spent in loc
 
 ## Compare-And-Swap (CAS)
 
-**Compare-And-Swap** is a CPU instruction (`CMPXCHG` on x86) that atomically:
+**Compare-And-Swap** is a CPU instruction (`LOCK CMPXCHG` on x86; `CAS` or a load-exclusive/store-exclusive pair on ARM) that atomically:
 
 1. Reads the current value of a memory location
 2. Compares it to an **expected** value
@@ -257,9 +257,9 @@ public class AtomicBalance {
     private final AtomicLong balancePence = new AtomicLong(0);
 
     public boolean debit(long amountPence) {
-        // updateAndGet atomically applies the function in a CAS loop internally
-        // However: this doesn't allow returning false on insufficient funds
-        // For conditional updates, the explicit CAS loop is still required
+        // getAndUpdate runs the function in a CAS loop internally and returns
+        // the PREVIOUS value — enough to tell whether the debit was applied
+        // (the function may run several times, so it must have no side effects)
         long previous = balancePence.getAndUpdate(current -> {
             if (current < amountPence) return current; // No change — insufficient funds
             return current - amountPence;
@@ -274,7 +274,7 @@ public class AtomicBalance {
 ```
 
 > [!WARNING]
-> **CAS loops can spin indefinitely under extreme contention.** If 400 threads are all competing to CAS the same `AtomicLong`, many will fail and retry continuously — this is called a **CAS storm**. Under high contention, `LongAdder` outperforms `AtomicLong` significantly by reducing contention across multiple cells.
+> **CAS loops can retry many times under extreme contention.** Lock-free code guarantees that *some* thread always makes progress, but an individual thread may keep losing. If 400 threads are all competing to CAS the same `AtomicLong`, many will fail and retry continuously — a **CAS storm**. For pure counters, `LongAdder` outperforms `AtomicLong` significantly by spreading updates across multiple cells. (A conditional debit cannot use `LongAdder`; there, reduce contention by sharding the state or serialising per account.)
 
 ## LongAdder — High-Contention Counters
 
@@ -425,7 +425,8 @@ public class HighPerformanceCounter {
         }
     }
 
-    // Plain field — VarHandle provides the atomic access
+    // volatile field: plain reads of it are volatile reads;
+    // the VarHandle adds atomic operations such as getAndAdd and CAS
     private volatile long count;
 
     public long incrementAndGet() {
@@ -444,6 +445,8 @@ public class HighPerformanceCounter {
 ## Practical Patterns in Financial Systems
 
 ### Idempotency Token via AtomicReference
+
+This pattern works inside **one JVM** only. Across several service instances, the claim must live in shared storage — a database row with a unique key (Track 02, lesson 14). The in-memory map also needs eviction, or it grows forever.
 
 ```java17
 // Ensure a payment is processed exactly once using CAS
@@ -466,12 +469,16 @@ public class IdempotentPaymentGateway {
                 ref.set(result); // Publish final result
                 return result;
             } catch (Exception e) {
-                ref.set(PaymentResult.failed(e)); // Publish failure
+                // Publishes the failure to waiting callers. Note: the failure is
+                // now cached for this key — a transient error should rather
+                // remove the entry so that a retry can try again
+                ref.set(PaymentResult.failed(e));
                 throw e;
             }
         }
 
         // Another thread is processing or has processed — wait for result
+        // (spinning burns CPU if processing takes long: see the Java 21 version)
         PaymentResult result;
         while ((result = ref.get()) == PaymentResult.PENDING) {
             Thread.onSpinWait(); // Hint to CPU — brief spin before retry
@@ -488,8 +495,8 @@ public class IdempotentPaymentGateway {
 
 ```java21
 // Java 21 — Thread.onSpinWait() hint is available in both 17 and 21
-// For long-waiting scenarios, replace onSpinWait with LockSupport.parkNanos()
-// or a CompletableFuture to avoid spinning virtual threads
+// For long waits, park instead of spinning. Cleaner still: store a
+// CompletableFuture<PaymentResult> per key and let waiters call join()
 public class IdempotentPaymentGateway {
 
     private final ConcurrentHashMap<String, AtomicReference<PaymentResult>> processing
@@ -527,6 +534,9 @@ public class IdempotentPaymentGateway {
 ```java17
 // High-throughput transaction sequence number generator
 // Used to generate unique, monotonically increasing transaction IDs
+// WARNING: an in-memory counter restarts at 0 when the JVM restarts —
+// seed it from durable storage (or a database sequence) on start-up, or
+// IDs will repeat
 public class TransactionSequencer {
 
     private final AtomicLong sequence = new AtomicLong(0);
@@ -597,7 +607,7 @@ public class TransactionSequencer {
       "Acquire a ReentrantLock and retry the debit under the lock"
     ],
     "correct": 2,
-    "explanation": "CAS returning false means another thread changed the balance between our read and CAS attempt. The correct response is to re-read the current value and retry — this is the fundamental CAS loop pattern. The retry loop is usually very short in practice because the failing thread backs off and tries again with fresh data. Only switch to a lock if extremely high contention makes the CAS loop unacceptably slow."
+    "explanation": "CAS returning false means another thread changed the balance between our read and our CAS attempt. The correct response is to re-read the current value and retry — this is the fundamental CAS loop pattern. The retry is usually very short in practice, because the thread retries immediately with fresh data. Only switch to a lock (or reduce contention another way) if extremely high contention makes the CAS loop unacceptably slow."
   }
 ] -->
 
@@ -622,7 +632,7 @@ public class TransactionSequencer {
     },
     {
       "id": "pc-ao-04",
-      "description": "Implement a `PaymentIdGenerator` that generates sequential IDs using `AtomicLong`. IDs must be strictly monotonically increasing across all threads. Add a test that generates 1,000,000 IDs from 100 threads and verifies no duplicates and no gaps."
+      "description": "Implement a `PaymentIdGenerator` that generates sequential IDs using `AtomicLong`. IDs must be strictly monotonically increasing across all threads and must not repeat after a restart (seed the counter from durable storage). Add a test that generates 1,000,000 IDs from 100 threads and verifies no duplicates and no gaps."
     },
     {
       "id": "pc-ao-05",

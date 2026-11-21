@@ -50,7 +50,7 @@ Communicating architecture to a diverse audience — from a product manager aski
 
 ## Business Context
 
-Apex Clearing, a broker-dealer processing 2.3 million trades per day, failed a FINRA technology review in Q2 2025 because the firm could not produce accurate diagrams showing which systems transmitted order data to external venues. The engineering team had diagrams, but they were drawn in Lucidchart by a solutions architect who left 18 months earlier and had not been updated since three major system changes. Producing accurate diagrams for the regulator required two senior engineers working full-time for two weeks — a £95,000 engineering cost that could have been avoided. The root cause was not a lack of diagramming discipline but a lack of diagram-as-code practices that would have kept the diagrams updated as the codebase changed.
+Consider a broker-dealer processing 2.3 million trades per day (a composite example, not a specific firm) that fails a regulator's technology review because it cannot produce accurate diagrams showing which systems transmitted order data to external venues. The engineering team has diagrams, but they were drawn in Lucidchart by a solutions architect who left 18 months earlier and have not been updated since three major system changes. Producing accurate diagrams for the regulator takes two senior engineers working full-time for two weeks — an avoidable cost of tens of thousands of pounds. The root cause was not a lack of diagramming discipline but a lack of diagram-as-code practices that would have kept the diagrams updated as the codebase changed.
 
 ## The Four Levels of C4
 
@@ -76,10 +76,10 @@ C4 uses five element types with consistent visual conventions. When rendering in
 | **Software System** | An entire software system (yours or external) | Name + one-line description |
 | **Container** | A deployable unit within a Software System | Name + technology + one-line description |
 | **Component** | A logical grouping within a Container | Name + technology + responsibility |
-| **Relationship** | A dependency or communication link | Label describes *what* is communicated, not how |
+| **Relationship** | A dependency or communication link | Description says *what* is communicated; an optional technology label says how (e.g. "HTTPS/JSON") |
 
 > [!IMPORTANT]
-> Every relationship label must describe *what* flows across it, not the protocol. Write "Submits payment authorisation request" not "HTTPS POST". The technology label belongs on the element, not the relationship arrow.
+> Every relationship needs a description of *what* flows across it. Write "Submits payment authorisation request", not just "HTTPS POST". The protocol is optional and goes in the relationship's separate technology field (in Mermaid, the fourth argument of `Rel`), never instead of the description. Lower-level details such as ports and TLS settings belong in a deployment diagram.
 
 ## Level 1: System Context Diagram
 
@@ -99,12 +99,12 @@ C4Context
   System_Ext(kyc_provider, "KYC Provider", "Real-time identity verification for merchant onboarding")
   System_Ext(fraud_engine, "Fraud Intelligence Service", "Third-party ML-based transaction scoring")
 
-  Rel(merchant, mpp, "Submits payment requests", "HTTPS/REST")
-  Rel(ops, mpp, "Monitors and manages transactions", "HTTPS/Browser")
-  Rel(mpp, card_networks, "Routes authorisation and settlement", "ISO 8583 / HTTPS")
-  Rel(mpp, open_banking, "Initiates and confirms bank transfers", "HTTPS/REST")
-  Rel(mpp, kyc_provider, "Verifies merchant identity during onboarding", "HTTPS/REST")
-  Rel(mpp, fraud_engine, "Scores transaction risk in real time", "HTTPS/REST")
+  Rel(merchant, mpp, "Submits payment requests")
+  Rel(ops, mpp, "Monitors and manages transactions")
+  Rel(mpp, card_networks, "Routes authorisation and settlement")
+  Rel(mpp, open_banking, "Initiates and confirms bank transfers")
+  Rel(mpp, kyc_provider, "Verifies merchant identity during onboarding")
+  Rel(mpp, fraud_engine, "Scores transaction risk in real time")
 ```
 
 > [!NOTE]
@@ -291,7 +291,7 @@ public class ContainerDependencyTest {
 
 | Mistake | Why It Happens | Correct Practice |
 |---|---|---|
-| **Technology on relationship arrows** | Engineers default to "it uses REST" descriptions | Technology goes on elements; relationships describe *what* is communicated |
+| **Protocol instead of a description** | Engineers default to "it uses REST" labels | Every relationship says *what* is communicated; the protocol, if shown, goes in the separate technology field |
 | **Internal classes on a Context diagram** | Over-eager detail | Level 1 shows only persons, software systems, and their relationships |
 | **Missing external systems** | Teams focus on what they own | Every external system the platform communicates with must appear |
 | **One monolithic diagram** | Resistance to maintaining multiple diagrams | Use the zoom hierarchy; each level has a distinct audience |
@@ -301,15 +301,15 @@ public class ContainerDependencyTest {
 
 **Q:** A colleague draws a Level 2 Container diagram for the payment service and labels the relationship between the Payment Service and PostgreSQL as "JDBC over port 5432, SSL required." What is wrong with this label and how should it be corrected?
 
-**A:** The label describes the *transport mechanism* (JDBC, port 5432, SSL) rather than *what is communicated*. In C4, relationship labels describe the nature of the information or action flowing across the relationship, not the protocol. The correct label would be something like "Reads and writes payment records" or "Persists payment state and idempotency keys." The technology detail (JDBC, PostgreSQL 16) belongs on the Container element itself, not on the arrow. This distinction matters because the relationship label must remain meaningful if the transport technology changes — a future migration from JDBC to R2DBC should not require updating the relationship label.
+**A:** The label describes only the *transport mechanism* (JDBC, port 5432, SSL) and says nothing about *what is communicated*. In C4, every relationship needs a description of the information or action flowing across it, such as "Reads and writes payment records" or "Persists payment state and idempotency keys". The protocol can still appear, but in the relationship's separate technology field ("JDBC"); the database technology (PostgreSQL 16) goes on the Container element; and details like the port and TLS setting belong in a deployment diagram. This matters because the description must stay meaningful if the transport changes — a future migration from JDBC to R2DBC should change only the technology field.
 
 **Q:** Your team maintains C4 diagrams in Confluence. A FINRA examiner asks you to demonstrate that your architecture diagrams accurately reflected the production system topology as of 15 March 2026. How does storing diagrams in Confluence differ from storing them as DSL files in Git, and which approach makes this request easier to satisfy?
 
-**A:** Confluence stores diagrams as blobs in a proprietary database. While Confluence has page history, it does not provide a tamper-evident, externally auditable record of when a specific diagram version existed. Git, by contrast, provides a cryptographically chained commit history where every change to the DSL file is timestamped, attributed, and immutable (assuming a protected main branch). To satisfy the FINRA examiner's request with Git-stored diagrams, you would run `git log --before="2026-03-15" docs/architecture/workspace.dsl` to retrieve the exact DSL state on that date and render the diagrams from that commit — a process that takes minutes and produces evidence the examiner can verify independently. The same request against Confluence requires manual reconstruction, page archaeology, and the examiner must trust your word that the history is accurate.
+**A:** Confluence stores diagrams as blobs in a proprietary database. While Confluence has page history, it does not provide a tamper-evident, externally auditable record of when a specific diagram version existed. Git, by contrast, provides a hash-chained commit history where every change to the DSL file is timestamped and attributed; with a protected main branch, signed commits and server-side push logs, rewriting that history is detectable. To satisfy the FINRA examiner's request with Git-stored diagrams, you would find the last commit before that date with `git rev-list -1 --before="2026-03-15" main`, print the file as it was with `git show <sha>:docs/architecture/workspace.dsl`, and render the diagrams from that commit — a process that takes minutes and produces evidence the examiner can verify independently. The same request against Confluence requires manual reconstruction, page archaeology, and the examiner must trust your word that the history is accurate.
 
 ## Practical Challenge
 
-1. **Draw Level 1 and Level 2 diagrams.** Using Mermaid's `C4Context` and `C4Container` syntax, draw a System Context diagram and a Container diagram for a Lending-as-a-Service platform that includes: a Loan Origination Service (Spring Boot), a Credit Bureau Adapter (Spring Boot), a Document Storage Service (Spring Boot), a PostgreSQL database for loan records, an S3-compatible object store for documents, a Kafka cluster for integration events, and three external systems (Equifax credit bureau, DocuSign for e-signatures, and an internal core banking ledger). The diagrams must follow all C4 notation rules (technology on elements, communication label on relationships).
+1. **Draw Level 1 and Level 2 diagrams.** Using Mermaid's `C4Context` and `C4Container` syntax, draw a System Context diagram and a Container diagram for a Lending-as-a-Service platform that includes: a Loan Origination Service (Spring Boot), a Credit Bureau Adapter (Spring Boot), a Document Storage Service (Spring Boot), a PostgreSQL database for loan records, an S3-compatible object store for documents, a Kafka cluster for integration events, and three external systems (Equifax credit bureau, DocuSign for e-signatures, and an internal core banking ledger). The diagrams must follow all C4 notation rules (technology on elements, a description of what is communicated on every relationship).
 
 2. **Write a Structurizr DSL model.** Convert both Mermaid diagrams from task 1 into a single `workspace.dsl` file. The model section must define all elements and relationships exactly once. The views section must generate both a `systemContext` view and a `container` view. Add appropriate styles to distinguish databases, external systems, and internal services visually.
 
@@ -324,12 +324,12 @@ public class ContainerDependencyTest {
       "text": "A colleague draws a Level 2 Container diagram and labels the relationship between the Payment Service and PostgreSQL as 'JDBC over port 5432, SSL required.' What is wrong with this label?",
       "options": [
         "The label is too short and needs more technical detail about the SSL certificate chain.",
-        "The label describes the transport mechanism instead of what is communicated across the relationship.",
+        "The label describes only the transport mechanism and never says what is communicated across the relationship.",
         "Port numbers should never appear in C4 diagrams at any level.",
         "Level 2 diagrams should not show database containers at all."
       ],
       "correct": 1,
-      "explanation": "In C4, relationship labels must describe what flows across the relationship (e.g., 'Reads and writes payment records'), not the protocol or transport. Technology details like JDBC and port numbers belong on the Container element itself, not on the arrow."
+      "explanation": "In C4, every relationship must describe what flows across it (e.g., 'Reads and writes payment records'). The protocol may be shown in the relationship's separate technology field ('JDBC'), and port or TLS details belong in a deployment diagram — but the protocol never replaces the description."
     },
     {
       "text": "What does 'Container' mean in C4 model terminology?",
@@ -346,12 +346,12 @@ public class ContainerDependencyTest {
       "text": "A FINRA examiner asks you to demonstrate that your architecture diagrams accurately reflected the production system topology as of a specific past date. Why does storing diagrams as DSL files in Git make this significantly easier to satisfy than storing them in Confluence?",
       "options": [
         "Git compresses files more efficiently than Confluence, so the diagrams load faster.",
-        "Git provides a cryptographically chained, tamper-evident commit history that can prove exactly what a diagram contained on any past date.",
+        "Git provides a hash-chained commit history (tamper-evident with a protected branch and signed commits) that can show exactly what a diagram contained on any past date.",
         "Confluence does not support diagram file attachments, only embedded images.",
         "Git diagrams render automatically in browsers without any additional tooling."
       ],
       "correct": 1,
-      "explanation": "Git provides a cryptographically chained commit history where every change is timestamped and attributed. You can retrieve the exact DSL state on any past date with git log --before and render the diagrams from that commit — producing evidence the examiner can independently verify. Confluence page history lacks this tamper-evident, externally auditable property."
+      "explanation": "Git provides a hash-chained commit history where every change is timestamped and attributed; with a protected branch and signed commits, rewriting it is detectable. You can retrieve the exact DSL state on any past date (git rev-list -1 --before=<date>, then git show <sha>:<path>) and render the diagrams from that commit — producing evidence the examiner can independently verify. Confluence page history lacks this tamper-evident, externally auditable property."
     }
   ]
 }
@@ -363,7 +363,7 @@ public class ContainerDependencyTest {
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
-    {"id": "1", "description": "Using Mermaid C4Context and C4Container syntax, draw a Level 1 System Context diagram and a Level 2 Container diagram for a Lending-as-a-Service platform with a Loan Origination Service, Credit Bureau Adapter, Document Storage Service, PostgreSQL database, S3-compatible object store, Kafka cluster, and three external systems (Equifax, DocuSign, and an internal core banking ledger). All relationship labels must describe what is communicated, not the protocol."},
+    {"id": "1", "description": "Using Mermaid C4Context and C4Container syntax, draw a Level 1 System Context diagram and a Level 2 Container diagram for a Lending-as-a-Service platform with a Loan Origination Service, Credit Bureau Adapter, Document Storage Service, PostgreSQL database, S3-compatible object store, Kafka cluster, and three external systems (Equifax, DocuSign, and an internal core banking ledger). Every relationship must describe what is communicated; protocols go only in the technology field."},
     {"id": "2", "description": "Convert both Mermaid diagrams into a single Structurizr DSL workspace.dsl file. The model section must define all elements and relationships exactly once. The views section must generate both a systemContext view and a container view. Add styles to visually distinguish databases, external systems, and internal services."},
     {"id": "3", "description": "You are given a Level 2 Container diagram showing the Payment Service communicating directly with the Card Network. In the actual codebase, a new ISO 8583 Gateway container was added 6 months ago and all card network calls now route through it. Update both the Mermaid diagram and the Structurizr DSL to reflect the current topology, then write a MADR-format ADR for the introduction of the ISO 8583 Gateway."},
     {"id": "4", "description": "Write three ArchUnit @ArchTest rules for the Payment Service enforcing the dependency constraints visible in your Level 2 diagram: (a) the domain package has no dependency on the adapter package, (b) the Kafka adapter only imports from application port interfaces, and (c) no class in the controller package imports from the repository package. Run the tests against a sample package structure and verify they pass."}

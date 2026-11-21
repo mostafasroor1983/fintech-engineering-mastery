@@ -47,6 +47,8 @@ references:
   - "Bank for International Settlements — Statistics on Payment, Clearing and Settlement Systems"
 ---
 
+## Overview
+
 Payment processing sits at the intersection of the core banking system and the external payment schemes that move money between banks. Every card swipe, contactless tap, or online checkout triggers a precisely choreographed sequence of messages spanning merchants, acquirers, card schemes, and issuing banks — often completing the visible authorisation in under 300 milliseconds while the actual money movement takes days. Understanding where authorisation ends and settlement begins, and what happens in between, is the foundation of every payment integration you will ever build.
 
 ## Learning Objectives
@@ -64,7 +66,7 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-In November 2021, a major UK neobank suffered a £12 million operational loss when their payment processor failed to correctly distinguish between authorised-but-not-settled transactions and declined transactions during a database failover. When the system came back online, it replayed 47,000 authorisation messages — but the deduplication key had been stored in the failed node's in-memory cache rather than the database. The result: 47,000 customers were double-debited. The bank spent three weeks issuing refunds, fielded 190,000 support contacts, and paid £4.3 million in compensation plus a £1.9 million FCA fine for systems inadequacy. The root cause was a missing idempotency key column in the `payments` table and a state machine that did not validate prior states before transitions.
+*Composite example (based on common industry failure patterns, not a specific company):* a neobank's payment processor failed to distinguish correctly between authorised-but-not-settled transactions and declined transactions during a database failover. When the system came back online, it replayed tens of thousands of authorisation messages — but the deduplication keys had been kept only in the failed node's in-memory cache, not in the database. The result: tens of thousands of customers were double-debited. The bank spent weeks issuing refunds, handled a flood of support contacts, paid compensation, and faced regulatory scrutiny of its systems and controls. The root cause was a missing idempotency key column (with a unique constraint) in the `payments` table and a state machine that did not validate prior states before transitions.
 
 ## Authorisation, Clearing, and Settlement: Three Different Things
 
@@ -112,10 +114,10 @@ stateDiagram-v2
     INITIATED --> AUTHORISED : Issuer approves
     INITIATED --> FAILED : Issuer declines / timeout
     AUTHORISED --> CLEARING : Capture submitted to scheme
-    AUTHORISED --> CANCELLED : Pre-capture cancellation
+    AUTHORISED --> REVERSED : Authorisation reversal (hold released)
+    AUTHORISED --> CANCELLED : Hold expired, never captured
     CLEARING --> SETTLED : Interbank settlement complete
     CLEARING --> FAILED : Clearing rejected by scheme
-    SETTLED --> REVERSED : Full reversal posted
     SETTLED --> PARTIALLY_REFUNDED : Partial refund posted
     PARTIALLY_REFUNDED --> REFUNDED : Remaining balance refunded
     SETTLED --> REFUNDED : Full refund posted
@@ -144,9 +146,9 @@ public enum PaymentStatus {
     private static final Map<PaymentStatus, Set<PaymentStatus>> ALLOWED_TRANSITIONS =
         Map.of(
             INITIATED,           Set.of(AUTHORISED, FAILED),
-            AUTHORISED,          Set.of(CLEARING, CANCELLED),
+            AUTHORISED,          Set.of(CLEARING, REVERSED, CANCELLED),
             CLEARING,            Set.of(SETTLED, FAILED),
-            SETTLED,             Set.of(REVERSED, REFUNDED, PARTIALLY_REFUNDED),
+            SETTLED,             Set.of(REFUNDED, PARTIALLY_REFUNDED),
             PARTIALLY_REFUNDED,  Set.of(REFUNDED),
             CANCELLED,           Set.of(),
             FAILED,              Set.of(),
@@ -212,78 +214,87 @@ public class PaymentProcessor {
     private final PaymentRepository paymentRepository;
     private final AccountHoldService holdService;
     private final LedgerService ledgerService;
-    private final SchemeGateway schemeGateway;
-    private final ApplicationEventPublisher eventPublisher;
+    private final OutboxRepository outbox;
 
     /**
      * Step 1: Authorise — check funds, place hold, record authorisation.
-     * Idempotent: second call with same idempotencyKey returns existing payment.
+     * Idempotent: a repeated idempotencyKey returns the existing payment.
      */
     public PaymentAuthorisationResult authorise(AuthorisationRequest request) {
-        // Idempotency check — prevents duplicate processing on retry
-        return paymentRepository.findByIdempotencyKey(request.idempotencyKey())
-            .map(existing -> PaymentAuthorisationResult.alreadyProcessed(existing))
-            .orElseGet(() -> processNewAuthorisation(request));
+        // Claim the key FIRST: INSERT ... ON CONFLICT (idempotency_key) DO NOTHING.
+        // The UNIQUE constraint (not a find-then-save check) stops two
+        // concurrent retries from both authorising.
+        Optional<Payment> claimed = paymentRepository.claimIdempotencyKey(
+            request.idempotencyKey(), request);   // empty → key already used
+        if (claimed.isEmpty()) {
+            Payment existing = paymentRepository.findByIdempotencyKeyOrThrow(request.idempotencyKey());
+            return PaymentAuthorisationResult.alreadyProcessed(existing);
+        }
+        return processNewAuthorisation(claimed.get(), request);
     }
 
-    private PaymentAuthorisationResult processNewAuthorisation(AuthorisationRequest req) {
-        Payment payment = Payment.builder()
-            .id(UUID.randomUUID().toString())
-            .idempotencyKey(req.idempotencyKey())
-            .accountId(req.accountId())
-            .amountMinorUnits(req.amountMinorUnits())
-            .currency(req.currency())
-            .merchantId(req.merchantId())
-            .status(PaymentStatus.INITIATED)
-            .createdAt(Instant.now())
-            .build();
-
-        paymentRepository.save(payment);
-
-        // Place hold — reduces available balance immediately
-        HoldReference hold = holdService.place(
+    private PaymentAuthorisationResult processNewAuthorisation(Payment payment, AuthorisationRequest req) {
+        // Place hold — reduces available balance immediately.
+        // place() must check-and-reserve ATOMICALLY in the database, e.g.
+        // UPDATE accounts SET available = available - :amt WHERE id = :id AND available >= :amt
+        Optional<HoldReference> hold = holdService.tryPlace(
             req.accountId(),
             req.amountMinorUnits(),
             req.currency(),
             payment.getId(),
             HoldReason.CARD_AUTHORISATION,
-            Instant.now().plus(Duration.ofHours(72)) // Pre-auth expires in 72h
+            // Hold validity depends on scheme rules and merchant type
+            // (e.g. a few days for retail, much longer for hotels/car hire)
+            Instant.now().plus(Duration.ofDays(7))
         );
+        if (hold.isEmpty()) {
+            payment.transitionTo(PaymentStatus.FAILED);
+            payment.setDeclineReason("INSUFFICIENT_FUNDS");
+            return PaymentAuthorisationResult.declined("INSUFFICIENT_FUNDS");
+        }
 
-        payment.setHoldId(hold.holdId());
+        payment.setHoldId(hold.get().holdId());
         payment.transitionTo(PaymentStatus.AUTHORISED);
         payment.setAuthorisedAt(Instant.now());
-        paymentRepository.save(payment);
 
-        eventPublisher.publishEvent(new PaymentAuthorisedEvent(payment.getId(),
-            req.accountId(), req.amountMinorUnits(), req.currency()));
+        // Event via the outbox, in the same transaction: published only if
+        // this transaction commits (a plain in-process event would fire
+        // even if the transaction later rolls back)
+        outbox.save(OutboxEvent.of(new PaymentAuthorisedEvent(payment.getId(),
+            req.accountId(), req.amountMinorUnits(), req.currency())));
 
-        return PaymentAuthorisationResult.approved(payment.getId(), hold.holdId());
+        return PaymentAuthorisationResult.approved(payment.getId(), hold.get().holdId());
     }
 
     /**
-     * Step 2: Capture/Clear — submit to scheme. Transitions AUTHORISED → CLEARING.
+     * Step 2: Capture/Clear — transitions AUTHORISED → CLEARING.
+     * The clearing message itself is sent by a relay from the outbox: never
+     * call the scheme inside the database transaction (if the call succeeds
+     * but the commit fails, the two systems disagree).
      */
     public void capture(String paymentId) {
-        Payment payment = paymentRepository.findByIdOrThrow(paymentId);
+        Payment payment = paymentRepository.findByIdForUpdateOrThrow(paymentId);
 
         if (!payment.getStatus().canTransitionTo(PaymentStatus.CLEARING)) {
             throw new IllegalStateTransitionException(payment.getStatus(), PaymentStatus.CLEARING);
         }
 
-        schemeGateway.submitClearingMessage(payment);
         payment.transitionTo(PaymentStatus.CLEARING);
         payment.setClearingSubmittedAt(Instant.now());
-        paymentRepository.save(payment);
+        outbox.save(OutboxEvent.of(new SubmitClearingCommand(payment.getId())));
     }
 
     /**
-     * Step 3: Settle — called by settlement reconciliation job. Transitions CLEARING → SETTLED.
-     * Releases hold and posts ledger entries.
+     * Step 3: Settle — called by the settlement reconciliation job.
+     * Transitions CLEARING → SETTLED. Releases hold and posts ledger entries.
+     * Idempotent: a settlement file may be processed twice.
      */
     public void settle(String paymentId, SettlementReference settlementRef) {
-        Payment payment = paymentRepository.findByIdOrThrow(paymentId);
+        Payment payment = paymentRepository.findByIdForUpdateOrThrow(paymentId);   // row lock
 
+        if (payment.getStatus() == PaymentStatus.SETTLED) {
+            return;   // already settled — duplicate settlement record, nothing to do
+        }
         if (!payment.getStatus().canTransitionTo(PaymentStatus.SETTLED)) {
             throw new IllegalStateTransitionException(payment.getStatus(), PaymentStatus.SETTLED);
         }
@@ -291,7 +302,8 @@ public class PaymentProcessor {
         // Release hold — no longer needed after settlement
         holdService.release(payment.getHoldId());
 
-        // Post definitive ledger entries
+        // Post definitive ledger entries (DR customer account, CR scheme
+        // settlement account) — keyed by payment id so a retry cannot post twice
         ledgerService.postDebit(
             payment.getAccountId(),
             payment.getAmountMinorUnits(),
@@ -303,10 +315,9 @@ public class PaymentProcessor {
         payment.transitionTo(PaymentStatus.SETTLED);
         payment.setSettledAt(Instant.now());
         payment.setSettlementReference(settlementRef.referenceId());
-        paymentRepository.save(payment);
 
-        eventPublisher.publishEvent(new PaymentSettledEvent(payment.getId(),
-            payment.getAccountId(), payment.getAmountMinorUnits()));
+        outbox.save(OutboxEvent.of(new PaymentSettledEvent(payment.getId(),
+            payment.getAccountId(), payment.getAmountMinorUnits())));
     }
 }
 ```
@@ -322,7 +333,7 @@ The hold mechanism is what allows available balance to reflect pending card auth
 graph TD
     A[Authorisation received] --> B[Place hold on account\navail_balance -= £85]
     B --> C{Merchant captures?}
-    C -->|Yes, within 72h| D[Submit clearing message\nStatus: CLEARING]
+    C -->|Yes, before hold expiry| D[Submit clearing message\nStatus: CLEARING]
     C -->|No — expired| E[Hold auto-expires\navail_balance += £85 restored]
     D --> F[Settlement confirmed]
     F --> G[Release hold\nPost ledger debit\nledger_balance -= £85\nStatus: SETTLED]
@@ -342,9 +353,10 @@ public record PaymentBalanceImpact(
     public static PaymentBalanceImpact forStatus(PaymentStatus status, long amount) {
         return switch (status) {
             case AUTHORISED          -> new PaymentBalanceImpact(status, -amount, 0);
-            case CANCELLED           -> new PaymentBalanceImpact(status, +amount, 0);  // Hold released
+            case REVERSED, CANCELLED -> new PaymentBalanceImpact(status, +amount, 0);  // Hold released
             case SETTLED             -> new PaymentBalanceImpact(status, 0, -amount);  // Hold→Ledger
-            case REVERSED, REFUNDED  -> new PaymentBalanceImpact(status, 0, +amount);  // Credit back
+            case REFUNDED            -> new PaymentBalanceImpact(status, 0, +amount);  // Credit back
+            // (a partial refund credits only the refunded amount)
             default                  -> new PaymentBalanceImpact(status, 0, 0);
         };
     }
@@ -359,10 +371,10 @@ Settlement timing varies dramatically by payment scheme. This has real cash-flow
 |---|---|---|---|
 | **CHAPS (UK)** | T+0 (same day, intraday) | RTGS — individual settlement | Irrevocable |
 | **Faster Payments (UK)** | T+0 (seconds) | Deferred net settlement (DNS) | Near-immediate |
-| **Visa / Mastercard (UK)** | T+1 (next business day) | Net settlement via VICS / MCCS | End of day |
-| **BACS (UK)** | T+3 | Deferred net settlement | Day 3 |
+| **Visa / Mastercard (UK)** | T+1 (next business day after clearing) | Net settlement via each scheme's settlement service | End of day |
+| **BACS (UK)** | T+2 (3-day cycle: input day, processing day, entry day) | Deferred net settlement | Day 3 of the cycle |
 | **SEPA Credit Transfer** | T+1 (or instant via SCT Inst) | DNS or RTGS | Day 1 / instant |
-| **ACH (US)** | T+1 to T+2 | Batch DNS | Day 1–2 |
+| **ACH (US)** | T+0 (Same Day ACH) to T+1 | Batch DNS | Same day or next day |
 
 > [!NOTE]
 > "T+1" means the next **business** day. A Visa payment authorised on a Friday evening settles on Monday. The merchant's acquirer does not receive funds until Monday. This creates multi-day counterparty exposure — the scheme guarantees payment, but the guarantee spans a weekend.
@@ -375,9 +387,8 @@ public enum PaymentScheme {
     public LocalDate expectedSettlementDate(LocalDate submissionDate, BusinessCalendar cal) {
         return switch (this) {
             case CHAPS, FASTER_PAYMENTS, SEPA_INST -> submissionDate; // T+0
-            case VISA, MASTERCARD, SEPA_CT         -> cal.addBusinessDays(submissionDate, 1); // T+1
-            case ACH_US                            -> cal.addBusinessDays(submissionDate, 2); // T+2
-            case BACS                              -> cal.addBusinessDays(submissionDate, 3); // T+3
+            case VISA, MASTERCARD, SEPA_CT, ACH_US -> cal.addBusinessDays(submissionDate, 1); // T+1
+            case BACS                              -> cal.addBusinessDays(submissionDate, 2); // day 3 of the cycle
         };
     }
 }
@@ -385,7 +396,7 @@ public enum PaymentScheme {
 
 ## Reversals and Refunds
 
-A **reversal** undoes an authorisation before it settles. A **refund** returns money after settlement. Both require posting compensating journal entries — they cannot simply delete the original transaction.
+An **authorisation reversal** cancels an authorisation before it is captured: the hold is released and no money ever moves. A **refund** returns money after settlement by posting a compensating credit — the original transaction is never deleted. (A **chargeback**, by contrast, is the card scheme's dispute process, started by the cardholder's issuer.)
 
 ```java17
 @Service
@@ -397,17 +408,18 @@ public class PaymentReversalService {
     private final LedgerService ledgerService;
 
     /**
-     * Pre-settlement reversal — only valid when status is AUTHORISED or CLEARING.
-     * Releases hold; no ledger entry needed (none was posted at authorisation).
+     * Authorisation reversal — only valid while the payment is AUTHORISED
+     * (not yet captured). Releases the hold; no ledger entry is needed
+     * because none was posted at authorisation. Once a capture has been sent
+     * to the scheme, the money will move: use refund() after settlement.
      */
     public void reverse(String paymentId, String reason) {
-        Payment payment = paymentRepository.findByIdOrThrow(paymentId);
+        Payment payment = paymentRepository.findByIdForUpdateOrThrow(paymentId);
 
-        if (!Set.of(PaymentStatus.AUTHORISED, PaymentStatus.CLEARING)
-                .contains(payment.getStatus())) {
+        if (payment.getStatus() != PaymentStatus.AUTHORISED) {
             throw new InvalidOperationException(
                 "Cannot reverse payment in status: " + payment.getStatus() +
-                ". Use refund() for settled payments.");
+                ". Use refund() once the payment has settled.");
         }
 
         holdService.release(payment.getHoldId());
@@ -422,25 +434,34 @@ public class PaymentReversalService {
      * Post-settlement refund — only valid when status is SETTLED or PARTIALLY_REFUNDED.
      * Posts a credit journal entry — the original debit remains for audit trail.
      */
-    public RefundResult refund(String paymentId, long refundAmountMinorUnits, String reason) {
-        Payment payment = paymentRepository.findByIdOrThrow(paymentId);
+    public RefundResult refund(String paymentId, long refundAmountMinorUnits,
+                               String reason, String refundIdempotencyKey) {
+        // Row lock: two concurrent partial refunds must not both pass the check
+        Payment payment = paymentRepository.findByIdForUpdateOrThrow(paymentId);
+
+        if (!Set.of(PaymentStatus.SETTLED, PaymentStatus.PARTIALLY_REFUNDED)
+                .contains(payment.getStatus())) {
+            throw new InvalidOperationException("Cannot refund payment in status: " + payment.getStatus());
+        }
 
         long alreadyRefunded = payment.getTotalRefundedMinorUnits();
         long maxRefundable   = payment.getAmountMinorUnits() - alreadyRefunded;
 
-        if (refundAmountMinorUnits > maxRefundable) {
+        if (refundAmountMinorUnits <= 0 || refundAmountMinorUnits > maxRefundable) {
             throw new InvalidOperationException(
-                "Refund amount %d exceeds refundable amount %d"
+                "Refund amount %d outside refundable range 1..%d"
                     .formatted(refundAmountMinorUnits, maxRefundable));
         }
 
-        // Credit the customer's account
+        // Credit the customer's account. The refund's own idempotency key
+        // (supplied by the caller and reused on retry) makes the posting safe
+        // to repeat — a random UUID here would post again on every retry
         ledgerService.postCredit(
             payment.getAccountId(),
             refundAmountMinorUnits,
             payment.getCurrency(),
             "REFUND:ORIG:" + paymentId,
-            UUID.randomUUID().toString()
+            refundIdempotencyKey
         );
 
         payment.addRefund(refundAmountMinorUnits, reason, Instant.now());
@@ -449,7 +470,9 @@ public class PaymentReversalService {
             ? PaymentStatus.REFUNDED
             : PaymentStatus.PARTIALLY_REFUNDED;
 
-        payment.transitionTo(nextStatus);
+        if (nextStatus != payment.getStatus()) {
+            payment.transitionTo(nextStatus);   // a second partial refund stays PARTIALLY_REFUNDED
+        }
         paymentRepository.save(payment);
 
         return new RefundResult(paymentId, refundAmountMinorUnits, nextStatus);
@@ -477,15 +500,15 @@ public class PaymentReversalService {
   },
   {
     "id": "kc-pp-02",
-    "question": "A merchant disputes a Visa transaction settled two days ago. Your fraud team determines the dispute is valid. Should you use a reversal or a refund, and why?",
+    "question": "A customer returns goods bought with a Visa card two days ago, and the merchant agrees to give the money back. The payment has already settled. Should the system use an authorisation reversal or a refund, and why?",
     "options": [
       "Reversal — it undoes the original transaction cleanly with no extra accounting entries",
       "Refund — the payment has already settled; you must post a compensating credit entry",
       "Either — they are functionally equivalent once a payment has settled",
-      "Neither — settled transactions can only be disputed via the card scheme chargeback process"
+      "Neither — settled transactions can only be returned through the card scheme chargeback process"
     ],
     "correct": 1,
-    "explanation": "A reversal is only valid before settlement (status AUTHORISED or CLEARING). Once a payment is SETTLED, the ledger entry is final. The correct mechanism is a refund, which posts a compensating credit entry to the customer's account. Both the original debit and the credit remain in the ledger for audit purposes. The net effect is zero, but the trail of both entries is preserved."
+    "explanation": "An authorisation reversal is only valid before capture (status AUTHORISED): it releases the hold and no money moves. Once a payment is SETTLED, the ledger entry is final. The correct mechanism is a refund, which posts a compensating credit entry; both the original debit and the credit remain in the ledger for audit. A chargeback is different: it is the scheme's dispute process, started by the cardholder's issuer when the merchant does NOT agree to return the money."
   }
 ] -->
 
@@ -498,15 +521,15 @@ public class PaymentReversalService {
   "tasks": [
     {
       "id": "pc-pp-01",
-      "description": "Design a SQL schema for a `payments` table that captures: idempotency_key, status, amount_minor_units, currency, account_id, hold_id (FK), settlement_reference, and all timestamp fields (created, authorised, clearing_submitted, settled, reversed). Add a check constraint ensuring amount_minor_units > 0."
+      "description": "Design a SQL schema for a `payments` table that captures: idempotency_key (with a UNIQUE constraint), status, amount_minor_units, currency, account_id, hold_id (FK), settlement_reference, decline_reason, and all timestamp fields (created, authorised, clearing_submitted, settled, reversed). Add a check constraint ensuring amount_minor_units > 0."
     },
     {
       "id": "pc-pp-02",
-      "description": "Implement the `PaymentStatus.canTransitionTo(PaymentStatus next)` method as a Java 17 enum with the full allowed-transitions map. Write a unit test that verifies: AUTHORISED → CLEARING is allowed; SETTLED → AUTHORISED is rejected; FAILED → SETTLED is rejected."
+      "description": "Implement the `PaymentStatus.canTransitionTo(PaymentStatus next)` method as a Java 17 enum with the full allowed-transitions map. Write a unit test that verifies: AUTHORISED → CLEARING is allowed; AUTHORISED → REVERSED is allowed; SETTLED → AUTHORISED is rejected; FAILED → SETTLED is rejected."
     },
     {
       "id": "pc-pp-03",
-      "description": "Extend the `PaymentProcessor.authorise()` method to handle the case where the account has insufficient available balance. It should return a `PaymentAuthorisationResult.declined(reason)` rather than throwing an exception, and must NOT create a payment record or place a hold."
+      "description": "Extend the `PaymentProcessor.authorise()` method to handle insufficient available balance. It should return `PaymentAuthorisationResult.declined(reason)` rather than throwing an exception, record the payment as FAILED with the decline reason (declines must be auditable), and must NOT place a hold. The funds check and the hold must be one atomic database operation."
     },
     {
       "id": "pc-pp-04",

@@ -15,7 +15,7 @@ prerequisites: []
 # Gossip Protocols and Epidemic Algorithms
 
 > [!NOTE]
-> Gossip protocols power some of the most reliable distributed databases used in fintech: Cassandra uses gossip for cluster membership and schema propagation, and DynamoDB's internal architecture is built on similar epidemic algorithms. Understanding gossip is essential for operating, debugging, and scaling Cassandra-backed transaction state stores.
+> Gossip protocols power some of the most reliable distributed databases used in fintech: Cassandra uses gossip for cluster membership and schema propagation, and Amazon's original Dynamo design (the 2007 paper) used gossip for membership too. (DynamoDB, the managed service, has a different design that uses Multi-Paxos per partition.) Understanding gossip is essential for operating, debugging, and scaling Cassandra-backed transaction state stores.
 
 ## The Gossip Analogy
 
@@ -88,12 +88,9 @@ public class GossipEngine {
 
     private void applyAck(GossipAck ack) {
         for (NodeState state : ack.newStates()) {
-            // Only accept updates with a higher version (heartbeat counter)
-            if (localState.versionFor(state.nodeId()) < state.version()) {
-                localState.update(state);
-                log.debug("Gossip: updated state for node {} to version {}",
-                    state.nodeId(), state.version());
-            }
+            // update() keeps only newer information: higher generation first,
+            // then higher heartbeat within the same generation
+            localState.update(state);
         }
     }
 
@@ -183,11 +180,13 @@ public class AntiEntropyRepairScheduler {
 
     /**
      * Schedule Cassandra repair for the transactions keyspace.
-     * Best practice: run incremental repair weekly, full repair monthly.
+     * The hard rule: every range must be repaired within gc_grace_seconds
+     * (default 10 days), or deleted data can come back. Many teams use a
+     * tool such as Cassandra Reaper instead of hand-written scheduling.
      * During repair, the node exchanges Merkle tree digests with peers
      * and streams missing mutations.
      */
-    @Scheduled(cron = "0 2 * * 0")  // Every Sunday at 2 AM
+    @Scheduled(cron = "0 0 2 * * SUN")  // Every Sunday at 02:00 (Spring cron has 6 fields)
     public void scheduleWeeklyRepair() {
         log.info("Initiating weekly incremental repair for transactions keyspace");
         try {
@@ -317,7 +316,9 @@ public class SwimFailureDetector {
     }
 
     private void gossipFailure(String failedNodeId) {
-        // Spread the failure notification via gossip
+        // Simplified: real SWIM piggybacks this notification on its ping and ack
+        // messages, so it spreads epidemically. A suspected node that is alive
+        // refutes the suspicion by gossiping a higher incarnation number.
         FailureNotification notification = FailureNotification.builder()
             .failedNodeId(failedNodeId)
             .detectedBy(nodeRegistry.localNodeId())
@@ -337,7 +338,7 @@ public class SwimFailureDetector {
 
 Cassandra uses gossip for three purposes:
 1. **Membership**: Which nodes are in the ring and what token ranges they own
-2. **Failure detection**: Detecting dead or slow nodes using a phi-accrual failure detector
+2. **Failure detection**: Detecting dead or slow nodes using a phi-accrual failure detector (Hayashibara et al.) — not SWIM
 3. **Schema propagation**: Distributing schema changes across the cluster
 
 ### Cassandra Gossip Internals
@@ -410,13 +411,12 @@ public class CassandraGossipMonitor {
     }
 
     /**
-     * Query nodetool gossipinfo equivalent via JMX.
-     * Shows each node's gossip state as seen from the local node.
+     * The nodetool gossipinfo equivalent via JMX: each node's gossip state as
+     * seen from the local node, as text (FailureDetectorMBean).
      */
-    public Map<String, EndpointState> getGossipInfo() {
-        // In production, use the StorageServiceMBean via JMX
-        StorageServiceMBean storageProxy = getStorageProxy();
-        return storageProxy.getEndpointState(); // Returns raw gossip state per endpoint
+    public String getGossipInfo() {
+        FailureDetectorMBean failureDetector = getFailureDetectorProxy();
+        return failureDetector.getAllEndpointStates();
     }
 }
 ```
@@ -441,7 +441,7 @@ public class TransactionStateRepository {
             "INSERT INTO transactions.payment_state " +
             "(payment_id, state, amount_cents, currency, updated_at) " +
             "VALUES (?, ?, ?, ?, ?) " +
-            "USING TIMESTAMP ? AND TTL 86400"  // 24-hour TTL for completed payments
+            "USING TIMESTAMP ?"   // no TTL: payment state must not silently expire
         );
         this.readTxState = session.prepare(
             "SELECT payment_id, state, amount_cents, currency, updated_at " +
@@ -453,12 +453,12 @@ public class TransactionStateRepository {
     /**
      * Write payment state with LOCAL_QUORUM consistency.
      * This requires acknowledgment from a majority of replicas in the
-     * local DC, providing strong consistency within a datacenter
-     * without the latency of cross-DC writes.
+     * local DC; combined with LOCAL_QUORUM reads it gives read-your-writes
+     * within a datacenter without the latency of cross-DC writes.
      *
-     * Gossip health affects this: if quorum replicas are unavailable
-     * (detected via gossip failure detection), Cassandra returns
-     * NoHostAvailableException.
+     * Gossip health affects this: if the coordinator already knows (via
+     * gossip) that too few replicas are alive, it fails fast with
+     * UnavailableException instead of trying.
      */
     public void savePaymentState(PaymentState state) {
         BoundStatement stmt = insertTxState.bind(
@@ -472,10 +472,10 @@ public class TransactionStateRepository {
 
         try {
             session.execute(stmt);
-        } catch (NoHostAvailableException e) {
-            // Gossip has detected that quorum replicas are unavailable
-            log.error("Cannot write payment state — quorum unavailable: {}",
-                e.getErrors().keySet());
+        } catch (UnavailableException e) {
+            // Gossip says fewer than LOCAL_QUORUM replicas are alive
+            log.error("Cannot write payment state — quorum unavailable: {} of {} alive",
+                e.getAliveReplicas(), e.getRequiredReplicas());
             throw new PaymentSystemUnavailableException(
                 "Cassandra quorum unavailable — transaction state cannot be persisted", e);
         } catch (WriteTimeoutException e) {
@@ -483,15 +483,15 @@ public class TransactionStateRepository {
             // The write MAY have succeeded on some replicas — idempotency is critical
             log.warn("Write timeout for payment {} — checking idempotency key before retry",
                 state.paymentId());
-            throw new WriteTimeoutException(e.getConsistencyLevel(),
-                e.getReceivedAcknowledgements(), e.getRequiredAcknowledgements(),
-                e.getWriteType());
+            throw e;   // the caller decides; a retry must be safe to repeat
         }
     }
 
     /**
-     * Read with SERIAL consistency for read-your-writes guarantee
-     * in a linearizable context (e.g., checking idempotency before write).
+     * Read with SERIAL consistency: a linearizable read that also completes
+     * any in-flight lightweight transaction. Only meaningful when the writes
+     * to this row also use LWT (IF ...) — mixing LWT and plain writes on the
+     * same data is unsafe.
      */
     public Optional<PaymentState> findByIdLinearizable(UUID paymentId) {
         BoundStatement stmt = readTxState.bind(paymentId)
@@ -578,7 +578,7 @@ CREATE TABLE payments.idempotency_keys (
     expires_at        TIMESTAMP,
     PRIMARY KEY (idempotency_key)
 ) WITH default_time_to_live = 86400  -- Keys expire after 24 hours
-  AND gc_grace_seconds = 86400       -- Tombstone lifetime
+  AND gc_grace_seconds = 864000      -- 10 days: must exceed the repair interval
   AND compaction = {
       'class': 'LeveledCompactionStrategy'
   };
@@ -589,22 +589,28 @@ CREATE TABLE payments.idempotency_keys (
 public class CassandraIdempotencyStore {
 
     private final Session session;
+    private final PreparedStatement insertIfAbsent;
+    private final PreparedStatement fetchKey;
 
-    private final PreparedStatement insertIfAbsent = session.prepare(
-        "INSERT INTO payments.idempotency_keys " +
-        "(idempotency_key, created_at, payment_id, status, response_body, expires_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?) IF NOT EXISTS"
-    );
-
-    private final PreparedStatement fetchKey = session.prepare(
-        "SELECT payment_id, status, response_body " +
-        "FROM payments.idempotency_keys WHERE idempotency_key = ?"
-    );
+    // Prepare in the constructor: a field initializer would run before
+    // `session` is assigned
+    public CassandraIdempotencyStore(Session session) {
+        this.session = session;
+        this.insertIfAbsent = session.prepare(
+            "INSERT INTO payments.idempotency_keys " +
+            "(idempotency_key, created_at, payment_id, status, response_body, expires_at) " +
+            "VALUES (?, ?, ?, ?, ?, ?) IF NOT EXISTS");
+        this.fetchKey = session.prepare(
+            "SELECT payment_id, status, response_body " +
+            "FROM payments.idempotency_keys WHERE idempotency_key = ?");
+    }
 
     /**
      * Atomically insert an idempotency key using Cassandra LWT (IF NOT EXISTS).
-     * This uses Paxos internally and is not affected by gossip timing —
-     * it provides linearizable guarantees.
+     * LWT runs Paxos among the key's replicas, so the claim is linearizable
+     * for this key (it still needs a quorum of those replicas to be alive).
+     * SERIAL spans all DCs; LOCAL_SERIAL is faster but only safe if each key
+     * is always claimed in the same DC.
      *
      * Returns the existing entry if the key already exists (duplicate request),
      * or empty if this is a new request.
@@ -646,7 +652,7 @@ The fan-out factor (number of peers contacted per gossip round) directly impacts
 - **Network overhead**: Higher fan-out → more gossip traffic
 - **Cluster size limit**: Gossip bandwidth scales as O(N × fan-out) per round
 
-For a Cassandra cluster used for fintech transaction state:
+Cassandra itself does not use a configurable fan-out: each second a node gossips with one random live peer, sometimes also with an unreachable node and a seed. What you tune is failure detection and topology. For a Cassandra cluster used for fintech transaction state:
 
 ```yaml
 # cassandra.yaml — gossip tuning
@@ -669,44 +675,38 @@ endpoint_snitch: GossipingPropertyFileSnitch
 public class CassandraGossipHealthMetrics {
 
     private final MeterRegistry meterRegistry;
-    private final Session cassandraSession;
+    private final AlertingService alerting;
+    private static final int REPLICATION_FACTOR = 3;
+
+    // Gauges need a long-lived holder: registering a boxed Long each time
+    // would be garbage-collected and report NaN
+    private final Map<String, AtomicLong> nodesByStatus = new ConcurrentHashMap<>();
 
     @Scheduled(fixedDelayString = "30000")
     public void collectGossipMetrics() {
         try {
-            // Count nodes in each state
             Map<String, Long> stateCount = getNodeStates()
                 .entrySet().stream()
                 .collect(Collectors.groupingBy(
-                    e -> e.getValue().status(),
-                    Collectors.counting()
-                ));
+                    e -> e.getValue().status(), Collectors.counting()));
 
             stateCount.forEach((status, count) ->
-                meterRegistry.gauge(
-                    "cassandra.gossip.nodes",
-                    Tags.of("status", status),
-                    count
-                )
-            );
+                nodesByStatus.computeIfAbsent(status, st -> meterRegistry.gauge(
+                        "cassandra.gossip.nodes", Tags.of("status", st), new AtomicLong()))
+                    .set(count));
 
-            // Alert if any nodes are DOWN or leaving
             long downNodes = stateCount.getOrDefault("DOWN", 0L)
                 + stateCount.getOrDefault("LEAVING", 0L);
 
-            if (downNodes > 0) {
+            // Quorum is per REPLICA SET (replication factor), not per cluster:
+            // with RF=3, two down nodes that share a token range already break
+            // LOCAL_QUORUM for that range, even in a 30-node cluster
+            int quorum = REPLICATION_FACTOR / 2 + 1;
+            if (downNodes > REPLICATION_FACTOR - quorum) {
+                alerting.sendP1Alert("Cassandra quorum at risk",
+                    downNodes + " nodes down — some token ranges may have lost quorum");
+            } else if (downNodes > 0) {
                 log.warn("Cassandra gossip: {} nodes in abnormal state", downNodes);
-                // Page on-call if down nodes affect quorum
-                long totalNodes = stateCount.values().stream().mapToLong(l -> l).sum();
-                long quorum = (totalNodes / 2) + 1;
-                long normalNodes = stateCount.getOrDefault("NORMAL", 0L);
-
-                if (normalNodes < quorum) {
-                    alerting.sendP1Alert(
-                        "Cassandra quorum at risk",
-                        String.format("Only %d/%d nodes normal, quorum requires %d",
-                            normalNodes, totalNodes, quorum));
-                }
             }
         } catch (Exception e) {
             log.error("Failed to collect Cassandra gossip metrics", e);
@@ -723,8 +723,9 @@ public class CassandraGossipHealthMetrics {
 
 Long JVM garbage collection pauses (> phi threshold) can cause Cassandra nodes to be marked as DOWN by other nodes' failure detectors, even though the node is actually alive. The result is unnecessary hinted handoff and repair work. Solutions:
 
-```yaml
-# cassandra-env.sh — JVM tuning to minimize GC pauses
+```bash
+# JVM tuning to minimize GC pauses (cassandra-env.sh; in Cassandra 4.x and
+# later these flags usually live in conf/jvm*-server.options)
 JVM_OPTS="$JVM_OPTS -XX:+UseG1GC"
 JVM_OPTS="$JVM_OPTS -XX:MaxGCPauseMillis=300"
 JVM_OPTS="$JVM_OPTS -XX:G1HeapRegionSize=16m"
@@ -744,10 +745,12 @@ Cassandra propagates schema changes via gossip. During a schema migration in a h
 @Service
 public class CassandraSchemaManager {
 
-    public void applySchemaChange(String ddl) {
+    public void applySchemaChange(String ddl) throws InterruptedException {
         log.info("Applying schema change: {}", ddl);
 
-        // 1. Apply the change
+        // 1. Apply the change (the driver itself waits briefly for agreement,
+        //    up to maxSchemaAgreementWaitSeconds — this loop adds a longer,
+        //    explicit wait and a clear failure)
         session.execute(ddl);
 
         // 2. Wait for schema agreement across all nodes
@@ -773,11 +776,11 @@ public class CassandraSchemaManager {
 
 ### Pitfall 3: Tombstone Accumulation and Gossip Interaction
 
-Deleted rows in Cassandra become tombstones, which are eventually garbage collected after `gc_grace_seconds`. If a node is down longer than `gc_grace_seconds` and misses tombstone creation, it can resurface deleted data when it rejoins — a data consistency issue for transaction records. Ensure `gc_grace_seconds` is longer than your maximum expected node down time:
+Deleted rows in Cassandra become tombstones, which are eventually garbage collected after `gc_grace_seconds`. If a replica misses a tombstone and is not repaired within `gc_grace_seconds`, it can resurface deleted data — a data consistency issue for transaction records. Two rules follow: repair every range within `gc_grace_seconds`, and never let a node that was down longer than that rejoin without being rebuilt or replaced:
 
 ```sql
--- For payment idempotency keys, 10-day gc_grace ensures nodes down
--- for up to 10 days won't resurrect deleted keys on rejoin
+-- 10 days (the default): repairs must complete within this window,
+-- and a node down longer than this must be rebuilt, not just restarted
 ALTER TABLE payments.idempotency_keys
 WITH gc_grace_seconds = 864000;  -- 10 days
 ```
@@ -791,27 +794,44 @@ Gossip protocols provide a scalable, resilient mechanism for cluster-wide inform
 - Cassandra uses gossip for membership, failure detection, and schema propagation
 - The SWIM protocol's indirect probing prevents false positives from transient network issues
 - Anti-entropy repair ensures eventual consistency of transaction data across replicas
-- Fan-out of 3 and 1-second gossip intervals provide convergence in O(log N) rounds
-- For payment systems on Cassandra: use LOCAL_QUORUM for writes, monitor schema agreement, and tune phi threshold to tolerate JVM GC pauses
+- Gossip converges in O(log N) rounds; Cassandra gossips once a second with one random live peer (plus, at times, an unreachable node and a seed)
+- For payment systems on Cassandra: use LOCAL_QUORUM for reads and writes, monitor schema agreement, finish repairs within gc_grace_seconds, and tune the phi threshold to tolerate JVM GC pauses
+
+Gossip is not a mechanism for replicating financial transaction data — that needs quorum replication or consensus. Gossip is the metadata layer that makes consensus protocols possible by keeping every node informed about cluster membership and health.
 
 <!-- KNOWLEDGE-CHECK
 {
   "questions": [
     {
       "text": "Why is gossip protocol used for Cassandra cluster membership rather than for replicating transaction data?",
-      "options": ["Gossip is faster than Paxos for all data types", "Gossip provides only eventual consistency, which is insufficient for transaction data correctness but acceptable for membership and schema state", "Cassandra does not support quorum-based replication", "Gossip requires less network bandwidth than any other replication strategy"],
+      "options": [
+        "Gossip is faster than Paxos for all data types",
+        "Gossip provides only eventual consistency, which is insufficient for transaction data correctness but acceptable for membership and schema state",
+        "Cassandra does not support quorum-based replication",
+        "Gossip requires less network bandwidth than any other replication strategy"
+      ],
       "correct": 1,
       "explanation": "Gossip is eventually consistent — all nodes converge eventually but there is no guarantee of recency at any given moment. Transaction data requires strong consistency guarantees (Cassandra uses quorum-based replication for that). Cluster membership, failure detection, and schema propagation tolerate eventual consistency."
     },
     {
-      "text": "What does the phi accrual failure detector in Cassandra's SWIM protocol measure?",
-      "options": ["The number of pending compaction tasks on a node", "A continuous suspicion level based on inter-arrival times of heartbeats, allowing adaptive rather than binary failure detection", "The replication lag between primary and secondary replicas", "The CPU utilization of each gossip peer"],
+      "text": "What does the phi accrual failure detector used by Cassandra's gossip measure?",
+      "options": [
+        "The number of pending compaction tasks on a node",
+        "A continuous suspicion level based on inter-arrival times of heartbeats, allowing adaptive rather than binary failure detection",
+        "The replication lag between primary and secondary replicas",
+        "The CPU utilization of each gossip peer"
+      ],
       "correct": 1,
       "explanation": "The phi accrual failure detector computes a suspicion value (phi) based on the statistical distribution of heartbeat inter-arrival times. A node is marked DOWN when phi exceeds a threshold. This adaptive approach avoids false positives from transient delays like JVM GC pauses."
     },
     {
       "text": "In a 10-node Cassandra cluster with fan-out 3 and 1-second gossip rounds, approximately how many rounds does it take for all nodes to receive a new piece of information?",
-      "options": ["10 rounds", "O(log N) rounds — roughly 3-4 rounds", "1 round (broadcast)", "N/fan-out = 3-4 rounds but with guaranteed delivery"],
+      "options": [
+        "10 rounds",
+        "O(log N) rounds — roughly 3-4 rounds",
+        "1 round (broadcast)",
+        "N/fan-out = 3-4 rounds but with guaranteed delivery"
+      ],
       "correct": 1,
       "explanation": "Gossip convergence time is O(log N) rounds with fan-out k. For N=10 and fan-out=3, convergence takes approximately log_3(10) ≈ 2.1 rounds, so roughly 3 gossip intervals. This logarithmic scaling is why gossip works efficiently even in large clusters."
     }
@@ -825,12 +845,23 @@ Gossip protocols provide a scalable, resilient mechanism for cluster-wide inform
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Deploy a 3-node Cassandra cluster locally using Docker Compose. Use nodetool gossipinfo and nodetool ring to inspect gossip state. Simulate a node failure and observe how quickly the other nodes update their membership view. Measure convergence time against the theoretical O(log N) bound."},
-    {"id": "2", "description": "Implement a Java gossip simulation using the GossipEngine pattern from the lesson. Simulate a 20-node cluster with fan-out 3 and measure the number of rounds until all nodes have received a schema change. Plot convergence time vs cluster size to verify the logarithmic relationship."},
-    {"id": "3", "description": "Configure Cassandra's phi_convict_threshold and read_repair_chance for a payment keyspace. Run nodetool repair and anti-entropy repair on a keyspace that has been seeded with intentional inconsistencies. Verify that all replicas converge to the same data."},
-    {"id": "4", "description": "Build a Micrometer-based gossip health dashboard: instrument a Cassandra-backed service to expose metrics for schema agreement (nodetool describecluster output), unreachable nodes count, and gossip round latency. Alert when schema agreement drops below 100% for more than 60 seconds."}
+    {
+      "id": "1",
+      "description": "Deploy a 3-node Cassandra cluster locally using Docker Compose. Use nodetool gossipinfo and nodetool ring to inspect gossip state. Simulate a node failure and observe how quickly the other nodes update their membership view. Measure convergence time against the theoretical O(log N) bound."
+    },
+    {
+      "id": "2",
+      "description": "Implement a Java gossip simulation using the GossipEngine pattern from the lesson. Simulate a 20-node cluster with fan-out 3 and measure the number of rounds until all nodes have received a schema change. Plot convergence time vs cluster size to verify the logarithmic relationship."
+    },
+    {
+      "id": "3",
+      "description": "Configure Cassandra's phi_convict_threshold and the table-level read_repair option (read_repair_chance was removed in Cassandra 4.0) for a payment keyspace. Seed a keyspace with intentional inconsistencies (stop a node, write, restart it), run nodetool repair, and verify that all replicas converge to the same data."
+    },
+    {
+      "id": "4",
+      "description": "Build a Micrometer-based gossip health dashboard: instrument a Cassandra-backed service to expose metrics for schema agreement (nodetool describecluster output), unreachable nodes count, and gossip round latency. Alert when schema agreement drops below 100% for more than 60 seconds."
+    }
   ]
 }
 -->
 
-Gossip is not a mechanism for replicating financial transaction data — that requires consensus protocols. Gossip is the metadata layer that makes consensus protocols possible by keeping every node informed about cluster membership and health.

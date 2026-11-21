@@ -26,7 +26,7 @@ Architecture decisions are the most expensive thing software teams make and the 
 
 Every engineer who inherits a codebase eventually asks *why didn't they just use Kafka instead of this custom queue?* The answer is almost always locked inside someone's head or buried in a Confluence page nobody can find. The cost compounds:
 
-- Senior engineers spend 20–40 % of onboarding time reverse-engineering past decisions
+- New senior engineers can spend weeks of their onboarding reverse-engineering past decisions
 - Teams repeat expensive spikes that were already done three years ago
 - Incidents caused by misunderstood constraints (e.g., "this table must never be truncated") go undetected until production blows up
 - Regulatory audits (PCI-DSS, SOC 2) demand evidence of *why* controls are in place — undocumented decisions become findings
@@ -71,11 +71,12 @@ The workflow is:
   Write RFC (optional for small teams)
   Circulate for comment (async 48 h)
          │
-         ├─── Approved ───► Write ADR (outcome summary)
-         │                       │
-         ├─── Rejected ──────────┤  (ADR status: REJECTED)
-         │                       │
-         └─── Withdrawn ─────────┘  (ADR status: SUPERSEDED)
+         ├─── Approved ───► Write ADR (status: ACCEPTED)
+         │
+         ├─── Rejected ───► Optional ADR (status: REJECTED) so the
+         │                  idea is not proposed again without new facts
+         │
+         └─── Withdrawn ──► No ADR; note the reason in the RFC
 ```
 
 **Rule of thumb for fintech:** Any decision that affects data durability, consistency guarantees, PCI scope, or availability SLAs deserves an ADR even if no RFC was written.
@@ -177,7 +178,7 @@ MongoDB 7.
 ACID transactions without the overhead of session-pinned distributed
 transactions, the team's existing expertise reduces operational risk,
 and pgcrypto satisfies the column-encryption requirement.
-CockroachDB was ruled out due to 3× cost and undocumented PCI controls.
+CockroachDB was ruled out due to 3× cost and no existing audit evidence in our PCI scope.
 
 ### Positive Consequences
 
@@ -207,9 +208,9 @@ Purpose-built relational engine with 30+ years of ACID guarantees.
 Document store with multi-document ACID since v4.
 
 * Good, because schema flexibility for evolving event payloads
-* Bad, because distributed transaction overhead (avg +12 ms per txn)
-* Bad, because column encryption requires application-side logic (not PCI-approved path)
-* Bad, because no native window functions for balance aggregation
+* Bad, because multi-document transactions added ~12 ms per write in our spike
+* Bad, because field-level encryption is client-side (CSFLE), a path our security team had not yet approved
+* Bad, because point-in-time balance and roll-up queries are harder to write and tune than in SQL
 
 ### CockroachDB
 
@@ -217,7 +218,7 @@ Distributed SQL with automatic sharding.
 
 * Good, because unlimited horizontal write scaling
 * Bad, because 3× infrastructure cost vs managed RDS
-* Bad, because PCI compliance documentation not available for SOC 2 Type II audit
+* Bad, because our auditors had no prior evidence for it in our PCI / SOC 2 scope
 ```
 
 ---
@@ -289,8 +290,8 @@ adr init docs/decisions
 adr new "Use PostgreSQL for the Payments Ledger"
 # → docs/decisions/0012-use-postgresql-for-the-payments-ledger.md
 
-# Mark an ADR as superseded
-adr supersede 0012 "Use CockroachDB for Payments Ledger"
+# Create a new ADR that supersedes ADR 12 (updates the status of both files)
+adr new -s 12 "Use CockroachDB for Payments Ledger"
 
 # Generate a table of contents
 adr list
@@ -332,7 +333,7 @@ kind: Component
 metadata:
   name: payment-service
   annotations:
-    backstage.io/adr-location: url:./docs/decisions
+    backstage.io/adr-location: docs/decisions
 spec:
   type: service
   lifecycle: production
@@ -393,14 +394,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # needed for the origin/main...HEAD diff
 
-      - name: Validate MADR frontmatter
+      - name: Validate MADR fields in changed ADRs
         run: |
-          #!/usr/bin/env bash
           set -euo pipefail
           ERRORS=0
-          for f in $(find . -path "*/decisions/*.md" -newer HEAD~1 2>/dev/null || \
-                     git diff --name-only origin/main...HEAD | grep "decisions/.*\.md"); do
+          CHANGED=$(git diff --name-only --diff-filter=AM origin/main...HEAD \
+                    | grep -E '(^|/)decisions/[^/]+\.md$' || true)
+          for f in $CHANGED; do
             echo "Checking $f"
             # Must contain Status line
             if ! grep -qE "^\*\*Status:\*\*" "$f"; then
@@ -422,7 +425,7 @@ jobs:
           done
           exit $ERRORS
 
-      - name: Check for orphaned ADR numbers
+      - name: Check ADR file names
         run: |
           # Ensure ADR filenames follow 0NNN-slug.md pattern
           find . -path "*/decisions/*.md" | \
@@ -464,7 +467,8 @@ public class LedgerEntryRepository {
 ```
 
 ```java
-// ADR-0017: Idempotency keys are stored in Redis with a 24-hour TTL.
+// ADR-0017: Idempotency responses are cached in Redis for 24 hours;
+// PostgreSQL holds the keys as the source of truth.
 // See docs/decisions/0017-idempotency-key-storage.md
 // WARNING: Do not change TTL without updating ADR-0017.
 private static final Duration IDEMPOTENCY_TTL = Duration.ofHours(24);
@@ -491,7 +495,7 @@ Already shown in Section 3.2. Key takeaway: ACID multi-row transactions and colu
 The fraud detection ML model (FraudGuard v2) adds 180–220 ms p99 latency
 when called synchronously in the payment authorisation path. Card network
 rules require sub-300 ms responses. With existing gateway overhead (80 ms),
-the synchronous call leaves only 20 ms margin — insufficient for peak load.
+the synchronous call leaves 0–40 ms of margin — insufficient for peak load.
 
 ## Decision Drivers
 
@@ -521,7 +525,7 @@ review within 50 ms of authorisation.
 ### 10.3 ADR-0017 — Idempotency Key Storage
 
 ```markdown
-# ADR-0017: Store Idempotency Keys in Redis with PostgreSQL Fallback
+# ADR-0017: Store Idempotency Keys in PostgreSQL, Cache Replays in Redis
 
 **Date:** 2024-06-10
 **Status:** Accepted
@@ -529,22 +533,30 @@ review within 50 ms of authorisation.
 ## Context and Problem Statement
 
 Payment API clients retry on network failure. Without idempotency enforcement,
-a client timeout can result in duplicate charges. We need sub-5 ms idempotency
-checks at 20 k RPS peak load.
+a client timeout can result in duplicate charges. Replayed requests should be
+answered in under 5 ms at 20 k RPS peak load.
 
 ## Decision Drivers
 
-* Sub-5 ms p99 idempotency lookup at 20 k RPS
 * Keys must survive a Redis node failure (no duplicate charges)
-* 24-hour TTL (matches maximum client retry window per API contract)
+* Sub-5 ms p99 for replayed requests at 20 k RPS
+* 24-hour retention (matches maximum client retry window per API contract)
+
+## Considered Options
+
+* Redis only
+* Redis first, copied to PostgreSQL asynchronously (write-behind)
+* PostgreSQL as source of truth, Redis as a cache of stored responses
 
 ## Decision Outcome
 
-**Chosen option: Redis (primary) + PostgreSQL write-behind (fallback).**
-Redis handles the hot path. A CDC consumer writes confirmed keys to
-PostgreSQL within 500 ms. On Redis cache-miss, the service checks
-PostgreSQL before proceeding. TTL is enforced by both Redis expiry
-and a nightly PostgreSQL purge job.
+**Chosen option: PostgreSQL as source of truth, Redis as cache.**
+The key is inserted with ON CONFLICT DO NOTHING in the same transaction as
+the payment, so a key can never exist without its payment or be lost with
+Redis. The stored response is then cached in Redis (24 h TTL) so replays
+are fast; a cache miss falls back to PostgreSQL. A nightly job purges keys
+older than 24 h. Write-behind was rejected: a Redis failure before the copy
+would lose keys and allow duplicate charges.
 ```
 
 ---
@@ -677,7 +689,7 @@ Two teams both write `0023-*.md` on the same day.
 
 ### Pitfall 5: Compliance auditors cannot find the ADR for a specific control
 
-PCI requirement 6.3.2 requires documented evidence of approved components.
+PCI DSS v4.0 requirement 6.3.2 asks for an inventory of bespoke software and the third-party components it uses, and auditors ask why each control exists.
 
 **Fix:** Tag ADRs with compliance labels in frontmatter and generate a compliance manifest:
 
@@ -733,12 +745,12 @@ grep -r "pci-req:" docs/decisions/ | \
       "text": "What is the primary reason the payments ledger team in ADR-0012 rejected MongoDB 7?",
       "options": [
         "MongoDB does not support multi-document ACID transactions",
-        "MongoDB distributed transactions add ~12 ms overhead and column encryption requires application-side logic outside the PCI-approved path",
+        "Its multi-document transactions added ~12 ms per write in the spike, and its field-level encryption is client-side, a path security had not approved",
         "The team lacked MongoDB operational expertise",
         "MongoDB cannot handle 50 M transactions per year"
       ],
       "correct": 1,
-      "explanation": "The ADR explicitly states that MongoDB 7 multi-document transaction overhead averages +12 ms per transaction and that column encryption requires application-side logic, which was not the PCI-approved path. Team expertise was a secondary concern, not the primary rejection criterion."
+      "explanation": "The ADR lists two technical reasons: multi-document transactions added about 12 ms per write in the team's spike, and MongoDB's field-level encryption is client-side (CSFLE), a path the security team had not approved. Team expertise was a secondary concern, not the primary rejection criterion. (MongoDB has supported multi-document ACID transactions since 4.0, so option A is false.)"
     }
   ]
 } -->

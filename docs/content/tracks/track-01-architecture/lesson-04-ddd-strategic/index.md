@@ -116,7 +116,7 @@ Identifying bounded context boundaries is a discovery process, not a design exer
 
 ## Context Map Patterns
 
-Once you have identified bounded contexts, you must document and design the relationships between them. DDD defines eight relationship patterns that describe both the technical and organisational dynamics of context integration.
+Once you have identified bounded contexts, you must document and design the relationships between them. DDD describes eight common relationship patterns (plus the "Big Ball of Mud" label for areas with no clear model) that capture both the technical and organisational dynamics of context integration.
 
 | Pattern | Relationship Type | Organisational Dynamic | Integration Mechanism |
 |---|---|---|---|
@@ -198,7 +198,7 @@ public class CoreBankingTranslator {
             debitAccount,
             creditAccount,
             translateStatus(legacyTx.getStatusCode()),
-            legacyTx.getValueDate().toInstant(ZoneOffset.UTC)
+            legacyTx.getValueDate().atStartOfDay(ZoneOffset.UTC).toInstant() // LocalDate value date
         );
     }
 
@@ -263,13 +263,15 @@ graph LR
     end
 
     PP -->|Customer-Supplier\nPaymentAuthorised events| FM
-    PP -->|Customer-Supplier\nPaymentCapture events| SET
-    PP -->|ACL| CBS
+    PP -->|Customer-Supplier\nPaymentCaptured events| SET
+    CBS -->|ACL in Payment Processing| PP
     MA -->|Customer-Supplier\nMerchant profile queries| PP
-    SET -->|Conformist| VIS
-    REG -->|Customer-Supplier\nAudit events| PP
-    REG -->|Conformist + ACL| HMRC
+    VIS -->|Conformist| SET
+    PP -->|Customer-Supplier\nAudit events| REG
+    HMRC -->|Conformist + ACL\nreporting schema| REG
 ```
+
+Arrows point from the upstream context to the downstream context; the label names the pattern the downstream side uses. For example, Payment Processing protects itself from the legacy Core Banking model with an ACL, and Settlement conforms to the card schemes' formats.
 
 ## Event Storming Overview
 
@@ -297,7 +299,7 @@ One of the most common and costly DDD misapplications is the belief that one bou
 | Complex context with high internal variation | 1 context → multiple modules within 1 service | Internal modular monolith; avoids distributed transaction complexity |
 | Two teams own the same domain capability | 2 contexts → 1 service (temporarily) | Strangler fig pattern during context separation |
 
-The rule is: **bounded context boundaries are always respected in the domain model; they may or may not be respected in the deployment topology.** A well-designed modular monolith with clear bounded context boundaries is infinitely easier to split later than a "microservices" deployment where service boundaries were drawn arbitrarily and contexts are tangled across services.
+The rule is: **bounded context boundaries are always respected in the domain model; they may or may not be respected in the deployment topology.** A well-designed modular monolith with clear bounded context boundaries is far easier to split later than a "microservices" deployment where service boundaries were drawn arbitrarily and contexts are tangled across services.
 
 > [!WARNING]
 > Creating a microservice for every aggregate or entity is the most expensive DDD mistake in fintech. Each service boundary is a distributed transaction boundary, and distributed transactions across payment systems introduce consistency risks that are difficult to manage and even harder to audit. Split services when organisational or operational need drives it, not on principle.
@@ -310,7 +312,7 @@ The rule is: **bounded context boundaries are always respected in the domain mod
 
 **Q:** NovaPay's Payment Processing context calls SWIFT's payment network, which uses ISO 20022 message format. The team is debating whether to adopt the ISO 20022 message model directly in their domain (Conformist) or to translate it to the payment domain model (ACL). What criteria should drive this decision?
 
-**A:** The decision turns on whether SWIFT's ISO 20022 model is a suitable representation for the Payment Processing domain's core concepts, or whether it is an external standard that happens to carry the same data. ISO 20022 is designed for interoperability across all financial institutions globally — it is a deliberately generic message format, not a domain model optimised for NovaPay's specific business rules. Adopting it as the domain model (Conformist) would mean the domain code speaks SWIFT's language of `FinancialInstrument`, `CreditTransferTransaction`, and `RemittanceInformation` rather than NovaPay's language of `PaymentOrder`, `Beneficiary`, and `PaymentReference`. The ACL approach is correct here: an ISO 20022 adapter in the infrastructure layer translates incoming SWIFT messages to `PaymentOrder` domain objects, and outgoing `PaymentOrder` objects to ISO 20022 messages. This isolates the domain from SWIFT schema version changes (ISO 20022 has had four major versions) and allows the domain model to evolve independently of the interoperability standard.
+**A:** The decision turns on whether SWIFT's ISO 20022 model is a suitable representation for the Payment Processing domain's core concepts, or whether it is an external standard that happens to carry the same data. ISO 20022 is designed for interoperability across all financial institutions globally — it is a deliberately generic message format, not a domain model optimised for NovaPay's specific business rules. Adopting it as the domain model (Conformist) would mean the domain code speaks SWIFT's language of `Debtor`, `CreditTransferTransaction`, and `RemittanceInformation` rather than NovaPay's language of `PaymentOrder`, `Beneficiary`, and `PaymentReference`. The ACL approach is correct here: an ISO 20022 adapter in the infrastructure layer translates incoming SWIFT messages to `PaymentOrder` domain objects, and outgoing `PaymentOrder` objects to ISO 20022 messages. This isolates the domain from ISO 20022 message version changes (each message definition is versioned and updated regularly, for example pacs.008.001.08 to pacs.008.001.10) and allows the domain model to evolve independently of the interoperability standard.
 
 ## Practical Challenge
 
@@ -356,7 +358,7 @@ The rule is: **bounded context boundaries are always respected in the domain mod
         "Anti-Corruption Layer only during the initial integration; after six months the team should switch to Conformist to reduce translation overhead."
       ],
       "correct": 1,
-      "explanation": "The ACL is correct. ISO 20022 is designed for global interoperability, not for NovaPay's specific domain. Using it as the domain model would mean domain code speaks SWIFT's vocabulary rather than NovaPay's. The ACL isolates the domain from SWIFT schema version changes (there have been four major versions) and allows the domain model to evolve independently of the interoperability standard."
+      "explanation": "The ACL is correct. ISO 20022 is designed for global interoperability, not for NovaPay's specific domain. Using it as the domain model would mean domain code speaks SWIFT's vocabulary rather than NovaPay's. The ACL isolates the domain from ISO 20022 message version changes (each message definition is versioned and updated regularly) and allows the domain model to evolve independently of the interoperability standard."
     }
   ]
 }

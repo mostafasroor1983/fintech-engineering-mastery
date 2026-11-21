@@ -109,7 +109,9 @@ eureka:
   instance:
     # Use IP address rather than hostname for container environments
     preferIpAddress: true
-    # Health check URL — Eureka uses this to verify instance health
+    # Eureka does NOT poll this URL itself — it only trusts heartbeats.
+    # client.healthcheck.enabled (below) makes the heartbeat carry the
+    # actuator health status, so a DOWN instance is marked DOWN in Eureka.
     healthCheckUrlPath: /actuator/health
     statusPageUrlPath: /actuator/info
     # How often to send heartbeats to Eureka (default 30s — reduce for faster failover)
@@ -121,6 +123,8 @@ eureka:
       region: ${cloud.region}
       datacenter: ${datacenter.name}
   client:
+    healthcheck:
+      enabled: true
     serviceUrl:
       defaultZone: http://eureka-1.payments.internal:8761/eureka/
     # Cache TTL — lower values mean faster discovery of new instances
@@ -133,15 +137,18 @@ eureka:
 @Service
 public class FraudCheckClient {
 
-    private final RestTemplate restTemplate;
+    private final RestTemplate restTemplate;        // @LoadBalanced: resolves service names
+    private final RestTemplate plainRestTemplate;   // NOT load-balanced: for host:port URLs
     private final LoadBalancerClient loadBalancer;
 
     // Spring Cloud's @LoadBalanced RestTemplate automatically resolves
     // service names to instances via the discovery registry
     public FraudCheckClient(
             @LoadBalanced RestTemplate restTemplate,
+            @Qualifier("plainRestTemplate") RestTemplate plainRestTemplate,
             LoadBalancerClient loadBalancer) {
         this.restTemplate = restTemplate;
+        this.plainRestTemplate = plainRestTemplate;
         this.loadBalancer = loadBalancer;
     }
 
@@ -156,8 +163,11 @@ public class FraudCheckClient {
     }
 
     /**
-     * When you need explicit control over instance selection —
-     * e.g., for sticky sessions in a stateful fraud model context.
+     * When you need explicit control over instance selection.
+     * Note: choose() alone is not sticky — for real affinity configure a
+     * request-based sticky-session load balancer or hash the session key.
+     * The URL already contains host:port, so it must go through a plain
+     * RestTemplate: a @LoadBalanced one would treat the IP as a service name.
      */
     public FraudAssessment checkWithAffinity(TransactionContext ctx, String sessionKey) {
         ServiceInstance instance = loadBalancer.choose("fraud-detection-service");
@@ -168,7 +178,7 @@ public class FraudCheckClient {
         String url = String.format("http://%s:%d/v1/assess",
             instance.getHost(), instance.getPort());
 
-        return restTemplate.postForObject(url,
+        return plainRestTemplate.postForObject(url,
             FraudCheckRequest.from(ctx).withSessionKey(sessionKey),
             FraudAssessment.class
         );
@@ -248,6 +258,9 @@ consul intention create -deny "*" account-service
 
 # View effective intentions
 consul intention list
+
+# Note: newer Consul versions manage intentions as "service-intentions"
+# config entries (consul config write), which can be kept in Git
 ```
 
 ### Querying Consul from Java
@@ -327,10 +340,11 @@ DNS-based discovery is the simplest and most universally compatible approach. Se
 ### DNS SRV Records for Payment Services
 
 ```bash
-# SRV record format: _service._proto.name TTL class SRV priority weight port target
-_payment-processor._tcp.payments.svc.cluster.local. 5 IN SRV 10 100 8080 pp-1.payments.svc.cluster.local.
-_payment-processor._tcp.payments.svc.cluster.local. 5 IN SRV 10 100 8080 pp-2.payments.svc.cluster.local.
-_payment-processor._tcp.payments.svc.cluster.local. 5 IN SRV 10 100 8080 pp-3.payments.svc.cluster.local.
+# SRV record format: _port-name._proto.service.namespace.svc.zone TTL class SRV priority weight port target
+# Kubernetes publishes these for named ports; for a headless Service there is one per pod
+_http._tcp.payment-processor.payments.svc.cluster.local. 5 IN SRV 0 33 8080 10-0-1-5.payment-processor.payments.svc.cluster.local.
+_http._tcp.payment-processor.payments.svc.cluster.local. 5 IN SRV 0 33 8080 10-0-1-6.payment-processor.payments.svc.cluster.local.
+_http._tcp.payment-processor.payments.svc.cluster.local. 5 IN SRV 0 33 8080 10-0-1-7.payment-processor.payments.svc.cluster.local.
 ```
 
 ```java
@@ -339,10 +353,13 @@ public class DnsServiceDiscovery {
 
     /**
      * Resolve service instances via DNS SRV records.
-     * Lower TTL (5s) ensures rapid propagation of instance changes.
+     * Lower TTL (5s) ensures rapid propagation of instance changes —
+     * provided nothing in between caches longer (check the JVM's
+     * networkaddress.cache.ttl and any local DNS cache).
+     * Example: resolveViaSrv("http", "payment-processor.payments.svc.cluster.local")
      */
-    public List<ServiceEndpoint> resolveViaSrv(String serviceName, String domain) {
-        String srvQuery = String.format("_%s._tcp.%s", serviceName, domain);
+    public List<ServiceEndpoint> resolveViaSrv(String portName, String serviceDomain) {
+        String srvQuery = String.format("_%s._tcp.%s", portName, serviceDomain);
 
         try {
             Hashtable<String, String> env = new Hashtable<>();
@@ -427,6 +444,8 @@ spec:
       labels:
         app: payment-processor
     spec:
+      # Must exceed the preStop sleep plus Spring's graceful shutdown time
+      terminationGracePeriodSeconds: 45
       containers:
         - name: payment-processor
           image: payments/processor:2.4.1
@@ -449,7 +468,9 @@ spec:
           lifecycle:
             preStop:
               exec:
-                # Allow in-flight requests to complete before the pod stops
+                # Give endpoints/kube-proxy time to stop routing here before
+                # SIGTERM; Spring Boot (server.shutdown: graceful) then
+                # finishes the in-flight requests
                 command: ["/bin/sh", "-c", "sleep 15"]
 ```
 
@@ -474,14 +495,13 @@ public class PaymentHealthConfiguration {
     public HealthIndicator databaseHealthIndicator(DataSource dataSource) {
         return () -> {
             try (Connection conn = dataSource.getConnection()) {
-                conn.setAutoCommit(false);
-                // Test actual write capability, not just connectivity
+                // Checks the ledger table is readable — a read, not a write test
                 try (PreparedStatement ps = conn.prepareStatement(
                         "SELECT 1 FROM payment_ledger LIMIT 1")) {
                     ps.executeQuery();
                 }
                 return Health.up()
-                    .withDetail("database", "writable")
+                    .withDetail("database", "reachable")
                     .build();
             } catch (SQLException e) {
                 return Health.down()
@@ -493,13 +513,12 @@ public class PaymentHealthConfiguration {
     }
 
     @Bean
-    public HealthIndicator kafkaHealthIndicator(KafkaTemplate<?, ?> kafkaTemplate) {
+    public HealthIndicator kafkaHealthIndicator(KafkaAdmin kafkaAdmin) {
         return () -> {
-            try {
-                // Probe Kafka connectivity by describing the topic
-                kafkaTemplate.getProducerFactory()
-                    .createProducer()
-                    .partitionsFor("payment-events");
+            // Short-lived admin client, always closed (creating a producer per
+            // probe and never closing it leaks threads and connections)
+            try (AdminClient admin = AdminClient.create(kafkaAdmin.getConfigurationProperties())) {
+                admin.describeCluster().nodes().get(3, TimeUnit.SECONDS);
                 return Health.up().withDetail("kafka", "reachable").build();
             } catch (Exception e) {
                 return Health.down()
@@ -545,11 +564,14 @@ management:
         enabled: true  # Enables /actuator/health/liveness and /readiness
       group:
         readiness:
-          include: db, kafka, fraudService
-          # Service is not ready until all critical dependencies are healthy
+          include: readinessState, db
+          # Only dependencies THIS instance owns. If a SHARED downstream service
+          # (fraud, Kafka) were in readiness, its outage would mark EVERY
+          # instance unready and Kubernetes would remove them all at once.
+          # Handle shared dependencies with circuit breakers instead.
         liveness:
-          include: ping
-          # Service is alive as long as the JVM is running
+          include: livenessState
+          # Never include external systems: a DB outage must not restart pods
 ```
 
 ### Readiness vs Liveness
@@ -561,29 +583,26 @@ This distinction is critical in a Kubernetes payment service:
 
 ```java
 @Component
-public class PaymentProcessorReadinessState implements ApplicationListener<ApplicationReadyEvent> {
+public class PaymentProcessorWarmUp implements ApplicationRunner {
 
-    private final ReadinessState readinessState;
+    private final ApplicationEventPublisher events;
     private final LedgerConnectionPool ledgerPool;
+    private final ConfigurationCache configurationCache;
 
     /**
-     * During startup, the service marks itself as not-ready until
-     * it has pre-warmed its connection pool and loaded configuration.
-     * This prevents premature routing of payment requests.
+     * Spring Boot reports ReadinessState.ACCEPTING_TRAFFIC only after all
+     * ApplicationRunners have finished, so warming up here keeps payment
+     * requests away until the connection pool and configuration are ready.
      */
     @Override
-    public void onApplicationEvent(ApplicationReadyEvent event) {
+    public void run(ApplicationArguments args) {
         try {
-            // Pre-warm connection pool
-            ledgerPool.initialize(minimumPoolSize());
-            // Load fraud rules, exchange rates, etc.
-            configurationCache.refresh();
-
-            readinessState.acceptTraffic();
-            log.info("Payment processor ready — accepting traffic");
+            ledgerPool.initialize(minimumPoolSize());   // pre-warm connections
+            configurationCache.refresh();               // fraud rules, FX rates, ...
+            log.info("Payment processor warmed up");
         } catch (Exception e) {
-            log.error("Startup initialization failed — marking as not-ready", e);
-            readinessState.refuseTraffic();
+            log.error("Startup initialization failed — refusing traffic", e);
+            AvailabilityChangeEvent.publish(events, this, ReadinessState.REFUSING_TRAFFIC);
         }
     }
 }
@@ -604,6 +623,9 @@ public class GracefulShutdownHandler {
     private final ServiceRegistry serviceRegistry;
     private final ActiveRequestTracker activeRequests;
 
+    // Spring Boot can do the waiting for you: server.shutdown: graceful and
+    // spring.lifecycle.timeout-per-shutdown-phase: 30s. This handler shows
+    // the extra step for registries outside Kubernetes: deregister FIRST.
     @PreDestroy
     public void shutdown() {
         log.info("Shutdown initiated — deregistering from service registry");
@@ -631,7 +653,7 @@ public class GracefulShutdownHandler {
 
 ### Consul Deregistration on Critical Health Failure
 
-The `deregisterCriticalServiceAfter` field in the Consul health check definition automatically removes a service from the registry after it has been in a critical (failing) state for the specified duration. This handles cases where the service process dies without calling the deregister API:
+Two separate mechanisms matter. **Routing stops as soon as a check turns critical**: clients that ask Consul only for passing instances (the health API with `passing=true`, Consul DNS, or Connect) skip the instance at once. **Cleanup** is done by `deregisterCriticalServiceAfter`, which removes an instance that has stayed critical for the given time — for processes that die without calling the deregister API. Its minimum is 1 minute, and the reaper runs about every 30 seconds:
 
 ```json
 {
@@ -644,7 +666,7 @@ The `deregisterCriticalServiceAfter` field in the Consul health check definition
 }
 ```
 
-For payment systems, 60 seconds of continued routing to a failed instance is too long. Use aggressive deregistration settings:
+For payment systems, make detection fast — that is what stops routing — and keep cleanup at its minimum:
 
 ```json
 {
@@ -652,7 +674,7 @@ For payment systems, 60 seconds of continued routing to a failed instance is too
     "http": "http://localhost:8080/actuator/health/readiness",
     "interval": "5s",
     "timeout": "3s",
-    "deregisterCriticalServiceAfter": "15s"
+    "deregisterCriticalServiceAfter": "1m"
   }
 }
 ```
@@ -710,11 +732,10 @@ spring:
     name: payment-processor
   cloud:
     loadbalancer:
-      ribbon:
-        enabled: false  # Use Spring Cloud LoadBalancer, not Ribbon
+      # Spring Cloud LoadBalancer (Ribbon was removed in Spring Cloud 2020)
       retry:
         enabled: true
-        max-retries-on-next-instance: 2  # Try up to 2 other instances on failure
+        max-retries-on-next-service-instance: 2  # Try up to 2 other instances on failure
         retry-on-all-operations: false   # Only retry on GET; POST retries need idempotency keys
 
 resilience4j:
@@ -742,7 +763,7 @@ resilience4j:
 
 ### Pitfall 1: Stale Registry Caches
 
-Eureka clients cache the registry locally. If `registryFetchIntervalSeconds` is 30 (the default), a newly failed instance can receive traffic for up to 30 seconds after failing. Reduce this for payment services:
+Eureka clients cache the registry locally, and the delays add up: the lease must expire (90 seconds by default), the server's eviction task must run, the server's response cache refreshes every 30 seconds, and each client fetches every 30 seconds. With defaults, a crashed instance can keep receiving traffic for two minutes or more. Reduce these for payment services (and use `eureka.server.responseCacheUpdateIntervalMs` on the server):
 
 ```yaml
 eureka:
@@ -755,7 +776,7 @@ eureka:
 
 ### Pitfall 2: Health Checks That Don't Reflect Reality
 
-A health check that only verifies `SELECT 1` from the database is misleading — it proves the database is reachable but not that the service can actually process payments. Health checks should exercise the critical path:
+A health check that only verifies `SELECT 1` from the database is misleading — it proves the database is reachable but not that the service can actually process payments. A deep check should exercise the critical path. Expose it as a separate endpoint for monitoring and alerting — not as the readiness probe — so that one shared dependency failing does not take every instance out of rotation at once:
 
 ```java
 @Component("deepPaymentHealthCheck")
@@ -794,7 +815,7 @@ eureka:
 
 ### Pitfall 4: Missing Readiness Probe Delay
 
-New instances start receiving payment traffic before they are fully initialized — connection pools are cold, caches are empty, configuration hasn't loaded. Add an `initialDelaySeconds` to readiness probes:
+New instances start receiving payment traffic before they are fully initialized — connection pools are cold, caches are empty, configuration hasn't loaded. Make readiness reflect the warm-up (see the ApplicationRunner above) and, for slow starts, add a `startupProbe`; a modest `initialDelaySeconds` on the readiness probe also helps:
 
 ```yaml
 readinessProbe:
@@ -817,30 +838,47 @@ Service discovery is the backbone of resilient payment microservices. The key de
 |---|---|
 | Discovery approach | Client-side (Spring Cloud + Eureka) or Consul for service mesh |
 | Health check frequency | Every 5-10 seconds for payment-critical services |
-| Deregistration timeout | 15-30 seconds maximum (Consul `deregisterCriticalServiceAfter`) |
+| Stop routing to a failed instance | Fast health checks (5s) + clients that use only passing instances; `deregisterCriticalServiceAfter` (min 1 minute) is for cleanup |
 | Registry cache TTL | 5 seconds (reduce Eureka's default 30s) |
-| Readiness vs liveness | Readiness must check ALL critical dependencies |
+| Readiness vs liveness | Readiness checks the instance's own critical dependencies; liveness checks only the process |
 | Load balancing | Combine with circuit breakers to avoid routing to degraded instances |
 | Kubernetes | Use readiness/liveness probes + `preStop` hook for graceful shutdown |
+
+The fundamental principle: **the registry must always reflect reality**. Any gap between the registry state and actual service health directly translates to failed payment transactions.
 
 <!-- KNOWLEDGE-CHECK
 {
   "questions": [
     {
       "text": "What is the fundamental difference between client-side and server-side service discovery?",
-      "options": ["Client-side uses DNS; server-side uses IP addresses", "In client-side discovery the consumer queries the registry and chooses an instance; in server-side discovery a load balancer queries the registry and routes the call", "Client-side discovery requires Kubernetes; server-side works on bare metal only", "Server-side discovery cannot perform health checks"],
+      "options": [
+        "Client-side uses DNS; server-side uses IP addresses",
+        "In client-side discovery the consumer queries the registry and chooses an instance; in server-side discovery a load balancer queries the registry and routes the call",
+        "Client-side discovery requires Kubernetes; server-side works on bare metal only",
+        "Server-side discovery cannot perform health checks"
+      ],
       "correct": 1,
-      "explanation": "In client-side discovery (e.g., Netflix Eureka with Ribbon), the consumer fetches the instance list from the registry and performs load balancing itself. In server-side discovery (e.g., AWS ALB, Consul with Envoy), the consumer calls a fixed endpoint and an intermediary does the lookup and routing."
+      "explanation": "In client-side discovery (e.g., Netflix Eureka with Spring Cloud LoadBalancer), the consumer fetches the instance list from the registry and performs load balancing itself. In server-side discovery (e.g., AWS ALB, Consul with Envoy), the consumer calls a fixed endpoint and an intermediary does the lookup and routing."
     },
     {
       "text": "Why should a payment service's health check endpoint verify its database connection and downstream dependencies rather than just returning HTTP 200?",
-      "options": ["HTTP 200 alone causes Eureka to deregister the instance", "A service that cannot reach its database will fail every request; routing traffic to it wastes capacity and causes cascading failures", "Kubernetes ignores HTTP 200 responses for liveness probes", "Deep health checks are required by PCI-DSS"],
+      "options": [
+        "HTTP 200 alone causes Eureka to deregister the instance",
+        "A service that cannot reach its database will fail every request; routing traffic to it wastes capacity and causes cascading failures",
+        "Kubernetes ignores HTTP 200 responses for liveness probes",
+        "Deep health checks are required by PCI-DSS"
+      ],
       "correct": 1,
-      "explanation": "A shallow health check that only confirms the process is running allows a broken instance (unreachable database, saturated thread pool) to remain in the registry and receive traffic. Deep health checks verify that the instance can actually process requests."
+      "explanation": "A shallow health check that only confirms the process is running allows a broken instance (unreachable database, saturated thread pool) to remain in the registry and receive traffic. Checks should verify that the instance can actually process requests — but keep shared downstream services out of the readiness probe, or one outage will take every instance out of rotation at once."
     },
     {
       "text": "What is the main drawback of Eureka's default 30-second heartbeat and registration cache TTL in a Kubernetes payment environment?",
-      "options": ["It prevents more than 500 service instances from registering", "Stale routing persists for up to 90 seconds after an instance failure, sending payments to dead pods", "Consul becomes the single point of failure", "mTLS certificates cannot be renewed within the TTL window"],
+      "options": [
+        "It prevents more than 500 service instances from registering",
+        "Stale routing persists for up to 90 seconds after an instance failure, sending payments to dead pods",
+        "Consul becomes the single point of failure",
+        "mTLS certificates cannot be renewed within the TTL window"
+      ],
       "correct": 1,
       "explanation": "With a 30-second heartbeat and a 3-missed-heartbeat eviction threshold, a failed instance can remain in the registry for up to 90 seconds. During this window, clients route payment requests to a dead service instance, causing failures."
     }
@@ -862,4 +900,3 @@ Service discovery is the backbone of resilient payment microservices. The key de
 }
 -->
 
-The fundamental principle: **the registry must always reflect reality**. Any gap between the registry state and actual service health directly translates to failed payment transactions.

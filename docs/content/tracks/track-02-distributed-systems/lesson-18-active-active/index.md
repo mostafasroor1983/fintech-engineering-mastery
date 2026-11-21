@@ -15,14 +15,14 @@ prerequisites: [track-02-lesson-01, track-02-lesson-02, track-02-lesson-04]
 # Cross-Region Active-Active Architecture
 
 > [!NOTE]
-> Active-active means every region can accept writes and serve reads. No region is a hot standby waiting for a failover. This eliminates the recovery time objective (RTO) for a region failure — traffic shifts immediately — and can achieve a recovery point objective (RPO) of near zero. It is also the hardest distributed systems architecture to build correctly, particularly for financial systems where conflicting writes on the same account balance are financially dangerous.
+> Active-active means every region can accept writes and serve reads. No region is a hot standby waiting for a failover. When a region fails, traffic shifts to the others within seconds, and with synchronous (quorum) replication the recovery point objective (RPO) can be zero. But availability for each piece of data still depends on where its replicas live — an account whose replicas are all in the failed region is unavailable until it returns. It is also the hardest distributed systems architecture to build correctly, particularly for financial systems where conflicting writes on the same account balance are financially dangerous.
 
 ## Active-Active vs Active-Passive
 
 | Property | Active-Passive | Active-Active |
 |---|---|---|
-| Write availability on failover | Minutes (failover time) | Zero (other region is live) |
-| RPO on failure | Seconds to minutes (replication lag) | Near-zero (synchronous) or seconds (async) |
+| Write availability on failover | Minutes (failover time) | Seconds for data whose replica quorum survives; none for data homed only in the failed region |
+| RPO on failure | Seconds to minutes (replication lag) | Zero (quorum/synchronous) or seconds (async) |
 | Write conflicts | None — single primary | Possible — multiple primaries |
 | Complexity | Moderate | High |
 | Latency for cross-region users | High (all writes go to primary) | Low (write to nearest region) |
@@ -30,7 +30,7 @@ prerequisites: [track-02-lesson-01, track-02-lesson-02, track-02-lesson-04]
 
 For most financial systems, **active-passive is the right starting point**. Active-active is justified when:
 - Users in geographically distant regions need low-latency writes (sub-50ms write SLA)
-- Regulatory requirements mandate zero RPO for financial data
+- The business needs zero RPO and fast recovery for critical services, and accepts the cost (operational-resilience rules such as DORA and FCA PS21/3 push in this direction, but do not mandate active-active)
 - The firm has a true multi-jurisdictional regulatory presence requiring data isolation per region
 
 ---
@@ -51,7 +51,7 @@ This is the **write conflict problem**. Solving it requires either:
 2. **Using CRDTs** for data types that support conflict-free merging — works for counters, not balances.
 3. **Accepting conflicts and resolving post-hoc** (last-write-wins, compensation) — loses data or requires complex reconciliation.
 
-For financial balances, option 1 is the only safe choice.
+For financial balances, option 1 is the only safe choice — either built by hand (as below) or provided by a consensus database that keeps each row's leader (leaseholder) in its home region.
 
 ---
 
@@ -119,34 +119,42 @@ public class GCounter {
 Purpose-built distributed SQL databases manage replication, conflict detection, and global ordering internally:
 
 ```sql
--- CockroachDB: create a multi-region table
-CREATE TABLE payments (
-    id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id  VARCHAR(128) NOT NULL,
-    amount      DECIMAL(19,4) NOT NULL,
-    region      VARCHAR(32)  NOT NULL,
-    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
-) LOCALITY GLOBAL;  -- replicated to all regions
+-- CockroachDB: make the database multi-region first
+ALTER DATABASE payments PRIMARY REGION "eu-west-1";
+ALTER DATABASE payments ADD REGION "us-east-1";
+ALTER DATABASE payments ADD REGION "ap-southeast-1";
 
--- Regional table: row is pinned to a region based on a column value
+-- Payments are write-heavy: keep each row in its home region.
+-- (LOCALITY GLOBAL is for read-mostly reference data — every write to a
+--  GLOBAL table waits for cross-region consensus.)
+CREATE TABLE payments (
+    id          UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id  VARCHAR(128)  NOT NULL,
+    amount      DECIMAL(19,4) NOT NULL,
+    created_at  TIMESTAMPTZ   NOT NULL DEFAULT now()
+) LOCALITY REGIONAL BY ROW;   -- adds a hidden crdb_region column, set to the
+                              -- gateway's region on insert
+
+-- Regional by row with an explicit, computed home region
 CREATE TABLE accounts (
-    id      VARCHAR(128) PRIMARY KEY,
+    id           VARCHAR(128) PRIMARY KEY,
     home_region  crdb_internal_region NOT NULL AS (
         CASE
             WHEN id LIKE 'EU%' THEN 'eu-west-1'
             WHEN id LIKE 'US%' THEN 'us-east-1'
             ELSE 'ap-southeast-1'
-        END
+        END::crdb_internal_region
     ) STORED,
-    balance DECIMAL(19,4) NOT NULL,
-    version BIGINT        NOT NULL DEFAULT 0
-) LOCALITY REGIONAL BY ROW;
+    balance      DECIMAL(19,4) NOT NULL,
+    version      BIGINT        NOT NULL DEFAULT 0
+) LOCALITY REGIONAL BY ROW AS home_region;
 -- Writes for EU accounts are low-latency in EU; US accounts in US
 ```
 
 ```java
-// CockroachDB provides serialisable isolation across regions
-// No application-level conflict detection needed for regional tables
+// CockroachDB always runs SERIALIZABLE. Conflicting transactions fail with
+// SQLSTATE 40001 and must be retried (e.g. with Spring Retry), so the method
+// must be safe to run again.
 @Transactional(isolation = Isolation.SERIALIZABLE)
 public void debit(String accountId, BigDecimal amount) {
     Account account = accountRepo.findByIdForUpdate(accountId)
@@ -159,7 +167,7 @@ public void debit(String accountId, BigDecimal amount) {
     account.setBalance(account.getBalance().subtract(amount));
     account.setVersion(account.getVersion() + 1);
     accountRepo.save(account);
-    // CockroachDB serialises concurrent cross-region writes on this row
+    // The row's leaseholder (in its home region) serialises concurrent writes
 }
 ```
 
@@ -256,6 +264,7 @@ public class AccountQueryService {
 
     private final AccountReadRepository localReadRepo;
     private final RegionAwarePaymentRouter writeRouter;
+    private final RegionResolver regionResolver;
 
     // Reads always served from local replica — sub-5ms, any region
     public AccountBalance getBalance(String accountId) {
@@ -263,8 +272,9 @@ public class AccountQueryService {
             .orElseThrow(() -> new AccountNotFoundException(accountId));
     }
 
-    // Balance may be slightly stale (replication lag: ~50–200ms async)
-    // For payment authorisation, route to home region instead
+    // Above: for rows homed elsewhere this is a stale read — a CockroachDB
+    // follower read (a few seconds old by default) or an async replica.
+    // For payment authorisation, read from the home region instead:
     public AccountBalance getBalanceConsistent(String accountId) {
         String homeRegion    = regionResolver.homeRegionOf(accountId);
         String currentRegion = System.getenv("AWS_REGION");
@@ -310,8 +320,8 @@ flowchart TD
     EUAPP -- "EU account write\n(local, ~5ms)" --> EUDB
     EUAPP -- "US account write\n(proxied, +50ms)" --> USAPP
 
-    EUDB <-- "async replication\n(~50ms lag)" --> USDB
-    USDB <-- "async replication" --> APDB
+    EUDB <-- "Raft replication\n(per-range quorums)" --> USDB
+    USDB <-- "Raft replication" --> APDB
 
     USAPP -- "US account write\n(local, ~5ms)" --> USDB
 ```
@@ -334,7 +344,7 @@ Design your SLAs around the home-region routing latency for the user segment. Eu
 
 ## Data Residency Constraints
 
-EU GDPR and financial regulation require that certain personal and financial data remain within EU borders:
+GDPR does not, by itself, require data to stay in the EU — it restricts transfers outside the EEA unless safeguards apply (an adequacy decision, standard contractual clauses). But many firms adopt a data-residency policy, and some regulators, contracts, or national rules do require local storage. Enforce whatever your policy says in code:
 
 ```java
 @Component
@@ -365,13 +375,13 @@ public class DataResidencyValidator {
 }
 ```
 
-This check must run **before** any cross-region routing decision to prevent inadvertent data placement violations. PII that leaves the EU jurisdiction triggers mandatory breach reporting under GDPR Article 33.
+This check must run **before** any cross-region routing decision to prevent inadvertent data placement violations. A transfer without a valid legal basis breaks GDPR's transfer rules (Chapter V, Articles 44–49) and can lead to heavy fines. Note that proxying a request through another region also moves the request's personal data through that region — where possible, route customers to their home-region endpoint at the edge (geo-DNS or a region-aware gateway).
 
 ---
 
 ## Disaster Recovery with Active-Active (Zero RPO)
 
-In an active-active architecture, a region failure does not cause data loss if replication is synchronous:
+In an active-active architecture, a region failure does not cause data loss if replication is synchronous (quorum-based):
 
 ```
 Region EU-WEST-1 fails at T=0.
@@ -386,7 +396,7 @@ Result:
   - EU-to-US or US-to-EU payments: partially degraded (debit fails; credit would succeed)
 ```
 
-The practical RPO is the replication lag for async replicas (~50–200ms for CockroachDB across EU–US). Use `FOLLOWER READS AS OF SYSTEM TIME '-10s'` to query a consistent snapshot from non-home regions.
+With CockroachDB's default survival goal (`SURVIVE ZONE FAILURE`), all voting replicas of EU rows live in EU: RPO is zero, but EU rows are unavailable while EU is down — exactly the result above. With `SURVIVE REGION FAILURE` (at least 3 regions), EU rows stay writable during an EU outage, at the price of cross-region latency on every write. To read a consistent, slightly old snapshot from any region, use `SELECT ... AS OF SYSTEM TIME follower_read_timestamp()`.
 
 ---
 
@@ -416,7 +426,7 @@ sequenceDiagram
     EUAPP-->>EUClient: 200 OK {paymentId, timestamp}
 ```
 
-If the US credit fails after the EU debit succeeds, a **compensation event** is emitted to refund EU-A. This is managed by a saga (Lesson 15).
+If the US credit fails after the EU debit succeeds, a **compensation event** is emitted to refund EU-A. This is managed by a saga (Lesson 15). The cross-region credit carries the payment's idempotency key, so when the call times out the saga can safely retry it — the outcome is unknown, so it must not compensate until it knows the credit did not happen.
 
 ---
 
@@ -426,7 +436,7 @@ When a region becomes unreachable:
 
 1. **DNS/load balancer**: Remove failing region from health checks within 30 seconds (Route 53 health checks or Global Accelerator endpoint weights).
 2. **Write routing**: The `RegionAwarePaymentRouter` will receive gRPC `UNAVAILABLE` on cross-region calls. Caller retries must have a timeout (5 seconds) and circuit breaker.
-3. **Account migrations**: For EU-account holders stranded in US during EU outage, temporarily allow US writes with a "region override" flag — creates a reconciliation liability when EU returns.
+3. **Stand-in processing**: Do NOT let another region debit EU accounts freely — it could not see the real balance, so it could allow double spending. At most, allow pre-approved, limited operations (for example card authorisations up to a small stand-in limit, recorded for later posting), and accept the reconciliation work when EU returns.
 4. **Recovery**: On EU region recovery, reconcile any writes made outside the account's home region during the outage.
 
 ---
@@ -454,12 +464,16 @@ A slow or failing home region will cascade into the calling region if calls are 
 ```java
 @CircuitBreaker(name = "cross-region-debit", fallbackMethod = "debitFallback")
 @TimeLimiter(name = "cross-region-debit")
-public CompletableFuture<PaymentResult> routeDebitAsync(String accountId, ...) {
+public CompletableFuture<PaymentResult> routeDebitAsync(String accountId,
+        BigDecimal amount, String idempotencyKey) {
+    // A dedicated executor: blocking gRPC calls must not run on the common pool
     return CompletableFuture.supplyAsync(() ->
-        writeRouter.routeDebit(accountId, amount, idempotencyKey));
+        writeRouter.routeDebit(accountId, amount, idempotencyKey), crossRegionExecutor);
 }
 
-public CompletableFuture<PaymentResult> debitFallback(String accountId, Throwable ex) {
+// The fallback has the same parameters as the method, plus the Throwable
+public CompletableFuture<PaymentResult> debitFallback(String accountId,
+        BigDecimal amount, String idempotencyKey, Throwable ex) {
     // Return 503 Service Unavailable — do not attempt local write for EU account
     return CompletableFuture.failedFuture(
         new HomeRegionUnavailableException(accountId, ex));
@@ -468,7 +482,7 @@ public CompletableFuture<PaymentResult> debitFallback(String accountId, Throwabl
 
 ### 3. Data Residency Not Validated Before Replication
 
-CockroachDB will replicate all rows to all regions by default. Without `LOCALITY REGIONAL BY ROW` and data residency pre-validation, EU customer PII can land in US nodes.
+In a multi-region CockroachDB database, regional tables still get non-voting replicas in every other region by default (to make follower reads fast) — so EU rows are stored on US nodes. For strict residency, use `ALTER DATABASE ... PLACEMENT RESTRICTED` or super regions, together with `LOCALITY REGIONAL BY ROW` and the pre-write validation above.
 
 ---
 
@@ -479,7 +493,7 @@ CockroachDB will replicate all rows to all regions by default. Without `LOCALITY
 - [ ] Circuit breakers on all cross-region gRPC calls with timeout < 5s
 - [ ] Local reads clearly distinguished from consistent reads in service API
 - [ ] Cross-region payment uses saga with compensation for partial failure
-- [ ] CockroachDB regional tables use `LOCALITY REGIONAL BY ROW` for account data
+- [ ] CockroachDB regional tables use `LOCALITY REGIONAL BY ROW` for account data, with `PLACEMENT RESTRICTED` (or super regions) where residency requires it
 - [ ] Failover runbook tested with chaos engineering — specifically EU-region-unavailable scenario
 - [ ] Replication lag monitored: alert when lag > 5s
 
@@ -509,7 +523,7 @@ CockroachDB will replicate all rows to all regions by default. Without `LOCALITY
       "explanation": "A G-Counter's value is the sum of all region slots. Each region only increments its own slot, so there are no conflicts. The global total is 100 + 150 + 50 = 300."
     },
     {
-      "text": "An EU customer's data must remain in eu-west-1 per GDPR. The payment service runs in both eu-west-1 and us-east-1. A US region API gateway receives a request to modify this customer's account. What should happen?",
+      "text": "An EU customer's data must remain in eu-west-1 under the firm's data-residency policy. The payment service runs in both eu-west-1 and us-east-1. A US region API gateway receives a request to modify this customer's account. What should happen?",
       "options": [
         "Reject the request — only EU region can modify EU customer accounts",
         "Process it locally in US region to minimise latency",
@@ -517,7 +531,7 @@ CockroachDB will replicate all rows to all regions by default. Without `LOCALITY
         "Copy the data to US region temporarily and delete after processing"
       ],
       "correct": 2,
-      "explanation": "Data residency rules require the data to stay in eu-west-1. The correct approach is to proxy the write to eu-west-1, accepting the cross-region latency penalty. Processing it locally in US region or temporarily copying data would violate GDPR data localisation requirements."
+      "explanation": "The residency policy requires the data to stay in eu-west-1. The correct approach is to proxy the write to eu-west-1, accepting the cross-region latency penalty (and, better still, to route such customers to the EU endpoint at the edge). Processing it locally in the US region or temporarily copying the data would break the policy — and, without a valid transfer mechanism, GDPR's international-transfer rules."
     }
   ]
 }

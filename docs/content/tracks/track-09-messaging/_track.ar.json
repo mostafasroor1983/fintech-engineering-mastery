@@ -1,0 +1,377 @@
+{
+  "id": "track-09",
+  "sequence": 9,
+  "title": "الرسائل وتدفق البيانات وتكامل الأنظمة",
+  "shortTitle": "الرسائل وتدفق البيانات",
+  "slug": "messaging",
+  "color": "#8b5cf6",
+  "colorMuted": "rgba(139, 92, 246, 0.15)",
+  "description": "بنية Apache Kafka، ودلالات المعالجة مرة واحدة فقط (Exactly-Once)، ونمط Outbox، والتقاط تغييرات البيانات (CDC)، وEvent Sourcing، وCQRS، ونمط Saga، والمعالجة المالية القائمة على الأحداث.",
+  "difficulty": "advanced",
+  "estimatedHours": 30,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-09-lesson-01",
+      "sequence": 1,
+      "title": "بنية Kafka — المواضيع والأقسام ومجموعات المستهلكين",
+      "slug": "kafka-architecture",
+      "path": "content/tracks/track-09-messaging/lesson-01-kafka-architecture/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "topic",
+        "partition",
+        "consumer-group",
+        "broker"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-09-lesson-02",
+      "sequence": 2,
+      "title": "منتِج Kafka — الإقرار والتجميع والترتيب",
+      "slug": "kafka-producer",
+      "path": "content/tracks/track-09-messaging/lesson-02-kafka-producer/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "producer",
+        "acks",
+        "idempotent",
+        "ordering"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-09-lesson-03",
+      "sequence": 3,
+      "title": "مستهلك Kafka — إدارة الإزاحات وإعادة التوازن",
+      "slug": "kafka-consumer",
+      "path": "content/tracks/track-09-messaging/lesson-03-kafka-consumer/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "consumer",
+        "offset",
+        "rebalance",
+        "commit-strategy"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-09-lesson-04",
+      "sequence": 4,
+      "title": "Kafka Streams — معالجة التدفقات ذات الحالة",
+      "slug": "kafka-streams",
+      "path": "content/tracks/track-09-messaging/lesson-04-kafka-streams/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "Kafka-Streams",
+        "KStream",
+        "KTable",
+        "state-store",
+        "windowing"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-05",
+      "sequence": 5,
+      "title": "المعالجة مرة واحدة فقط — المعاملات في Kafka",
+      "slug": "kafka-exactly-once",
+      "path": "content/tracks/track-09-messaging/lesson-05-exactly-once/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "exactly-once",
+        "Kafka",
+        "transactions",
+        "idempotent-producer",
+        "EOS"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-09-lesson-06",
+      "sequence": 6,
+      "title": "نمط Transactional Outbox مع Debezium CDC",
+      "slug": "outbox-cdc-debezium",
+      "path": "content/tracks/track-09-messaging/lesson-06-outbox-cdc/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "outbox",
+        "CDC",
+        "Debezium",
+        "dual-write",
+        "WAL"
+      ],
+      "tier": "supporting"
+    },
+    {
+      "id": "track-09-lesson-07",
+      "sequence": 7,
+      "title": "سجل المخططات — Avro وProtobuf وتطور المخطط",
+      "slug": "schema-registry",
+      "path": "content/tracks/track-09-messaging/lesson-07-schema-registry/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "schema-registry",
+        "Avro",
+        "Protobuf",
+        "schema-evolution",
+        "compatibility"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-08",
+      "sequence": 8,
+      "title": "Kafka Connect — بنية موصلات المصدر والوجهة",
+      "slug": "kafka-connect",
+      "path": "content/tracks/track-09-messaging/lesson-08-kafka-connect/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "Kafka-Connect",
+        "source-connector",
+        "sink-connector",
+        "SMT",
+        "worker"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-09",
+      "sequence": 9,
+      "title": "Event Sourcing مع Kafka — بنية مخزن الأحداث",
+      "slug": "event-sourcing-kafka",
+      "path": "content/tracks/track-09-messaging/lesson-09-event-sourcing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "event-sourcing",
+        "event-store",
+        "append-only",
+        "snapshot",
+        "projection"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-10",
+      "sequence": 10,
+      "title": "CQRS مع Kafka — استراتيجيات إسقاط نماذج القراءة",
+      "slug": "cqrs-kafka",
+      "path": "content/tracks/track-09-messaging/lesson-10-cqrs/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "CQRS",
+        "read-model",
+        "projection",
+        "eventual-consistency",
+        "Kafka"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-11",
+      "sequence": 11,
+      "title": "طوابير الرسائل الميتة — التعامل مع الرسائل السامة وإعادة المحاولة",
+      "slug": "dead-letter-queues",
+      "path": "content/tracks/track-09-messaging/lesson-11-dlq/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "DLQ",
+        "poison-pill",
+        "dead-letter",
+        "retry",
+        "alerting"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-12",
+      "sequence": 12,
+      "title": "أمان Kafka — TLS وSASL وقوائم التحكم بالوصول",
+      "slug": "kafka-security",
+      "path": "content/tracks/track-09-messaging/lesson-12-kafka-security/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "TLS",
+        "SASL",
+        "ACL",
+        "mTLS"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-13",
+      "sequence": 13,
+      "title": "ضبط أداء Kafka — الإنتاجية مقابل الكمون",
+      "slug": "kafka-performance",
+      "path": "content/tracks/track-09-messaging/lesson-13-kafka-performance/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "performance",
+        "throughput",
+        "latency",
+        "compression"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-14",
+      "sequence": 14,
+      "title": "Kafka متعدد المناطق — MirrorMaker 2 والنسخ المتماثل",
+      "slug": "multi-region-kafka",
+      "path": "content/tracks/track-09-messaging/lesson-14-multi-region-kafka/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "MirrorMaker",
+        "multi-region",
+        "geo-replication",
+        "failover",
+        "Kafka"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-15",
+      "sequence": 15,
+      "title": "نمط Saga — التنسيق الذاتي (Choreography) والتنسيق المركزي (Orchestration)",
+      "slug": "saga-pattern",
+      "path": "content/tracks/track-09-messaging/lesson-15-saga/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "saga",
+        "choreography",
+        "orchestration",
+        "compensation",
+        "Axon"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-09-lesson-16",
+      "sequence": 16,
+      "title": "الخدمات المصغّرة القائمة على الأحداث — أنماط التكامل",
+      "slug": "event-driven-microservices",
+      "path": "content/tracks/track-09-messaging/lesson-16-event-driven-microservices/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "event-driven",
+        "microservices",
+        "event-mesh",
+        "choreography",
+        "decoupling"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-17",
+      "sequence": 17,
+      "title": "مراقبة Kafka — تأخر المستهلكين ومقاييس الوسطاء",
+      "slug": "kafka-monitoring",
+      "path": "content/tracks/track-09-messaging/lesson-17-kafka-monitoring/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "Kafka",
+        "monitoring",
+        "consumer-lag",
+        "JMX",
+        "Prometheus"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-18",
+      "sequence": 18,
+      "title": "ترتيب الرسائل — الضمانات الشاملة مقابل ضمانات القسم",
+      "slug": "message-ordering",
+      "path": "content/tracks/track-09-messaging/lesson-18-message-ordering/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "message-ordering",
+        "partition-key",
+        "global-order",
+        "sequence-number"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-19",
+      "sequence": 19,
+      "title": "RabbitMQ أم Kafka — اختيار الوسيط المناسب",
+      "slug": "rabbitmq-vs-kafka",
+      "path": "content/tracks/track-09-messaging/lesson-19-rabbitmq-vs-kafka/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "RabbitMQ",
+        "Kafka",
+        "comparison",
+        "queue",
+        "log"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-09-lesson-20",
+      "sequence": 20,
+      "title": "إطار المهندس الرئيسي لقرارات أنظمة الرسائل",
+      "slug": "messaging-decision-framework",
+      "path": "content/tracks/track-09-messaging/lesson-20-messaging-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "messaging",
+        "trade-offs",
+        "staff-engineer",
+        "broker"
+      ],
+      "tier": "optional"
+    }
+  ],
+  "mainPathMinutes": 505,
+  "optionalLessonCount": 14
+}

@@ -26,7 +26,7 @@ This lesson covers the full migration lifecycle: the three-phase model (coexist,
 
 ### 1.1 Why Not a Big-Bang Rewrite?
 
-A "big-bang" rewrite — where the team freezes the old system, rebuilds from scratch, and cuts over in a single release — has a failure rate exceeding 60% in enterprise contexts. For a payment processor handling £50 million per day, the risk profile is unacceptable:
+A "big-bang" rewrite — where the team freezes the old system, rebuilds from scratch, and cuts over in a single release — is notoriously one of the riskiest projects an enterprise can run. For a payment processor handling £50 million per day, the risk profile is unacceptable:
 
 - Undiscovered business rules embedded in legacy code
 - Implicit contracts between modules never captured in documentation
@@ -374,8 +374,8 @@ public class PercentageFeatureToggleService implements FeatureToggleService {
 
         // Deterministic hash — same payment always goes to same processor
         // This avoids flip-flopping between processors for the same payment
-        int hash = Math.abs(Objects.hash(toggleName, contextKey));
-        int bucket = hash % 100; // 0–99
+        // floorMod, not Math.abs(...) % 100: Math.abs(Integer.MIN_VALUE) is negative
+        int bucket = Math.floorMod(Objects.hash(toggleName, contextKey), 100); // 0–99
 
         return bucket < config.getRolloutPercentage();
     }
@@ -446,33 +446,30 @@ CREATE INDEX CONCURRENTLY idx_payments_currency
 **Phase 2 — Migrate**: Back-fill the new column from the old column. Run as a background job in small batches to avoid table locks.
 
 ```sql
--- Phase 2: Migrate — back-fill in batches to avoid lock contention
+-- Phase 2: Migrate — back-fill in small batches, one COMMIT per batch
+-- (COMMIT inside DO works on PostgreSQL 11+ when not run inside an outer transaction)
 DO $$
 DECLARE
-    batch_size  INT := 1000;
-    last_id     BIGINT := 0;
+    batch_size   INT := 1000;
     rows_updated INT;
 BEGIN
     LOOP
         UPDATE payments
-        SET
-            amount_minor_units = (pmt_amt * 100)::BIGINT,
-            currency_code      = COALESCE(ccy_iso, 'GBP')
-        WHERE id > last_id
-          AND amount_minor_units IS NULL
-          AND id IN (
-              SELECT id FROM payments
-              WHERE id > last_id
-                AND amount_minor_units IS NULL
-              ORDER BY id
-              LIMIT batch_size
-          )
-        RETURNING id INTO last_id;
+        SET amount_minor_units = (pmt_amt * 100)::BIGINT,  -- 2-decimal currencies only
+            currency_code      = ccy_iso                   -- never guess a currency
+        WHERE id IN (
+            SELECT id FROM payments
+            WHERE amount_minor_units IS NULL
+              AND ccy_iso IS NOT NULL        -- NULL currencies: investigate by hand
+            ORDER BY id
+            LIMIT batch_size
+        );
 
         GET DIAGNOSTICS rows_updated = ROW_COUNT;
         EXIT WHEN rows_updated = 0;
 
-        PERFORM pg_sleep(0.1); -- back-off between batches
+        COMMIT;                  -- release row locks; let replicas keep up
+        PERFORM pg_sleep(0.1);   -- back-off between batches
     END LOOP;
 END;
 $$;
@@ -482,6 +479,8 @@ SELECT COUNT(*) AS unmigrated
 FROM payments
 WHERE amount_minor_units IS NULL;
 ```
+
+Note: multiplying by 100 is right only for currencies with two decimal places (JPY has none, BHD has three) — use each currency's exponent in real code, and check that no amount has more decimals than its currency allows before casting.
 
 **Phase 3 — Contract**: Remove the old column. Only safe once no deployed code references it.
 
@@ -497,6 +496,8 @@ ALTER TABLE payments
   ALTER COLUMN amount_minor_units SET NOT NULL,
   ALTER COLUMN currency_code      SET NOT NULL;
 ```
+
+`SET NOT NULL` takes an exclusive lock and scans the whole table. On a large table, first add `CHECK (amount_minor_units IS NOT NULL) NOT VALID`, run `VALIDATE CONSTRAINT` (which does not block writes), and then `SET NOT NULL` — PostgreSQL 12+ uses the validated constraint and skips the scan.
 
 ### 5.2 Application-Level Dual-Write During Phase 2
 
@@ -561,6 +562,8 @@ public class DualWritePaymentRepository implements PaymentRepository {
 ## 6. Event Interception During Transition
 
 When the monolith publishes domain events (e.g., `PaymentProcessed`), the new service may need to consume them, and during the transition period, both old and new consumers may be active. The event interception pattern routes events to both consumers.
+
+In practice, the simplest and most reliable form is to publish each event once to a Kafka topic and give the legacy and the new consumer separate consumer groups: each receives every event, with its own offsets and retries. The in-process router below shows the idea, but note that it only logs a timeout — an event that times out is never redelivered.
 
 ### 6.1 Dual-Publish Architecture
 
@@ -633,10 +636,12 @@ public class ShadowModePaymentProcessor {
         ProcessingResult primaryResult = primaryProcessor.process(payment);
 
         // Execute shadow processor asynchronously — fire and forget
-        // We must NOT let shadow errors propagate to the caller
+        // We must NOT let shadow errors propagate to the caller, and the shadow
+        // must be a DRY RUN: it computes a result but moves no money, calls no
+        // payment scheme and writes nothing to the ledger
         CompletableFuture.runAsync(() -> {
             try {
-                ProcessingResult shadowResult = shadowProcessor.process(payment);
+                ProcessingResult shadowResult = shadowProcessor.simulate(payment);
                 recorder.record(payment.id(), primaryResult, shadowResult);
             } catch (Exception e) {
                 recorder.recordShadowFailure(payment.id(), e);
@@ -812,8 +817,9 @@ public void save(Payment payment) {
     } catch (Exception e) {
         log.error("Legacy write failed for payment {}, triggering compensating action",
             payment.id(), e);
-        compensationService.scheduleRetry(payment);
+        compensationService.scheduleRetry(payment);   // must be durable (a DB row), not in memory
         // Do NOT rethrow — primary write succeeded; legacy is eventually consistent
+        // only if the retry itself survives a crash
     }
 }
 ```
@@ -884,7 +890,7 @@ public class PaymentEnrichmentService {
 
 // CORRECT: ACL is the only place where legacy types appear; enforced by ArchUnit
 @AnalyzeClasses(packages = "com.bank.payments.newservice")
-public class AclBoundaryTest implements FreezingArchRule {
+public class AclBoundaryTest {
 
     @ArchTest
     static final ArchRule noDirectLegacyImports = noClasses()
@@ -900,7 +906,7 @@ public class AclBoundaryTest implements FreezingArchRule {
 
 ### Pitfall 4: Missing Idempotency During Traffic Split
 
-When a payment request is in flight during a toggle flip — say the first attempt goes to legacy and fails, then the retry goes to the new service — the new service must be idempotent. Without idempotency, the customer could be charged twice.
+When a payment request is in flight during a toggle flip — say the first attempt goes to legacy and times out, then the retry goes to the new service — the new service must be idempotent, and the idempotency store must be **shared by the legacy and the new path**. Otherwise each path only knows its own attempts, and the customer could be charged twice.
 
 ```java
 // REQUIRED: new service must reject duplicate payment attempts
@@ -911,19 +917,20 @@ public class IdempotentPaymentService {
     private final PaymentProcessor processor;
 
     public ProcessingResult process(Payment payment, IdempotencyKey key) {
-        // Check if we have already processed this exact request
-        Optional<ProcessingResult> cached = keyStore.find(key);
-        if (cached.isPresent()) {
-            log.info("Returning cached result for idempotency key {}", key);
-            return cached.get();
+        // Claim the key FIRST (INSERT ... ON CONFLICT DO NOTHING on a UNIQUE key).
+        // A check-then-store would let two concurrent attempts both through.
+        // Keep keys at least as long as the longest client retry window.
+        ClaimResult claim = keyStore.claim(key, Duration.ofHours(24));
+        if (claim.alreadyCompleted()) {
+            log.info("Returning stored result for idempotency key {}", key);
+            return claim.storedResult();              // replay the original outcome
+        }
+        if (claim.inProgressElsewhere()) {
+            throw new PaymentInProgressException(key); // 409 — the client retries later
         }
 
         ProcessingResult result = processor.process(payment);
-
-        // Store result associated with idempotency key
-        // TTL = 24 hours (FPS same-day settlement window)
-        keyStore.store(key, result, Duration.ofHours(24));
-
+        keyStore.complete(key, result);
         return result;
     }
 }

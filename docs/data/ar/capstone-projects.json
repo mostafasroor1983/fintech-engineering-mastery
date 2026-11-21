@@ -1,0 +1,204 @@
+{
+  "projects": [
+    {
+      "id": "project-a",
+      "sequence": 1,
+      "title": "خدمة مدفوعات مع منع التكرار وTransactional Outbox وKafka",
+      "shortTitle": "Payment Service",
+      "slug": "payment-service",
+      "path": "content/capstone/project-a-payment-platform/index.md",
+      "difficulty": "advanced",
+      "estimatedHours": 12,
+      "status": "published",
+      "color": "#6366f1",
+      "colorMuted": "rgba(99, 102, 241, 0.15)",
+      "description": "واجهة مدفوعات لا تخصم الدفعة مرتين أبدًا، ولا تفقد أبدًا الحدث الذي يُبلغ نظام التسوية بها.",
+      "objectives": [
+        "جعل POST /payments آمنًا من التكرار عند إعادة المحاولة المتزامنة",
+        "حل مشكلة الكتابة المزدوجة باستخدام Transactional Outbox",
+        "استهلاك الأحداث المسلَّمة مرة واحدة على الأقل دون تكرار الأثر، مع موضوع للرسائل الميتة"
+      ],
+      "techStack": [
+        "Java 21",
+        "Spring Boot 4.0",
+        "PostgreSQL 17",
+        "Kafka 4.1",
+        "Testcontainers 2"
+      ],
+      "tracks": [
+        "track-05",
+        "track-09",
+        "track-13",
+        "track-14"
+      ],
+      "tags": [
+        "payments",
+        "idempotency",
+        "outbox",
+        "kafka",
+        "dead-letter-topic"
+      ],
+      "module": "examples/capstone-1-payment-service"
+    },
+    {
+      "id": "project-b",
+      "sequence": 2,
+      "title": "محفظة متعددة العملات على دفتر أستاذ بالقيد المزدوج، مع تحويلات الصرف الأجنبي",
+      "shortTitle": "Wallet + Ledger",
+      "slug": "wallet-ledger",
+      "path": "content/capstone/project-b-ledger-engine/index.md",
+      "difficulty": "advanced",
+      "estimatedHours": 12,
+      "status": "published",
+      "color": "#ef4444",
+      "colorMuted": "rgba(239, 68, 68, 0.15)",
+      "description": "محافظ لا يمكن أن تتجاوز رصيدها، ولا تقع في الجمود، ولا تنحرف عن دفتر الأستاذ، مع تحويلات من الجنيه إلى اليورو بسعر محدد مسبقًا.",
+      "objectives": [
+        "ترحيل قيود يومية متوازنة مع قفل متشائم بترتيب ثابت",
+        "فرض ثوابت دفتر الأستاذ داخل قاعدة البيانات (التوازن، والإضافة فقط)",
+        "نمذجة تحويل صرف أجنبي من أربعة أطراف ومطابقة الأرصدة مع القيود"
+      ],
+      "techStack": [
+        "Java 21",
+        "Spring Boot 4.0",
+        "PostgreSQL 17",
+        "Hibernate 7",
+        "Testcontainers 2"
+      ],
+      "tracks": [
+        "track-05",
+        "track-04",
+        "track-08"
+      ],
+      "tags": [
+        "ledger",
+        "double-entry",
+        "fx",
+        "locking",
+        "reconciliation"
+      ],
+      "module": "examples/capstone-2-wallet-ledger"
+    },
+    {
+      "id": "project-c",
+      "sequence": 3,
+      "title": "تفويض البطاقات ومقاصتها مع فحص الاحتيال والمرونة",
+      "shortTitle": "Card Authorisation",
+      "slug": "card-authorisation",
+      "path": "content/capstone/project-c-card-authorisation/index.md",
+      "difficulty": "advanced",
+      "estimatedHours": 12,
+      "status": "published",
+      "color": "#10b981",
+      "colorMuted": "rgba(16, 185, 129, 0.15)",
+      "description": "تفويض مدفوعات البطاقات والتقاطها وعكسها واستردادها والاعتراض عليها، مع فحص احتيال محمي بمهلة زمنية وقاطع دائرة وعزل.",
+      "objectives": [
+        "تنفيذ دورة حياة البطاقة كآلة حالات باستخدام الأنواع المغلقة (sealed types)",
+        "حماية عمليات الالتقاط المتزامنة بالقفل المتفائل و@Retryable",
+        "استدعاء محرك الاحتيال مع مهلة زمنية وقاطع دائرة وعزل وبديل واضح"
+      ],
+      "techStack": [
+        "Java 21",
+        "Spring Boot 4.0",
+        "Spring Framework 7 resilience",
+        "Resilience4j 2.4",
+        "PostgreSQL 17"
+      ],
+      "tracks": [
+        "track-04",
+        "track-05",
+        "track-06",
+        "track-13"
+      ],
+      "tags": [
+        "cards",
+        "state-machine",
+        "circuit-breaker",
+        "bulkhead",
+        "timeouts"
+      ],
+      "module": "examples/capstone-3-card-authorisation"
+    },
+    {
+      "id": "project-d",
+      "sequence": 4,
+      "title": "منظومة التسوية والمطابقة (استقبال CAMT.053، والمطابقة، والفروقات)",
+      "shortTitle": "Reconciliation",
+      "slug": "settlement-reconciliation",
+      "path": "content/capstone/project-d-reconciliation-engine/index.md",
+      "difficulty": "advanced",
+      "estimatedHours": 12,
+      "status": "published",
+      "color": "#f59e0b",
+      "colorMuted": "rgba(245, 158, 11, 0.15)",
+      "description": "استقبال كشوف الحسابات البنكية بأمان، ومطابقتها مع دفتر الأستاذ، وتصنيف كل فرق ومعالجته عبر سير عمل خاضع للتدقيق.",
+      "objectives": [
+        "قراءة كشوف ISO 20022 camt.053 بأمان (بدون XXE) والتحقق من الأرصدة",
+        "مطابقة سطور البنك مع قيود دفتر الأستاذ وتصنيف الفروقات",
+        "تشغيل سير عمل للاستثناءات بمبدأ المُنشئ والمراجِع (maker-checker) مع سجل تدقيق للإضافة فقط"
+      ],
+      "techStack": [
+        "Java 21",
+        "Spring Boot 4.0",
+        "StAX",
+        "PostgreSQL 17",
+        "Testcontainers 2"
+      ],
+      "tracks": [
+        "track-04",
+        "track-05",
+        "track-08",
+        "track-11"
+      ],
+      "tags": [
+        "reconciliation",
+        "iso-20022",
+        "camt053",
+        "settlement",
+        "audit"
+      ],
+      "module": "examples/capstone-4-reconciliation"
+    },
+    {
+      "id": "project-e",
+      "sequence": 5,
+      "title": "واجهة تحويلات فورية بين الأفراد مع OAuth2 وتحديد المعدّل لكل مستأجر وWebhooks",
+      "shortTitle": "Instant P2P API",
+      "slug": "instant-p2p",
+      "path": "content/capstone/project-e-instant-p2p/index.md",
+      "difficulty": "advanced",
+      "estimatedHours": 12,
+      "status": "published",
+      "color": "#8b5cf6",
+      "colorMuted": "rgba(139, 92, 246, 0.15)",
+      "description": "واجهة تحويلات متعددة المستأجرين محمية بـ OAuth2، وعادلة بفضل Token Bucket في Redis، وتُبلغ المستأجرين عبر Webhooks موقَّعة مع إعادة المحاولة.",
+      "objectives": [
+        "تأمين خادم الموارد بالتحقق من جمهور JWT والصلاحيات وصلاحية الوصول لكل كائن",
+        "تحديد المعدّل لكل مستأجر باستخدام Token Bucket ذري في Redis",
+        "إرسال Webhooks موقَّعة مع حجز مؤقت، وتراجع أسي مع عشوائية، وحماية من SSRF"
+      ],
+      "techStack": [
+        "Java 21",
+        "Spring Boot 4.0",
+        "Spring Security 7",
+        "Redis 7.4",
+        "PostgreSQL 17"
+      ],
+      "tracks": [
+        "track-11",
+        "track-02",
+        "track-06",
+        "track-13"
+      ],
+      "tags": [
+        "p2p",
+        "oauth2",
+        "rate-limiting",
+        "webhooks",
+        "multi-tenant",
+        "ssrf"
+      ],
+      "module": "examples/capstone-5-instant-p2p"
+    }
+  ]
+}

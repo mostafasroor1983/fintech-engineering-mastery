@@ -10,6 +10,9 @@ EM.Progress = (function () {
 
   const STORAGE_KEY = 'em_progress';
   const VERSION = 2;
+  // Bump when Decision Lab options are reordered/rewritten: saved answers
+  // refer to option ids, so old answers would point at the wrong options.
+  const DECISION_LAB_VERSION = 2;
 
   let _cache = null;
 
@@ -23,6 +26,7 @@ EM.Progress = (function () {
       lastUpdated: new Date().toISOString(),
       lessons:     {},
       decisionLab: {},
+      decisionLabVersion: DECISION_LAB_VERSION,
       capstone:    {}
     };
   }
@@ -38,6 +42,10 @@ EM.Progress = (function () {
         const parsed = JSON.parse(raw);
         if (parsed && parsed.version === VERSION) {
           _cache = parsed;
+          if (_cache.decisionLabVersion !== DECISION_LAB_VERSION) {
+            _cache.decisionLab = {};
+            _cache.decisionLabVersion = DECISION_LAB_VERSION;
+          }
           return _cache;
         }
         // Version migration placeholder — just reset for now

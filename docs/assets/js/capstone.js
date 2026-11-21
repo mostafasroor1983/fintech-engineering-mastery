@@ -41,18 +41,44 @@ EM.Capstone = (function () {
   /* ----------------------------------------------------------
      Data Loading
   ---------------------------------------------------------- */
+  var _loadPromises = {};
+  var _fallback = {};
+
+  EM.I18n.add({
+    en: {
+      'cs.title': 'Capstone Projects',
+      'cs.subtitle': '{n} hands-on projects that bring several tracks together. Each one is a runnable Spring Boot service with requirements, architecture, implementation, tests and decision records.',
+      'cs.projects': 'Projects', 'cs.totalHours': 'Total Hours', 'cs.level': 'Level', 'cs.hoursShort': '{n}h',
+      'cs.project': 'PROJECT {n}', 'cs.projectShort': 'Project {n}', 'cs.estimated': '{n}h estimated', 'cs.hours': '{n} hours',
+      'cs.notStarted': 'Not Started', 'cs.inProgress': 'In Progress', 'cs.completed': 'Completed',
+      'cs.markInProgress': 'Mark In Progress', 'cs.markCompleted': 'Mark Completed',
+      'cs.integrates': 'Integrates:', 'cs.progress': 'Project Progress', 'cs.all': '← All Projects',
+      'cs.loading': 'Loading project…', 'cs.loadFailed': 'Failed to load capstone projects: {e}',
+      'cs.notFound': 'Project not found: {id}', 'cs.error': 'Error: {e}'
+    },
+    ar: {
+      'cs.title': 'المشاريع التطبيقية',
+      'cs.subtitle': '{n} مشاريع عملية تجمع بين عدة مسارات. كل مشروع خدمة Spring Boot قابلة للتشغيل، مع المتطلبات والبنية المعمارية والتنفيذ والاختبارات وسجلات القرارات.',
+      'cs.projects': 'مشاريع', 'cs.totalHours': 'إجمالي الساعات', 'cs.level': 'المستوى', 'cs.hoursShort': '{n} ساعة',
+      'cs.project': 'المشروع {n}', 'cs.projectShort': 'المشروع {n}', 'cs.estimated': 'نحو {n} ساعة', 'cs.hours': '{n} ساعة',
+      'cs.notStarted': 'لم يبدأ', 'cs.inProgress': 'قيد التنفيذ', 'cs.completed': 'مكتمل',
+      'cs.markInProgress': 'قيد التنفيذ', 'cs.markCompleted': 'تم الإنجاز',
+      'cs.integrates': 'يجمع بين:', 'cs.progress': 'تقدّم المشروع', 'cs.all': '→ كل المشاريع',
+      'cs.loading': 'جارٍ تحميل المشروع…', 'cs.loadFailed': 'تعذّر تحميل المشاريع: {e}',
+      'cs.notFound': 'المشروع غير موجود: {id}', 'cs.error': 'خطأ: {e}'
+    }
+  });
+
+  function _cdir() { return _fallback[EM.I18n.lang()] ? ' dir="ltr"' : ''; }
+
   function _load() {
-    if (_loadPromise) return _loadPromise;
-    _loadPromise = fetch('data/capstone-projects.json')
-      .then(function (r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
-      })
-      .then(function (data) {
-        _projects = data.projects || [];
-        return _projects;
-      });
-    return _loadPromise;
+    var lang = EM.I18n.lang();
+    if (!_loadPromises[lang]) {
+      _loadPromises[lang] = EM.I18n.fetchJSON('data/capstone-projects.json')
+        .then(function (res) { _fallback[lang] = res.fallback; return res.body.projects || []; })
+        .catch(function (err) { delete _loadPromises[lang]; throw err; });
+    }
+    return _loadPromises[lang].then(function (list) { _projects = list; return list; });
   }
 
   function _findProject(projectId) {
@@ -71,15 +97,15 @@ EM.Capstone = (function () {
   ---------------------------------------------------------- */
   function _diffBadge(diff) {
     return '<span class="badge badge-' + EM.esc(diff) + '">' +
-      (diff === 'principal' ? 'Principal' : 'Advanced') +
+      EM.t(diff === 'principal' ? 'badge.principal' : 'badge.advanced') +
     '</span>';
   }
 
   function _statusPill(status) {
     var map = {
-      'not-started': { cls: 'cs-pill-idle',        label: 'Not Started'  },
-      'in-progress': { cls: 'cs-pill-in-progress',  label: 'In Progress'  },
-      'completed':   { cls: 'cs-pill-completed',    label: 'Completed'    }
+      'not-started': { cls: 'cs-pill-idle',        label: EM.t('cs.notStarted') },
+      'in-progress': { cls: 'cs-pill-in-progress',  label: EM.t('cs.inProgress') },
+      'completed':   { cls: 'cs-pill-completed',    label: EM.t('cs.completed')  }
     };
     var s = map[status] || map['not-started'];
     return '<span class="cs-pill ' + s.cls + '">' + s.label + '</span>';
@@ -93,7 +119,7 @@ EM.Capstone = (function () {
     var num    = String(project.sequence).padStart(2, '0');
 
     var techPills = (project.techStack || []).slice(0, 5).map(function (t) {
-      return '<span class="cs-tech-pill">' + EM.esc(t) + '</span>';
+      return '<span class="cs-tech-pill" dir="ltr">' + EM.esc(t) + '</span>';
     }).join('');
 
     var objectives = (project.objectives || []).slice(0, 3).map(function (o) {
@@ -106,21 +132,21 @@ EM.Capstone = (function () {
       'onclick="EM.Router.navigate(\'/capstone/' + project.slug + '\');return false;">' +
 
       '<div class="cs-card-header">' +
-        '<div class="cs-card-label">PROJECT ' + num + '</div>' +
-        '<div class="cs-card-title">' + EM.esc(project.title) + '</div>' +
+        '<div class="cs-card-label">' + EM.t('cs.project', { n: num }) + '</div>' +
+        '<div class="cs-card-title"' + _cdir() + '>' + EM.esc(project.title) + '</div>' +
         '<div class="cs-card-badges">' +
           _diffBadge(project.difficulty) +
           _statusPill(status) +
         '</div>' +
       '</div>' +
 
-      '<p class="cs-card-desc">' + EM.esc(project.description) + '</p>' +
+      '<p class="cs-card-desc"' + _cdir() + '>' + EM.esc(project.description) + '</p>' +
 
-      '<ul class="cs-card-objectives">' + objectives + '</ul>' +
+      '<ul class="cs-card-objectives"' + _cdir() + '>' + objectives + '</ul>' +
 
       '<div class="cs-card-footer">' +
         '<div class="cs-tech-pills">' + techPills + '</div>' +
-        '<span class="cs-hours">' + EM.esc(String(project.estimatedHours)) + 'h estimated</span>' +
+        '<span class="cs-hours">' + EM.esc(EM.t('cs.estimated', { n: project.estimatedHours })) + '</span>' +
       '</div>' +
 
     '</a>';
@@ -131,41 +157,28 @@ EM.Capstone = (function () {
   ---------------------------------------------------------- */
   function renderIndex() {
     var main = document.getElementById('main-content');
-    main.innerHTML =
-      '<div class="page">' +
+    return _load().then(function (projects) {
+      var hours = projects.reduce(function (sum, p) { return sum + (p.estimatedHours || 0); }, 0);
+      var levels = projects.map(function (p) { return p.difficulty; });
+      var level  = levels.indexOf('principal') !== -1 && levels.every(function (l) { return l === 'principal'; })
+        ? EM.t('badge.principal') : EM.t('badge.advanced');
+
+      return '<div class="page">' +
         '<div class="page-header">' +
-          '<h1 class="page-title">Capstone Projects</h1>' +
-          '<p class="page-subtitle">' +
-            'Six principal-level enterprise projects that integrate knowledge across all 14 tracks. ' +
-            'Each project simulates a real production system with requirements, architecture, full implementation, testing, and ADRs.' +
-          '</p>' +
+          '<h1 class="page-title">' + EM.t('cs.title') + '</h1>' +
+          '<p class="page-subtitle">' + EM.esc(EM.t('cs.subtitle', { n: projects.length })) + '</p>' +
         '</div>' +
+        (_fallback[EM.I18n.lang()] ? EM.I18n.fallbackNote() : '') +
         '<div class="cs-stats-row">' +
-          '<div class="cs-stat"><span class="cs-stat-val">6</span><span class="cs-stat-lbl">Projects</span></div>' +
-          '<div class="cs-stat"><span class="cs-stat-val">104h</span><span class="cs-stat-lbl">Total Hours</span></div>' +
-          '<div class="cs-stat"><span class="cs-stat-val">Principal</span><span class="cs-stat-lbl">Level</span></div>' +
+          '<div class="cs-stat"><span class="cs-stat-val">' + projects.length + '</span><span class="cs-stat-lbl">' + EM.t('cs.projects') + '</span></div>' +
+          '<div class="cs-stat"><span class="cs-stat-val">' + EM.esc(EM.t('cs.hoursShort', { n: hours })) + '</span><span class="cs-stat-lbl">' + EM.t('cs.totalHours') + '</span></div>' +
+          '<div class="cs-stat"><span class="cs-stat-val">' + EM.esc(level) + '</span><span class="cs-stat-lbl">' + EM.t('cs.level') + '</span></div>' +
         '</div>' +
-        '<div class="loading-wrap"><div class="spinner"></div></div>' +
+        '<div class="cs-grid">' + projects.map(_projectCard).join('') + '</div>' +
       '</div>';
-
-    _load().then(function (projects) {
-      var grid = projects.map(_projectCard).join('');
-
-      var pageEl = main.querySelector('.page');
-      var loadEl = pageEl.querySelector('.loading-wrap');
-      if (loadEl) loadEl.remove();
-
-      var gridEl = document.createElement('div');
-      gridEl.className = 'cs-grid';
-      gridEl.innerHTML = grid;
-      pageEl.appendChild(gridEl);
-
-      EM.Router.setActiveNav('/capstone');
     }).catch(function (err) {
-      main.innerHTML = '<div class="page"><p class="error-text">Failed to load capstone projects: ' + EM.esc(String(err)) + '</p></div>';
+      return '<div class="page"><p class="error-text">' + EM.esc(EM.t('cs.loadFailed', { e: String(err) })) + '</p></div>';
     });
-
-    return main.innerHTML;
   }
 
   /* ----------------------------------------------------------
@@ -176,27 +189,23 @@ EM.Capstone = (function () {
     main.innerHTML =
       '<div class="page">' +
         '<div class="loading-wrap"><div class="spinner"></div>' +
-          '<span style="color:var(--text-muted);font-size:var(--text-sm)">Loading project&hellip;</span>' +
+          '<span style="color:var(--text-muted);font-size:var(--text-sm)">' + EM.esc(EM.t('cs.loading')) + '</span>' +
         '</div>' +
       '</div>';
 
     _load().then(function () {
       var project = _findProject(projectId);
       if (!project) {
-        main.innerHTML = '<div class="page"><p class="error-text">Project not found: ' + EM.esc(projectId) + '</p></div>';
+        main.innerHTML = '<div class="page"><p class="error-text">' + EM.esc(EM.t('cs.notFound', { id: projectId })) + '</p></div>';
         return;
       }
 
-      return fetch(project.path)
-        .then(function (r) {
-          if (!r.ok) throw new Error('HTTP ' + r.status);
-          return r.text();
-        })
-        .then(function (mdRaw) {
-          _renderProjectPage(project, mdRaw);
+      return EM.I18n.fetchText(project.path)
+        .then(function (res) {
+          _renderProjectPage(project, res.body, res.fallback);
         });
     }).catch(function (err) {
-      main.innerHTML = '<div class="page"><p class="error-text">Error: ' + EM.esc(String(err)) + '</p></div>';
+      main.innerHTML = '<div class="page"><p class="error-text">' + EM.esc(EM.t('cs.error', { e: String(err) })) + '</p></div>';
     });
 
     return main.innerHTML;
@@ -205,7 +214,7 @@ EM.Capstone = (function () {
   /* ----------------------------------------------------------
      Internal: build the project page from markdown
   ---------------------------------------------------------- */
-  function _renderProjectPage(project, mdRaw) {
+  function _renderProjectPage(project, mdRaw, mdFallback) {
     // Strip YAML frontmatter
     var md = mdRaw.replace(/^---[\s\S]*?---\n?/, '');
 
@@ -216,7 +225,7 @@ EM.Capstone = (function () {
     var num       = String(project.sequence).padStart(2, '0');
 
     var techPills = (project.techStack || []).map(function (t) {
-      return '<span class="cs-tech-pill">' + EM.esc(t) + '</span>';
+      return '<span class="cs-tech-pill" dir="ltr">' + EM.esc(t) + '</span>';
     }).join('');
 
     var trackLinks = (project.tracks || []).map(function (tid) {
@@ -237,49 +246,50 @@ EM.Capstone = (function () {
 
     var main = document.getElementById('main-content');
     main.innerHTML =
-      '<div class="lesson-page">' +
+      '<div class="lesson-wrap cs-project-page"><div class="lesson-main">' +
 
-        '<div class="lesson-breadcrumb">' +
-          '<button onclick="EM.Router.navigate(\'/capstone\')" class="breadcrumb-link">Capstone Projects</button>' +
-          '<span class="breadcrumb-sep">›</span>' +
-          '<span class="breadcrumb-current">Project ' + num + '</span>' +
-        '</div>' +
+        '<nav class="lesson-breadcrumb" aria-label="Breadcrumb">' +
+          '<button onclick="EM.Router.navigate(\'/capstone\')">' + EM.t('cs.title') + '</button>' +
+          '<span class="lesson-breadcrumb-sep rtl-flip">›</span>' +
+          '<span>' + EM.t('cs.projectShort', { n: num }) + '</span>' +
+        '</nav>' +
 
         '<header class="lesson-header" style="--tc:' + project.color + ';--tc-muted:' + project.colorMuted + '">' +
           '<div class="lesson-header-top">' +
-            '<span class="lesson-track-label">PROJECT ' + num + '</span>' +
+            '<span class="lesson-track-label">' + EM.t('cs.project', { n: num }) + '</span>' +
             _diffBadge(project.difficulty) +
             _statusPill(status) +
           '</div>' +
-          '<h1 class="lesson-title">' + EM.esc(project.title) + '</h1>' +
-          '<p class="lesson-subtitle">' + EM.esc(project.description) + '</p>' +
+          '<h1 class="lesson-title"' + _cdir() + '>' + EM.esc(project.title) + '</h1>' +
+          '<p class="lesson-subtitle"' + _cdir() + '>' + EM.esc(project.description) + '</p>' +
           '<div class="lesson-meta-row">' +
-            '<span class="lesson-meta-item">' + EM.Icons.clock + ' ' + project.estimatedHours + ' hours</span>' +
+            '<span class="lesson-meta-item">' + EM.Icons.clock + ' ' + EM.esc(EM.t('cs.hours', { n: project.estimatedHours })) + '</span>' +
           '</div>' +
           '<div class="cs-tech-pills" style="margin-top:0.75rem">' + techPills + '</div>' +
         '</header>' +
 
         '<div class="cs-tracks-row">' +
-          '<span class="cs-tracks-label">Integrates:</span>' +
+          '<span class="cs-tracks-label">' + EM.t('cs.integrates') + '</span>' +
           trackLinks +
         '</div>' +
 
-        '<div class="lesson-content" id="project-content">' +
+        (mdFallback && EM.I18n.lang() !== 'en' ? EM.I18n.fallbackNote() : '') +
+        '<div class="lesson-body" id="project-content"' + (mdFallback && EM.I18n.lang() !== 'en' ? ' dir="ltr"' : '') + '>' +
           html +
         '</div>' +
 
         '<div class="cs-status-panel" id="cs-status-panel">' +
-          '<div class="cs-status-title">Project Progress</div>' +
+          '<div class="cs-status-title">' + EM.t('cs.progress') + '</div>' +
           statusActions +
         '</div>' +
 
         '<div class="lesson-nav">' +
           '<button class="lesson-nav-btn" onclick="EM.Router.navigate(\'/capstone\')">' +
-            '← All Projects' +
+            EM.esc(EM.t('cs.all')) +
           '</button>' +
         '</div>' +
 
-      '</div>';
+      '</div></div>';
 
     // Post-render: syntax highlighting, Mermaid, KaTeX
     EM.Renderer.postProcess(document.getElementById('project-content'));
@@ -290,9 +300,9 @@ EM.Capstone = (function () {
 
   function _buildStatusActions(projectId, currentStatus) {
     var btns = [
-      { status: 'not-started', label: 'Not Started' },
-      { status: 'in-progress', label: 'Mark In Progress' },
-      { status: 'completed',   label: 'Mark Completed'   }
+      { status: 'not-started', label: EM.t('cs.notStarted') },
+      { status: 'in-progress', label: EM.t('cs.markInProgress') },
+      { status: 'completed',   label: EM.t('cs.markCompleted')  }
     ].map(function (opt) {
       var active = currentStatus === opt.status ? ' cs-status-btn-active' : '';
       return '<button class="cs-status-btn' + active + '" ' +
@@ -314,7 +324,7 @@ EM.Capstone = (function () {
     var panel = document.getElementById('cs-status-panel');
     if (panel) {
       panel.innerHTML =
-        '<div class="cs-status-title">Project Progress</div>' +
+        '<div class="cs-status-title">' + EM.t('cs.progress') + '</div>' +
         _buildStatusActions(projectId, status);
     }
 

@@ -144,7 +144,8 @@ public class SafeTransferService {
 ```
 
 ```java21
-// Java 21 — same lock-ordering discipline; use ReentrantLock for virtual-thread safety
+// Java 21 — same lock-ordering discipline; ReentrantLock avoids virtual-thread
+// pinning on Java 21–23 (JDK 24+ no longer pins in synchronized)
 public class SafeTransferService {
 
     public void transfer(BankAccount from, BankAccount to, Money amount)
@@ -241,7 +242,8 @@ public class RiskyAccountService {
 public class SafeAccountService {
 
     private final Object lock = new Object();
-    private final List<AccountListener> listeners = new ArrayList<>();
+    // Iterated WITHOUT the lock now, so the list itself must be thread-safe
+    private final List<AccountListener> listeners = new CopyOnWriteArrayList<>();
 
     public void debit(Money amount) {
         Money snapshot;
@@ -273,6 +275,9 @@ kill -3 <pid>
 
 # Method 4: HTTP endpoint (Spring Boot Actuator)
 curl http://localhost:8080/actuator/threaddump
+
+# Method 5 (Java 21+): jcmd — the only one that also lists VIRTUAL threads
+jcmd <pid> Thread.dump_to_file -format=json threads.json
 ```
 
 ### Reading a Deadlock in a Thread Dump
@@ -376,7 +381,8 @@ ReentrantLock fairLock   = new ReentrantLock(true);    // Fair: FIFO ordering
 // - Throughput is lower (fair locks have higher overhead) but no starvation
 
 // Rule: use fair locks only when starvation is a known problem
-// Fair locks have 2–10x higher overhead than non-fair locks
+// The JDK documentation warns that fair locks often have much lower
+// throughput. Note: untimed tryLock() ignores fairness and can still barge
 ```
 
 ### Thread Priority Inversion
@@ -391,6 +397,8 @@ ReentrantLock fairLock   = new ReentrantLock(true);    // Fair: FIFO ordering
 // - H waits indefinitely because M prevents L from releasing the lock
 
 // Java does not have built-in priority inheritance (unlike real-time OS kernels)
+// Java thread priorities are only hints — on Linux, HotSpot ignores them by
+// default — so do not build correctness on them
 // Mitigation: minimize time holding locks; use virtual threads (all same priority)
 
 // Java 21 virtual thread note:
@@ -420,9 +428,9 @@ flowchart TD
 | Lock ordering | Circular wait | Multiple locks on objects with stable IDs |
 | `tryLock` with timeout | No preemption | Cannot guarantee ordering |
 | Open calls | Hold and wait | Calling external services / callbacks |
-| Single global lock | Mutual exclusion reduced | Low contention, simple invariants |
+| Single global lock | Circular wait (only one lock exists) | Low contention, simple invariants |
 | Lock-free structures | Mutual exclusion | Counters, queues, reference swaps |
-| Database transactions | Managed by DB | Persistent state, multi-step operations |
+| Database transactions | DB detects deadlocks and aborts one transaction — the app must retry it | Persistent state, multi-step operations |
 
 ---
 
@@ -473,7 +481,7 @@ flowchart TD
       "400 threads is too many for a fair lock — reduce thread pool size"
     ],
     "correct": 1,
-    "explanation": "Fair ReentrantLock maintains a FIFO queue of waiting threads, which requires additional synchronization overhead (CAS operations on the queue) compared to non-fair locks where any waiting thread can compete. The throughput reduction (commonly 2–10x) is the cost of preventing starvation. The correct approach: use non-fair locks by default, switch to fair only if starvation is a confirmed production incident — not a theoretical concern."
+    "explanation": "A fair ReentrantLock hands the lock to waiting threads in FIFO order, so a thread that releases and immediately re-requests the lock cannot jump the queue. That removes the cheap 'barging' that makes non-fair locks fast, and the JDK documentation warns that fair locks often have much lower throughput. The throughput loss is the cost of preventing starvation. Use non-fair locks by default, and switch to fair only when starvation is a confirmed production problem — not a theoretical concern."
   }
 ] -->
 

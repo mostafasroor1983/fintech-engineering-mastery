@@ -42,7 +42,7 @@ Command Query Responsibility Segregation addresses one of the most persistent pe
 
 ## Business Context
 
-In 2021, a European neobank serving 4 million customers hit a wall during its Black Friday cashback campaign. Transaction history queries — customers checking whether cashback had landed — were issuing full table scans against the same `accounts` table that the payment engine was writing to under peak load. Lock wait times spiked to 8 seconds. Payment acceptance latency, normally under 120ms at P99, reached 14 seconds. The bank halted the campaign at 11:40 AM, losing an estimated €2.3M in planned transaction volume.
+Consider a European neobank serving 4 million customers (a composite example) that hits a wall during its Black Friday cashback campaign. Transaction history queries — customers checking whether cashback had landed — were issuing full table scans against the same `accounts` table that the payment engine was writing to under peak load. Lock wait times spiked to 8 seconds. Payment acceptance latency, normally under 120ms at P99, reached 14 seconds. The bank halted the campaign at 11:40 AM, losing an estimated €2.3M in planned transaction volume.
 
 The root cause was a single `Account` entity serving both the write path (balance mutation, transaction appends) and the read path (balance display, transaction history, cashback aggregation). Adding indexes to serve read queries slowed write throughput; removing them restored writes but broke read performance. The team had been playing this game for 18 months. CQRS was not a theoretical exercise — it was the architectural change that resolved a production crisis.
 
@@ -154,11 +154,13 @@ public class PaymentCommandHandler implements CommandHandler<ProcessPaymentComma
             return;
         }
 
-        Account source = accountRepository.findById(command.sourceAccountId())
-            .orElseThrow(() -> new AccountNotFoundException(command.sourceAccountId()));
-
-        Account target = accountRepository.findById(command.targetAccountId())
-            .orElseThrow(() -> new AccountNotFoundException(command.targetAccountId()));
+        // Lock both accounts in id order: no lost updates, no A→B / B→A deadlock
+        Map<UUID, Account> locked = new HashMap<>();
+        Stream.of(command.sourceAccountId(), command.targetAccountId()).sorted()
+            .forEach(id -> locked.put(id, accountRepository.findByIdForUpdate(id)
+                .orElseThrow(() -> new AccountNotFoundException(id))));
+        Account source = locked.get(command.sourceAccountId());
+        Account target = locked.get(command.targetAccountId());
 
         // Domain invariant enforced inside the aggregate
         Payment payment = source.initiatePaymentTo(target, command.amount(), command.reference());
@@ -166,11 +168,13 @@ public class PaymentCommandHandler implements CommandHandler<ProcessPaymentComma
         paymentRepository.save(payment);
         accountRepository.save(source);
         accountRepository.save(target);
-        idempotencyStore.record(command.idempotencyKey());
+        idempotencyStore.record(command.idempotencyKey());   // UNIQUE key: a concurrent duplicate fails here
 
-        // Events are collected by the aggregate, published here after persistence
+        // eventPublisher is an outbox writer: the events are inserted as rows in THIS
+        // transaction and relayed to the broker only after the commit (see warning below)
         payment.domainEvents().forEach(eventPublisher::publish);
         source.domainEvents().forEach(eventPublisher::publish);
+        target.domainEvents().forEach(eventPublisher::publish);
     }
 }
 ```
@@ -245,7 +249,7 @@ public class AccountQueryHandler implements QueryHandler<AccountBalanceQuery, Ac
 
 ## Read Model Projection
 
-The `AccountProjectionUpdater` subscribes to domain events and maintains the `account_summary` table. It is the bridge between the write model and the read model.
+The `AccountProjectionUpdater` subscribes to domain events and maintains the `account_summary` table. It is the bridge between the write model and the read model. Each event carries the account's new balance and the write-side version it produced, so the projection never has to query the write database, and it can safely ignore duplicates and out-of-order events. (For brevity the listener is in-process; in production it consumes the same events from Kafka or the outbox relay.)
 
 ```java
 @Component
@@ -254,44 +258,37 @@ The `AccountProjectionUpdater` subscribes to domain events and maintains the `ac
 public class AccountProjectionUpdater {
 
     private final AccountSummaryRepository summaryRepository;
-    private final AccountRepository accountRepository; // write-side, used only at rebuild time
-
-    @EventListener
-    @Transactional
-    public void on(PaymentCompletedEvent event) {
-        updateSummary(event.sourceAccountId());
-        updateSummary(event.targetAccountId());
-    }
 
     @EventListener
     @Transactional
     public void on(AccountCreditedEvent event) {
-        updateSummary(event.accountId());
+        apply(event.accountId(), event.accountVersion(), event.balanceAfter(), event.occurredAt());
     }
 
     @EventListener
     @Transactional
     public void on(AccountDebitedEvent event) {
-        updateSummary(event.accountId());
+        apply(event.accountId(), event.accountVersion(), event.balanceAfter(), event.occurredAt());
     }
 
-    private void updateSummary(UUID accountId) {
-        // Fetch current write-side state to recompute read projection
+    private void apply(UUID accountId, long accountVersion, Money balanceAfter, Instant occurredAt) {
         AccountSummary summary = summaryRepository.findById(accountId)
             .orElseGet(() -> AccountSummary.empty(accountId));
 
-        // Re-query write side for fresh balances (simple projection strategy)
-        AccountBalanceProjection projection = accountRepository.projectBalance(accountId);
+        // Idempotent and order-safe: ignore events the projection has already applied
+        if (accountVersion <= summary.getVersion()) {
+            log.debug("Skipping stale event for account {} (v{} <= v{})",
+                accountId, accountVersion, summary.getVersion());
+            return;
+        }
 
-        summary.setAvailableBalance(projection.availableBalance());
-        summary.setPendingBalance(projection.pendingBalance());
-        summary.setLastTransactionAt(Instant.now());
-        summary.setTransactionCount30d(projection.transactionCount30d());
-        summary.setVersion(summary.getVersion() + 1);
+        summary.setAvailableBalance(balanceAfter.amount());
+        summary.setLastTransactionAt(occurredAt);            // business time, not now()
+        summary.setVersion(accountVersion);                  // same number as the write side
         summary.setUpdatedAt(Instant.now());
+        // transaction_count_30d is a rolling window: a scheduled job recomputes it
 
         summaryRepository.save(summary);
-        log.debug("Projection updated for account {} to version {}", accountId, summary.getVersion());
     }
 }
 ```
@@ -338,7 +335,7 @@ The read model lags behind the write model by the time it takes for an event to 
 
 However, the read-your-writes problem is real: a customer submits a payment and immediately refreshes their balance. The projection may not yet reflect the debit.
 
-One solution is a **version token**: the command response includes the version the write model is at after the mutation. The query side blocks (or retries) until the read model reaches that version.
+One solution is a **version token**: the command response includes the version the write model is at after the mutation. Because the projection stores that same version number, the query side can tell whether it has caught up, and the client retries until it has.
 
 ```java
 // Command response carries the version the write model advanced to
@@ -415,8 +412,8 @@ class PaymentCommandHandlerTest {
         Account target = Account.empty();
 
         when(idempotencyStore.exists(idempotencyKey)).thenReturn(false);
-        when(accountRepository.findById(source.getId())).thenReturn(Optional.of(source));
-        when(accountRepository.findById(target.getId())).thenReturn(Optional.of(target));
+        when(accountRepository.findByIdForUpdate(source.getId())).thenReturn(Optional.of(source));
+        when(accountRepository.findByIdForUpdate(target.getId())).thenReturn(Optional.of(target));
 
         handler.handle(new ProcessPaymentCommand(
             idempotencyKey, source.getId(), target.getId(),
@@ -489,7 +486,7 @@ A: No. With 10 writes and 50 reads per day, there is no workload asymmetry to ad
 
 **Task 2 — Read Model Schema:** Design the SQL schema for a `transaction_history_view` read model that supports efficient queries for "last 30 transactions for account X, sorted by timestamp descending, filtered by type (DEBIT/CREDIT)". Include appropriate indexes and explain your index choices.
 
-**Task 3 — Projection Updater:** Implement `TransactionHistoryProjectionUpdater` that listens to `FundsWithdrawnEvent` and `FundsDepositedEvent` and maintains the `transaction_history_view` table. Handle the case where the event arrives out of order (timestamp-based idempotency check).
+**Task 3 — Projection Updater:** Implement `TransactionHistoryProjectionUpdater` that listens to `FundsWithdrawnEvent` and `FundsDepositedEvent` and maintains the `transaction_history_view` table. Handle duplicate and out-of-order events using the account version carried by each event.
 
 **Task 4 — Eventual Consistency Test:** Write an integration test using an in-memory event bus that verifies: after dispatching `WithdrawFundsCommand`, within 100ms the query handler returns a `TransactionHistoryView` that includes the withdrawal transaction. The test should not use `Thread.sleep` — use `Awaitility` with a 200ms timeout.
 
@@ -526,25 +523,25 @@ A: No. With 10 writes and 50 reads per day, there is no workload asymmetry to ad
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "CQRS \u2014 Separating Commands and Queries in Payment Systems \u2014 Production Implementation",
+  "title": "CQRS — Separating Commands and Queries in Payment Systems — Production Implementation",
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
     {
       "id": "1",
-      "description": "Implement `WithdrawFundsCommand` and `WithdrawFundsCommandHandler`. The handler must: check sufficient balance via the `Account` aggregate, debit the account, persist the updated aggregate, record ide"
+      "description": "Implement `WithdrawFundsCommand` and `WithdrawFundsCommandHandler`. The handler must: check sufficient balance via the `Account` aggregate, debit the account, persist the updated aggregate, record idempotency, and publish a `FundsWithdrawnEvent`. Write a unit test that verifies a withdrawal of £200 from an account with £150 balance raises `InsufficientFundsException`."
     },
     {
       "id": "2",
-      "description": "Design the SQL schema for a `transaction_history_view` read model that supports efficient queries for \"last 30 transactions for account X, sorted by timestamp descending, filtered by type (DEBIT/CREDI"
+      "description": "Design the SQL schema for a `transaction_history_view` read model that supports efficient queries for \"last 30 transactions for account X, sorted by timestamp descending, filtered by type (DEBIT/CREDIT)\". Include appropriate indexes and explain your index choices."
     },
     {
       "id": "3",
-      "description": "Implement `TransactionHistoryProjectionUpdater` that listens to `FundsWithdrawnEvent` and `FundsDepositedEvent` and maintains the `transaction_history_view` table. Handle the case where the event arri"
+      "description": "Implement `TransactionHistoryProjectionUpdater` that listens to `FundsWithdrawnEvent` and `FundsDepositedEvent` and maintains the `transaction_history_view` table. Handle duplicate and out-of-order events using the account version carried by each event."
     },
     {
       "id": "4",
-      "description": "Write an integration test using an in-memory event bus that verifies: after dispatching `WithdrawFundsCommand`, within 100ms the query handler returns a `TransactionHistoryView` that includes the with"
+      "description": "Write an integration test using an in-memory event bus that verifies: after dispatching `WithdrawFundsCommand`, within 100ms the query handler returns a `TransactionHistoryView` that includes the withdrawal transaction. The test should not use `Thread.sleep` — use `Awaitility` with a 200ms timeout."
     }
   ]
 }

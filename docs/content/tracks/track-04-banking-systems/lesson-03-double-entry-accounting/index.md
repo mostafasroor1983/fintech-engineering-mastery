@@ -48,6 +48,8 @@ references:
   - "PostgreSQL Documentation — Transactions and Concurrency"
 ---
 
+## Overview
+
 Every financial system built on top of a core banking system ultimately writes to a general ledger. The general ledger is not a database table — it is an accounting structure governed by rules that have been unchanged since Luca Pacioli formalised them in 1494. Those rules — double-entry bookkeeping — are what make a financial system verifiable: any error that creates or destroys value leaves a mathematical trace. As a Principal Engineer designing banking systems, you must understand double-entry deeply enough to review schema designs, audit service implementations, and immediately identify when a proposed change will violate the invariant that the sum of all debits must always equal the sum of all credits.
 
 ## Learning Objectives
@@ -64,7 +66,7 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-In 2012, a European payments startup raised Series B funding on the strength of reported customer balances totalling €47 million. During due diligence, their new CFO ran a trial balance query for the first time in company history. The query returned a €340,000 discrepancy — total credits exceeded total debits by that amount. Investigation revealed that a junior engineer had implemented refunds as a "balance adjustment" that credited the customer's account without posting a corresponding debit anywhere. Over 18 months, 1,247 refunds had been processed this way, each creating €0 to €850 of phantom money. The startup's real customer balance was €46.66 million — not €47 million. The Series B closed at a valuation €2.1 million lower than expected, and the engineer's shortcut cost the founding team roughly €630,000 in dilution. A properly implemented `JournalEntryService` that rejected unbalanced entries would have caught the first occurrence.
+*Composite example (based on common industry failure patterns, not a specific company):* a payments start-up was raising a new funding round on the strength of its reported customer balances. During due diligence, a newly hired CFO ran a trial balance query for the first time in the company's history. It showed a discrepancy of several hundred thousand euros — total credits exceeded total debits. Investigation revealed that refunds had been implemented as a "balance adjustment" that credited the customer's account without posting a corresponding debit anywhere. Over many months, more than a thousand refunds had been processed this way, each creating phantom money. The real customer balances were lower than reported, the funding round closed at a lower valuation, and the founders paid for the shortcut in dilution. A `JournalEntryService` that rejected unbalanced entries would have caught the first occurrence.
 
 ## The Accounting Equation
 
@@ -205,7 +207,7 @@ INSERT INTO chart_of_accounts (account_code, account_name, category_id, currency
   ('4100',      'Fee and Commission Income',              4, 'GBP'),
   ('5000',      'Interest Expense',                       5, 'GBP'),
   ('5100',      'Operating Expenses',                     5, 'GBP'),
-  ('9000',      'Suspense Account',                       2, 'GBP');  -- Must net to 0 by EOD
+  ('9000',      'Suspense Account',                       2, 'GBP');  -- Items investigated and cleared daily
 ```
 
 ## Journal Entry Schema DDL
@@ -243,8 +245,14 @@ CREATE TABLE journal_entry_lines (
     UNIQUE (journal_id, line_number)
 );
 
--- Database-level constraint: sum of DR lines must equal sum of CR lines
--- Enforced in application layer (database constraint would require triggers)
+-- Database-level constraint: sum of DR lines must equal sum of CR lines.
+-- A CHECK constraint cannot see other rows, so it is enforced in the
+-- application layer — and can be backed up in PostgreSQL by a DEFERRABLE
+-- INITIALLY DEFERRED constraint trigger that checks each journal at COMMIT
+
+-- One journal per source event: a retried posting cannot create a duplicate
+CREATE UNIQUE INDEX ux_je_source ON journal_entries (source_system, source_ref)
+    WHERE source_ref IS NOT NULL;
 -- Index for balance queries
 CREATE INDEX idx_jel_account_date
     ON journal_entry_lines (account_code, currency)
@@ -359,7 +367,8 @@ public class JournalEntryService {
      * Post a reversal of an existing entry. Creates mirror-image lines (DR↔CR swapped).
      */
     public JournalEntry reverse(UUID originalEntryId, String reason, String reversedBy) {
-        JournalEntry original = journalRepo.findByIdOrThrow(originalEntryId);
+        // Row lock: two concurrent reversals of the same entry must not both pass
+        JournalEntry original = journalRepo.findByIdForUpdateOrThrow(originalEntryId);
 
         if (original.getStatus() != JournalStatus.POSTED) {
             throw new InvalidOperationException(
@@ -380,7 +389,7 @@ public class JournalEntryService {
 
         PostJournalEntryCommand reversalCmd = PostJournalEntryCommand.builder()
             .description("Reversal of " + original.getReference() + ": " + reason)
-            .businessDate(LocalDate.now())
+            .businessDate(businessCalendar.today())   // the BUSINESS date, not the wall clock
             .entryType(original.getEntryType())
             .sourceSystem(original.getSourceSystem())
             .sourceRef("REV:" + original.getSourceRef())
@@ -389,9 +398,13 @@ public class JournalEntryService {
             .build();
 
         JournalEntry reversal = post(reversalCmd);
+        reversal.setReversalOf(original.getId());   // link the reversal to what it reverses
+        journalRepo.save(reversal);
 
+        // Mark the original as reversed. Its LINES stay in the ledger: balance
+        // queries must include REVERSED entries too, otherwise the reversal
+        // would be counted without the original
         original.setStatus(JournalStatus.REVERSED);
-        original.setReversalOf(null); // original is not a reversal
         journalRepo.save(original);
 
         return reversal;
@@ -407,25 +420,32 @@ The trial balance proves that the general ledger is in balance — total debits 
 -- Trial balance for a given business date (cumulative from inception to that date)
 -- For each account: net balance = sum(DR amounts) - sum(CR amounts)
 -- If normal balance is DEBIT, a positive net = debit balance (expected for assets/expenses)
--- Sum of ALL account net balances (accounting for normal balance direction) must = 0
+-- Every journal that has been POSTED counts — including ones later REVERSED,
+-- because their reversal entries are counted too. Only PENDING is excluded.
 
-WITH account_balances AS (
+WITH ledger_lines AS (
+    SELECT jel.account_code, jel.side, jel.amount
+    FROM journal_entry_lines jel
+    JOIN journal_entries je ON je.id = jel.journal_id
+    WHERE je.status IN ('POSTED', 'REVERSED')
+      AND je.business_date <= :asOfDate
+      AND jel.currency = :currency
+),
+account_balances AS (
     SELECT
         coa.account_code,
         coa.account_name,
         ac.code                                        AS category,
         ac.normal_balance,
-        SUM(CASE WHEN jel.side = 'DR' THEN jel.amount ELSE 0 END) AS total_debits,
-        SUM(CASE WHEN jel.side = 'CR' THEN jel.amount ELSE 0 END) AS total_credits,
-        SUM(CASE WHEN jel.side = 'DR' THEN jel.amount ELSE -jel.amount END) AS net_balance
+        COALESCE(SUM(CASE WHEN l.side = 'DR' THEN l.amount ELSE 0 END), 0) AS total_debits,
+        COALESCE(SUM(CASE WHEN l.side = 'CR' THEN l.amount ELSE 0 END), 0) AS total_credits,
+        COALESCE(SUM(CASE WHEN l.side = 'DR' THEN l.amount ELSE -l.amount END), 0) AS net_balance
     FROM chart_of_accounts coa
     JOIN account_categories ac ON coa.category_id = ac.id
-    LEFT JOIN journal_entry_lines jel ON jel.account_code = coa.account_code
-    LEFT JOIN journal_entries je ON je.id = jel.journal_id
-        AND je.status = 'POSTED'
-        AND je.business_date <= :asOfDate
-    WHERE coa.is_active = TRUE
-      AND coa.currency = :currency
+    -- Filtering the lines in the CTE (not in a LEFT JOIN's ON clause) makes
+    -- sure lines of PENDING or later-dated journals are really excluded.
+    -- No is_active filter: a closed account can still hold a balance
+    LEFT JOIN ledger_lines l ON l.account_code = coa.account_code
     GROUP BY coa.account_code, coa.account_name, ac.code, ac.normal_balance
 )
 SELECT
@@ -455,52 +475,56 @@ public class LedgerIntegrityService {
 
     private final JdbcTemplate jdbc;
     private final AlertService alertService;
+    private final BusinessCalendar businessCalendar;
 
     /**
      * Run at end-of-day. If the ledger is unbalanced, this is a P0 incident.
      * The imbalance means money was created or destroyed somewhere in the system.
+     * Checked per currency: amounts in different currencies cannot be added.
      */
     @Scheduled(cron = "0 0 23 * * MON-FRI")
     public void runEndOfDayBalanceCheck() {
-        LocalDate today = LocalDate.now();
+        LocalDate businessDate = businessCalendar.today();
 
-        Map<String, Long> results = jdbc.queryForMap(
+        jdbc.query(
             """
-            SELECT
-              SUM(CASE WHEN side = 'DR' THEN amount ELSE 0 END) AS total_dr,
-              SUM(CASE WHEN side = 'CR' THEN amount ELSE 0 END) AS total_cr
+            SELECT jel.currency,
+                   COALESCE(SUM(CASE WHEN side = 'DR' THEN amount ELSE 0 END), 0) AS total_dr,
+                   COALESCE(SUM(CASE WHEN side = 'CR' THEN amount ELSE 0 END), 0) AS total_cr
             FROM journal_entry_lines jel
             JOIN journal_entries je ON je.id = jel.journal_id
-            WHERE je.status = 'POSTED'
+            WHERE je.status IN ('POSTED', 'REVERSED')
               AND je.business_date <= ?
-              AND jel.currency = 'GBP'
+            GROUP BY jel.currency
             """,
-            today
+            rs -> {
+                // getLong() converts PostgreSQL's NUMERIC sum safely
+                String currency = rs.getString("currency");
+                long totalDr = rs.getLong("total_dr");
+                long totalCr = rs.getLong("total_cr");
+                long imbalance = totalDr - totalCr;
+
+                if (imbalance != 0) {
+                    // This is a critical financial integrity failure
+                    alertService.raiseCriticalAlert(LedgerImbalanceAlert.builder()
+                        .businessDate(businessDate)
+                        .currency(currency)
+                        .totalDebits(totalDr)
+                        .totalCredits(totalCr)
+                        .imbalanceMinorUnits(imbalance)
+                        .detectedAt(Instant.now())
+                        .severity(AlertSeverity.P0)
+                        .message("LEDGER IMBALANCE DETECTED in %s: %,d minor units. Immediate investigation required."
+                            .formatted(currency, Math.abs(imbalance)))
+                        .build());
+                    log.error("CRITICAL: Ledger imbalance of {} {} minor units for business date {}",
+                        imbalance, currency, businessDate);
+                } else {
+                    log.info("Ledger balance check PASSED for {} {}: DR=CR={}", businessDate, currency, totalDr);
+                }
+            },
+            businessDate
         );
-
-        long totalDr = (Long) results.get("total_dr");
-        long totalCr = (Long) results.get("total_cr");
-        long imbalance = totalDr - totalCr;
-
-        if (imbalance != 0) {
-            // This is a critical financial integrity failure
-            alertService.raiseCriticalAlert(LedgerImbalanceAlert.builder()
-                .businessDate(today)
-                .totalDebits(totalDr)
-                .totalCredits(totalCr)
-                .imbalanceMinorUnits(imbalance)
-                .detectedAt(Instant.now())
-                .severity(AlertSeverity.P0)
-                .message("LEDGER IMBALANCE DETECTED: %,d pence. Immediate investigation required."
-                    .formatted(Math.abs(imbalance)))
-                .build());
-
-            // Do NOT throw here — allow the alert to propagate; throwing would mask the alert
-            log.error("CRITICAL: Ledger imbalance of {} pence detected for business date {}",
-                imbalance, today);
-        } else {
-            log.info("Ledger balance check PASSED for {}. Total DR=CR={} pence", today, totalDr);
-        }
     }
 }
 ```
@@ -595,7 +619,7 @@ long interestPence = interestPounds.multiply(new BigDecimal("100")).longValueExa
   "tasks": [
     {
       "id": "pc-dea-01",
-      "description": "Using the schema provided, write the SQL INSERT statements to record a customer payment of £250 from account 2000 (Customer Deposits) to settle a bank fee: DR Customer Deposits (2000) £250, CR Fee Income (4100) £250. Write a follow-up SELECT to verify the entry is balanced."
+      "description": "Using the schema provided, write the SQL INSERT statements to record a bank fee of £250 charged to a customer: DR Customer Deposits (2000) £250, CR Fee and Commission Income (4100) £250. Write a follow-up SELECT to verify the entry is balanced."
     },
     {
       "id": "pc-dea-02",

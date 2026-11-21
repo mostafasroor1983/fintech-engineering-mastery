@@ -41,11 +41,11 @@ Feature flags — also called feature toggles — are one of the most powerful a
 
 ## Business Context
 
-In 2021, a UK neobank shipped a new real-time payment limit calculation engine without a feature flag. During peak traffic on Black Friday, the new engine exhibited a race condition that applied a £0 spending limit to 180,000 customers. The fix required a hotfix deployment that took 23 minutes, during which those customers could not spend. Total estimated customer-visible impact: £4.2 million in declined transactions and 14,000 customer complaints. Post-incident review concluded that a kill switch would have resolved the issue in under 30 seconds. The architectural change mandated after the incident: every new code path touching payment authorisation must be gated by an operational feature flag for a minimum of 30 days post-launch.
+Consider a UK neobank (a composite example) that ships a new real-time payment limit calculation engine without a feature flag. During peak traffic on Black Friday, the new engine exhibits a race condition that applied a £0 spending limit to 180,000 customers. The fix required a hotfix deployment that took 23 minutes, during which those customers could not spend. Total estimated customer-visible impact: £4.2 million in declined transactions and 14,000 customer complaints. Post-incident review concluded that a kill switch would have resolved the issue in under 30 seconds. The architectural change mandated after the incident: every new code path touching payment authorisation must be gated by an operational feature flag for a minimum of 30 days post-launch.
 
 ## Feature Flag Taxonomy
 
-Martin Fowler's taxonomy defines four flag types, each with different characteristics. Using the wrong type creates technical debt and compliance risk.
+Pete Hodgson's taxonomy (published on martinfowler.com) defines four flag types, each with different characteristics. Using the wrong type creates technical debt and compliance risk.
 
 | Flag Type | Lifespan | Owner | Decision Point |
 |---|---|---|---|
@@ -77,7 +77,7 @@ public @interface FeatureFlag {
 
 ## FeatureFlagService Abstraction
 
-Coupling application code directly to the LaunchDarkly SDK creates a hard dependency on a third-party library throughout your codebase. The correct approach is a narrow abstraction that your application calls, with LaunchDarkly as a pluggable backend.
+Coupling application code directly to the LaunchDarkly SDK creates a hard dependency on a third-party library throughout your codebase. The correct approach is a narrow abstraction that your application calls, with LaunchDarkly as a pluggable backend. (OpenFeature, a CNCF project, standardises exactly this kind of vendor-neutral API, with providers for LaunchDarkly, Unleash, flagd and others.)
 
 ```java
 // Core abstraction — application code only depends on this interface
@@ -106,7 +106,7 @@ public class LaunchDarklyFeatureFlagService implements FeatureFlagService {
 
     public LaunchDarklyFeatureFlagService(@Value("${launchdarkly.sdk-key}") String sdkKey) {
         LDConfig config = new LDConfig.Builder()
-            .events(Components.sendEvents().flushIntervalSeconds(5))
+            .events(Components.sendEvents().flushInterval(Duration.ofSeconds(5)))
             .build();
         this.ldClient = new LDClient(sdkKey, config);
     }
@@ -114,6 +114,8 @@ public class LaunchDarklyFeatureFlagService implements FeatureFlagService {
     @Override
     public boolean isEnabled(String flagKey, FlagContext context) {
         LDContext ldContext = toLdContext(context);
+        // The SDK serves the last value it received; 'false' is used only if it has
+        // never connected. Choose each flag's default deliberately (safe = legacy path).
         return ldClient.boolVariation(flagKey, ldContext, false);
     }
 
@@ -127,17 +129,23 @@ public class LaunchDarklyFeatureFlagService implements FeatureFlagService {
             return type.cast(ldClient.intVariation(flagKey, ldContext, (Integer) defaultValue));
         }
         // JSON variations for complex config objects
-        return ldClient.jsonValueVariation(flagKey, ldContext,
-            LDValue.ofNull(), LDValue.class).as(type);
+        LDValue json = ldClient.jsonValueVariation(flagKey, ldContext, LDValue.ofNull());
+        if (json.isNull()) {
+            return defaultValue;
+        }
+        try {
+            return objectMapper.readValue(json.toJsonString(), type);
+        } catch (JsonProcessingException e) {
+            return defaultValue;
+        }
     }
 
     private LDContext toLdContext(FlagContext ctx) {
-        return LDContext.builder(ctx.userId())
+        ContextBuilder builder = LDContext.builder(ctx.userId())
             .set("tenantId", ctx.tenantId())
-            .set("region", ctx.region())
-            .putAll(ctx.attributes().entrySet().stream()
-                .collect(LDAttributeMap.collector()))
-            .build();
+            .set("region", ctx.region());
+        ctx.attributes().forEach(builder::set);
+        return builder.build();
     }
 }
 
@@ -204,8 +212,13 @@ public class PaymentAuthorisationService {
                 "outcome", result.decision().name()));
 
             return result;
-        } catch (Exception e) {
-            // Automatic fallback to legacy on any exception from new engine
+        } catch (RuntimeException e) {
+            if (!useNewEngine) {
+                throw e;   // a legacy failure is not retried on the legacy engine
+            }
+            // Automatic fallback to legacy when the NEW engine fails. Safe only because
+            // both engines are idempotent on the payment id and the new engine has no
+            // side effects (holds, ledger writes) before it reaches a decision.
             meterRegistry.counter("auth.new-engine.fallback").increment();
             log.error("New auth engine failed, falling back to legacy", e);
             return legacyEngine.authorise(request);
@@ -216,7 +229,7 @@ public class PaymentAuthorisationService {
 
 ## Dark Launch for High-Risk Migrations
 
-A dark launch runs the new code path in parallel with the production path, comparing results without exposing users to the new behaviour. This is the safest possible migration technique for high-risk financial logic.
+A dark launch runs the new code path in parallel with the production path, comparing results without exposing users to the new behaviour. This is the safest possible migration technique for high-risk financial logic — provided the shadow run is a dry run: it must compute its answer without moving money, writing to the ledger, or sending files to a payment scheme.
 
 ```java
 @Service
@@ -247,7 +260,8 @@ public class DarkLaunchPaymentProcessor {
 
     private void runShadow(SettlementRequest request, SettlementResult legacyResult) {
         try {
-            SettlementResult newResult = newEngine.settle(request);
+            // Dry run: compute the result only — no money moved, no scheme files sent
+            SettlementResult newResult = newEngine.simulate(request);
             DarkLaunchComparison comparison = compare(legacyResult, newResult);
 
             resultStore.record(DarkLaunchRecord.builder()
@@ -389,7 +403,7 @@ class PaymentAuthorisationServiceTest {
 
 ## Compliance: Audit Trail for Flag Changes
 
-In regulated fintech environments, a change to a feature flag is a material change to system behaviour. PCI DSS Requirement 10 and FCA SYSC 8 require that all configuration changes affecting payment processing be logged with who made the change and when.
+In regulated fintech environments, a change to a feature flag is a material change to system behaviour. PCI DSS v4.0 expects changes to in-scope systems to go through change control (Requirement 6.5) and to be traceable in audit logs (Requirement 10), and operational-resilience supervisors expect the same discipline: every flag change affecting payment processing must record who changed what, and when.
 
 ```java
 // LaunchDarkly audit webhook receiver — record every flag change
@@ -455,25 +469,25 @@ public class LaunchDarklyAuditWebhook {
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Feature Flags and Progressive Delivery in Banking \u2014 Production Implementation",
+  "title": "Feature Flags and Progressive Delivery in Banking — Production Implementation",
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
     {
       "id": "1",
-      "description": "Design the feature flag taxonomy for this migration. What flags do you need, what type is each, and what are their targeting rules? Define the rollout phases (percentage milestones) and the criteria f"
+      "description": "Your bank is migrating its BACS Direct Credit submission engine to a new implementation. Design the feature flag taxonomy for this migration: which flags you need, the type of each, and their targeting rules. Define the rollout phases (percentage milestones) and the criteria for moving from one phase to the next."
     },
     {
       "id": "2",
-      "description": "Implement the `BacsSubmissionService` with an ops-type kill switch. The kill switch must revert all in-flight requests within 200ms of being activated. Describe how you test the kill switch without af"
+      "description": "Implement a `BacsSubmissionService` with an ops-type kill switch that takes effect for new requests within 200ms of being flipped. Describe how you test the kill switch without affecting production traffic."
     },
     {
       "id": "3",
-      "description": "The new engine generates BACS file hashes differently. Design the dark launch comparison logic. What fields do you compare, what fields do you exclude as expected differences, and at what divergence r"
+      "description": "The new engine generates BACS file hashes differently. Design the dark-launch comparison logic: which fields you compare, which you exclude as expected differences, and at what divergence rate — after what investigation — you would allow the cutover."
     },
     {
       "id": "4",
-      "description": "Your compliance team requires a full audit trail of all flag changes for PCI DSS. Design the audit log schema and the process for reviewing flag changes in your change management system (e.g., Service"
+      "description": "Your compliance team requires a full audit trail of all flag changes for PCI DSS. Design the audit log schema and the process for reviewing flag changes in your change management system (e.g., ServiceNow)."
     }
   ]
 }

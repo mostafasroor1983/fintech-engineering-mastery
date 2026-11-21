@@ -24,42 +24,43 @@ Every distributed systems engineer eventually encounters the **clock skew proble
 ```
 Clock Skew in a Payment Network:
 
-Node A (payment-service-1): clock reads 10:00:00.000
-Node B (payment-service-2): clock reads 10:00:00.015  (15ms ahead)
-Node C (database-primary):  clock reads 09:59:59.990  (10ms behind)
+Node A (payment-service-1): clock is accurate
+Node B (payment-service-2): clock is 15ms AHEAD of real time
 
-Payment P1 submitted via Node A at   10:00:00.000
-Payment P2 submitted via Node B at   10:00:00.005
+Real time 09:59:59.990  Payment P2 arrives at Node B
+                        Node B stamps it 10:00:00.005   (15ms ahead)
+Real time 10:00:00.000  Payment P1 arrives at Node A
+                        Node A stamps it 10:00:00.000
 
-Question: Which payment came first?
-Node A's perspective: P1 first
-Node C's perspective: timestamps P2=.005, P1=.000, but C's clock is behind
-                      so C records P2 at 09:59:59.995 and P1 at 09:59:59.990
-                      -> C thinks P1 came before P2, which matches
-But if C is 15ms behind Node B:
-  P2 at node B:  10:00:00.005
-  P2 at node C:  10:00:00.005 - 15ms = 09:59:59.990
-  P1 at node C:  10:00:00.000 - 10ms = 09:59:59.990
-                 -> SAME timestamp — ordering is arbitrary
+Sorted by timestamp:  P1 (10:00:00.000) before P2 (10:00:00.005)
+What really happened: P2 arrived 10ms BEFORE P1
+
+The timestamps reverse the real order. If both payments draw on the same
+balance, the wrong one may be declined for insufficient funds — and no
+log line will show why.
 ```
 
 ### NTP Is Not Good Enough for Financial Ordering
 
-Network Time Protocol (NTP) synchronises clocks to within tens of milliseconds under normal conditions and can experience jumps of hundreds of milliseconds during network disruption. For financial transaction ordering, this is catastrophically imprecise.
+Network Time Protocol (NTP) typically keeps clocks within a millisecond or so on a good LAN and within tens of milliseconds over the internet, and offsets can grow to hundreds of milliseconds during network disruption. For ordering financial transactions that arrive microseconds apart, this is far too imprecise.
 
 ```
 NTP limitations:
-- Typical accuracy: 1-50ms on LAN, 50-200ms on WAN
-- Leap second handling can cause time to go backwards
-- During NTP re-sync, time may jump forward or backward
-- Virtualization adds 10-100ms of additional uncertainty
-- Hardware clock drift: ~1ms/sec without correction
+- Typical accuracy: under 1ms to a few ms on a LAN, 10-100ms over the internet
+- Leap second handling can cause time to repeat or go backwards
+- During NTP re-sync, time may be stepped forward or backward
+- Virtualisation adds extra uncertainty (VM pauses, live migration)
+- Quartz oscillator drift: tens of microseconds per second (seconds per day)
+  without correction
 
 Impact on financial systems:
-- Two transactions within 50ms of each other have no guaranteed wall-clock order
-- A backward clock jump can produce negative transaction durations in logs
-- Leap second handling has caused production incidents at major financial institutions
+- Two transactions a few ms apart on different nodes have no reliable wall-clock order
+- A backward clock step can produce negative transaction durations in logs
+- The 2012 leap second caused well-known outages (Linux kernel livelocks)
 ```
+
+> [!NOTE]
+> Regulation sets hard limits here. MiFID II (RTS 25) requires EU trading firms to keep business clocks within 100 microseconds of UTC for high-frequency trading and within 1 millisecond for other algorithmic trading. NTP alone usually cannot meet this; firms use PTP (IEEE 1588) with GPS-disciplined clocks.
 
 ---
 
@@ -119,11 +120,13 @@ public class LamportClock {
     }
 }
 
-public record LamportTimestamp(String nodeId, long logicalTime) {
+public record LamportTimestamp(String nodeId, long logicalTime)
+        implements Comparable<LamportTimestamp> {
     /**
      * Total ordering: compare by logical time, break ties by node ID.
      * This gives a consistent total order across all nodes.
      */
+    @Override
     public int compareTo(LamportTimestamp other) {
         int timeComparison = Long.compare(this.logicalTime, other.logicalTime);
         return timeComparison != 0
@@ -187,7 +190,7 @@ public class PaymentOrderingService {
 
 ### Limitations of Lamport Clocks
 
-Lamport clocks establish that if `a → b` then `clock(a) < clock(b)`. But the converse is not true: `clock(a) < clock(b)` does NOT imply `a → b`. Two concurrent events can have any ordering of Lamport timestamps. This makes Lamport clocks insufficient for causal consistency — they establish ordering but not causality.
+Lamport clocks establish that if `a → b` then `clock(a) < clock(b)`. But the converse is not true: `clock(a) < clock(b)` does NOT imply `a → b`. Two concurrent events can have any ordering of Lamport timestamps. So a Lamport clock gives a total order that never contradicts causality, but it cannot tell you whether two events were causally related or concurrent — that needs vector clocks.
 
 ---
 
@@ -202,11 +205,9 @@ public class VectorClock {
 
     private final String nodeId;
     private final Map<String, Long> clock;
-    private final Set<String> knownNodes;
 
     public VectorClock(String nodeId, Set<String> allNodes) {
         this.nodeId     = nodeId;
-        this.knownNodes = new HashSet<>(allNodes);
         this.clock      = new HashMap<>();
         allNodes.forEach(node -> clock.put(node, 0L));
     }
@@ -214,7 +215,7 @@ public class VectorClock {
     /**
      * Increment this node's component before a local event or send.
      */
-    public Map<String, Long> tick() {
+    public synchronized Map<String, Long> tick() {
         clock.merge(nodeId, 1L, Long::sum);
         return Collections.unmodifiableMap(new HashMap<>(clock));
     }
@@ -222,7 +223,7 @@ public class VectorClock {
     /**
      * Merge incoming vector clock (component-wise max) and increment local.
      */
-    public Map<String, Long> receive(Map<String, Long> incoming) {
+    public synchronized Map<String, Long> receive(Map<String, Long> incoming) {
         incoming.forEach((node, ts) ->
             clock.merge(node, ts, Math::max)
         );
@@ -268,62 +269,52 @@ public class DistributedAccountUpdateService {
 
     private final VectorClock vectorClock;
     private final AccountRepository accountRepo;
+    private final ConflictResolutionRepository conflictResolutionRepo;
 
     /**
-     * Update account with vector clock to detect and resolve conflicts.
-     * In a multi-master setup, two nodes may update the same account.
-     * Vector clocks let us detect this and apply a conflict resolution policy.
+     * Multi-master update of account CONTACT details (never balances).
+     * The client sends the vector clock of the version it read (readClock).
+     * If the stored version has changes the client never saw, the two
+     * updates are concurrent: a conflict.
      */
     public UpdateResult updateAccountDetails(String accountId,
                                               AccountUpdateRequest update) {
-        Map<String, Long> currentClock = vectorClock.tick();
-
-        Account existingAccount = accountRepo.findById(accountId)
+        Account existing = accountRepo.findById(accountId)
             .orElseThrow(() -> new AccountNotFoundException(accountId));
 
-        // Check for conflicts: has another node made changes we haven't seen?
-        if (existingAccount.vectorClock() != null) {
-            Map<String, Long> storedClock = existingAccount.vectorClock();
+        Map<String, Long> stored = existing.vectorClock() != null
+            ? existing.vectorClock() : Map.of();
+        Map<String, Long> seen   = update.readClock();
 
-            if (VectorClock.areConcurrent(storedClock, currentClock)) {
-                // Concurrent updates detected — apply conflict resolution
-                log.warn("Concurrent update conflict for account {}: " +
-                          "stored={}, incoming={}", accountId, storedClock, currentClock);
-                return resolveConflict(existingAccount, update, currentClock);
-            }
+        boolean clientSawLatest = stored.equals(seen)
+            || VectorClock.happensBefore(stored, seen);
+
+        if (!clientSawLatest) {
+            // Concurrent update: record it for audit before resolving
+            log.warn("Concurrent update conflict for account {}: stored={}, seen={}",
+                     accountId, stored, seen);
+            conflictResolutionRepo.save(ConflictResolution.builder()
+                .accountId(accountId)
+                .existingVersion(stored)
+                .incomingVersion(seen)
+                .strategy(ConflictResolutionStrategy.LAST_WRITER_WINS)
+                .resolvedAt(Instant.now())
+                .build());
+            // Contact details: last-writer-wins is acceptable.
+            // Financial-critical data: reject and require manual resolution.
         }
 
-        Account updated = existingAccount.toBuilder()
+        // The new version dominates both histories: merge, then tick
+        Map<String, Long> newClock = vectorClock.receive(stored);
+
+        Account updated = existing.toBuilder()
             .address(update.address())
             .emailAddress(update.emailAddress())
-            .vectorClock(currentClock)
+            .vectorClock(newClock)
             .lastUpdated(Instant.now())
             .build();
 
         return UpdateResult.success(accountRepo.save(updated));
-    }
-
-    private UpdateResult resolveConflict(Account existing,
-                                          AccountUpdateRequest incoming,
-                                          Map<String, Long> incomingClock) {
-        // Financial systems typically use "last-writer-wins" for non-critical data
-        // or "reject and require manual resolution" for financial-critical data
-
-        // For account contact details: last-writer-wins (acceptable)
-        // For account balance: MUST NOT use last-writer-wins (use transactions instead)
-
-        ConflictResolution resolution = ConflictResolution.builder()
-            .accountId(existing.accountId())
-            .existingVersion(existing.vectorClock())
-            .incomingVersion(incomingClock)
-            .resolvedAt(Instant.now())
-            .strategy(ConflictResolutionStrategy.LAST_WRITER_WINS)
-            .build();
-
-        conflictResolutionRepo.save(resolution);
-
-        // Apply the incoming change (last-writer-wins for contact details)
-        return updateAccountDetails(existing.accountId(), incoming);
     }
 }
 ```
@@ -332,13 +323,13 @@ public class DistributedAccountUpdateService {
 
 ## Hybrid Logical Clocks (HLC)
 
-Hybrid Logical Clocks combine the properties of physical (wall) clocks with logical clocks. The goal: provide causality tracking like vector clocks, while keeping clock values close to physical time for observability and debugging.
+Hybrid Logical Clocks combine physical (wall) clocks with logical clocks. Like a Lamport clock, an HLC guarantees that if a → b then hlc(a) < hlc(b); unlike a Lamport clock, its value stays close to physical time, so it is readable and useful for debugging. It does not detect concurrency — that still needs vector clocks. CockroachDB and YugabyteDB use HLCs.
 
 ```java
 /**
  * Hybrid Logical Clock (HLC) — provides:
  * - Physical time component: for human readability and approximate ordering
- * - Logical counter: for precise causality within the same millisecond
+ * - Logical counter: keeps the order consistent with causality within the same millisecond
  *
  * Based on Kulkarni et al., "Logical Physical Clocks and Consistent Snapshots"
  */
@@ -395,7 +386,8 @@ public class HybridLogicalClock {
     }
 }
 
-public record HlcTimestamp(long physicalMs, long counter) {
+public record HlcTimestamp(long physicalMs, long counter)
+        implements Comparable<HlcTimestamp> {
 
     /**
      * Convert to a sortable string representation.
@@ -410,6 +402,7 @@ public record HlcTimestamp(long physicalMs, long counter) {
         return Instant.ofEpochMilli(physicalMs);
     }
 
+    @Override
     public int compareTo(HlcTimestamp other) {
         int physicalComparison = Long.compare(this.physicalMs, other.physicalMs);
         return physicalComparison != 0
@@ -503,7 +496,8 @@ TT.now() timestamp that is definitely after T1's commit timestamp.
 This provides external consistency: the global order of commits matches
 the real-time order in which they were observed.
 
-Cost: Average wait = uncertainty/2 ≈ 2-3ms for intra-datacenter
+Cost: the wait is about the width of the uncertainty interval (2 x epsilon),
+a few ms; Spanner overlaps it with Paxos replication to hide most of it
 ```
 
 This is why Spanner can offer global strong consistency: by waiting out the clock uncertainty before making a commit visible, it ensures the commit timestamp is unambiguously in the past when any subsequent transaction starts.
@@ -558,78 +552,37 @@ public class TrueTimeCommitService {
 public class TransactionOrderingAnalysisService {
 
     /**
-     * Demonstrate why wall-clock ordering is unreliable for concurrent transactions.
-     * This service shows the gap between wall-clock ordering and logical ordering.
+     * Find causal inversions: pairs where event a causally happened before b
+     * (by vector clock) but a's wall-clock timestamp is LATER than b's.
+     * Every inversion proves the clocks were skewed by at least the gap.
+     * O(n^2): run it on a sample, not on the full day.
      */
-    public OrderingAnalysisReport analyseOrderingRisk(
-            List<Transaction> transactions) {
+    public OrderingAnalysisReport analyseOrderingRisk(List<Transaction> transactions) {
+        List<OrderingConflict> inversions = new ArrayList<>();
+        Duration maxObservedSkew = Duration.ZERO;
 
-        List<OrderingConflict> conflicts = new ArrayList<>();
-
-        // Sort by wall clock
-        List<Transaction> wallClockOrder = transactions.stream()
-            .sorted(Comparator.comparing(Transaction::wallClockAt))
-            .collect(toList());
-
-        // Sort by Lamport clock (causal order)
-        List<Transaction> lamportOrder = transactions.stream()
-            .sorted(Comparator.comparingLong(Transaction::lamportTimestamp))
-            .collect(toList());
-
-        // Find cases where wall-clock order disagrees with logical order
-        for (int i = 0; i < wallClockOrder.size(); i++) {
-            Transaction wallClockFirst = wallClockOrder.get(i);
-            int lamportPosition = lamportOrder.indexOf(wallClockFirst);
-
-            if (lamportPosition != i) {
-                conflicts.add(new OrderingConflict(
-                    wallClockFirst.transactionId(),
-                    i,            // position in wall-clock ordering
-                    lamportPosition  // position in logical ordering
-                ));
+        for (Transaction a : transactions) {
+            for (Transaction b : transactions) {
+                if (a == b) continue;
+                boolean causallyBefore =
+                    VectorClock.happensBefore(a.vectorClock(), b.vectorClock());
+                if (causallyBefore && a.wallClockAt().isAfter(b.wallClockAt())) {
+                    Duration gap = Duration.between(b.wallClockAt(), a.wallClockAt());
+                    inversions.add(new OrderingConflict(a.transactionId(), b.transactionId(), gap));
+                    if (gap.compareTo(maxObservedSkew) > 0) maxObservedSkew = gap;
+                }
             }
         }
 
-        Duration maxSkew = computeMaxSkew(transactions);
-
         return new OrderingAnalysisReport(
             transactions.size(),
-            conflicts.size(),
-            maxSkew,
-            conflicts.size() == 0
-                ? "Wall-clock and logical ordering agree"
-                : "Wall-clock ordering unreliable: %d conflicts detected"
-                    .formatted(conflicts.size())
+            inversions.size(),
+            maxObservedSkew,   // a lower bound on the real clock skew
+            inversions.isEmpty()
+                ? "No causal inversions in this sample"
+                : "Wall-clock order contradicts causality %d times (skew >= %s)"
+                    .formatted(inversions.size(), maxObservedSkew)
         );
-    }
-
-    private Duration computeMaxSkew(List<Transaction> transactions) {
-        // Compute the maximum difference between wall-clock times on the same
-        // logical event sequence
-        OptionalLong maxLamport = transactions.stream()
-            .mapToLong(Transaction::lamportTimestamp)
-            .max();
-
-        if (maxLamport.isEmpty()) return Duration.ZERO;
-
-        // Find transactions at the same Lamport time — these were concurrent
-        // and their wall-clock difference is the observed skew
-        Map<Long, List<Transaction>> byLamport = transactions.stream()
-            .collect(groupingBy(Transaction::lamportTimestamp));
-
-        return byLamport.values().stream()
-            .filter(group -> group.size() > 1)
-            .map(group -> {
-                Instant earliest = group.stream()
-                    .map(Transaction::wallClockAt)
-                    .min(Comparator.naturalOrder()).get();
-                Instant latest   = group.stream()
-                    .map(Transaction::wallClockAt)
-                    .max(Comparator.naturalOrder()).get();
-                return Duration.between(earliest, latest);
-            })
-            .max(Comparator.naturalOrder())
-            .orElse(Duration.ZERO);
     }
 }
 ```
@@ -651,11 +604,13 @@ Display timestamps to users                 Wall clock (Instant/OffsetDateTime)
 Idempotency key expiry                      Wall clock + sufficient TTL buffer
                                             (add 5x expected clock skew as buffer)
 
-Event ordering within single node           Wall clock (monotonic, never backwards)
+Event ordering within single node           Local sequence counter (wall clock can
+                                            step backwards; nanoTime only for durations)
 
 Event ordering across multiple nodes        Lamport clock or HLC
 
-Causality tracking across nodes             Vector clock or HLC
+Causality tracking across nodes             Vector clock (Lamport/HLC give an order
+                                            consistent with causality, not detection)
 
 Settlement sequencing (must be            Sequence number from single coordinator
   unambiguous)                              (not a clock at all)
@@ -691,7 +646,7 @@ Distributed locks that expire after N seconds rely on all nodes agreeing on when
 ## Production Tips
 
 **Use NTP with Multiple Sources and Monitor Offset**
-Configure servers to use at least 4 NTP sources from different providers. Monitor the `ntp_offset_seconds` metric and alert if it exceeds 10ms. In AWS/GCP/Azure, the cloud provider's NTP service is usually the most accurate source for VMs.
+On premises, configure servers with at least 4 NTP sources from different providers. In AWS/GCP/Azure, use the provider's time service (for example Amazon Time Sync Service), which is usually the most accurate source for VMs. Either way, monitor the clock offset (for example chrony's tracking output or node_exporter's `node_timex_offset_seconds`) and alert if it exceeds 10ms.
 
 **Add a Logical Sequence to Every Event in Kafka**
 Even with well-synchronised clocks, Kafka partition offsets provide a perfect within-partition ordering. Use the Kafka offset as the definitive sequence number for events within an account's partition, and supplement with HLC for cross-partition causality.
@@ -703,15 +658,15 @@ Add a test that starts two services with deliberately skewed clocks (use `java.t
 {
   "questions": [
     {
-      "text": "Payment P1 is submitted on Node A at wall-clock time 10:00:00.000 and Payment P2 on Node B at 10:00:00.005. Node C (the database primary) has a clock 15ms behind Node B. What problem occurs when wall-clock timestamps are used to determine payment ordering?",
+      "text": "Payment P2 arrives at Node B at real time 09:59:59.990, and Node B's clock is 15ms fast, so it stamps P2 as 10:00:00.005. Payment P1 arrives at Node A (accurate clock) 10ms later and is stamped 10:00:00.000. What goes wrong if the system orders payments by these timestamps?",
       "options": [
-        "Node C will record both payments with identical timestamps, making ordering arbitrary and non-deterministic.",
-        "NTP will automatically resolve the skew within 100ms, so ordering is only incorrect during the synchronisation window.",
-        "The database will reject one of the payments because two transactions cannot have different wall-clock timestamps within the same millisecond.",
-        "The ISO 8583 payment protocol automatically assigns sequence numbers that override wall-clock ordering."
+        "Nothing — a 15ms skew is within NTP tolerance, so the order is still correct.",
+        "The timestamps reverse the real order: P1 sorts before P2 although P2 arrived first, so a balance check or settlement sequence can act on the wrong payment first.",
+        "The database rejects one of the payments because two timestamps cannot be within 15ms of each other.",
+        "The ISO 8583 protocol automatically assigns sequence numbers that override wall-clock ordering."
       ],
-      "correct": 0,
-      "explanation": "With a 15ms clock skew, Node C may record P2 (originally at 10:00:00.005 on Node B) at 09:59:59.990 on its own clock — the same value it records for P1 (10:00:00.000 on Node A adjusted for Node C's lag). Two payments with identical database timestamps have no defined order, making wall-clock-based ordering unreliable for concurrent transactions."
+      "correct": 1,
+      "explanation": "Node B's 15ms skew is larger than the 10ms real gap between the two payments, so the timestamps put P1 first although P2 really arrived first. Wall-clock timestamps from different nodes cannot order events that are closer together than the clock skew. Use a single sequencer, a logical clock, or an HLC for ordering, and keep wall-clock time for display."
     },
     {
       "text": "What critical limitation of Lamport clocks makes them insufficient for causal consistency in a distributed payment system?",
@@ -722,7 +677,7 @@ Add a test that starts two services with deliberately skewed clocks (use `java.t
         "Lamport clocks only work correctly when all nodes have perfectly synchronised wall clocks, defeating the purpose of a logical clock."
       ],
       "correct": 1,
-      "explanation": "Lamport clocks establish that if a → b (a happened before b) then clock(a) < clock(b). But the converse is not true: clock(a) < clock(b) does NOT imply a → b. Two concurrent, causally unrelated events can have any ordering of Lamport timestamps. For causal consistency, you need vector clocks or Hybrid Logical Clocks, which precisely track causal relationships."
+      "explanation": "Lamport clocks establish that if a → b (a happened before b) then clock(a) < clock(b). But the converse is not true: clock(a) < clock(b) does NOT imply a → b. Two concurrent, causally unrelated events can have any ordering of Lamport timestamps. To detect causal relationships (and concurrency) you need vector clocks; HLCs, like Lamport clocks, only give an order that is consistent with causality."
     },
     {
       "text": "Google Spanner uses TrueTime and 'commit wait' to provide external consistency. What is the purpose of the commit wait step?",
@@ -733,7 +688,7 @@ Add a test that starts two services with deliberately skewed clocks (use `java.t
         "To allow the write-ahead log to be flushed to disk on all replicas before the transaction is considered durable."
       ],
       "correct": 1,
-      "explanation": "Commit wait ensures external consistency: Spanner sets the commit timestamp to the latest possible current time (TrueTime's upper bound), then waits until real time has definitely passed that timestamp. Any subsequent transaction gets a TrueTime interval starting after the commit timestamp, guaranteeing that the global order of commits matches the real-time order in which they were observed — without any global lock or coordination."
+      "explanation": "Commit wait ensures external consistency: Spanner sets the commit timestamp to the latest possible current time (TrueTime's upper bound), then waits until real time has definitely passed that timestamp. Any subsequent transaction gets a TrueTime interval starting after the commit timestamp, so the global order of commit timestamps matches the real-time order of commits — without a central timestamp service."
     }
   ]
 }
@@ -745,10 +700,22 @@ Add a test that starts two services with deliberately skewed clocks (use `java.t
   "difficulty": "advanced",
   "estimatedMinutes": 55,
   "tasks": [
-    {"id": "1", "description": "Implement a LamportClock class with tick(), send(), and receive(long receivedTimestamp) methods. Implement a LamportTimestamp record with a compareTo method that breaks ties by nodeId for total ordering. Write a PaymentOrderingService that stamps each payment submission with a Lamport timestamp and publishes it to Kafka with the timestamp in the message header. Write a unit test with two simulated nodes demonstrating that payments submitted 'simultaneously' get a consistent total order via Lamport timestamps."},
-    {"id": "2", "description": "Implement a VectorClock class with tick(), receive(Map<String, Long> incoming), happensBefore(Map a, Map b), and areConcurrent(Map a, Map b) static methods. Write a DistributedAccountUpdateService that uses vector clocks to detect concurrent updates to account contact details and applies a last-writer-wins conflict resolution strategy, logging detected conflicts to a conflict_resolutions audit table. Write tests covering sequential updates (no conflict), concurrent updates (conflict detected), and causally ordered updates."},
-    {"id": "3", "description": "Implement a HybridLogicalClock with now() and receive(HlcTimestamp remote) methods. Store HLC timestamps in a LedgerEntry JPA entity as two columns (hlc_physical_ms and hlc_counter). Write a SQL query that computes a running balance for an account ordered by HLC rather than wall-clock, and demonstrate with a test that two ledger entries with the same wall-clock millisecond are still correctly ordered by their HLC counter component."},
-    {"id": "4", "description": "Write a TransactionOrderingAnalysisService that takes a list of transactions with both wall-clock and Lamport timestamps, sorts by each, and identifies ordering conflicts where the two orderings disagree. Write a test with five transactions across two simulated nodes with 20ms clock skew and verify that the analysis correctly identifies which transactions cannot be reliably ordered by wall clock alone. Add a @Scheduled job that runs the analysis against the last 1 minute of production transactions and reports the conflict count as a Micrometer gauge."}
+    {
+      "id": "1",
+      "description": "Implement a LamportClock class with tick(), send(), and receive(long receivedTimestamp) methods. Implement a LamportTimestamp record with a compareTo method that breaks ties by nodeId for total ordering. Write a PaymentOrderingService that stamps each payment submission with a Lamport timestamp and publishes it to Kafka with the timestamp in the message header. Write a unit test with two simulated nodes demonstrating that payments submitted 'simultaneously' get a consistent total order via Lamport timestamps."
+    },
+    {
+      "id": "2",
+      "description": "Implement a VectorClock class with tick(), receive(Map<String, Long> incoming), happensBefore(Map a, Map b), and areConcurrent(Map a, Map b) static methods. Write a DistributedAccountUpdateService where each update carries the vector clock of the version the client read; detect concurrent updates to account contact details, apply last-writer-wins, and log each conflict to a conflict_resolutions audit table. Write tests covering sequential updates (no conflict), concurrent updates (conflict detected), and causally ordered updates."
+    },
+    {
+      "id": "3",
+      "description": "Implement a HybridLogicalClock with now() and receive(HlcTimestamp remote) methods. Store HLC timestamps in a LedgerEntry JPA entity as two columns (hlc_physical_ms and hlc_counter). Write a SQL query that computes a running balance for an account ordered by HLC rather than wall-clock, and demonstrate with a test that two ledger entries with the same wall-clock millisecond are still correctly ordered by their HLC counter component."
+    },
+    {
+      "id": "4",
+      "description": "Write a TransactionOrderingAnalysisService that takes a sample of transactions carrying both wall-clock timestamps and vector clocks, and finds causal inversions: pairs where a happened before b by vector clock but a has the later wall-clock timestamp. Write a test with five transactions across two simulated nodes with 20ms clock skew and verify the inversions and the observed skew lower bound. Add a @Scheduled job that analyses a sample of the last minute of transactions and reports the inversion count and maximum observed skew as Micrometer gauges."
+    }
   ]
 }
 -->

@@ -11,6 +11,8 @@ tags: [context-propagation, MDC, SecurityContext, ThreadLocal, Micrometer]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 Modern Java payment systems rarely execute a transaction on a single thread from entry to completion. A REST controller receives a payment authorisation request, forks enrichment and fraud checks via `CompletableFuture`, merges results on a common pool thread, and logs every step. The correlation ID, authenticated user principal, and distributed trace context that arrived in the HTTP headers must accompany each log line and downstream call — but `ThreadLocal`-based containers like MDC, Spring Security's `SecurityContextHolder`, and Micrometer's tracing context bind to the *originating* thread and vanish the moment execution hops to a pool thread. This lesson is about understanding why context is lost and how to restore it systematically, from manual capture-and-restore patterns through to `ScopedValue` and Java 21's structured concurrency model.
 
 ## Learning Objectives
@@ -27,7 +29,7 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-A payment authorisation service at a UK neobank processes 15,000 authorisations per second during peak. Each authorisation carries a `correlationId` for end-to-end log correlation, a `tenantId` for multi-tenant routing, and an authenticated `Principal` for audit trail. The service uses `CompletableFuture` to parallelise fraud scoring, balance checks, and FX rate lookups. A production incident revealed that 23% of log lines emitted from async continuations had no `correlationId` — making post-incident investigation extremely difficult. A second incident showed that the audit service was receiving unauthenticated requests because `SecurityContextHolder` was empty on pool threads. This lesson fixes both.
+*Composite example (based on common industry patterns, not a specific company):* a payment authorisation service at a neobank processes 15,000 authorisations per second during peak. Each authorisation carries a `correlationId` for end-to-end log correlation, a `tenantId` for multi-tenant routing, and an authenticated `Principal` for audit trail. The service uses `CompletableFuture` to parallelise fraud scoring, balance checks, and FX rate lookups. A production incident revealed that roughly a quarter of the log lines emitted from async continuations had no `correlationId` — making post-incident investigation extremely difficult. A second incident showed that the audit service was receiving unauthenticated requests because `SecurityContextHolder` was empty on pool threads. This lesson fixes both.
 
 ## 1. The Problem: ThreadLocal Context Does Not Cross Thread Boundaries
 
@@ -201,7 +203,9 @@ public CompletableFuture<AuthorisationResult> authorise(PaymentRequest payment) 
                 (fraud, balance) -> buildResult(fraud, balance)
             );
     } finally {
-        MDC.clear();   // clear the request thread's MDC after task submission
+        // Clear the request thread's MDC after task submission. (If an outer
+        // filter also put MDC values, remove only your own keys instead.)
+        MDC.clear();
     }
 }
 ```
@@ -318,6 +322,9 @@ emptyContext.setAuthentication(systemAuthentication());   // system-level auth
 SecurityContextHolder.setContext(emptyContext);
 ```
 
+> [!TIP]
+> In Spring, the idiomatic hook is a **`TaskDecorator`** on `ThreadPoolTaskExecutor` (`executor.setTaskDecorator(...)`): it wraps every submitted task, so you can capture context on the submitting thread and restore it on the worker. Spring Framework 6.1+ ships `ContextPropagatingTaskDecorator`, which propagates everything registered with Micrometer's context-propagation library (Section 5).
+
 > [!IMPORTANT]
 > `SecurityContextHolder` has three modes: `MODE_THREADLOCAL` (default), `MODE_INHERITABLETHREADLOCAL`, and `MODE_GLOBAL`. `MODE_INHERITABLETHREADLOCAL` propagates the context to child threads created from the current thread, but not to pool threads (same caveat as `InheritableThreadLocal`). `MODE_GLOBAL` uses a single shared context — never use this in a multi-user application. For pool-based async, `DelegatingSecurityContextExecutorService` is the correct approach.
 
@@ -396,6 +403,10 @@ public final class ContextSnapshot {
             SecurityContextHolder.setContext(securityContext);
             if (paymentContext != null) {
                 PaymentContext.set(paymentContext);
+            } else {
+                // MUST clear: otherwise a value left on this pooled thread by an
+                // earlier task (another tenant!) would be visible to this task
+                PaymentContext.clear();
             }
             return action.get();
         } finally {
@@ -483,7 +494,10 @@ public class PaymentAuthorisationPipeline {
                 .thenCombineAsync(balanceFuture, (fraud, balance) ->
                     new PartialResult(fraud, balance), processingPool)
                 .thenCombineAsync(fxFuture,
-                    snapshot.wrap((partial, fx) -> buildFinalResult(partial, fx, request)),
+                    // wrap() takes a Supplier/Runnable, so restore the context
+                    // inside the BiFunction with runWith()
+                    (partial, fx) -> snapshot.runWith(
+                        () -> buildFinalResult(partial, fx, request)),
                     processingPool);
         } finally {
             MDC.clear();
@@ -525,22 +539,24 @@ public class FraudScoringService {
 
 ### Propagating Observation Context Across Threads
 
-Micrometer provides `ObservationThreadLocalAccessor` for use with Project Reactor's context model, and `ContextExecutorService` for thread pool propagation:
+Micrometer's `context-propagation` library defines `ThreadLocalAccessor`s — such as `ObservationThreadLocalAccessor` for the current observation — and `ContextExecutorService` to propagate all of them across a thread pool:
 
 ```java
 import io.micrometer.context.ContextExecutorService;
-import io.micrometer.context.ContextRegistry;
+import io.micrometer.context.ContextSnapshotFactory;
 
 @Configuration
 public class MicrometerAsyncConfig {
 
     @Bean("tracingAwareExecutor")
-    public ExecutorService tracingAwareExecutorService(ObservationRegistry observationRegistry) {
+    public ExecutorService tracingAwareExecutorService() {
         ExecutorService base = Executors.newFixedThreadPool(10);
+        ContextSnapshotFactory snapshots = ContextSnapshotFactory.builder().build();
 
-        // ContextExecutorService propagates all registered ThreadLocalAccessors,
-        // including Micrometer's ObservationThreadLocalAccessor
-        return ContextExecutorService.wrap(base, ContextRegistry.getInstance());
+        // On each submit: capture every registered ThreadLocalAccessor
+        // (including ObservationThreadLocalAccessor, which Spring Boot registers)
+        // and restore them on the worker thread
+        return ContextExecutorService.wrap(base, snapshots::captureAll);
     }
 }
 ```
@@ -565,13 +581,13 @@ public CompletableFuture<FraudScore> scoreAsync(PaymentRequest payment) {
 ```
 
 > [!NOTE]
-> Micrometer's `ContextSnapshot` (from `micrometer-context-propagation`) is a production-grade implementation of the pattern described in Section 4. It discovers all registered `ThreadLocalAccessor` implementations via `ContextRegistry` and handles capture/restore automatically. If your project already includes Micrometer, prefer this over building your own. The key class is `io.micrometer.context.ContextSnapshot` with `ContextSnapshot.captureAll()` and `snapshot.wrap(task)`.
+> Micrometer's `ContextSnapshot` (from `micrometer-context-propagation`) is a production-grade implementation of the pattern described in Section 4. It discovers all registered `ThreadLocalAccessor` implementations via `ContextRegistry` and handles capture/restore automatically. If your project already includes Micrometer, prefer this over building your own: `ContextSnapshotFactory.builder().build().captureAll()` returns a snapshot, and `snapshot.wrap(task)` restores it around a task. Register your own `ThreadLocalAccessor` for custom context such as `PaymentContext`.
 
 ---
 
 ## 6. ScopedValue (Java 21) — Context Without ThreadLocal
 
-`ScopedValue` (finalised in Java 21 via JEP 446/481) provides immutable, automatically scoped bindings that propagate through the call tree without manual capture/restore. Combined with `StructuredTaskScope`, they eliminate the context-propagation problem entirely within a scope.
+`ScopedValue` (preview from Java 21 — JEP 446 — and final in Java 25 via JEP 506) provides immutable, automatically scoped bindings that propagate through the call tree without manual capture/restore. Combined with `StructuredTaskScope` (still a preview API), they remove the context-propagation problem within a scope. They do **not** reach plain executors or `CompletableFuture.supplyAsync` — only forked subtasks.
 
 > [!NOTE]
 > This lesson recaps the core propagation behaviour introduced in Lesson 15 (Scoped Values). The focus here is specifically on how `ScopedValue` removes the need for the `ContextSnapshot` pattern when using structured concurrency.
@@ -587,13 +603,15 @@ CompletableFuture.supplyAsync(() -> CORRELATION_ID.get());   // returns null
 // ScopedValue: immutable, automatic lifecycle, propagates through StructuredTaskScope
 static final ScopedValue<String> CORRELATION_ID = ScopedValue.newInstance();
 
+// call() instead of run(): join()/throwIfFailed() throw checked exceptions
 ScopedValue.where(CORRELATION_ID, "PAY-001")
-    .run(() -> {
+    .call(() -> {
         try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
             var fraudTask   = scope.fork(() -> CORRELATION_ID.get());   // returns "PAY-001"
             var balanceTask = scope.fork(() -> CORRELATION_ID.get());   // returns "PAY-001"
             scope.join().throwIfFailed();
         }
+        return null;
     });
 ```
 
@@ -623,7 +641,9 @@ public class StructuredPaymentAuthoriser {
                 try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
 
                     var fraudTask   = scope.fork(() -> {
-                        // No manual MDC.put() needed — ScopedValue is automatically available
+                        // No capture/restore needed — the ScopedValue is automatically
+                        // available. (The log PATTERN still reads the MDC: copy the value
+                        // into the MDC inside the task if you rely on %X{correlationId})
                         log.info("Scoring fraud for correlationId={}",
                                  PaymentScopes.CORRELATION_ID.get());
                         return fraudClient.score(request);
@@ -722,6 +742,8 @@ public final class ContextAwareExecutor implements Executor {
                 SecurityContextHolder.setContext(capturedSecurity);
                 if (capturedPayment != null) {
                     PaymentContext.set(capturedPayment);
+                } else {
+                    PaymentContext.clear();   // never inherit a previous task's tenant
                 }
 
                 command.run();
@@ -760,7 +782,10 @@ public class PaymentExecutorConfig {
         base.setThreadNamePrefix("payment-proc-");
         base.initialize();
 
-        // Wrap with context propagation
+        // Wrap with context propagation.
+        // Note: `base` is not a Spring bean here, so Spring will not shut it down
+        // gracefully. Alternatively keep `base` as the bean and plug the same
+        // capture/restore logic in with base.setTaskDecorator(...)
         return new ContextAwareExecutor(base.getThreadPoolExecutor());
     }
 }
@@ -813,7 +838,7 @@ flowchart TD
     Q1 -->|Yes| ScopedValue["Use ScopedValue<br/>— automatic, immutable,<br/>no capture/restore needed"]
     Q1 -->|No| Q2
 
-    Q2{Spring Security<br/>context only?}
+    Q2{"Spring Security<br/>context only?<br/>(Spring executors: or a TaskDecorator)"}
     Q2 -->|Yes| DSC["DelegatingSecurityContext-<br/>ExecutorService"]
     Q2 -->|No| Q3
 
@@ -899,7 +924,7 @@ public class ContextAwareCompletableFutureFactory {
         "The colleague is wrong only when using ThreadLocal instead of MDC"
       ],
       "correct": 1,
-      "explanation": "Thread pool threads can carry residual context from a previous task if that task threw an uncaught exception before cleaning up its MDC. Additionally, if the executor is shared between different request paths, a thread completing request A may still carry A's MDC when it picks up request B. In multi-tenant payment systems, tenant ID leaking between requests is a data isolation violation. Save-and-restore in finally guarantees isolation regardless of prior task history."
+      "explanation": "Thread pool threads can carry residual context from a previous task if that task threw before cleaning up its MDC or ThreadLocals. And if the executor is shared between different request paths, a thread that ran request A may still carry A's values when it picks up request B. For the same reason, when the captured value is null the wrapper must CLEAR the thread's value, not leave it. In multi-tenant payment systems, a tenant ID leaking between requests is a data isolation violation. Save-and-restore in finally guarantees isolation regardless of the thread's history."
     },
     {
       "text": "What is the key advantage of ScopedValue (Java 21) over ThreadLocal for context propagation in payment processing pipelines using StructuredTaskScope?",

@@ -74,7 +74,7 @@ Payment write request arrives at leader:
     Leader → Follower-2: AppendEntries(term=3, prevLogIndex=41, entries=[Log[42]])
     Leader → Follower-3: AppendEntries(term=3, prevLogIndex=41, entries=[Log[42]])
 
-  Step 3: Followers append to their logs, respond success
+  Step 3: Followers append to their logs, fsync to disk, respond success
 
   Step 4: Leader receives majority (2 of 3 followers) → commits entry
     Leader marks Log[42] committed, applies to state machine
@@ -95,14 +95,14 @@ If Follower-3 is partitioned:
 Election scenario (3-node cluster):
 
   Normal operation:
-    Leader sends heartbeats every 150ms
+    Leader sends heartbeats every 50ms (well below the election timeout)
     Followers reset election timer on heartbeat (timeout: 150-300ms randomized)
 
   Leader fails:
     - Follower-1 election timer expires first (randomized timeout)
     - Follower-1 → CANDIDATE, increments term to 4
     - Follower-1 → Follower-2: RequestVote(term=4, lastLogIndex=41, lastLogTerm=3)
-    - Follower-1 → Follower-3: RequestVote(term=4, lastLogIndex=41, lastLogTerm=3)
+    - Follower-1 → old leader:  RequestVote(...) — no reply, it is down
 
   Vote granting rules:
     - Only vote for candidate if candidate log is at least as up-to-date as own log
@@ -112,7 +112,7 @@ Election scenario (3-node cluster):
   Follower-1 wins majority (itself + Follower-2)
   Follower-1 → LEADER, starts sending heartbeats
 
-  Time to new leader: election timeout + RPC round trip ~ 300-600ms
+  Time to new leader: election timeout + RPC round trip ~ 150-350ms
 ```
 
 ### The Quorum Requirement
@@ -197,7 +197,7 @@ services:
 
 ### etcd Java Client Configuration
 
-```java
+```groovy
 // build.gradle
 dependencies {
     implementation 'io.etcd:jetcd-core:0.7.5'
@@ -279,8 +279,8 @@ public class EtcdDistributedLock {
 
     private final Client etcdClient;
 
-    // Lock TTL — must be longer than max expected operation time
-    // but short enough that a dead node's lock expires reasonably
+    // Lease TTL — the lease is kept alive while we work, so the TTL only
+    // decides how quickly a DEAD holder's lock is released
     private static final long LOCK_TTL_SECONDS = 30;
 
     /**
@@ -346,8 +346,10 @@ public class EtcdDistributedLock {
         } catch (java.util.concurrent.TimeoutException e) {
             throw new LockAcquisitionException(
                 "Could not acquire lock for key=" + lockKey + " within " + acquireTimeoutMs + "ms", e);
-        } catch (Exception e) {
-            Thread.currentThread().interrupt();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();   // restore the flag only when interrupted
+            throw new LockAcquisitionException("Interrupted while locking key=" + lockKey, e);
+        } catch (java.util.concurrent.ExecutionException e) {
             throw new LockAcquisitionException("Lock operation failed for key=" + lockKey, e);
         } finally {
             if (leaseId != -1) {
@@ -381,8 +383,7 @@ public class PaymentProcessingService {
 
     private final EtcdDistributedLock distributedLock;
     private final PaymentRepository    paymentRepository;
-    private final AccountService       accountService;
-    private final AuditService         auditService;
+    private final PaymentExecutor      paymentExecutor;
 
     /**
      * Process a payment with distributed idempotency guarantee.
@@ -391,6 +392,10 @@ public class PaymentProcessingService {
      * the same idempotency key concurrently, only one will execute
      * the actual payment logic. The second will block at the lock,
      * then find the existing record and return it.
+     *
+     * The lock is an optimisation, not the last line of defence: a lease can
+     * expire during a long GC pause. The UNIQUE constraint on
+     * payments.idempotency_key is what finally prevents a double debit.
      */
     public PaymentResult processPayment(PaymentRequest request) {
         String lockKey = "payment-" + request.getIdempotencyKey();
@@ -404,30 +409,39 @@ public class PaymentProcessingService {
                             request.getIdempotencyKey(), existing.getId());
                         return PaymentResult.alreadyProcessed(existing);
                     })
-                    .orElseGet(() -> executePayment(request));
+                    .orElseGet(() -> paymentExecutor.execute(request));
             });
 
         } catch (LockAcquisitionException e) {
             // Another node is currently processing the same key.
-            // Return 429 or retry after delay — do NOT process twice.
+            // Return 409 Conflict ("in progress") — do NOT process twice.
             log.warn("Concurrent processing for idempotencyKey={}", request.getIdempotencyKey());
             throw new PaymentConcurrentProcessingException(
                 "Payment " + request.getIdempotencyKey() + " is currently being processed", e);
         }
     }
 
-    @Transactional
-    private PaymentResult executePayment(PaymentRequest request) {
-        log.info("Executing payment: idempotencyKey={} amount={} currency={}",
-            request.getIdempotencyKey(), request.getAmount(), request.getCurrency());
+}
 
+// A separate bean: @Transactional does not apply to private methods or to
+// calls from inside the same class (Spring proxies are bypassed).
+@Service
+@RequiredArgsConstructor
+class PaymentExecutor {
+
+    private final PaymentRepository paymentRepository;
+    private final AccountService    accountService;
+    private final AuditService      auditService;
+
+    @Transactional
+    public PaymentResult execute(PaymentRequest request) {
         accountService.debit(
             request.getSourceAccountId(), request.getAmount(), request.getCurrency());
         accountService.credit(
             request.getDestinationAccountId(), request.getAmount(), request.getCurrency());
 
         Payment payment = paymentRepository.save(Payment.builder()
-            .idempotencyKey(request.getIdempotencyKey())
+            .idempotencyKey(request.getIdempotencyKey())   // UNIQUE column
             .sourceAccountId(request.getSourceAccountId())
             .destinationAccountId(request.getDestinationAccountId())
             .amount(request.getAmount())
@@ -460,6 +474,7 @@ import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -512,13 +527,15 @@ public class EtcdLeaderElection {
                     .get(5, TimeUnit.SECONDS).getID();
 
                 final long finalLeaseId = leaseId;
+                CountDownLatch leaseLost = new CountDownLatch(1);
                 var keepAlive = leaseClient.keepAlive(finalLeaseId,
                     new io.grpc.stub.StreamObserver<>() {
                         @Override public void onNext(io.etcd.jetcd.lease.LeaseKeepAliveResponse r) {}
                         @Override public void onError(Throwable t) {
-                            log.error("Keepalive failed for election={} — may lose leadership", electionName, t);
+                            log.error("Keepalive failed for election={} — stepping down", electionName, t);
+                            leaseLost.countDown();
                         }
-                        @Override public void onCompleted() {}
+                        @Override public void onCompleted() { leaseLost.countDown(); }
                     }
                 );
 
@@ -534,8 +551,10 @@ public class EtcdLeaderElection {
 
                     try {
                         onBecomeLeader.run();
-                        // Stay leader until keepalive fails or we are interrupted
-                        Thread.currentThread().join(); // Wait until interrupted
+                        // Stay leader until the lease is lost or we are interrupted.
+                        // (Thread.join() on yourself would wait forever and keep
+                        // isLeader=true after the lease had already expired.)
+                        leaseLost.await();
 
                     } finally {
                         isLeader.set(false);
@@ -587,8 +606,9 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.TaskScheduler;
 
-import java.time.Duration;
-import java.time.Instant;
+import org.springframework.scheduling.support.CronTrigger;
+
+import java.time.ZoneId;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -622,10 +642,13 @@ public class SettlementJobConfiguration {
 
     private void startSettlementScheduler() {
         log.info("LEADER: Starting settlement job scheduler on this node");
-        ScheduledFuture<?> future = taskScheduler.scheduleWithFixedDelay(
+        // A cron trigger, not "every 24h from now": a fixed delay starting now
+        // would run settlement immediately on every leadership change.
+        // runEndOfDaySettlement() also claims the date first (UNIQUE row),
+        // so an old and a new leader can never both settle the same day.
+        ScheduledFuture<?> future = taskScheduler.schedule(
             settlementJobService::runEndOfDaySettlement,
-            Instant.now(),
-            Duration.ofHours(24)
+            new CronTrigger("0 0 23 * * *", ZoneId.of("Europe/London"))
         );
         scheduledJob.set(future);
     }
@@ -658,8 +681,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
-import javax.annotation.PostConstruct;
-import javax.annotation.PreDestroy;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -679,6 +702,8 @@ public class PaymentRoutingWatcher {
 
     private static final String ROUTING_PREFIX = "/fintech/routing/payment-processor/";
 
+    // On start-up (and after a reconnect), load the full prefix with a GET and
+    // watch from that GET's revision + 1, so no change is missed in between.
     @PostConstruct
     public void startWatching() {
         ByteSequence prefix = ByteSequence.from(ROUTING_PREFIX, StandardCharsets.UTF_8);
@@ -870,10 +895,12 @@ Without consensus-backed coordinator:
 
 ```
 Migration guidance:
-  - Kafka 3.3+: use KRaft mode — eliminates ZooKeeper for Kafka entirely
-  - New coordination needs: use etcd (already in your K8s cluster)
-  - Existing ZK-only coordination: migrate to etcd over 6-12 months
-  - Never run ZooKeeper only for leader election on Kubernetes — etcd is free
+  - Kafka: use KRaft mode (production-ready since 3.3; Kafka 4.0 removed ZooKeeper)
+  - Leader election on Kubernetes: the Kubernetes Lease API (coordination.k8s.io,
+    e.g. Spring Cloud Kubernetes leader election) is often enough
+  - Locks and coordination data: a DEDICATED etcd cluster — never your
+    application's keys in the Kubernetes control-plane etcd
+  - Existing ZK-only coordination: migrate gradually (6-12 months)
 ```
 
 ---
@@ -953,6 +980,8 @@ groups:
 # Step 1: Assess surviving nodes
 etcdctl --endpoints=http://etcd-1:2379 endpoint status
 
+# Step 2: Preferred — restore from the latest snapshot on new members
+#   etcdutl snapshot restore backup.db --data-dir=/var/lib/etcd-restored ...
 # Step 2 (LAST RESORT): Force a new cluster from surviving member
 # WARNING: This risks data loss if surviving node is not most up-to-date.
 # NEVER do this without understanding the implications.
@@ -976,34 +1005,51 @@ etcdctl --endpoints=http://etcd-1:2379 member add etcd-2 \
 
 1. **Consensus is not free** — a Raft commit requires a round trip to a majority of nodes. In multi-AZ deployments this is 5-20ms per coordinated operation. Keep consensus off the synchronous payment critical path where possible.
 
-2. **Use leases, not raw locks** — etcd leases automatically expire when the holder dies, preventing stuck locks. TTL is your safety net. Set it to 2-3x your maximum expected operation duration.
+2. **Use leases, not raw locks** — etcd leases automatically expire when the holder dies, preventing stuck locks. Keep the lease alive while working; the TTL then only decides how fast a dead holder's lock is released. Back every lock with fencing or a database constraint, because a long pause can outlast any lease.
 
 3. **Leader election is the right tool for singleton jobs** — settlement, fee calculation, and regulatory reports belong behind leader election, not database-level mutual exclusion or cron locks.
 
-4. **etcd is not a database** — it has an 8GB size limit by default and is optimized for small key-value pairs with low write rate. Store only coordination state (locks, leader identity, routing config), not business data.
+4. **etcd is not a database** — its storage quota is 2GB by default (8GB is the suggested maximum) and it is optimized for small key-value pairs with low write rate. Store only coordination state (locks, leader identity, routing config), not business data.
 
-5. **ZooKeeper → etcd migration is worth it** — if you are running ZooKeeper only for coordination (not Kafka), migrating to etcd reduces operational complexity significantly on Kubernetes. etcd is already there.
+5. **ZooKeeper → etcd migration is worth it** — if you are running ZooKeeper only for coordination (not Kafka), a simpler coordination service reduces operational complexity. On Kubernetes, the built-in Lease API is often enough for leader election.
+
+6. **Consensus protects correctness, not throughput** — if your use case tolerates eventual consistency, use a cache or message queue. Reserve consensus for cases where split-brain has direct financial consequences (double charges, missed settlement).
 
 <!-- KNOWLEDGE-CHECK
 {
   "questions": [
     {
       "text": "Which property of consensus ensures that no two correct nodes decide different values?",
-      "options": ["Validity", "Termination", "Agreement", "Safety"],
+      "options": [
+        "Validity",
+        "Termination",
+        "Agreement",
+        "Safety"
+      ],
       "correct": 2,
       "explanation": "Agreement is the consensus property that guarantees no two correct nodes decide different values. Validity ensures the decided value was proposed by some node, and Termination ensures every correct node eventually decides."
     },
     {
       "text": "In Raft consensus, what happens when a follower does not receive a heartbeat within the election timeout?",
-      "options": ["It stops accepting client requests", "It promotes itself to leader immediately", "It becomes a candidate and starts an election", "It contacts ZooKeeper to trigger failover"],
+      "options": [
+        "It stops accepting client requests",
+        "It promotes itself to leader immediately",
+        "It becomes a candidate and starts an election",
+        "It contacts ZooKeeper to trigger failover"
+      ],
       "correct": 2,
       "explanation": "When a follower times out without receiving a heartbeat, it transitions to the candidate state and begins a new election by incrementing its term and requesting votes from other nodes."
     },
     {
       "text": "Why should etcd NOT be used as a primary data store for financial transaction records?",
-      "options": ["It does not support TLS encryption", "It has an 8 GB size limit and is optimized for small coordination state, not high-write business data", "It lacks Raft consensus guarantees", "It cannot run on Kubernetes"],
+      "options": [
+        "It does not support TLS encryption",
+        "It has a small storage quota (2 GB by default, 8 GB suggested maximum) and is optimized for small coordination state, not high-write business data",
+        "It lacks Raft consensus guarantees",
+        "It cannot run on Kubernetes"
+      ],
       "correct": 1,
-      "explanation": "etcd has an 8 GB default size limit and is optimized for small key-value pairs with low write rates. It is designed for coordination state like locks and leader identity, not for storing high-volume business transaction data."
+      "explanation": "etcd's storage quota is 2 GB by default (8 GB is the suggested maximum), and it is optimized for small key-value pairs with low write rates. It is designed for coordination state like locks and leader identity, not for storing high-volume business transaction data."
     }
   ]
 }
@@ -1022,5 +1068,3 @@ etcdctl --endpoints=http://etcd-1:2379 member add etcd-2 \
   ]
 }
 -->
-
-6. **Consensus protects correctness, not throughput** — if your use case tolerates eventual consistency, use a cache or message queue. Reserve consensus for cases where split-brain has direct financial consequences (double charges, missed settlement).

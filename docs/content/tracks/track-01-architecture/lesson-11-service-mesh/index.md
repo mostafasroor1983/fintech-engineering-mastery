@@ -31,9 +31,9 @@ A service mesh is infrastructure that makes the communication between microservi
 
 ## Learning Objectives
 
-- Distinguish the control plane from the data plane in a service mesh architecture and explain what Istio's Pilot and Citadel components do
+- Distinguish the control plane from the data plane in a service mesh architecture and explain what istiod does (it merged the former Pilot, Citadel and Galley components)
 - Explain how Envoy sidecar injection works and why it requires no application code changes
-- Implement mTLS between services using Istio `PeerAuthentication` and explain its relevance to PCI DSS Requirement 4 and GDPR transmission security
+- Implement mTLS between services using Istio `PeerAuthentication` and explain how it supports PCI DSS segmentation and zero-trust expectations and GDPR Article 32 security of processing
 - Write a `VirtualService` YAML performing canary routing (10% traffic to a new payment service version)
 - Configure a `DestinationRule` for circuit breaking on the account service
 - Describe how distributed tracing headers (B3 / W3C TraceContext) propagate through Envoy and reach Jaeger
@@ -42,23 +42,23 @@ A service mesh is infrastructure that makes the communication between microservi
 
 ## Business Context
 
-In 2022, a tier-2 UK bank underwent a PCI DSS v4.0 audit. The auditors required evidence that all card data transmitted between internal microservices was encrypted in transit. The bank had 34 microservices, six teams, and no uniform TLS enforcement policy. Three services were found to be transmitting card-related data over unencrypted HTTP within the cluster, relying on "network segmentation" as a compensating control. The auditors rejected this control. The bank faced a remediation timeline of 90 days or risk losing PCI certification.
+Consider a mid-sized UK bank (a composite example) preparing for a PCI DSS v4.0 assessment. PCI DSS Requirement 4 mandates strong cryptography for cardholder data on *open, public* networks, but the bank's Kubernetes cluster was a flat network shared with out-of-scope workloads, and its own security policy required encryption of cardholder data everywhere in transit. The bank had 34 microservices, six teams, and no uniform TLS enforcement. Three services were found sending card-related data over plain HTTP inside the cluster, relying on a "network segmentation" argument that the assessor could not verify. The bank gave itself 90 days to fix it or keep the whole cluster in PCI scope.
 
-The remediation team evaluated two paths: instrument TLS in each of the 34 services individually (estimated 6 weeks per service, staggered), or deploy Istio with strict mTLS mode cluster-wide (estimated 3 weeks total). They chose Istio. Within 21 days, all intra-cluster communication was mTLS-enforced, certificate rotation was automated via Citadel, and the mesh generated the cryptographic evidence the auditors needed. The service mesh paid for itself in that one compliance exercise.
+The remediation team evaluated two paths: instrument TLS in each of the 34 services individually (estimated 6 weeks per service, staggered), or deploy Istio with strict mTLS mode cluster-wide (estimated 3 weeks total). They chose Istio. Within 21 days, all intra-cluster communication was mTLS-enforced, certificate rotation was automated by istiod, and the mesh generated the evidence the assessor needed. The service mesh paid for itself in that one compliance exercise.
 
 ## Service Mesh Architecture: Control Plane vs Data Plane
 
 ```mermaid
 graph TB
     subgraph "Control Plane"
-        PILOT[Pilot\nService discovery\nTraffic policy distribution]
-        CITADEL[Citadel\nCertificate authority\nmTLS cert issuance]
-        GALLEY[Galley / Istiod\nConfiguration validation\n& distribution]
+        PILOT[istiod — discovery\nformerly Pilot\nTraffic policy distribution]
+        CITADEL[istiod — CA\nformerly Citadel\nmTLS cert issuance]
+        GALLEY[istiod — config\nformerly Galley\nValidation & distribution]
     end
 
     subgraph "Data Plane — Pod A: Payment Service"
         APP_A[Payment Service\nJava App :8080]
-        ENV_A[Envoy Sidecar\n:15001 inbound\n:15001 outbound]
+        ENV_A[Envoy Sidecar\n:15006 inbound\n:15001 outbound]
         APP_A <-->|localhost| ENV_A
     end
 
@@ -130,7 +130,7 @@ public class PaymentProcessingService {
 
 ## mTLS for Service-to-Service Authentication
 
-Mutual TLS (mTLS) means both parties present certificates — not just the server as in standard TLS. Each Envoy sidecar holds a SPIFFE Verifiable Identity Document (SVID) issued by Citadel. This certificate encodes the service identity (`spiffe://cluster.local/ns/payments/sa/payment-service`) and rotates every 24 hours automatically.
+Mutual TLS (mTLS) means both parties present certificates — not just the server as in standard TLS. Each Envoy sidecar holds a SPIFFE Verifiable Identity Document (SVID) issued by istiod's built-in CA. This certificate encodes the service identity (`spiffe://cluster.local/ns/payments/sa/payment-service`) and rotates every 24 hours automatically.
 
 ```yaml
 # Enforce strict mTLS for all services in the payments namespace
@@ -228,8 +228,8 @@ The `outlierDetection` block implements circuit breaking at the mesh level — n
 Envoy generates a trace span for every request it handles. For the trace to be correlated across service calls, the application must propagate the trace headers from incoming requests to outgoing requests. This is the only mesh-related code change required.
 
 ```java
-// Spring Boot configuration for B3 / W3C trace header propagation
-// Spring Cloud Sleuth (or Micrometer Tracing) handles this automatically
+// Trace header propagation (B3 / W3C)
+// Micrometer Tracing handles this automatically in Spring Boot 3+
 // Manual propagation for reference:
 
 @Component
@@ -263,7 +263,7 @@ public class TracingPropagationFilter implements Filter {
 }
 ```
 
-With Micrometer Tracing + Zipkin/Jaeger, `spring.sleuth.propagation.type=B3,W3C` in `application.yml` handles header propagation automatically. The manual filter is shown for understanding.
+With Micrometer Tracing (the successor to Spring Cloud Sleuth) and an OpenTelemetry or Zipkin exporter, `management.tracing.propagation.type=w3c,b3` in `application.yml` handles header propagation automatically — as long as outbound clients are built from Spring's auto-configured `RestClient.Builder`. The manual filter is shown for understanding.
 
 ## Service Mesh Topology Diagram
 
@@ -331,7 +331,10 @@ spec:
 | Operational complexity | High — Istio has a steep learning curve | Requires dedicated platform team; don't deploy without one |
 | Upgrade risk | Istio upgrades can break services | Use canary control plane upgrades; test in staging |
 | Debugging complexity | Envoy config errors are cryptic | Learn `istioctl proxy-config` and `istioctl analyze` |
-| Certificate rotation failure | Services reject connections | Monitor `citadel_server_csr_count` and cert expiry alerts |
+| Certificate rotation failure | Services reject connections | Monitor istiod's CA metrics (e.g. `citadel_server_csr_count`) and cert expiry alerts |
+
+> [!NOTE]
+> Istio's ambient mode (generally available since Istio 1.24) removes the per-pod sidecar: a per-node proxy (ztunnel) provides mTLS, and optional waypoint proxies add L7 features. It lowers memory overhead and upgrade friction; the policy concepts in this lesson stay the same.
 
 > [!NOTE]
 > The 1ms per-hop latency is the median. Under Kubernetes network policy enforcement, Envoy sidecar startup delays, and busy nodes, tail latency can reach 5-10ms. For a payment flow with 4 service hops, this adds up to 4-40ms. Profile your specific deployment before committing to SLOs that assume zero mesh overhead.
@@ -340,7 +343,7 @@ spec:
 
 **Q1: During a PCI DSS audit, the auditor asks you to prove that card data is encrypted between the account service and the payment service inside the Kubernetes cluster. How do you provide this evidence using Istio?**
 
-A: Show the auditor three artefacts: (1) the `PeerAuthentication` resource with `mode: STRICT` applied to the namespace containing both services — this configuration enforces that Envoy rejects any connection not presenting a valid mTLS client certificate; (2) a Kiali service graph screenshot showing the mTLS lock icon on the edge between payment-service and account-service; (3) an Envoy access log entry showing `upstream_transport_failure_reason: null` and the connection details. Additionally, show a Citadel certificate inspection confirming the SVID for each service and its rotation frequency. This provides cryptographic evidence of encryption without requiring application-level code review.
+A: Show the auditor three artefacts: (1) the `PeerAuthentication` resource with `mode: STRICT` applied to the namespace containing both services — this configuration enforces that Envoy rejects any connection not presenting a valid mTLS client certificate; (2) a Kiali service graph screenshot showing the mTLS lock icon on the edge between payment-service and account-service; (3) a Prometheus query over a recent period showing that all requests between the two workloads carry `connection_security_policy="mutual_tls"` in `istio_requests_total`. Additionally, show the workload certificates (`istioctl proxy-config secret`) confirming each service's SPIFFE identity and its rotation period. This provides cryptographic evidence of encryption without requiring application-level code review.
 
 **Q2: Your payment service canary is running at 10% traffic. You observe that the v2 subset is returning 2% error rates vs 0.1% for v1. The `outlierDetection` circuit breaker has not triggered. Why not, and what should you do?**
 
@@ -391,25 +394,25 @@ A: `outlierDetection` triggers on `consecutiveErrors` (3 consecutive 5xx from a 
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Service Mesh \u2014 Istio and Envoy in Financial Services \u2014 Production Implementation",
+  "title": "Service Mesh — Istio and Envoy in Financial Services — Production Implementation",
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
     {
       "id": "1",
-      "description": "Design a phased rollout (PERMISSIVE \u2192 STRICT per namespace). Write PeerAuthentication YAML for each phase and the Prometheus query identifying namespaces still sending non-mTLS traffic"
+      "description": "Design a phased mTLS rollout. Phase 1: deploy Istio with PERMISSIVE mode cluster-wide. Phase 2: enforce STRICT mode namespace by namespace. Write the `PeerAuthentication` YAML for each phase and the Prometheus query you use to identify namespaces still sending non-mTLS traffic before advancing."
     },
     {
       "id": "2",
-      "description": "Write VirtualService and DestinationRule YAML for payment-service v2 at 5% with header override, circuit breaking on 2 consecutive 5xx, and 60-second ejection. Explain automation for 5% \u2192 25% \u2192 50% \u2192"
+      "description": "Write the complete `VirtualService` and `DestinationRule` YAML for deploying payment-service v2 at 5% traffic, with: a header override (`X-Canary: true`) that routes 100% to v2, circuit breaking on 2 consecutive 5xx errors, and a 60-second ejection time. Explain how you automate the progression from 5% → 25% → 50% → 100% based on error rate thresholds."
     },
     {
       "id": "3",
-      "description": "The fraud service shows broken Jaeger spans. Diagnose the root cause and provide a Spring configuration fix. Write a test verifying trace header propagation through RestClient calls"
+      "description": "The fraud service team reports that their Jaeger traces show broken spans — incoming payment requests start a new root span rather than continuing the payment's trace. Diagnose the root cause and provide the fix as a Spring configuration snippet. Write a test that verifies trace headers are propagated from incoming requests to outbound RestClient calls."
     },
     {
       "id": "4",
-      "description": "With 5 service hops and 1ms mesh overhead each, calculate the remaining application latency budget within a P99 < 200ms SLO. Propose which hops to collapse or make async if the budget is insufficient"
+      "description": "Your payment flow has 5 service hops: gateway → payment → account → fraud → notification → payment. Mesh overhead is 1ms per hop. The existing SLO is P99 < 200ms. Measure the baseline (pre-mesh) P99 and calculate the available latency budget for the application logic after mesh overhead. If the budget is too tight, propose which hops to collapse or make asynchronous, with reasoning."
     }
   ]
 }

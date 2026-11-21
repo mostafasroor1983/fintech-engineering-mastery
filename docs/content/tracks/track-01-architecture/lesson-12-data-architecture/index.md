@@ -35,14 +35,14 @@ Data architecture in financial services is simultaneously a technical, regulator
 - Compare Lambda and Kappa architectures for financial analytics, with specific trade-offs for payment event processing
 - Apply data mesh principles — domain-oriented data ownership, data as a product — to a retail banking organisation
 - Trace a `payment_events` Kafka topic through Flink stream processing to a `payment_facts` data warehouse table
-- Explain data lineage requirements under EBA data governance guidelines and how event sourcing satisfies them
+- Explain data lineage requirements under BCBS 239 and supervisory guidance, and how an event log supports them
 - Evaluate schema-on-read vs schema-on-write trade-offs for transaction data with regulatory immutability requirements
 - Identify GDPR data residency implications for multi-region financial data platforms
 - Design a real-time analytics query that runs against a streaming layer without touching the operational database
 
 ## Business Context
 
-In 2023, a UK challenger bank received an FCA Section 166 notice requesting complete data lineage for its credit risk models — specifically: for each customer who had been declined a loan in the previous 24 months, what data inputs had been used, what transformations had been applied, and where had those inputs originated. The bank had a centralised data lake into which all teams dumped data via nightly batch jobs. It had no lineage tracking, no data contracts between producers and consumers, and no formal ownership of datasets. Responding to the Section 166 took 11 weeks and cost approximately £1.4M in consultant time. The FCA subsequently required a formal data governance remediation programme monitored quarterly.
+Consider a UK challenger bank (a composite example) whose regulator commissions a skilled-person review (Section 166) requiring complete data lineage for its credit risk models — specifically: for each customer who had been declined a loan in the previous 24 months, what data inputs had been used, what transformations had been applied, and where had those inputs originated. The bank had a centralised data lake into which all teams dumped data via nightly batch jobs. It had no lineage tracking, no data contracts between producers and consumers, and no formal ownership of datasets. Responding takes 11 weeks and well over a million pounds in consultant time, and the regulator then requires a formal data governance remediation programme monitored quarterly.
 
 The core problem was not technical — it was architectural. Data was treated as a shared resource with no domain ownership, no contracts, and no provenance tracking. Data mesh directly addresses this.
 
@@ -61,7 +61,7 @@ Payment processing is an OLTP workload. Risk reporting, customer analytics, and 
 | Consistency requirement | Strict ACID | Eventual — T-1 or T-hour acceptable |
 | Infrastructure | PostgreSQL, Oracle RAC | BigQuery, Redshift, ClickHouse, Snowflake |
 
-Sharing infrastructure forces compromises that harm both workloads. OLAP queries holding row-scan locks compete with OLTP writes. OLTP indexes slow OLAP scans. Normalisation that prevents OLTP anomalies requires joins that OLAP queries cannot afford.
+Sharing infrastructure forces compromises that harm both workloads. Long analytical scans compete with OLTP writes for CPU, I/O and buffer cache, and long-running queries hold back vacuum and bloat hot tables. OLTP indexes slow OLAP scans. Normalisation that prevents OLTP anomalies requires joins that OLAP queries cannot afford.
 
 ## Lambda vs Kappa Architecture
 
@@ -82,7 +82,7 @@ graph LR
 
 ```mermaid
 graph LR
-    SRC[Payment Events\nKafka Topic\nRetained 7 years] --> FLINK[Flink\nStream Processing\nHandles all time horizons]
+    SRC[Payment Events\nKafka Topic\nLong retention + tiered storage] --> FLINK[Flink\nStream Processing\nHandles all time horizons]
     FLINK --> DWH[Data Warehouse\npayment_facts table]
     FLINK --> RT[Real-time Views\nRedis / ClickHouse]
     DWH & RT --> QUERY[Analytics Queries]
@@ -118,16 +118,20 @@ public class PaymentFactsJob {
         DataStream<PaymentEvent> events = env.fromSource(
             source, WatermarkStrategy.forBoundedOutOfOrderness(Duration.ofSeconds(30)), "payment-events");
 
-        // Enrich and transform to analytical fact record
+        // Individual facts: one row per completed payment
         DataStream<PaymentFact> facts = events
             .filter(e -> e.status() == PaymentStatus.COMPLETED)
-            .map(PaymentFactsJob::toFact)
-            .keyBy(PaymentFact::currencyCode)
-            .window(TumblingEventTimeWindows.of(Time.minutes(1)))
+            .map(PaymentFactsJob::toFact);
+
+        // Separate per-minute volume aggregates for dashboards (own sink, not shown)
+        DataStream<PaymentVolume> volumes = facts
+            .keyBy(PaymentFact::currency)
+            .window(TumblingEventTimeWindows.of(Duration.ofMinutes(1)))
             .aggregate(new PaymentVolumeAggregator());
 
-        // Sink: payment_facts table in data warehouse
-        JdbcSink<PaymentFact> sink = JdbcSink.sink(
+        // Sink: payment_facts table in the data warehouse. Checkpointing gives
+        // at-least-once delivery; ON CONFLICT makes replays and retries harmless.
+        SinkFunction<PaymentFact> sink = JdbcSink.sink(
             """
             INSERT INTO payment_facts
                 (payment_id, source_account_id, target_account_id, amount, currency,
@@ -188,6 +192,7 @@ Data mesh applies the same domain-ownership principle from DDD to data: each dom
 ```java
 // Data product: payment-domain publishes a formal PaymentDataProduct contract
 // Other teams consume this contract — not direct database access
+// (@DataProduct is an illustrative in-house annotation, not a library API)
 
 @DataProduct(
     domain = "payments",
@@ -215,9 +220,9 @@ public interface CompletedPaymentsDataProduct {
 
 ## Regulatory Data Requirements: Lineage and Immutability
 
-EBA Guidelines on Internal Governance (2021) and the ECB's Data Reporting Framework require banks to maintain complete data lineage: for any reported figure, the bank must be able to trace the data from the source system through every transformation to the reported output.
+BCBS 239 (the Basel Committee's principles for risk data aggregation and risk reporting) and the ECB's 2024 guide on effective risk data aggregation and risk reporting expect banks to maintain complete data lineage: for any reported figure, the bank must be able to trace the data from the source system through every transformation to the reported output.
 
-Event sourcing satisfies immutability: events are facts that happened; they are never updated or deleted. The event log is the data lineage.
+Event sourcing provides immutability: events are facts that happened; they are never updated or deleted. The event log is the starting point of lineage — you still have to record every transformation applied to it.
 
 ```java
 // Immutable payment event — stored once, never mutated
@@ -248,6 +253,8 @@ CREATE TABLE data_lineage (
     schema_version  VARCHAR(20) NOT NULL
 );
 ```
+
+One row per event per dataset is the clearest way to explain lineage, but at millions of payments a day it grows fast. Many platforms record lineage per pipeline run instead (input offsets or partitions, code version, output tables), for example with the OpenLineage standard, and keep per-event detail only for regulatory datasets.
 
 ## Financial Data Platform Architecture Diagram
 
@@ -301,19 +308,18 @@ For regulatory reporting, schema-on-write is mandatory. You cannot go back to th
 
 GDPR Article 44 restricts transfer of EU personal data to non-EU jurisdictions without adequate safeguards. For a multi-region financial data platform:
 
-```yaml
-# Kafka topic configuration — data residency enforcement
-# EU personal data topics stay in EU-WEST-1
-payment_events:
-  replication-factor: 3
-  min.insync.replicas: 2
-  # Only replicate to EU regions
-  replica.selector.class: org.apache.kafka.common.replica.RackAwareReplicaSelector
+```properties
+# mm2.properties — MirrorMaker 2 between an EU cluster and a US cluster.
+# Data residency comes from WHERE a cluster runs: personal data lives only on the
+# EU cluster, and only aggregated, non-personal topics are mirrored out.
+clusters = eu, us
+eu.bootstrap.servers = kafka-eu-west-1:9092
+us.bootstrap.servers = kafka-us-east-1:9092
 
-# Non-PII analytics topics can replicate globally
-payment_volume_aggregates:
-  replication-factor: 3
-  # Can replicate to US-EAST-1 for latency
+eu->us.enabled = true
+eu->us.topics = payment_volume_aggregates      # aggregated, no personal data
+eu->us.topics.exclude = payment_events.*       # (tokenised) personal data stays in the EU
+us->eu.enabled = false
 ```
 
 ```java
@@ -329,11 +335,14 @@ public record PaymentCompletedEvent(
 ) {}
 ```
 
+> [!IMPORTANT]
+> Tokenised (pseudonymised) data is still personal data under GDPR (Recital 26) as long as someone can re-identify it. Keeping the token vault in the EU lowers the risk of a transfer, but sending tokenised payment events to a US region still needs a lawful transfer mechanism (an adequacy decision such as the EU–US Data Privacy Framework, or Standard Contractual Clauses). Only properly aggregated or anonymised data falls outside GDPR.
+
 ## Knowledge Check
 
 **Q1: Your Flink payment facts job has been running for 6 months. The payments team needs to add a new field `corridor` to the `PaymentCompletedEvent` schema. Some events in Kafka are old (pre-corridor field). How do you handle schema evolution without breaking the Flink job or historical reprocessing?**
 
-A: Use Avro with a Schema Registry configured for BACKWARD_TRANSITIVE compatibility. Add the `corridor` field with a default value (`null` or `"DOMESTIC"`). Old events that lack the field will deserialise successfully, with the default applied. The Flink job's `toFact` method handles the nullable field — either deriving corridor from currency codes when the field is absent, or using it directly when present. For historical reprocessing (replaying Kafka from offset 0), the same logic applies. Document the schema change in an ADR and register the new schema version before deploying the updated Flink job. Never use FULL or NONE compatibility for financial event schemas — backward compatibility is the minimum requirement for safely replaying historical events.
+A: Use Avro with a Schema Registry configured for BACKWARD_TRANSITIVE compatibility. Add the `corridor` field with a default value (`null` or `"DOMESTIC"`). Old events that lack the field will deserialise successfully, with the default applied. The Flink job's `toFact` method handles the nullable field — either deriving corridor from currency codes when the field is absent, or using it directly when present. For historical reprocessing (replaying Kafka from offset 0), the same logic applies. Document the schema change in an ADR and register the new schema version before deploying the updated Flink job. Never use NONE compatibility for financial event schemas — BACKWARD_TRANSITIVE (or the stricter FULL_TRANSITIVE) is the minimum for safely replaying historical events, because every old version in the topic must stay readable.
 
 **Q2: The FCA requests data lineage for all loan decisions made using payment history data over the past 2 years. Your data lake stores raw Parquet files from various ETL jobs with no schema versioning. What is the fundamental problem with your current architecture, and what would you change?**
 
@@ -356,15 +365,15 @@ A: The fundamental problem is schema-on-read without lineage tracking. Parquet f
   "questions": [
     {
       "id": "q1",
-      "text": "Your Flink payment facts job needs to replay 6 months of historical payment events from Kafka to recompute aggregates after a bug fix. What Kafka configuration makes this possible, and what is the typical retention setting for a fintech event log?",
+      "text": "Your Flink payment facts job needs to replay 6 months of historical payment events from Kafka to recompute aggregates after a bug fix. What makes this possible?",
       "options": [
         "Kafka does not support replay — historical data must be fetched from the database",
-        "log.retention.ms set to 7 years (the regulatory retention period); Flink consumer seeks to offset 0 to replay",
+        "A topic retention long enough for the replay (retention.ms, often with tiered storage), and a Flink source that starts from the earliest offset (or a timestamp)",
         "Kafka compaction retains only the latest event per key — replay requires a snapshot database",
         "Kafka MirrorMaker replicates events to S3 for replay; direct topic replay is not supported"
       ],
       "correct": 1,
-      "explanation": "Kafka's log retention (log.retention.ms or log.retention.bytes) controls how long events are kept. For financial event logs, retaining events for 7 years satisfies typical regulatory requirements and enables full historical replay. Flink's KafkaSource supports seeking to any offset including the beginning of the topic. This is the defining advantage of Kappa architecture over Lambda: a single streaming pipeline handles both real-time and historical reprocessing."
+      "explanation": "Kafka keeps events for as long as the topic's retention allows (retention.ms / retention.bytes). Some teams keep years of events on the topic using tiered storage; others archive older events to object storage and replay from there. Flink's KafkaSource can start from the earliest offset, a timestamp, or specific offsets. This is the defining advantage of Kappa over Lambda: one streaming pipeline handles both real-time and historical reprocessing — and idempotent sinks make the replay safe."
     },
     {
       "id": "q2",
@@ -384,25 +393,25 @@ A: The fundamental problem is schema-on-read without lineage tracking. Parquet f
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Data Architecture for Financial Systems \u2014 Production Implementation",
+  "title": "Data Architecture for Financial Systems — Production Implementation",
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
     {
       "id": "1",
-      "description": "Write a Flink job consuming payment_events from Kafka, filtering completed payments, computing 5-minute tumbling window aggregates per currency/corridor, and writing facts and aggregates to separate s"
+      "description": "Design a Flink streaming job that consumes `payment_events` from Kafka, filters for completed payments, computes a 5-minute tumbling window aggregate of payment volume per currency per corridor, and writes both individual facts and aggregates to separate sinks. Write the Flink job skeleton with source, transformation, window, and sink definitions."
     },
     {
       "id": "2",
-      "description": "Define Avro schemas for PaymentCompletedEvent v1 and v2 (adds processingRegion field). Configure Schema Registry BACKWARD_TRANSITIVE compatibility. Write a test verifying v1 events deserialise with v2"
+      "description": "Define an Avro schema for `PaymentCompletedEvent` v1 and v2 (v2 adds `processingRegion` field). Write the Schema Registry configuration to enforce BACKWARD_TRANSITIVE compatibility. Write a unit test that verifies a v1 event deserialises successfully with the v2 reader schema, with `processingRegion` defaulting to `\"UNKNOWN\"`."
     },
     {
       "id": "3",
-      "description": "Design a data_lineage SQL table schema answering: \"For customer X's loan decision on date Y, list every payment event that influenced it, its schema version, and the pipeline version that transformed"
+      "description": "Design the SQL schema for a `data_lineage` table that can answer the FCA's question: \"For customer X's loan decision on date Y, list every payment event that influenced the decision, the schema version of each event, and the pipeline version that transformed it.\" Include the foreign key relationships and the query you would run to answer this question."
     },
     {
       "id": "4",
-      "description": "Identify personal data fields in PaymentCompletedEvent, propose a tokenisation strategy, and write Kafka topic configuration ensuring PII events are processed only in EU regions"
+      "description": "The bank has customers in Germany, France, and the UK. The data warehouse is in AWS us-east-1 for cost reasons. Identify which fields in `PaymentCompletedEvent` are personal data under GDPR, propose a tokenisation strategy, and write the Kafka topic configuration that ensures PII events are only processed in EU regions."
     }
   ]
 }

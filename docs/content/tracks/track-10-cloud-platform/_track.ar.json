@@ -1,0 +1,306 @@
+{
+  "id": "track-10",
+  "sequence": 10,
+  "title": "السحابة والبنية التحتية وهندسة المنصات",
+  "shortTitle": "السحابة والمنصات",
+  "slug": "cloud-platform",
+  "color": "#3b82f6",
+  "colorMuted": "rgba(59, 130, 246, 0.15)",
+  "description": "إدارة الحاويات بـ Kubernetes، والحاويات بـ Docker، وأنماط البنية السحابية، وGitOps، وشبكة الخدمات (Service Mesh)، وهندسة المنصات للخدمات المالية.",
+  "difficulty": "advanced",
+  "estimatedHours": 24,
+  "status": "published",
+  "priority": "medium",
+  "lessons": [
+    {
+      "id": "track-10-lesson-01",
+      "sequence": 1,
+      "title": "Kubernetes للخدمات المالية — البنية وأحمال العمل",
+      "slug": "kubernetes-financial",
+      "path": "content/tracks/track-10-cloud-platform/lesson-01-kubernetes-financial/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 90,
+      "status": "published",
+      "tags": [
+        "Kubernetes",
+        "K8s",
+        "deployment",
+        "pod",
+        "namespace"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-10-lesson-02",
+      "sequence": 2,
+      "title": "جدولة الـ Pods — التقارب والتلطيخ (Taints) وطلبات الموارد",
+      "slug": "pod-scheduling",
+      "path": "content/tracks/track-10-cloud-platform/lesson-02-pod-scheduling/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "pod-scheduling",
+        "affinity",
+        "taint",
+        "toleration",
+        "resource-quota"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-03",
+      "sequence": 3,
+      "title": "الشبكات في Kubernetes — CNI والخدمات وIngress",
+      "slug": "kubernetes-networking",
+      "path": "content/tracks/track-10-cloud-platform/lesson-03-k8s-networking/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "CNI",
+        "Service",
+        "Ingress",
+        "NetworkPolicy",
+        "Calico"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-04",
+      "sequence": 4,
+      "title": "Helm وGitOps — البنية التحتية التصريحية مع ArgoCD",
+      "slug": "helm-gitops",
+      "path": "content/tracks/track-10-cloud-platform/lesson-04-helm-gitops/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "Helm",
+        "GitOps",
+        "ArgoCD",
+        "Flux",
+        "declarative"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-10-lesson-05",
+      "sequence": 5,
+      "title": "شبكة الخدمات — إدارة المرور والمراقبة في Istio",
+      "slug": "service-mesh-istio",
+      "path": "content/tracks/track-10-cloud-platform/lesson-05-service-mesh/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "Istio",
+        "service-mesh",
+        "mTLS",
+        "traffic-management",
+        "Envoy"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-06",
+      "sequence": 6,
+      "title": "أمان الحاويات — فحص الصور وأمان الـ Pods",
+      "slug": "container-security",
+      "path": "content/tracks/track-10-cloud-platform/lesson-06-container-security/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "container-security",
+        "Trivy",
+        "PSP",
+        "seccomp",
+        "non-root"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-07",
+      "sequence": 7,
+      "title": "إدارة الأسرار — Vault وExternal Secrets Operator",
+      "slug": "secret-management",
+      "path": "content/tracks/track-10-cloud-platform/lesson-07-secret-management/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "secrets",
+        "HashiCorp-Vault",
+        "ESO",
+        "rotation",
+        "encryption-at-rest"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-08",
+      "sequence": 8,
+      "title": "التخزين السحابي الأصلي — الأقراص الدائمة وStatefulSets",
+      "slug": "cloud-native-storage",
+      "path": "content/tracks/track-10-cloud-platform/lesson-08-storage/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "PVC",
+        "StatefulSet",
+        "StorageClass",
+        "CSI",
+        "EBS"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-09",
+      "sequence": 9,
+      "title": "التوسع التلقائي — HPA وVPA وKEDA للأحمال المالية",
+      "slug": "auto-scaling",
+      "path": "content/tracks/track-10-cloud-platform/lesson-09-auto-scaling/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "HPA",
+        "VPA",
+        "KEDA",
+        "auto-scaling",
+        "event-driven-scaling"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-10-lesson-10",
+      "sequence": 10,
+      "title": "Kubernetes متعدد العناقيد — الاتحاد وتوزيع أحمال العمل",
+      "slug": "multi-cluster",
+      "path": "content/tracks/track-10-cloud-platform/lesson-10-multi-cluster/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "multi-cluster",
+        "federation",
+        "fleet",
+        "workload-distribution",
+        "DR"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-11",
+      "sequence": 11,
+      "title": "هندسة التكلفة السحابية — FinOps للمنصات المالية",
+      "slug": "cloud-cost",
+      "path": "content/tracks/track-10-cloud-platform/lesson-11-cloud-cost/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 70,
+      "status": "published",
+      "tags": [
+        "FinOps",
+        "cloud-cost",
+        "spot-instances",
+        "reserved-instances",
+        "right-sizing"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-12",
+      "sequence": 12,
+      "title": "هندسة المنصات — تصميم منصة داخلية للمطورين",
+      "slug": "platform-engineering",
+      "path": "content/tracks/track-10-cloud-platform/lesson-12-platform-engineering/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "platform-engineering",
+        "IDP",
+        "developer-experience",
+        "golden-path",
+        "paved-road"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-13",
+      "sequence": 13,
+      "title": "خطوط CI/CD — التسليم الآمن للخدمات المالية",
+      "slug": "cicd-pipelines",
+      "path": "content/tracks/track-10-cloud-platform/lesson-13-cicd/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "CI/CD",
+        "GitHub-Actions",
+        "Tekton",
+        "SAST",
+        "DAST"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-14",
+      "sequence": 14,
+      "title": "نشر Canary وBlue-Green — إصدارات بدون توقف",
+      "slug": "canary-deployments",
+      "path": "content/tracks/track-10-cloud-platform/lesson-14-canary/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "canary",
+        "blue-green",
+        "rolling-update",
+        "traffic-split",
+        "Argo-Rollouts"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-15",
+      "sequence": 15,
+      "title": "التعافي من الكوارث على Kubernetes — النسخ الاحتياطي والاستعادة",
+      "slug": "k8s-disaster-recovery",
+      "path": "content/tracks/track-10-cloud-platform/lesson-15-k8s-dr/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "K8s-DR",
+        "Velero",
+        "backup",
+        "restore",
+        "RTO"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-10-lesson-16",
+      "sequence": 16,
+      "title": "إطار المهندس الرئيسي لقرارات البنية السحابية",
+      "slug": "cloud-decision-framework",
+      "path": "content/tracks/track-10-cloud-platform/lesson-16-cloud-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "cloud",
+        "trade-offs",
+        "staff-engineer",
+        "platform"
+      ],
+      "tier": "optional"
+    }
+  ],
+  "mainPathMinutes": 250,
+  "optionalLessonCount": 13
+}

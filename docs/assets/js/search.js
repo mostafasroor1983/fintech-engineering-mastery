@@ -11,21 +11,68 @@ EM.Search = (function () {
   /* ----------------------------------------------------------
      State
   ---------------------------------------------------------- */
-  var _index      = null;   // lunr.js index
-  var _documents  = {};     // id → document map
+  var _index      = null;   // lunr.js index (current language)
+  var _documents  = {};     // id → document map (current language)
   var _loadPromise = null;
+  var _loadedLang  = null;
+
+  EM.I18n.add({
+    en: {
+      'search.title': 'Search',
+      'search.subtitle': 'Search across all lessons, tracks, Decision Lab scenarios, Concurrency Lab experiments and capstone projects.',
+      'search.placeholder': 'Search lessons, tracks, scenarios, capstone projects…',
+      'search.all': 'All', 'search.lessons': 'Lessons', 'search.tracks': 'Tracks', 'search.scenarios': 'Lab Scenarios',
+      'search.experiments': 'Experiments', 'search.capstone': 'Capstone',
+      'search.unavailable': 'Search index unavailable: {e}',
+      'search.none': 'No results for “{q}”',
+      'search.hint': 'Try different keywords or browse the {link}.',
+      'search.count1': '1 result for “{q}”', 'search.count2': '2 results for “{q}”', 'search.countFew': '{n} results for “{q}”', 'search.countN': '{n} results for “{q}”',
+      'search.tLesson': 'Lesson', 'search.tTrack': 'Track', 'search.tScenario': 'Lab Scenario',
+      'search.tCapstone': 'Capstone', 'search.tExperiment': 'Experiment'
+    },
+    ar: {
+      'search.title': 'بحث',
+      'search.subtitle': 'ابحث في كل الدروس والمسارات وسيناريوهات مختبر القرارات وتجارب مختبر التزامن والمشاريع التطبيقية. يمكنك البحث بالعربية أو بالمصطلحات الإنجليزية.',
+      'search.placeholder': 'ابحث في الدروس والمسارات والسيناريوهات والمشاريع…',
+      'search.all': 'الكل', 'search.lessons': 'الدروس', 'search.tracks': 'المسارات', 'search.scenarios': 'سيناريوهات المختبر',
+      'search.experiments': 'التجارب', 'search.capstone': 'المشاريع',
+      'search.unavailable': 'فهرس البحث غير متاح: {e}',
+      'search.none': 'لا توجد نتائج لـ “{q}”',
+      'search.hint': 'جرّب كلمات أخرى أو تصفّح {link}.',
+      'search.count1': 'نتيجة واحدة لـ “{q}”', 'search.count2': 'نتيجتان لـ “{q}”', 'search.countFew': '{n} نتائج لـ “{q}”', 'search.countN': '{n} نتيجة لـ “{q}”',
+      'search.tLesson': 'درس', 'search.tTrack': 'مسار', 'search.tScenario': 'سيناريو',
+      'search.tCapstone': 'مشروع', 'search.tExperiment': 'تجربة'
+    }
+  });
+
+  /* lunr's default trimmer strips every non-ASCII character, which would erase
+     Arabic words. This trimmer keeps letters and digits from any script. */
+  // Arabic counted nouns: 1, 2, 3–10 and 11+ take different forms
+  function _countKey(n) {
+    if (n === 1) return 'search.count1';
+    if (n === 2) return 'search.count2';
+    if (n % 100 >= 3 && n % 100 <= 10) return 'search.countFew';
+    return 'search.countN';
+  }
+
+  function _unicodeTrimmer(token) {
+    return token.update(function (str) {
+      return str.replace(/^[^\p{L}\p{N}]+/u, '').replace(/[^\p{L}\p{N}]+$/u, '');
+    });
+  }
 
   /* ----------------------------------------------------------
      Load + build lunr index
   ---------------------------------------------------------- */
   function _init() {
-    if (_loadPromise) return _loadPromise;
+    var lang = EM.I18n.lang();
+    if (_loadPromise && _loadedLang === lang) return _loadPromise;
+    _loadedLang = lang;
+    _index = null;
+    _documents = {};
 
-    _loadPromise = fetch('data/search-index.json')
-      .then(function (r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
-      })
+    _loadPromise = EM.I18n.fetchJSON('data/search-index.json')
+      .then(function (res) { return res.body; })
       .then(function (data) {
         // Build document map
         (data.documents || []).forEach(function (doc) {
@@ -46,6 +93,14 @@ EM.Search = (function () {
           this.field('body',      { boost: 1  });
 
           this.pipeline.remove(lunr.stemmer);  // exact prefix matching feels better for tech terms
+          if (lang !== 'en') {
+            // Mixed Arabic/English text: no English stop words, Unicode-aware trimming
+            lunr.Pipeline.registerFunction(_unicodeTrimmer, 'emUnicodeTrimmer');
+            this.pipeline.reset();
+            this.searchPipeline.reset();
+            this.pipeline.add(_unicodeTrimmer);
+            this.searchPipeline.add(_unicodeTrimmer);
+          }
 
           var self = this;
           (data.documents || []).forEach(function (doc) {
@@ -158,11 +213,11 @@ EM.Search = (function () {
           'type="search" ' +
           'id="search-input" ' +
           'class="search-input" ' +
-          'placeholder="Search lessons, tracks, scenarios, capstone projects…" ' +
+          'placeholder="' + _esc(EM.t('search.placeholder')) + '" ' +
           'autocomplete="off" ' +
           'spellcheck="false" ' +
           'value="' + _esc(initialQuery) + '" ' +
-          'aria-label="Search" ' +
+          'aria-label="' + _esc(EM.t('search.title')) + '" ' +
         '/>' +
         '<div id="search-loading" class="search-loading" style="display:none">' +
           '<div class="spinner" style="width:16px;height:16px;border-width:2px"></div>' +
@@ -175,18 +230,19 @@ EM.Search = (function () {
 
     var filterHtml =
       '<div class="search-filters" id="search-filters">' +
-        '<button class="search-filter-btn active" data-filter="all"    onclick="EM.Search._setFilter(\'all\')">All</button>' +
-        '<button class="search-filter-btn"         data-filter="lesson"   onclick="EM.Search._setFilter(\'lesson\')">Lessons</button>' +
-        '<button class="search-filter-btn"         data-filter="track"    onclick="EM.Search._setFilter(\'track\')">Tracks</button>' +
-        '<button class="search-filter-btn"         data-filter="scenario" onclick="EM.Search._setFilter(\'scenario\')">Lab Scenarios</button>' +
-        '<button class="search-filter-btn"         data-filter="capstone" onclick="EM.Search._setFilter(\'capstone\')">Capstone</button>' +
+        [['all', 'search.all'], ['lesson', 'search.lessons'], ['track', 'search.tracks'],
+         ['scenario', 'search.scenarios'], ['experiment', 'search.experiments'], ['capstone', 'search.capstone']]
+          .map(function (f) {
+            return '<button class="search-filter-btn' + (f[0] === _currentFilter ? ' active' : '') + '" data-filter="' + f[0] + '" ' +
+              'onclick="EM.Search._setFilter(\'' + f[0] + '\')">' + EM.t(f[1]) + '</button>';
+          }).join('') +
       '</div>';
 
     var page =
       '<div class="page">' +
         '<div class="page-header">' +
-          '<h1 class="page-title">Search</h1>' +
-          '<p class="page-subtitle">Search across all lessons, tracks, Decision Lab scenarios, and capstone projects.</p>' +
+          '<h1 class="page-title">' + EM.t('search.title') + '</h1>' +
+          '<p class="page-subtitle">' + _esc(EM.t('search.subtitle')) + '</p>' +
         '</div>' +
         inputHtml +
         filterHtml +
@@ -293,7 +349,7 @@ EM.Search = (function () {
       if (loadingDiv) loadingDiv.style.display = 'none';
       resultsDiv.innerHTML =
         '<div class="search-empty">' +
-          '<p style="color:var(--text-muted)">Search index unavailable: ' + _esc(err.message) + '</p>' +
+          '<p style="color:var(--text-muted)">' + _esc(EM.t('search.unavailable', { e: err.message })) + '</p>' +
         '</div>';
     });
   }
@@ -305,15 +361,16 @@ EM.Search = (function () {
     if (!results.length) {
       return '<div class="search-empty">' +
         '<div class="search-empty-icon">' + EM.Icons.search + '</div>' +
-        '<p class="search-empty-title">No results for &ldquo;' + _esc(query) + '&rdquo;</p>' +
-        '<p class="search-empty-hint">Try different keywords or browse the <button class="btn-link" onclick="EM.Router.navigate(\'/curriculum\')">Curriculum</button>.</p>' +
+        '<p class="search-empty-title">' + _esc(EM.t('search.none', { q: query })) + '</p>' +
+        '<p class="search-empty-hint">' + _esc(EM.t('search.hint', { link: '\u0000' })).replace('\u0000',
+          '<button class="btn-link" onclick="EM.Router.navigate(\'/curriculum\')">' + EM.t('nav.curriculum') + '</button>') + '</p>' +
       '</div>';
     }
 
     var countLine =
       '<div class="search-count">' +
-        results.length + ' result' + (results.length === 1 ? '' : 's') +
-        ' for &ldquo;<strong>' + _esc(query) + '</strong>&rdquo;' +
+        _esc(EM.t(_countKey(results.length), { n: results.length, q: '\u0000' }))
+          .replace('\u0000', '<strong>' + _esc(query) + '</strong>') +
       '</div>';
 
     var cards = results.map(function (r) {
@@ -328,27 +385,27 @@ EM.Search = (function () {
     switch (doc.type) {
       case 'lesson':
         typeIcon  = EM.Icons.curriculum;
-        typeLabel = 'Lesson';
+        typeLabel = EM.t('search.tLesson');
         typeCls   = 'result-type-lesson';
         break;
       case 'track':
         typeIcon  = EM.Icons.dashboard;
-        typeLabel = 'Track';
+        typeLabel = EM.t('search.tTrack');
         typeCls   = 'result-type-track';
         break;
       case 'scenario':
         typeIcon  = EM.Icons.lab;
-        typeLabel = 'Lab Scenario';
+        typeLabel = EM.t('search.tScenario');
         typeCls   = 'result-type-scenario';
         break;
       case 'capstone':
         typeIcon  = EM.Icons.capstone;
-        typeLabel = 'Capstone';
+        typeLabel = EM.t('search.tCapstone');
         typeCls   = 'result-type-capstone';
         break;
       case 'experiment':
         typeIcon  = EM.Icons.threads || EM.Icons.lab;
-        typeLabel = 'Experiment';
+        typeLabel = EM.t('search.tExperiment');
         typeCls   = 'result-type-scenario';
         break;
       default:
@@ -358,14 +415,14 @@ EM.Search = (function () {
     }
 
     var tags = (doc.tags || []).slice(0, 4).map(function (t) {
-      return '<span class="tag-chip" style="font-size:11px">' + _esc(t) + '</span>';
+      return '<span class="tag-chip" dir="ltr" style="font-size:11px">' + _esc(t) + '</span>';
     }).join('');
 
     var excerpt = _excerpt(doc.body, query, 180);
 
     var statusBadge = '';
     if (doc.status === 'in-development') {
-      statusBadge = '<span class="badge badge-in-development" style="font-size:10px">In Development</span>';
+      statusBadge = '<span class="badge badge-in-development" style="font-size:10px">' + EM.t('badge.inDev') + '</span>';
     }
 
     var metaLine =
@@ -373,10 +430,10 @@ EM.Search = (function () {
         '<span class="result-track-dot" style="background:' + _esc(doc.trackColor || '#888') + '"></span>' +
         '<span class="result-track-name">' + _esc(doc.trackName) + '</span>' +
         (doc.estimatedMinutes
-          ? '<span class="result-sep">·</span><span>' + doc.estimatedMinutes + ' min</span>'
+          ? '<span class="result-sep">·</span><span>' + EM.t('common.min', { n: doc.estimatedMinutes }) + '</span>'
           : '') +
         (doc.estimatedHours
-          ? '<span class="result-sep">·</span><span>' + doc.estimatedHours + 'h</span>'
+          ? '<span class="result-sep">·</span><span>' + EM.t('common.hours', { n: doc.estimatedHours }) + '</span>'
           : '') +
         (doc.difficulty
           ? '<span class="result-sep">·</span>' + EM.difficultyBadge(doc.difficulty)
@@ -389,10 +446,10 @@ EM.Search = (function () {
       '<div class="result-card-top">' +
         '<div class="result-type-badge ' + typeCls + '">' + typeIcon + typeLabel + '</div>' +
       '</div>' +
-      '<div class="result-title">' + _esc(doc.title) + '</div>' +
-      (doc.subtitle ? '<div class="result-subtitle">' + _esc(doc.subtitle) + '</div>' : '') +
+      '<div class="result-title" dir="auto">' + _esc(doc.title) + '</div>' +
+      (doc.subtitle ? '<div class="result-subtitle" dir="auto">' + _esc(doc.subtitle) + '</div>' : '') +
       metaLine +
-      (excerpt ? '<div class="result-excerpt">' + excerpt + '</div>' : '') +
+      (excerpt ? '<div class="result-excerpt" dir="auto">' + excerpt + '</div>' : '') +
       (tags ? '<div class="result-tags">' + tags + '</div>' : '') +
     '</button>';
   }

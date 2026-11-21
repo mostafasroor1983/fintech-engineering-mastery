@@ -30,7 +30,7 @@ The only correct solution is a shared counter that all nodes read and write atom
 
 ---
 
-## Redis `INCR` + `EXPIRE` Sliding Window
+## Redis `INCR` + `EXPIRE` Fixed Window
 
 The simplest approach: a Redis key per client per time window, incremented on every request:
 
@@ -41,6 +41,14 @@ public class FixedWindowRateLimiter {
 
     private final StringRedisTemplate redis;
 
+    // INCR and EXPIRE in ONE atomic script: as two separate calls, a crash
+    // between them leaves a counter with no TTL — and the client is blocked
+    // forever once it reaches the limit
+    private static final RedisScript<Long> INCR_WITH_TTL = RedisScript.of(
+        "local c = redis.call('INCR', KEYS[1]) " +
+        "if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end " +
+        "return c", Long.class);
+
     /**
      * Returns true if the request is within the rate limit.
      * Uses a fixed 60-second window keyed on the current minute.
@@ -48,14 +56,10 @@ public class FixedWindowRateLimiter {
     public boolean isAllowed(String clientId, int limitPerMinute) {
         String windowKey = "rl:" + clientId + ":" + (System.currentTimeMillis() / 60_000);
 
-        Long count = redis.opsForValue().increment(windowKey);
+        // 70s TTL: a little longer than the window, to absorb clock skew
+        Long count = redis.execute(INCR_WITH_TTL, List.of(windowKey), "70");
 
-        if (count == 1) {
-            // First request in this window — set TTL so key expires automatically
-            redis.expire(windowKey, Duration.ofSeconds(70));  // 70s to handle clock skew
-        }
-
-        return count <= limitPerMinute;
+        return count != null && count <= limitPerMinute;
     }
 }
 ```
@@ -71,6 +75,8 @@ A sliding window counts requests within the last N seconds exactly. This require
 ```lua
 -- sliding_window_rate_limit.lua
 -- KEYS[1] = current window key,  KEYS[2] = previous window key
+-- (same prefix, consecutive slot numbers; a {clientId} hash tag keeps both
+--  keys in one Redis Cluster slot)
 -- ARGV[1] = current timestamp (ms), ARGV[2] = window size (ms), ARGV[3] = limit
 -- Returns: {allowed: 1|0, count: N, remaining: M}
 
@@ -115,8 +121,12 @@ public class SlidingWindowRateLimiter {
     public RateLimitResult check(String clientId, long windowMs, int limit) {
         long   now        = System.currentTimeMillis();
         long   windowSlot = now / windowMs;
-        String currKey    = "rl:curr:" + clientId + ":" + windowSlot;
-        String prevKey    = "rl:prev:" + clientId + ":" + (windowSlot - 1);
+        // The SAME key pattern for both: the "previous" key is simply the key
+        // that was "current" one window ago. (Different prefixes would mean
+        // the previous key is never written, silently turning this into a
+        // fixed window.)
+        String currKey    = "rl:{" + clientId + "}:" + windowSlot;
+        String prevKey    = "rl:{" + clientId + "}:" + (windowSlot - 1);
 
         List<Long> result = redis.execute(
             slidingWindowScript,
@@ -142,9 +152,11 @@ The token bucket algorithm allows bursting up to a maximum capacity, then refill
 ```lua
 -- token_bucket.lua
 -- KEYS[1] = bucket key
--- ARGV[1] = current timestamp (seconds), ARGV[2] = refill rate (tokens/s)
+-- ARGV[1] = current timestamp (seconds, with milliseconds as decimals),
+-- ARGV[2] = refill rate (tokens/s)
 -- ARGV[3] = bucket capacity, ARGV[4] = requested tokens (usually 1)
 -- Returns: {allowed: 1|0, tokens_remaining: N, retry_after_ms: M}
+-- (HMGET returns false for a missing field, so "or" supplies the default)
 
 local key        = KEYS[1]
 local now        = tonumber(ARGV[1])
@@ -166,7 +178,7 @@ if refilled < requested then
 end
 
 local newTokens = refilled - requested
-redis.call('HMSET', key, 'tokens', newTokens, 'last_refill', now)
+redis.call('HSET', key, 'tokens', newTokens, 'last_refill', now)
 redis.call('EXPIRE', key, math.ceil(capacity / rate) + 1)
 
 return {1, math.floor(newTokens), 0}
@@ -192,7 +204,9 @@ public class DistributedRateLimiter {
         List<Long> result = redis.execute(
             tokenBucketScript,
             List.of("bucket:" + clientId + ":" + resource),
-            String.valueOf(Instant.now().getEpochSecond()),
+            // Seconds with a fractional part: whole seconds would refill in
+            // one-second steps and allow bursts at each step
+            String.valueOf(System.currentTimeMillis() / 1000.0),
             String.valueOf(config.getRefillRatePerSecond()),
             String.valueOf(config.getBucketCapacity()),
             "1"
@@ -230,30 +244,35 @@ public class OpenBankingRateLimitFilter implements WebFilter {
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
-        String clientId = exchange.getRequest()
-            .getHeaders().getFirst("X-TPP-Client-Id");
+        // The TPP identity comes from the VALIDATED access token / client
+        // certificate — never from a header the caller can set themselves
+        return exchange.getPrincipal()
+            .cast(JwtAuthenticationToken.class)
+            .map(auth -> auth.getToken().getClaimAsString("client_id"))
+            .flatMap(clientId -> {
+                // Rate limit key: TPP ID + API resource (account-info, payment-initiation, etc.)
+                String resource = classifyResource(exchange.getRequest().getPath().value());
 
-        if (clientId == null) {
-            return unauthorized(exchange);
-        }
-
-        // Rate limit key: TPP ID + API resource (account-info, payment-initiation, etc.)
-        String resource = classifyResource(exchange.getRequest().getPath().value());
-        RateLimitDecision decision = rateLimiter.checkAndConsume(clientId, resource);
-
-        addRateLimitHeaders(exchange.getResponse(), decision);
-
-        if (!decision.isAllowed()) {
-            exchange.getResponse().setStatusCode(HttpStatus.TOO_MANY_REQUESTS);
-            return exchange.getResponse().setComplete();
-        }
-
-        return chain.filter(exchange);
+                // checkAndConsume uses the blocking StringRedisTemplate: run it
+                // off the event loop (or use ReactiveStringRedisTemplate)
+                return Mono.fromCallable(() -> rateLimiter.checkAndConsume(clientId, resource))
+                    .subscribeOn(Schedulers.boundedElastic());
+            })
+            .flatMap(decision -> {
+                addRateLimitHeaders(exchange.getResponse(), decision);
+                if (!decision.isAllowed()) {
+                    exchange.getResponse().setStatusCode(HttpStatus.TOO_MANY_REQUESTS);
+                    return exchange.getResponse().setComplete();
+                }
+                return chain.filter(exchange);
+            })
+            .switchIfEmpty(Mono.defer(() -> unauthorized(exchange)));
     }
 
     private void addRateLimitHeaders(ServerHttpResponse response,
                                      RateLimitDecision decision) {
-        response.getHeaders().set("X-RateLimit-Limit",     "100");
+        response.getHeaders().set("X-RateLimit-Limit",
+            String.valueOf(decision.getLimit()));
         response.getHeaders().set("X-RateLimit-Remaining",
             String.valueOf(decision.getTokensRemaining()));
         if (!decision.isAllowed()) {
@@ -277,7 +296,7 @@ Standard headers inform clients how to self-throttle:
 | `X-RateLimit-Reset` | Unix timestamp when window resets | `1704067260` |
 | `Retry-After` | Seconds to wait before retrying (429 only) | `12` |
 
-The `Retry-After` header on a 429 response enables clients to implement polite backoff without guess-and-check retry storms.
+The `Retry-After` header on a 429 response enables clients to implement polite backoff without guess-and-check retry storms. The `X-RateLimit-*` names are a widespread convention, not a standard; the IETF is standardising `RateLimit` and `RateLimit-Policy` headers to replace them.
 
 ---
 
@@ -325,8 +344,7 @@ public class RateLimitAbuseDetector {
         String key = "abuse:ips:" + tppClientId + ":" +
                      (System.currentTimeMillis() / 600_000);  // 10-min bucket
 
-        Long uniqueIps = redis.opsForHyperLogLog()
-            .add(key, sourceIp);
+        redis.opsForHyperLogLog().add(key, sourceIp);   // approximate distinct count
         redis.expire(key, Duration.ofMinutes(20));
 
         long estimate = redis.opsForHyperLogLog().size(key);
@@ -345,6 +363,9 @@ public class RateLimitAbuseDetector {
 Financial APIs often need both a burst limit (per-minute) and a quota (daily):
 
 ```java
+// Two separate calls are simple but not atomic: a request rejected by the
+// daily quota has already used a per-minute token. A single Lua script that
+// checks both and consumes only if both allow is better (see the challenge).
 public RateLimitDecision checkBothLimits(String clientId, String resource) {
     // Per-minute burst check
     RateLimitDecision perMinute = checkAndConsume(clientId, resource + ":pm",
@@ -369,8 +390,9 @@ public RateLimitDecision checkBothLimits(String clientId, String resource) {
 Resilience4j's `RateLimiter` is in-process only. For distributed enforcement, combine it with Redis:
 
 ```java
-// Use Redis for distributed enforcement
-// Use Resilience4j in-process for fast local rejection before the Redis hop
+// Use Redis for distributed, per-client enforcement.
+// Use Resilience4j in-process as a per-INSTANCE safety cap (all clients
+// together) — it protects this instance and Redis when traffic spikes.
 RateLimiter localGuard = RateLimiter.of("payment-api-local",
     RateLimiterConfig.custom()
         .limitRefreshPeriod(Duration.ofSeconds(1))
@@ -393,11 +415,11 @@ public RateLimitDecision combinedCheck(String clientId) {
 ## Key Takeaways
 
 - Per-node rate limiting is insufficient in a distributed system. All nodes must share state.
-- Redis INCR+EXPIRE provides fixed-window limiting in a single round-trip.
+- Redis INCR+EXPIRE provides fixed-window limiting; run both in one Lua script so a crash cannot leave a counter without a TTL.
 - Lua scripts execute atomically in Redis, eliminating TOCTOU races in check-and-decrement.
 - The token bucket algorithm handles burst tolerance; the sliding window handles boundary attacks.
-- Per-TPP rate limiting in Open Banking must be keyed on the consent/client identity, not on IP.
-- Resilience4j in-process limiting reduces Redis round-trips for clearly-over-limit clients.
+- Per-TPP rate limiting in Open Banking must be keyed on the authenticated client identity (from the validated token or certificate), not on IP or a caller-supplied header.
+- Resilience4j in-process limiting is a per-instance safety cap that spares Redis during traffic spikes; the per-client decision stays in Redis.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -407,7 +429,7 @@ public RateLimitDecision combinedCheck(String clientId) {
       "text": "A client sends 90 requests in the last 10 seconds of minute N and 90 requests in the first 10 seconds of minute N+1. A fixed-window limiter with a 100 req/min limit allows all of them. What is the actual request rate in that 20-second window?",
       "options": [
         "100 req/min — both windows are within limit",
-        "270 req/min — 180 requests in 20 seconds extrapolated to a minute",
+        "540 req/min — 180 requests in 20 seconds, extrapolated to a minute",
         "180 req/min — 180 requests in 60 seconds",
         "90 req/min — only the current window counts"
       ],
@@ -444,25 +466,25 @@ public RateLimitDecision combinedCheck(String clientId) {
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Distributed Rate Limiting \u2014 Production Implementation",
+  "title": "Rate Limiting Open Banking TPPs Across a Gateway Cluster",
   "difficulty": "advanced",
   "estimatedMinutes": 75,
   "tasks": [
     {
       "id": "1",
-      "description": "Design the Redis key schema for per-TPP, per-resource sliding window limits and daily quotas. Include TTL strategy and key naming conventions"
+      "description": "Design the Redis key schema for per-TPP, per-resource sliding-window limits and daily quotas: key names, hash tags for Redis Cluster, and the TTL of each key."
     },
     {
       "id": "2",
-      "description": "Write the Lua script for a combined sliding-window + daily-quota check that returns: allowed, per-minute remaining, daily remaining, retry-after"
+      "description": "Write one Lua script that checks the sliding-window limit and the daily quota together and consumes from both only if both allow. Return: allowed, per-minute remaining, daily remaining, and retry-after."
     },
     {
       "id": "3",
-      "description": "Implement the Spring WebFilter that enforces both limits, sets all four rate-limit headers, and records a Micrometer metric for each decision (allowed/"
+      "description": "Implement a Spring WebFilter that takes the TPP id from the validated token, enforces both limits without blocking the event loop, sets the rate-limit headers and Retry-After, and records a Micrometer metric for each decision (allowed/rejected, by scope)."
     },
     {
       "id": "4",
-      "description": "The Redis cluster fails. What should the gateway do \u2014 fail open (allow all requests) or fail closed (reject all)? Justify your answer for a regulated O"
+      "description": "The Redis cluster fails. Should the gateway fail open (allow all requests) or fail closed (reject all)? Justify your answer for a regulated Open Banking API, and design a middle path: a conservative in-process limit per instance while Redis is down, plus an alert."
     }
   ]
 }

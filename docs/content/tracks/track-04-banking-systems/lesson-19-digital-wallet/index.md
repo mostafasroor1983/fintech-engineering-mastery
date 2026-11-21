@@ -35,22 +35,24 @@ references:
   - "FCA PS19/3 — Strong Customer Authentication and Common and Secure Open Standards"
 ---
 
-Digital wallets have matured from convenience features into critical financial infrastructure: PayPal holds $38.5 billion in customer funds, Revolut manages 35 million accounts across 160+ currencies, and Alipay processes 175,000 transactions per second at Lunar New Year peak. The engineering challenge is not primarily one of velocity — the internal ledger of a wallet is a relatively constrained domain — but of regulatory compliance at every layer of the stack. The choice of legal structure (e-money institution, payment institution, or bank) determines which safeguarding rules apply, which transactions are permissible, and which capital requirements constrain product features.
+## Overview
+
+Digital wallets have matured from convenience features into critical financial infrastructure: the largest wallets hold tens of billions of dollars of customer money for tens of millions of customers, and the biggest Asian platforms handle hundreds of thousands of transactions per second at shopping-festival peaks. The engineering challenge is not primarily one of velocity — the internal ledger of a wallet is a relatively constrained domain — but of regulatory compliance at every layer of the stack. The choice of legal structure (e-money institution, payment institution, or bank) determines which safeguarding rules apply, which transactions are permissible, and which capital requirements constrain product features.
 
 ## Learning Objectives
 
 - Distinguish between e-money (EMD2), stored-value instruments, prepaid cards, and bank accounts and explain the engineering implications of each classification
-- Describe the EU EMD2 / PSD2 and US state money transmitter licence frameworks and map regulatory obligations to architectural constraints
+- Describe the EU EMD2 / PSD2 (soon to be merged into PSD3 and the Payment Services Regulation) and US state money transmitter licence frameworks and map regulatory obligations to architectural constraints
 - Design the five core components of a wallet platform: ledger, funding adapter, payout adapter, KYC gateway, and consent store
 - Implement a `WalletService` with an internal double-entry ledger, funding source abstraction, and idempotent transfer semantics
 - Model fund-in (bank transfer top-up and card top-up) and fund-out (bank withdrawal) flows as explicit state machines with compensating transactions
 - Implement safeguarding-compliant fund segregation using a designated safeguarding account per currency and a reconciliation daemon
-- Execute atomic wallet-to-wallet P2P transfers using database-level serialisable isolation and conflict-free retry semantics
-- Integrate a wallet with open banking PISP rails for bank-funded top-ups, reducing card interchange cost from ~1.8% to a fixed £0.20 per transfer
+- Execute atomic wallet-to-wallet P2P transfers using ordered row locks, conditional updates and safe retry semantics
+- Integrate a wallet with open banking PISP rails for bank-funded top-ups, replacing a percentage card acceptance fee with a small fixed fee per transfer
 
 ## Business Context
 
-In October 2021, an e-money institution (EMI) operating in the UK had a safeguarding failure. The firm had been co-mingling client e-money with operating funds in a single bank account, contrary to Regulation 23 of the Payment Services Regulations 2017. When a Barclays correspondent banking relationship was terminated at short notice, the safeguarding shortfall was discovered to be £23 million — the firm could not demonstrate that 100% of outstanding e-money liabilities were covered by segregated funds. The FCA imposed a requirement for the firm to cease issuing new e-money immediately, triggering a run-off process that cost 400,000 customers access to their funds for 11 weeks. The engineering lesson: safeguarding reconciliation must be automated, run on every settlement cycle, and alert immediately when the coverage ratio falls below 100.00%. It cannot be a manual monthly finance exercise.
+*Composite example (based on UK safeguarding failures, not a specific firm):* an e-money institution (EMI) kept client e-money and its own operating money in the same bank account, contrary to the safeguarding rules in the Electronic Money Regulations 2011. Nobody noticed, because safeguarding reconciliation was a manual monthly spreadsheet. When its bank gave notice to close the account, the firm could not show that 100% of its outstanding e-money was covered by segregated funds — there was a shortfall of millions. The FCA stopped it from issuing new e-money, the firm entered insolvency, and customers waited months to get their money back, minus the administrators' costs. Cases like this led the FCA to tighten the rules: since May 2026 UK payment and e-money firms must reconcile safeguarded funds every business day, file monthly safeguarding returns and have an annual safeguarding audit. The engineering lesson: safeguarding reconciliation must be automated, run on every settlement cycle, and alert immediately when coverage falls below 100.00%. It cannot be a manual monthly finance exercise.
 
 ## E-Money vs Stored-Value vs Bank Account
 
@@ -59,12 +61,12 @@ These three instruments are legally distinct and carry very different engineerin
 | Instrument | Regulatory regime | Segregation required | Interest bearing | Deposit guarantee |
 |---|---|---|---|---|
 | E-Money (EU) | EMD2 + national transposition | Yes — 100% safeguarding | No (prohibited by EMD2) | No (not FSCS/DGS) |
-| Prepaid card (US) | State MTL + CFPB Reg E | Varies by state | Generally no | No |
-| Bank current account | CRD IV / banking licence | N/A (fractional reserve) | Yes | Yes (FSCS £85k) |
-| Stored-value loop | Closed-loop exemption | No | No | No |
+| Prepaid card (US) | State MTL + CFPB Reg E (Prepaid Rule) | Varies by state ("permissible investments") | Generally no | No (unless held "for the benefit of" users at an insured bank) |
+| Bank current account | Banking licence (CRR/CRD) | N/A (fractional reserve) | Yes | Yes (UK FSCS £120k since December 2025; EU DGS €100k) |
+| Closed-loop stored value | Limited network exclusion | No | No | No |
 
 > [!IMPORTANT]
-> The closed-loop exemption (Art. 3(k) EMD2) allows gift cards, public transport cards, and similar instruments to operate without an EMI licence only if the network is limited to a single issuer, used for a limited range of goods/services, and the outstanding liability stays below €5 million. If a "loyalty wallet" grows beyond this, it crosses into regulated e-money territory without the operator being aware, creating retroactive compliance liability.
+> The limited network exclusion (PSD2 Art. 3(k), applied to e-money through EMD2 Art. 1(4)) lets gift cards, store cards, transport cards and similar instruments operate without an EMI licence only if they can be used within a limited network of merchants or for a very limited range of goods and services. Once the value of transactions exceeds €1 million in 12 months, the provider must notify the regulator, which decides whether the exclusion still applies. A "loyalty wallet" that keeps adding merchants can cross into regulated e-money without the operator noticing, creating compliance liability.
 
 **E-money** is the dominant model for general-purpose wallets (Revolut, Wise, Monese). An EMI is authorised by a central bank or financial regulator, must hold 100% of outstanding e-money liabilities in safeguarded funds (high-quality liquid assets — government bonds, central bank deposits, or segregated bank accounts), and cannot pay interest on balances.
 
@@ -74,11 +76,11 @@ The regulatory regime maps directly to system design decisions:
 
 | Constraint | EMD2 (EU EMI) | US Money Transmitter |
 |---|---|---|
-| Safeguarding | 100% segregated per Art. 7 | "Permissible investments" per state law |
-| AML/KYC | PSD2 + AMLD5 | BSA + FinCEN SAR obligations |
-| Transaction limits (un-KYC'd) | €150 per transaction / €2500 lifetime | Varies: typically $1,000/day anonymous |
-| Cross-border | Passporting in EEA | 50 separate state licences or federal charter |
-| Data residency | GDPR — EU/EEA for personal data | No federal mandate; California CCPA |
+| Safeguarding | 100% safeguarded per EMD2 Art. 7 | "Permissible investments" per state law |
+| AML/KYC | AML directives (AMLR from 2027) | BSA + FinCEN SAR obligations |
+| Limits without full KYC | Simplified due diligence only within tight limits (AMLD5: e.g. €150 per month, €50 for remote payments) | FinCEN prepaid access rules use a $1,000-per-day threshold; above it, customer identification applies |
+| Cross-border | Passporting in the EEA (not to the UK since Brexit) | A licence in almost every state (or a bank charter); the Money Transmission Modernization Act harmonises many state rules |
+| Data protection | GDPR — transfers outside the EEA need an adequacy decision or safeguards (not strict residency) | No federal law; state laws such as California's CCPA |
 
 ```java
 // Wallet legal entity type drives which rules apply at runtime
@@ -95,7 +97,7 @@ public record WalletAccount(
     UUID customerId,
     WalletRegime regime,
     Currency currency,
-    BigDecimal balance,          // Always positive or zero for client funds
+    BigDecimal balance,          // Cached projection of the ledger; never negative for client funds
     KycLevel kycLevel,           // NONE, BASIC, FULL — drives transaction limits
     boolean safeguardingEnabled,
     Instant createdAt,
@@ -144,9 +146,9 @@ graph TB
     SA --> RD
 ```
 
-**Ledger** is the authoritative source of truth — a double-entry accounting system (see Track 5 Lesson 3) with immutable journal entries. Every balance is derived from the sum of posted entries, never stored as a mutable field without derivability from the ledger.
+**Ledger** is the authoritative source of truth — a double-entry accounting system (see Track 5, Lesson 1) with immutable journal entries. Every balance is derived from the sum of posted entries, never stored as a mutable field without derivability from the ledger.
 
-**Funding adapters** abstract the mechanics of getting money into the wallet. Each adapter implements a common `FundingSource` interface but has very different latency and cost profiles: open banking bank transfers settle in seconds and cost a fixed fee; card top-ups are instantaneous but carry 1.5-2% interchange.
+**Funding adapters** abstract the mechanics of getting money into the wallet. Each adapter implements a common `FundingSource` interface but has very different latency and cost profiles: open banking bank transfers settle in seconds and cost a small fixed fee; card top-ups are instantaneous but carry percentage-based acceptance fees (interchange, scheme and acquirer fees together), and can be charged back.
 
 **KYC gateway** enforces transaction limits based on KYC level and routes enhanced due diligence checks for high-value customers to manual review queues.
 
@@ -162,52 +164,58 @@ public class WalletService {
     private final FundingSourceRegistry fundingSources;
     private final PayoutAdapterRegistry payoutAdapters;
     private final KycLimitEnforcer kycEnforcer;
-    private final IdempotencyStore idempotencyStore;
+    private final IdempotencyRepository idempotencyRepo;
 
     /**
      * Atomically transfers value between two wallet accounts within the same platform.
-     * Uses SELECT FOR UPDATE with consistent lock ordering (lower UUID first) to
-     * prevent deadlocks on concurrent transfers between the same pair of accounts.
+     * Locks both rows with SELECT FOR UPDATE in a CONSISTENT order (smaller UUID
+     * first) to prevent deadlocks between A→B and B→A transfers. With ordered
+     * row locks, READ COMMITTED is enough; SERIALIZABLE would add serialization
+     * failures that every caller must retry.
      */
-    @Transactional(isolation = Isolation.SERIALIZABLE)
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public TransferResult transfer(TransferRequest request) {
-        // Idempotency check — return cached result for duplicate request keys
-        return idempotencyStore.computeIfAbsent(request.idempotencyKey(), () -> {
-            WalletAccount source = walletRepo.findByIdForUpdate(request.sourceAccountId())
-                .orElseThrow(() -> new AccountNotFoundException(request.sourceAccountId()));
-            WalletAccount target = walletRepo.findByIdForUpdate(request.targetAccountId())
-                .orElseThrow(() -> new AccountNotFoundException(request.targetAccountId()));
+        // Claim the idempotency key IN THIS TRANSACTION (unique constraint):
+        // a duplicate request gets the stored result instead of a second transfer
+        Optional<TransferResult> previous = idempotencyRepo.claimOrGetResult(request.idempotencyKey());
+        if (previous.isPresent()) {
+            return previous.get();
+        }
+        if (request.sourceAccountId().equals(request.targetAccountId())) {
+            throw new InvalidTransferException("Source and target are the same account");
+        }
 
-            kycEnforcer.checkTransferLimit(source, request.amount());
+        // Lock in canonical order, whatever the transfer direction
+        UUID first  = min(request.sourceAccountId(), request.targetAccountId());
+        UUID second = max(request.sourceAccountId(), request.targetAccountId());
+        Map<UUID, WalletAccount> locked = walletRepo.findAllByIdForUpdateOrdered(List.of(first, second));
+        WalletAccount source = locked.get(request.sourceAccountId());
+        WalletAccount target = locked.get(request.targetAccountId());
+        if (source == null || target == null) {
+            throw new AccountNotFoundException(request.sourceAccountId(), request.targetAccountId());
+        }
+        if (!source.currency().equals(target.currency())) {
+            throw new InvalidTransferException("Currency mismatch — use the FX conversion flow");
+        }
 
-            if (source.balance().compareTo(request.amount()) < 0) {
-                throw new InsufficientFundsException(source.accountId(), request.amount());
-            }
+        kycEnforcer.checkTransferLimit(source, request.amount());
 
-            // Double-entry: debit source, credit target — atomic in same transaction
-            LedgerEntry debit = ledger.post(LedgerEntry.builder()
-                .accountId(source.accountId())
-                .entryType(EntryType.DEBIT)
-                .amount(request.amount())
-                .currency(source.currency())
-                .reference(request.reference())
-                .narrative("P2P transfer out to " + target.accountId())
-                .build());
+        if (source.balance().compareTo(request.amount()) < 0) {
+            throw new InsufficientFundsException(source.accountId(), request.amount());
+        }
 
-            LedgerEntry credit = ledger.post(LedgerEntry.builder()
-                .accountId(target.accountId())
-                .entryType(EntryType.CREDIT)
-                .amount(request.amount())
-                .currency(target.currency())
-                .reference(request.reference())
-                .narrative("P2P transfer in from " + source.accountId())
-                .build());
+        // Double-entry: one journal with a debit and a credit — atomic in the
+        // same transaction; the ledger updates both cached balances
+        JournalEntry journal = ledger.post(JournalEntry.of(request.reference(), source.currency(),
+            Debit.of(source.accountId(), request.amount(), "P2P transfer out"),
+            Credit.of(target.accountId(), request.amount(), "P2P transfer in")));
 
-            log.info("P2P transfer complete: ref={}, amount={} {}",
-                request.reference(), request.amount(), source.currency());
+        log.info("P2P transfer complete: ref={}, amount={} {}",
+            request.reference(), request.amount(), source.currency());
 
-            return TransferResult.success(debit.entryId(), credit.entryId());
-        });
+        TransferResult result = TransferResult.success(journal.journalId());
+        idempotencyRepo.storeResult(request.idempotencyKey(), result);
+        return result;
     }
 }
 ```
@@ -230,7 +238,7 @@ public FundInResult fundInViaBankTransfer(FundInRequest request) {
     );
 
     // Step 2: Initiate payment via PISP — asynchronous
-    OpenBankingPaymentOrder order = pipsp.initiatePayment(
+    OpenBankingPaymentOrder order = pisp.initiatePayment(
         OpenBankingPaymentOrder.builder()
             .amount(request.amount())
             .currency(request.currency())
@@ -244,66 +252,77 @@ public FundInResult fundInViaBankTransfer(FundInRequest request) {
     return FundInResult.pending(pendingRef, order.consentUrl());
 }
 
-// Called by webhook handler when PISP payment settles
+// Called when the SAFEGUARDING BANK confirms the money has arrived (bank
+// statement / account webhook) — not when the PISP order status says "completed",
+// which can come before the funds are actually in the account
 @Transactional
-public void onBankTransferSettled(String creditorReference, BigDecimal settledAmount) {
-    ledger.confirmPendingCredit(creditorReference, settledAmount);
-    // Safeguarding: the inbound funds are already in the safeguarding bank account
-    // (they were credited there directly). Ledger confirmation makes them available.
-    safeguardingReconciliation.recordReceipt(creditorReference, settledAmount);
+public void onFundsReceivedInSafeguardingAccount(String creditorReference, BigDecimal receivedAmount) {
+    // Idempotent: webhooks are delivered at least once — a second delivery
+    // for an already-confirmed reference does nothing
+    if (ledger.isPendingCreditConfirmed(creditorReference)) {
+        return;
+    }
+    // Credit what actually ARRIVED (it may differ from what was requested)
+    ledger.confirmPendingCredit(creditorReference, receivedAmount);
+    safeguardingReconciliation.recordReceipt(creditorReference, receivedAmount);
 }
 ```
 
 **Fund-out via Faster Payments:**
 
 ```java
-public PayoutResult fundOut(PayoutRequest request) {
-    // Atomically debit wallet and create a payout instruction
-    // If the payment rail fails, the debit must be reversed
+// Step 1 — ONE database transaction: debit the wallet AND record the payout
+// instruction (outbox). Either both happen or neither does.
+@Transactional
+public PayoutResult requestPayout(PayoutRequest request) {
     String payoutId = UUID.randomUUID().toString();
+    ledger.debitForPayout(request.walletAccountId(), request.amount(), payoutId);
+    payoutOutbox.save(PayoutInstruction.pending(payoutId, request));
+    return PayoutResult.accepted(payoutId);
+}
 
+// Step 2 — a dispatcher sends pending instructions to the rail (outside the
+// database transaction) and records the outcome
+public void dispatch(PayoutInstruction instruction) {
+    PayoutAdapter adapter = payoutAdapters.forCurrency(instruction.currency());
     try {
-        ledger.debitForPayout(request.walletAccountId(), request.amount(), payoutId);
+        // payoutId doubles as the end-to-end id, so a resend is recognisable
+        PaymentResult result = adapter.send(instruction.toPaymentInstruction());
+        ledger.confirmPayout(instruction.payoutId(), result.networkReference());
 
-        PayoutAdapter adapter = payoutAdapters.forCurrency(request.currency());
-        PaymentResult result = adapter.send(PaymentInstruction.builder()
-            .payoutId(payoutId)
-            .amount(request.amount())
-            .currency(request.currency())
-            .creditorIban(request.destinationIban())
-            .creditorName(request.destinationName())
-            .reference(request.reference())
-            .build());
+    } catch (PaymentRejectedException ex) {
+        // DEFINITE rejection (e.g. invalid account): safe to reverse the debit
+        ledger.reverseDebit(instruction.payoutId(), "PAYOUT_REJECTED: " + ex.getRailErrorCode());
+        log.warn("Payout rejected, debit reversed: payoutId={}", instruction.payoutId());
 
-        ledger.confirmPayout(payoutId, result.networkReference());
-        return PayoutResult.success(payoutId, result.networkReference());
-
-    } catch (PaymentRailException ex) {
-        // Compensating transaction — reverse the debit
-        ledger.reverseDebit(payoutId, "PAYOUT_FAILED: " + ex.getMessage());
-        log.warn("Payout failed, debit reversed: payoutId={}", payoutId, ex);
-        return PayoutResult.failed(payoutId, ex.getRailErrorCode());
+    } catch (PaymentTimeoutException ex) {
+        // UNKNOWN outcome: the money may have left. Reversing now could pay the
+        // customer twice. Mark it and query the rail for the real status.
+        payoutOutbox.markUnknown(instruction.payoutId());
+        statusChecker.scheduleQuery(instruction.payoutId());
     }
 }
 ```
 
 > [!WARNING]
-> Never debit the wallet ledger and dispatch the payment instruction in separate transactions. If the outbound payment is dispatched and the ledger debit rolls back (due to a crash between the two operations), money leaves the safeguarding account without a corresponding ledger debit — a safeguarding shortfall that must be detected and corrected before the next regulatory report.
+> An external payment can never be part of a database transaction, so never "send the payment, then debit the ledger". If the payment goes out and the debit is then lost (a crash between the two), money leaves the safeguarding account without a ledger debit — a safeguarding shortfall. Debit first and record the payout instruction in the **same** transaction (outbox), send afterwards, reverse only on a **definite** rejection, and treat a timeout as unknown until the rail confirms the status.
 
 ## Safeguarding Obligations
 
-Under Article 10 of PSD2 and Regulation 23 of the UK PSRs 2017, an EMI must at all times hold assets equal in value to its outstanding e-money liabilities. Acceptable safeguarding methods are:
+Under EMD2 Article 7 (which applies the PSD2 Article 10 safeguarding methods) and, in the UK, regulations 20–22 of the Electronic Money Regulations 2011 together with the FCA's CASS 15 rules (since May 2026), an EMI must safeguard funds received in exchange for e-money so that they are fully covered at all times. Acceptable safeguarding methods are:
 
-1. **Segregated bank account:** Funds held in an account with a credit institution, ring-fenced from operating funds, labeled as safeguarding.
-2. **Insurance/guarantee policy:** Third-party guarantee covering the full outstanding liability (rarely used in practice).
-3. **Secure, low-risk assets:** Government bonds or money market funds of equivalent value.
+1. **Segregation:** Funds held in a designated safeguarding account with a credit institution (or invested in secure, liquid, low-risk assets approved by the regulator), ring-fenced from the firm's own money.
+2. **Insurance or guarantee:** A policy or guarantee from an insurer or bank outside the firm's group covering the full amount (less common in practice).
 
 ```java
 @Scheduled(cron = "0 */1 * * * *")  // Every 1 minute
 public void reconcileSafeguarding() {
     for (Currency currency : supportedCurrencies) {
-        BigDecimal emoneyLiability = ledger.totalClientBalances(currency);
+        BigDecimal emoneyLiability = ledger.totalClientBalances(currency);   // incl. pending credits
         BigDecimal safeguardingBalance = safeguardingAccountClient.balance(currency);
+        if (emoneyLiability.signum() == 0) {
+            continue;                                   // nothing to cover; avoid divide-by-zero
+        }
 
         BigDecimal coverageRatio = safeguardingBalance
             .divide(emoneyLiability, 6, RoundingMode.DOWN);
@@ -327,7 +346,7 @@ private static final BigDecimal MINIMUM_COVERAGE_RATIO = BigDecimal.ONE; // 100%
 
 ## Tokenisation for Recurring Payments
 
-When a customer saves their wallet as a funding source for recurring payments (e.g., subscription billing), the merchant stores a **mandate token** rather than account credentials. This follows the PSD2 Secure Customer Authentication (SCA) model: the first payment requires explicit customer authentication (SCA challenge), and subsequent payments may qualify for the recurring exemption.
+When a customer saves their wallet as a funding source for recurring payments (e.g., subscription billing), the merchant stores a **mandate token** rather than account credentials. This follows the PSD2 Strong Customer Authentication (SCA) model: the first payment requires explicit customer authentication (SCA challenge), and subsequent payments may qualify for the recurring exemption.
 
 ```java
 public record RecurringMandate(
@@ -344,30 +363,33 @@ public record RecurringMandate(
 ```
 
 > [!NOTE]
-> Under PSD2 Article 97, recurring transactions of a fixed amount to the same payee after the initial SCA-authenticated setup are exempt from subsequent SCA. However, the payment amount must match the mandated amount exactly. Any deviation — even a currency conversion rounding difference — requires a new SCA challenge.
+> Under the SCA rules (PSD2 Article 97 and the RTS, Article 14), a series of recurring transactions of the **same amount** to the same payee needs SCA only for the first payment. If the amount changes, SCA is needed again. Payments that the merchant initiates under a mandate the customer agreed with SCA (merchant-initiated transactions) are outside SCA altogether, which is how variable subscriptions are usually handled.
 
 ## Wallet-to-Wallet P2P Transfer Atomicity
 
 The key safety guarantee is that money cannot appear or disappear: total wallet balances across the platform must be conserved across every transfer. This requires that the debit and credit journal entries are written in a single ACID transaction and that the ledger check and balance updates are locked against concurrent modification.
 
 ```sql
--- Serialisable isolation prevents phantom reads from concurrent transfers
-BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+-- Ordered row locks + a conditional debit: READ COMMITTED is enough
+BEGIN;
 
 -- Lock both accounts in consistent order (smaller UUID first)
-SELECT balance FROM wallet_accounts
+SELECT account_id, balance FROM wallet_accounts
 WHERE account_id IN (:sourceId, :targetId)
 ORDER BY account_id
 FOR UPDATE;
 
--- Verify sufficient balance
--- Post debit entry
-INSERT INTO ledger_entries (entry_id, account_id, entry_type, amount, currency, reference, created_at)
-VALUES (gen_random_uuid(), :sourceId, 'DEBIT', :amount, :currency, :reference, NOW());
+-- Conditional debit: 0 rows updated = insufficient funds → ROLLBACK
+UPDATE wallet_accounts SET balance = balance - :amount
+WHERE account_id = :sourceId AND balance >= :amount;
 
--- Post credit entry
-INSERT INTO ledger_entries (entry_id, account_id, entry_type, amount, currency, reference, created_at)
-VALUES (gen_random_uuid(), :targetId, 'CREDIT', :amount, :currency, :reference, NOW());
+UPDATE wallet_accounts SET balance = balance + :amount
+WHERE account_id = :targetId;
+
+-- One journal, two entries (debit + credit) that sum to zero
+INSERT INTO ledger_entries (entry_id, journal_id, account_id, entry_type, amount, currency, reference, created_at)
+VALUES (gen_random_uuid(), :journalId, :sourceId, 'DEBIT',  :amount, :currency, :reference, NOW()),
+       (gen_random_uuid(), :journalId, :targetId, 'CREDIT', :amount, :currency, :reference, NOW());
 
 COMMIT;
 ```
@@ -378,9 +400,9 @@ Wallets can integrate with open banking infrastructure as both TPP (Third Party 
 
 | Integration pattern | Cost to merchant | Latency | Use case |
 |---|---|---|---|
-| Card top-up (Visa/MC) | 1.5-2.2% interchange + scheme fees | Immediate | Emergency top-up |
-| Open Banking PISP top-up | £0.10-0.25 fixed | 10-30s (FPS) | Regular top-up |
-| SEPA CT top-up | €0.05-0.15 fixed | Same day (SEPA Inst: 10s) | EU users |
+| Card top-up (Visa/MC) | Percentage fee (interchange + scheme + acquirer), often around 1–2% | Immediate | Emergency top-up |
+| Open Banking PISP top-up | Small fixed fee (e.g. £0.10–0.25) | Seconds (FPS) | Regular top-up |
+| SEPA CT top-up | Small fixed fee | Next day (SEPA Instant: under 10s) | EU users |
 | SWIFT top-up | $5-25 correspondent fees | 1-3 business days | International |
 
 ## Knowledge Check
@@ -401,7 +423,7 @@ A: EMD2 Article 12 prohibits EMIs from paying interest on e-money or providing a
 
 3. **Fund-In State Machine:** Model the fund-in flow as a `FundInStateMachine` with states `INITIATED → CONSENT_GRANTED → PAYMENT_SUBMITTED → SETTLEMENT_PENDING → CREDITED | FAILED`. Implement state transitions as methods, persist the current state to PostgreSQL, and wire up a webhook handler that drives `PAYMENT_SUBMITTED → SETTLEMENT_PENDING → CREDITED`. Write an integration test with a stubbed PISP adapter that simulates a delayed settlement (arriving 2 seconds after initiation).
 
-4. **KYC Limit Enforcer:** Implement `KycLimitEnforcer` with three KYC tiers: NONE (£150/transaction, £2500 lifetime), BASIC (£1000/transaction, £10000/month), FULL (£50000/transaction, unlimited). The enforcer must track cumulative amounts using a rolling window query on the ledger table and throw `KycLimitExceededException` with a message indicating how much headroom remains. Test all boundary conditions (exactly at limit, 1p below, 1p above) for each tier.
+4. **KYC Limit Enforcer:** Implement `KycLimitEnforcer` with three illustrative KYC tiers (real limits come from your AML policy): NONE (£150/transaction, £2500 lifetime), BASIC (£1000/transaction, £10000/month), FULL (£50000/transaction, unlimited). The enforcer must track cumulative amounts using a rolling window query on the ledger table and throw `KycLimitExceededException` with a message indicating how much headroom remains. Test all boundary conditions (exactly at limit, 1p below, 1p above) for each tier.
 
 <!-- KNOWLEDGE-CHECK
 {

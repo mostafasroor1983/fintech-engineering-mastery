@@ -41,6 +41,7 @@ In a monolith, event sourcing is relatively straightforward: one event store, on
 ```sql
 CREATE TABLE account_events (
     event_id          UUID         NOT NULL DEFAULT gen_random_uuid(),
+    global_position   BIGSERIAL,               -- store-wide order for projections
     stream_id         VARCHAR(128) NOT NULL,   -- e.g. "account:ACC-001"
     sequence_number   BIGINT       NOT NULL,   -- monotonically increasing per stream
     event_type        VARCHAR(128) NOT NULL,   -- e.g. "FundsDeposited"
@@ -55,13 +56,13 @@ CREATE TABLE account_events (
         UNIQUE (stream_id, sequence_number)    -- optimistic concurrency guard
 );
 
--- Fast stream replay
-CREATE INDEX idx_account_events_stream
-    ON account_events (stream_id, sequence_number ASC);
+-- Fast stream replay: already covered by the index behind
+-- uq_account_events_stream_seq (stream_id, sequence_number)
 
--- Global ordering for projections (append-only, so this index grows monotonically)
-CREATE INDEX idx_account_events_global
-    ON account_events (occurred_at ASC, event_id ASC);
+-- Global ordering for projections. Not occurred_at: NOW() is the transaction
+-- START time, so a later-committed event can carry an earlier timestamp.
+CREATE UNIQUE INDEX idx_account_events_global
+    ON account_events (global_position);
 
 -- For catch-up subscriptions by event type
 CREATE INDEX idx_account_events_type
@@ -101,18 +102,24 @@ public class PostgresEventStore {
         }
 
         long nextSeq = expectedVersion + 1;
-        for (UnpersistedEvent event : events) {
-            jdbc.update("""
-                INSERT INTO account_events
-                    (stream_id, sequence_number, event_type, event_data,
-                     metadata, causation_id, correlation_id, schema_version)
-                VALUES (?, ?, ?, ?::jsonb, ?::jsonb, ?, ?, ?)
-                """,
-                streamId, nextSeq++, event.getType(),
-                event.getDataJson(), event.getMetadataJson(),
-                event.getCausationId(), event.getCorrelationId(),
-                event.getSchemaVersion()
-            );
+        try {
+            for (UnpersistedEvent event : events) {
+                jdbc.update("""
+                    INSERT INTO account_events
+                        (stream_id, sequence_number, event_type, event_data,
+                         metadata, causation_id, correlation_id, schema_version)
+                    VALUES (?, ?, ?, ?::jsonb, ?::jsonb, ?, ?, ?)
+                    """,
+                    streamId, nextSeq++, event.getType(),
+                    event.getDataJson(), event.getMetadataJson(),
+                    event.getCausationId(), event.getCorrelationId(),
+                    event.getSchemaVersion()
+                );
+            }
+        } catch (DuplicateKeyException e) {
+            // The version check above can race; the UNIQUE constraint cannot
+            throw new OptimisticConcurrencyException(
+                "Stream %s was appended to concurrently".formatted(streamId), e);
         }
     }
 
@@ -153,10 +160,10 @@ public class PostgresEventStore {
         return jdbc.query("""
             SELECT event_id, stream_id, sequence_number, event_type,
                    event_data, metadata, occurred_at, schema_version,
-                   ROW_NUMBER() OVER (ORDER BY occurred_at, event_id) AS global_position
+                   global_position
             FROM account_events
-            WHERE ROW_NUMBER() OVER (ORDER BY occurred_at, event_id) >= ?
-            ORDER BY occurred_at ASC, event_id ASC
+            WHERE global_position >= ?
+            ORDER BY global_position ASC
             LIMIT ?
             """,
             new EventRowMapper(), globalPosition, batchSize);
@@ -172,7 +179,7 @@ public class PostgresEventStore {
 ```
 
 > [!TIP]
-> The `loadGlobalFrom` using `ROW_NUMBER()` is expensive at scale. In production, use a dedicated `global_position` sequence column populated by a trigger or add a `BIGSERIAL global_position` column to the table.
+> A `BIGSERIAL` position has one trap: sequence values are taken at INSERT but become visible at COMMIT, so position 1001 can appear before 1000. A subscriber that has read up to 1001 would then skip 1000 forever. Common fixes: read only positions older than a short safety delay (for example 2–5 seconds), track gaps and wait for them to fill, or serialise appends (one writer, or an advisory lock around the append). Window functions such as `ROW_NUMBER()` cannot be used in `WHERE` at all.
 
 ---
 
@@ -185,8 +192,10 @@ public class Account {
     private AccountStatus status;
     private long      version;   // last applied sequence_number
 
-    // Private constructor — built only via projection
+    // Built only via events (or a snapshot) — never "new" from outside
     private Account() {}
+
+    public static Account empty() { return new Account(); }
 
     public static Account fromEvents(List<PersistedEvent> events) {
         Account account = new Account();
@@ -242,9 +251,11 @@ public class EventUpcaster {
         = new HashMap<>();
 
     static {
-        // FundsDeposited v1 → v2: added "currency" field (default "GBP")
-        register("FundsDeposited", 1, event -> {
-            ObjectNode upgraded = event.deepCopy();
+        // FundsDeposited v1 → v2: added "currency" field (default "GBP").
+        // A default is only safe if it is TRUE for every v1 event — here,
+        // a bank that took only GBP deposits before v2.
+        register("FundsDeposited", 1, data -> {
+            ObjectNode upgraded = (ObjectNode) data.deepCopy();
             if (!upgraded.has("currency")) {
                 upgraded.put("currency", "GBP");
             }
@@ -328,7 +339,7 @@ public class AccountRepository {
             account     = snapshot.get().toAccount();
             fromVersion = snapshot.get().getSnapshotVersion() + 1;
         } else {
-            account     = new Account();
+            account     = Account.empty();
             fromVersion = 0;
         }
 
@@ -377,10 +388,10 @@ public class AccountRepository {
 | Projection engine | Built-in (JavaScript projections) | Custom code |
 | Optimistic concurrency | Native `expectedVersion` parameter | UNIQUE constraint + app check |
 | Operational complexity | Separate cluster to operate | Reuses existing DB infra |
-| ACID guarantees | Yes (single-node), Eventual (cluster) | Full ACID |
+| Durability in a cluster | Writes replicated to a quorum of nodes | Synchronous replication if configured |
 | Recommended for | Greenfield, event-sourcing-first teams | Teams already on PostgreSQL |
 
-For most fintech teams with an existing PostgreSQL footprint, the PostgreSQL approach is pragmatic. EventStoreDB is worth considering when you have many aggregates, complex projection logic, or need native catch-up subscriptions.
+For most fintech teams with an existing PostgreSQL footprint, the PostgreSQL approach is pragmatic. EventStoreDB (renamed KurrentDB in 2025) is worth considering when you have many aggregates, complex projection logic, or need native catch-up subscriptions.
 
 ---
 
@@ -398,9 +409,10 @@ public class AccountBalanceProjection {
 
     /**
      * Full rebuild — truncates and replays all events.
-     * Run offline or against a shadow read replica.
+     * Run offline or into a shadow table (see the strategy below). For large
+     * stores, commit per batch and record the position reached, so that a
+     * failed rebuild can resume instead of starting again.
      */
-    @Transactional
     public void rebuild() {
         readRepo.truncate();
 
@@ -451,7 +463,7 @@ BEGIN
             'stream_id',       NEW.stream_id,
             'sequence_number', NEW.sequence_number,
             'event_type',      NEW.event_type,
-            'global_position', NEW.ctid
+            'global_position', NEW.global_position
         )::text
     );
     RETURN NEW;
@@ -468,18 +480,29 @@ CREATE TRIGGER account_events_notify_trigger
 @RequiredArgsConstructor
 public class AccountEventSubscription {
 
-    private final PgConnection pgConnection;
+    private final DataSource dataSource;
     private final AccountBalanceProjection projection;
 
-    @PostConstruct
-    public void subscribe() throws SQLException {
-        pgConnection.addNotificationProcessor(notification -> {
-            if ("account_events_channel".equals(notification.getName())) {
-                AccountEventNotification n = parseNotification(notification.getParameter());
-                projection.handleStreamEvent(n.streamId(), n.sequenceNumber());
+    // One dedicated connection, kept open: LISTEN belongs to a session.
+    // Notifications arrive only when the inserting transaction COMMITS.
+    public void listenLoop() throws SQLException {
+        try (Connection conn = dataSource.getConnection()) {
+            try (Statement st = conn.createStatement()) {
+                st.execute("LISTEN account_events_channel");
             }
-        });
-        pgConnection.execSQLUpdate("LISTEN account_events_channel");
+            projection.catchUp();   // close any gap from before LISTEN started
+
+            PGConnection pg = conn.unwrap(PGConnection.class);
+            while (!Thread.currentThread().isInterrupted()) {
+                // Blocks up to 10s waiting for notifications (pgjdbc 42.x)
+                PGNotification[] notes = pg.getNotifications(10_000);
+                if (notes != null && notes.length > 0) {
+                    // Treat a notification as a wake-up call only: read the new
+                    // events by global_position rather than trusting the payload
+                    projection.catchUp();
+                }
+            }
+        }
     }
 }
 ```
@@ -525,7 +548,8 @@ Event sourcing enables point-in-time queries by replaying only events up to a gi
 public Account loadAt(String accountId, Instant pointInTime) {
     String streamId = "account:" + accountId;
 
-    // Load snapshot taken before or at pointInTime
+    // Load the latest snapshot whose LAST EVENT occurred at or before
+    // pointInTime (not the snapshot's own created_at)
     Optional<AccountSnapshot> snapshot =
         snapshotRepo.loadLatestBefore(accountId, pointInTime);
 
@@ -536,7 +560,7 @@ public Account loadAt(String accountId, Instant pointInTime) {
         account     = snapshot.get().toAccount();
         fromVersion = snapshot.get().getSnapshotVersion() + 1;
     } else {
-        account     = new Account();
+        account     = Account.empty();
         fromVersion = 0;
     }
 
@@ -557,7 +581,7 @@ WHERE stream_id = ?
 ORDER BY sequence_number ASC;
 ```
 
-This is invaluable for regulatory reporting ("What was the customer's balance on 31 December?") and dispute resolution. Financial regulators in the EU require the ability to reconstruct account state at any point in time for up to 7 years.
+This is invaluable for regulatory reporting ("What was the customer's balance on 31 December?") and dispute resolution. Record-keeping rules — for example the five-year retention periods in EU anti-money-laundering rules and MiFID II — mean you must be able to show historical account activity for years.
 
 ---
 
@@ -581,7 +605,10 @@ public class PaymentSaga {
     private final AccountService accountService;
     private final NotificationService notificationService;
 
-    @Transactional
+    // Simplified, synchronous version to show the event trail. A production
+    // saga reacts to each step's event asynchronously and is driven by its
+    // stored state, so it can resume after a crash; every call it makes
+    // (reserve, notify, release) must be idempotent on sagaId.
     public void handle(PaymentInitiated event) {
         // Start saga — append PaymentSagaStarted
         sagaEventStore.append(SagaEvent.started(event.getSagaId(), event));
@@ -603,7 +630,8 @@ public class PaymentSaga {
             sagaEventStore.append(SagaEvent.completed(event.getSagaId()));
 
         } catch (Exception ex) {
-            // Compensate — release any reserved funds
+            // Compensate — release any reserved funds (idempotent: a no-op if
+            // nothing was reserved)
             accountService.releaseReservation(event.getAccountId(), event.getSagaId());
             sagaEventStore.append(SagaEvent.failed(event.getSagaId(), ex.getMessage()));
         }
@@ -633,10 +661,13 @@ public class SettlementProcessManager {
         ProcessState state = stateRepo.loadOrCreate(event.getCorrelationId());
         state.recordFundsWithdrawn(event.getAccountId(), event.getAmount());
 
-        if (state.isReadyForSettlement()) {
+        // Publish once: both handlers can find the state "ready", and an event
+        // can be delivered twice
+        if (state.isReadyForSettlement() && !state.isSettlementRequested()) {
+            state.markSettlementRequested();
             publisher.publish(new SettlementReadyEvent(state.getCorrelationId()));
         }
-        stateRepo.save(state);
+        stateRepo.save(state);   // in practice: save + publish via an outbox
     }
 
     // Triggered by ComplianceService event
@@ -645,10 +676,13 @@ public class SettlementProcessManager {
         ProcessState state = stateRepo.load(event.getCorrelationId());
         state.recordComplianceApproval();
 
-        if (state.isReadyForSettlement()) {
+        // Publish once: both handlers can find the state "ready", and an event
+        // can be delivered twice
+        if (state.isReadyForSettlement() && !state.isSettlementRequested()) {
+            state.markSettlementRequested();
             publisher.publish(new SettlementReadyEvent(state.getCorrelationId()));
         }
-        stateRepo.save(state);
+        stateRepo.save(state);   // in practice: save + publish via an outbox
     }
 }
 ```
@@ -705,17 +739,16 @@ A new business requirement needs a new field in the read model. If you built no 
 
 ```java
 // BUILD THIS FROM DAY ONE
-@Component
-public class ProjectionRebuildTool {
+public interface ProjectionRebuildTool {
 
-    // Rebuild a named projection from event position 0
-    public void rebuildProjection(String projectionName, long fromGlobalPosition);
+    // Rebuild a named projection from a global position (0 = from the start)
+    void rebuildProjection(String projectionName, long fromGlobalPosition);
 
     // Shadow rebuild — build in background, swap when caught up
-    public void shadowRebuild(String projectionName, String newTableSuffix);
+    void shadowRebuild(String projectionName, String newTableSuffix);
 
     // Status: how far behind is each projection?
-    public Map<String, ProjectionStatus> status();
+    Map<String, ProjectionStatus> status();
 }
 ```
 
@@ -728,7 +761,7 @@ public class ProjectionRebuildTool {
 - [ ] Upcaster chain implemented and tested before any schema evolution
 - [ ] Snapshot strategy defined: threshold, invalidation policy
 - [ ] Projection rebuild tooling built and tested before go-live
-- [ ] `occurred_at` indexed for temporal queries; ordering uses `sequence_number`
+- [ ] `occurred_at` indexed for temporal queries; ordering uses `sequence_number` (per stream) and `global_position` (store-wide, with gap handling)
 - [ ] Integration events are separate from domain events
 - [ ] Catch-up subscription combines LISTEN/NOTIFY with a startup catch-up query
 - [ ] Saga state is event-sourced (not mutable state) for auditability

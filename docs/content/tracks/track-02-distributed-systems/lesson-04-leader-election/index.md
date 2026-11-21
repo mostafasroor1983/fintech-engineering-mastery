@@ -38,8 +38,9 @@ Leader Election Problem:
   Safety:    At most one leader at any time
   Liveness:  Eventually, a leader will be elected
 
-  These cannot both be guaranteed unless we accept that liveness
-  requires a quorum (majority) of nodes to be available.
+  Safety can always be kept. Liveness needs a quorum (majority) of
+  nodes to be up and the network to be stable for long enough
+  (no algorithm can guarantee it in a fully asynchronous network — FLP).
 
   Quorum for 3 nodes: 2
   Quorum for 5 nodes: 3
@@ -99,7 +100,7 @@ This motivated the development of Raft, which achieves the same safety propertie
 ## Raft Consensus Algorithm
 
 Raft decomposes consensus into three relatively independent sub-problems:
-1. **Leader election**: Ensuring exactly one leader at any time
+1. **Leader election**: Ensuring at most one leader per term
 2. **Log replication**: Leader accepting entries and replicating them to followers
 3. **Safety**: Ensuring committed entries are never lost
 
@@ -136,7 +137,7 @@ Election Timeline:
            Sends RequestVote(term=1, lastLogIndex=0) to B and C
 
   t=152ms: Node B receives RequestVote
-           B has not voted in term 1, B's log is not newer than A
+           B has not voted in term 1, and A's log is at least as up to date as B's
            -> B grants vote, resets timeout
 
   t=152ms: Node C receives RequestVote
@@ -151,7 +152,8 @@ Election Timeline:
 
 ```java
 // Raft node state machine — simplified for illustration
-// Production implementations use io.etcd/jetcd or similar libraries
+// In production use a proven implementation (etcd's raft, Apache Ratis),
+// or better, a service built on one (etcd, ZooKeeper, Consul)
 
 public class RaftNode {
 
@@ -163,7 +165,7 @@ public class RaftNode {
     private final String       nodeId;
     private final List<String> peerIds;
     private final RaftRpc      rpc;
-    private final RaftLog      log;
+    private final RaftLog      raftLog;
 
     private ScheduledFuture<?> electionTimer;
     private ScheduledFuture<?> heartbeatTimer;
@@ -185,8 +187,8 @@ public class RaftNode {
             RequestVoteRequest request = RequestVoteRequest.builder()
                 .term(currentTerm)
                 .candidateId(nodeId)
-                .lastLogIndex(log.getLastIndex())
-                .lastLogTerm(log.getLastTerm())
+                .lastLogIndex(raftLog.getLastIndex())
+                .lastLogTerm(raftLog.getLastTerm())
                 .build();
 
             rpc.sendRequestVoteAsync(peerId, request)
@@ -198,7 +200,9 @@ public class RaftNode {
                            return;
                        }
 
-                       if (state != NodeState.CANDIDATE) return;
+                       // Ignore late replies from an earlier election
+                       if (state != NodeState.CANDIDATE
+                           || currentTerm != request.term()) return;
                        if (!response.voteGranted()) return;
 
                        int votes = votesReceived.incrementAndGet();
@@ -242,10 +246,10 @@ public class RaftNode {
             AppendEntriesRequest heartbeat = AppendEntriesRequest.builder()
                 .term(currentTerm)
                 .leaderId(nodeId)
-                .prevLogIndex(log.getLastIndex())
-                .prevLogTerm(log.getLastTerm())
+                .prevLogIndex(raftLog.getLastIndex())
+                .prevLogTerm(raftLog.getLastTerm())
                 .entries(List.of())  // Empty = heartbeat
-                .leaderCommit(log.getCommitIndex())
+                .leaderCommit(raftLog.getCommitIndex())
                 .build();
 
             rpc.sendAppendEntriesAsync(peerId, heartbeat)
@@ -304,7 +308,7 @@ public class ZooKeeperLeaderElection implements LeaderElectionParticipant {
         this.nodeId         = nodeId;
         this.leaderCallback = leaderCallback;
 
-        // LeaderLatch uses ephemeral sequential nodes under /payment-jobs/leader
+        // LeaderLatch uses ephemeral sequential nodes under this path
         this.leaderLatch = new LeaderLatch(
             client,
             "/payment-jobs/settlement-leader",
@@ -364,10 +368,11 @@ public class SettlementBatchService {
 
     /**
      * This job runs on all nodes, but only the leader actually processes.
-     * Non-leaders skip the work. When the leader fails, ZooKeeper
-     * elects a new leader within seconds, and the job runs on the new leader.
+     * Non-leaders skip the work. If the leader dies mid-run, a new leader is
+     * elected within seconds — but the cron will not fire again until
+     * tomorrow, so a recovery check must re-run unfinished settlements.
      */
-    @Scheduled(cron = "0 0 23 * * *")  // 11 PM daily
+    @Scheduled(cron = "0 0 23 * * *", zone = "Europe/London")  // 11 PM daily
     public void runEndOfDaySettlement() {
         if (!leaderElection.isLeader()) {
             log.debug("Skipping settlement — not the leader");
@@ -377,11 +382,13 @@ public class SettlementBatchService {
         log.info("Node {} running end-of-day settlement as leader",
                   nodeId);
 
-        LocalDate settlementDate = LocalDate.now();
+        LocalDate settlementDate = LocalDate.now(ZoneId.of("Europe/London"));
 
-        // Check idempotency: has settlement already run today?
-        if (settlementRepo.hasSettlementCompleted(settlementDate)) {
-            log.warn("Settlement already completed for {}. Skipping.",
+        // Claim the run first: INSERT into settlement_runs with a UNIQUE
+        // settlement_date (ON CONFLICT DO NOTHING). A check-then-run would let
+        // an old and a new leader both pass the check during a failover.
+        if (!settlementRepo.claimRun(settlementDate, nodeId)) {
+            log.warn("Settlement for {} already claimed. Skipping.",
                       settlementDate);
             return;
         }
@@ -407,7 +414,7 @@ public class SettlementBatchService {
 
 ## etcd Leader Election
 
-etcd is a popular alternative to ZooKeeper, used extensively in Kubernetes environments. It is well-suited to cloud-native fintech deployments.
+etcd is a popular alternative to ZooKeeper, used extensively in Kubernetes environments. It is well-suited to cloud-native fintech deployments. jetcd also ships a ready-made Election client (`campaign`, `observe`, `resign`); the loop below shows the mechanics underneath it.
 
 ```java
 @Component
@@ -482,6 +489,8 @@ public class EtcdLeaderElection {
                     log.trace("Lease {} renewed; TTL={}", leaseId, response.getTTL());
                 }
                 @Override public void onError(Throwable t) {
+                    // The lease may already have expired on the server: stop
+                    // leader work now; fencing tokens catch any writes in flight
                     log.warn("Lease keepalive error — may lose leadership", t);
                     leaderStatus = LeaderStatus.FOLLOWER;
                 }
@@ -526,8 +535,10 @@ it may corrupt data committed by Node B.
 **Fencing tokens** solve this: every leadership grant includes a monotonically increasing token. The database (or any resource) rejects operations from holders of older tokens.
 
 ```java
-// Fencing token implementation using ZooKeeper session IDs
-// ZooKeeper session IDs are monotonically increasing
+// Fencing token: a number that grows with every new leadership.
+// With ZooKeeper, use the creation zxid (czxid) of the leader's latch znode;
+// with etcd, use the revision at which the leader key was created.
+// (ZooKeeper session IDs are NOT suitable — they are not ordered.)
 
 @Component
 public class FencedLeaderOperation {
@@ -548,20 +559,19 @@ public class FencedLeaderOperation {
 
         for (Payment payment : payments) {
             database.executeWithFencingToken(fencingToken, conn -> {
-                // The database checks: is this token >= the last seen token?
-                // If not, it rejects the write — the leader has changed.
+                // check_fencing_token (below) locks the leader_state row until
+                // commit and returns false if a newer token has been seen.
+                // payment_id is UNIQUE, so a retried batch cannot double-process.
                 PreparedStatement stmt = conn.prepareStatement(
                     "INSERT INTO payment_processing_log " +
                     "(payment_id, processed_at, leader_token) " +
                     "SELECT ?, NOW(), ? " +
-                    "WHERE NOT EXISTS (" +
-                    "  SELECT 1 FROM leader_state " +
-                    "  WHERE current_token > ?" +
-                    ")"
+                    "WHERE check_fencing_token('settlement', ?, ?)"
                 );
                 stmt.setString(1, payment.paymentId());
                 stmt.setLong(2, fencingToken);
                 stmt.setLong(3, fencingToken);
+                stmt.setString(4, nodeId);
 
                 int rows = stmt.executeUpdate();
                 if (rows == 0) {
@@ -624,35 +634,37 @@ $$ LANGUAGE plpgsql;
 ## Spring Integration: Leader Election with Spring Batch
 
 ```java
-// Spring Batch with ZooKeeper leader election for distributed jobs
+// Spring Batch 5 (Spring Boot 3) with ZooKeeper leader election
 
 @Configuration
-@EnableBatchProcessing
 public class SettlementBatchConfig {
 
     @Bean
-    public Job settlementJob(JobBuilderFactory jobs,
-                              StepBuilderFactory steps,
-                              ZooKeeperLeaderElection election) {
-        return jobs.get("settlement-job")
-            .start(steps.get("leader-check-step")
-                .<Payment, Payment>chunk(100)
-                .reader(pendingPaymentsReader())
-                .processor(item -> {
-                    // Double-check leadership before processing each chunk
-                    if (!election.isLeader()) {
-                        throw new LeadershipLostException(
-                            "Leadership lost mid-batch; aborting"
-                        );
-                    }
-                    return item;
-                })
-                .writer(settlementWriter())
-                .faultTolerant()
-                .skipLimit(0)  // No skips — financial data must be perfect
-                .build()
-            )
+    public Job settlementJob(JobRepository jobRepository, Step settlementStep) {
+        return new JobBuilder("settlement-job", jobRepository)
+            .start(settlementStep)
             .build();
+    }
+
+    @Bean
+    public Step settlementStep(JobRepository jobRepository,
+                               PlatformTransactionManager txManager,
+                               ZooKeeperLeaderElection election) {
+        return new StepBuilder("settlement-step", jobRepository)
+            .<Payment, Payment>chunk(100, txManager)
+            .reader(pendingPaymentsReader())
+            .processor(item -> {
+                // Re-check leadership for every item; fencing tokens in the
+                // writer still guard against a leader that has not noticed yet
+                if (!election.isLeader()) {
+                    throw new LeadershipLostException(
+                        "Leadership lost mid-batch; aborting"
+                    );
+                }
+                return item;
+            })
+            .writer(settlementWriter())   // writes include the fencing token
+            .build();                     // no skip policy: any error fails the step
     }
 }
 ```
@@ -662,19 +674,19 @@ public class SettlementBatchConfig {
 ## Common Pitfalls
 
 **1. Not Accounting for the Leader Thinking It's Still Leader**
-A leader that has been network-partitioned away from the quorum may continue operating for the duration of its lease TTL. All writes during this window may be rejected (or cause split-brain) when the new leader is elected. Never set lease TTL below 2x the maximum expected network partition duration.
+A leader that has been partitioned away from the quorum may keep working until it notices that it cannot renew its lease — and a GC pause can make it notice too late. A longer TTL does not fix this; it only delays failover. The old leader must stop leader work as soon as a renewal fails, and fencing tokens must reject any writes it still sends.
 
-**2. Using Database Row Locks as Leader Election**
-`SELECT FOR UPDATE` on a "leader" row in the database is not a reliable leader election mechanism. If the application crashes without releasing the lock, the lock may persist indefinitely (depending on the database's connection handling). Use purpose-built tools (ZooKeeper, etcd) for distributed coordination.
+**2. Using Database Locks as Leader Election Without Care**
+A row lock or PostgreSQL advisory lock ties leadership to one database connection. A half-open TCP connection can keep the lock for minutes (until TCP keepalive gives up), and connection pools hide which session holds it. It can work with short TCP keepalives and fencing, but ZooKeeper and etcd give you sessions, leases, and watches designed for exactly this.
 
 **3. Ignoring Fencing Tokens**
 Implementing leader election without fencing tokens leaves you vulnerable to deposed leaders continuing to write data. A deposed leader that writes to the payment database can corrupt settlement results. Always implement fencing.
 
 **4. Too-Short Lease Periods**
-Lease periods shorter than the maximum GC pause time (which can be hundreds of milliseconds in Java) will cause leaders to expire their leases during GC pauses. Set lease TTL to at least 5x the maximum expected GC pause time.
+Lease periods shorter than the maximum GC pause time (which can be hundreds of milliseconds in Java) will cause leaders to expire their leases during GC pauses. Set lease TTL to at least 5x the maximum expected GC pause time — and still use fencing tokens, because a rare pause can outlast any TTL.
 
-**5. Split-Brain During Network Heals**
-When a network partition heals, both partitions may have elected leaders. The resolution protocol (term comparison in Raft, session ID comparison in ZooKeeper) must correctly identify and demote the stale leader before any writes are accepted.
+**5. Split-Brain When the Network Heals**
+With quorum-based election only the majority side can elect a new leader, but the old leader on the minority side may still believe it leads. When the network heals, the higher term (Raft) or the expired session (ZooKeeper) demotes it — but any writes it sent in the meantime must already have been rejected by fencing.
 
 ---
 
@@ -718,7 +730,7 @@ Formally document and test the maximum time between leader failure and new leade
       "explanation": "ZooKeeper ephemeral nodes are automatically deleted when the creating session expires (the client disconnects or times out). When Node B crashes, its session expires, ZooKeeper deletes the leader znode, and Node C (which was watching the znode with a Watcher) receives a NodeDeleted event. Node C then attempts to create a new leader znode — if successful, it becomes the new leader."
     },
     {
-      "text": "Why should the etcd distributed lock TTL be set to 2-3 times the maximum expected operation duration, rather than a very short TTL?",
+      "text": "An etcd lock is held with a lease that is NOT kept alive while the work runs. Why must its TTL be well above the maximum expected operation duration?",
       "options": [
         "A very short TTL causes etcd to replicate the lock state more frequently, increasing write amplification across the cluster.",
         "A TTL shorter than the operation duration can expire while the lock holder is still processing, causing two nodes to simultaneously hold the lock — the exact split-brain scenario the lock is designed to prevent.",
@@ -726,7 +738,7 @@ Formally document and test the maximum time between leader failure and new leade
         "A short TTL causes the lock holder to send excessive heartbeat requests to etcd, overwhelming the cluster under high load."
       ],
       "correct": 1,
-      "explanation": "If the TTL expires while the lock holder is still processing (due to a GC pause, slow query, or network delay), another node acquires the lock. Now two nodes hold the same lock simultaneously — the split-brain condition the lock was designed to prevent. Setting TTL to 2-3x the expected operation duration provides a safety margin for variability in processing time."
+      "explanation": "If the TTL expires while the lock holder is still processing (due to a GC pause, slow query, or network delay), another node acquires the lock. Now two nodes act as holders at the same time — the split-brain condition the lock was designed to prevent. A large margin helps, but the robust design keeps the lease alive while working and uses fencing tokens, because a long pause can still outlast any TTL."
     }
   ]
 }

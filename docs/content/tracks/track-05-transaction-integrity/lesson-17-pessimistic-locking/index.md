@@ -11,6 +11,8 @@ tags: [pessimistic-locking, SELECT-FOR-UPDATE, advisory-locks, deadlock, Postgre
 java-versions: [17, 21]
 ---
 
+## Overview
+
 Pessimistic locking assumes the worst: another transaction is about to touch the same row, so the database acquires an exclusive lock the moment you read it. In payment systems this is not paranoia — it is the correct default for any operation where the cost of a conflict exceeds the cost of waiting. Optimistic locking wins when conflicts are rare; pessimistic locking wins when they are not, and when user-facing correctness cannot tolerate a retry loop.
 
 ## Learning Objectives
@@ -24,7 +26,7 @@ Pessimistic locking assumes the worst: another transaction is about to touch the
 
 ## Business Context
 
-In March 2023 a mid-sized UK payments processor experienced a P1 incident during end-of-month bulk settlement. A batch job retried 12,000 failed payment records while the reconciliation job ran concurrently. Both jobs used optimistic locking with a single retry. Because 94% of the records were contested by both jobs simultaneously, the conflict rate exploded to 87% and each retry re-entered the same hot rows. The system issued 3.1× the expected database writes before the connection pool exhausted at 22:14 UTC. Settlement was delayed by 47 minutes, violating a Faster Payments SLA and triggering a £180,000 penalty from the scheme operator.
+*Composite example:* a mid-sized UK payments processor experiences a P1 incident during end-of-month bulk settlement. A batch job retried 12,000 failed payment records while the reconciliation job ran concurrently. Both jobs used optimistic locking with a single retry. Because 94% of the records were contested by both jobs simultaneously, the conflict rate exploded to 87% and each retry re-entered the same hot rows. The system issued 3.1× the expected database writes before the connection pool was exhausted. Settlement was delayed by 47 minutes, missing an internal settlement cut-off and triggering a formal incident review.
 
 Post-incident review concluded that the batch job — which processed rows sequentially and never needed concurrent access to the *same* row from two threads — should have used `SELECT FOR UPDATE SKIP LOCKED` from the start. That variant is entirely non-blocking: each worker claims a row exclusively and skips any row already claimed by a peer. The incident drove the team to mandate pessimistic locking for all batch consumers and reserve optimistic locking for real-time, user-initiated mutations on low-contention accounts.
 
@@ -86,7 +88,7 @@ public class WithdrawalService {
 ```
 
 > [!IMPORTANT]
-> `findByIdForUpdate` must only be called inside a `@Transactional` method. If called outside a transaction the lock is acquired and immediately released, providing no protection. Spring will not throw an exception — the method simply executes as a plain `SELECT`.
+> `findByIdForUpdate` must be called inside the same `@Transactional` method that performs the update. Outside a transaction, Hibernate rejects a locking query with `TransactionRequiredException`. Worse is the silent case: if only the repository call runs in its own tiny transaction, the lock is released the moment that call returns — before your update — and protects nothing.
 
 ## SKIP LOCKED and NOWAIT
 
@@ -100,10 +102,10 @@ public interface PaymentJobRepository extends JpaRepository<PaymentJob, UUID> {
 
     // Claim up to 50 unprocessed jobs; skip any already claimed by a peer worker
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @QueryHints(@QueryHint(name = "javax.persistence.lock.timeout", value = "-2"))
+    @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))
     @Query("""
         SELECT j FROM PaymentJob j
-         WHERE j.status = 'PENDING'
+         WHERE j.status = com.example.payments.JobStatus.PENDING
          ORDER BY j.createdAt
          LIMIT 50
         """)
@@ -111,13 +113,13 @@ public interface PaymentJobRepository extends JpaRepository<PaymentJob, UUID> {
 }
 ```
 
-The hint value `-2` maps to `FOR UPDATE SKIP LOCKED` in Hibernate's PostgreSQL dialect. Value `0` maps to `FOR UPDATE NOWAIT`.
+The hint value `-2` maps to `FOR UPDATE SKIP LOCKED` in Hibernate's PostgreSQL dialect. Value `0` maps to `FOR UPDATE NOWAIT`. (`LIMIT` in a JPQL query needs Hibernate 6; on older versions use a native query.) The claimed rows stay locked only until the transaction ends, so process them — or mark them `PROCESSING` — inside that transaction.
 
 **`NOWAIT`** raises an error immediately if any row in the result is already locked. Use this for user-facing operations where forcing the user to wait is unacceptable — the application can return a fast 409 Conflict rather than hanging until the holder commits.
 
 ```java
 @Lock(LockModeType.PESSIMISTIC_WRITE)
-@QueryHints(@QueryHint(name = "javax.persistence.lock.timeout", value = "0"))
+@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "0"))
 @Query("SELECT a FROM Account a WHERE a.id = :id")
 Optional<Account> findByIdNowait(@Param("id") UUID id);
 ```
@@ -137,7 +139,7 @@ public void processUserTransfer(UUID accountId, BigDecimal amount) {
 ```
 
 > [!NOTE]
-> The lock timeout hint is Hibernate-vendor-specific. In a PostgreSQL deployment `javax.persistence.lock.timeout = 0` translates to `FOR UPDATE NOWAIT` and `-2` translates to `FOR UPDATE SKIP LOCKED`. Always verify hint behaviour after upgrading Hibernate or switching database vendors.
+> The value `-2` is Hibernate-specific. In a PostgreSQL deployment `jakarta.persistence.lock.timeout = 0` translates to `FOR UPDATE NOWAIT` and `-2` translates to `FOR UPDATE SKIP LOCKED` (Spring Boot 2 / Hibernate 5 used the `javax.persistence.*` name). Always verify the generated SQL after upgrading Hibernate or switching database vendors.
 
 ## Deadlock Prevention: Canonical Lock Ordering
 
@@ -148,7 +150,7 @@ Transfer A→B: locks account A, then tries to lock account B  ─┐
 Transfer B→A: locks account B, then tries to lock account A  ─┴─ DEADLOCK
 ```
 
-PostgreSQL detects deadlocks by periodically traversing its wait-for graph (a directed graph where an edge from T1 to T2 means T1 is waiting for a lock T2 holds). When the traversal finds a cycle, PostgreSQL chooses one transaction as the victim and rolls it back with error code `40P01`. The default detection interval (`deadlock_timeout`) is 1 second — meaning your application hangs for up to a second before the error is raised.
+PostgreSQL detects deadlocks with its wait-for graph (a directed graph where an edge from T1 to T2 means T1 is waiting for a lock T2 holds). A backend that has waited for a lock longer than `deadlock_timeout` (default 1 second) checks the graph; if it finds a cycle, one transaction is rolled back with error code `40P01`. So a deadlock costs at least a second of hanging before the error is raised.
 
 The classical prevention technique is **canonical lock ordering**: always acquire locks in the same global order. For account transfers, sort by account ID before locking. If every transaction acquires the numerically smaller UUID first, a cycle in the wait-for graph is structurally impossible.
 
@@ -161,6 +163,9 @@ public class TransferService {
 
     @Transactional
     public void transfer(UUID fromId, UUID toId, BigDecimal amount) {
+        if (fromId.equals(toId)) {
+            throw new IllegalArgumentException("Source and destination must differ");
+        }
         // Canonical ordering: lock the account with the smaller UUID value first.
         // Both transfer directions will acquire locks in the same order,
         // making a deadlock cycle impossible.
@@ -212,7 +217,7 @@ sequenceDiagram
 ```
 
 > [!WARNING]
-> Canonical ordering only prevents deadlocks within a single code path. If a third service acquires locks on the same rows in a different order — for example, a background reconciliation job that sorts by `account_number` rather than UUID — deadlocks will still occur between services. Enforce lock ordering across *all* services that touch the same tables and document the rule in a shared Architecture Decision Record.
+> Canonical ordering only prevents deadlocks within a single code path. If a third service acquires locks on the same rows in a different order — for example, a background reconciliation job that sorts by `account_number` rather than UUID — deadlocks will still occur between services. Enforce lock ordering across *all* services that touch the same tables and document the rule in a shared Architecture Decision Record. Note that even "sort by UUID" is not automatically one rule: Java's `UUID.compareTo` compares the two halves as *signed* longs, which can differ from PostgreSQL's `ORDER BY` on a `uuid` column. The safest form is to lock all rows in one statement — `SELECT ... WHERE id IN (...) ORDER BY id FOR UPDATE` — so the database's own ordering applies everywhere.
 
 ## PostgreSQL Advisory Locks
 
@@ -221,22 +226,22 @@ Advisory locks are application-level locks managed by PostgreSQL but entirely ou
 - **Distributed leader election**: ensure only one pod runs a scheduled job at a time across a multi-instance deployment
 - **Background job exclusivity**: prevent two instances from processing the same logical entity simultaneously without holding a row lock for the full processing duration
 
-The key is a `BIGINT`. For domain objects, `hashtext(key_string)::bigint` produces a stable hash. Use `pg_try_advisory_xact_lock` for transaction-scoped locks (auto-released on commit/rollback) or `pg_try_advisory_lock` for session-scoped locks that must be explicitly released.
+The key is a `BIGINT`. For domain objects, `hashtext(key_string)::bigint` produces a stable hash (a 32-bit hash, so unrelated keys can collide — a collision only makes two jobs wait for each other, but keep it in mind). Use `pg_try_advisory_xact_lock` for transaction-scoped locks (auto-released on commit/rollback) or `pg_try_advisory_lock` for session-scoped locks that must be explicitly released.
 
 ```java
-@Repository
-public interface AdvisoryLockRepository {
+@Component
+@RequiredArgsConstructor
+public class AdvisoryLocks {
+
+    private final JdbcTemplate jdbc;   // joins the current Spring transaction's connection
 
     // Transaction-scoped: automatically released when the transaction ends.
+    // Must be called inside a @Transactional method.
     // Returns true if the lock was acquired; false if another holder exists.
-    @Query(value = "SELECT pg_try_advisory_xact_lock(:key)", nativeQuery = true)
-    boolean tryAcquireTransactionLock(@Param("key") long key);
-
-    @Query(value = "SELECT pg_try_advisory_lock(:key)", nativeQuery = true)
-    boolean tryAcquireSessionLock(@Param("key") long key);
-
-    @Query(value = "SELECT pg_advisory_unlock(:key)", nativeQuery = true)
-    boolean releaseSessionLock(@Param("key") long key);
+    public boolean tryAcquireTransactionLock(long key) {
+        return Boolean.TRUE.equals(jdbc.queryForObject(
+                "SELECT pg_try_advisory_xact_lock(?)", Boolean.class, key));
+    }
 }
 ```
 
@@ -245,7 +250,7 @@ public interface AdvisoryLockRepository {
 @RequiredArgsConstructor
 public class SettlementJobService {
 
-    private final AdvisoryLockRepository lockRepository;
+    private final AdvisoryLocks       advisoryLocks;
     private final SettlementProcessor processor;
 
     // A fixed key ensures only one JVM instance runs settlement at a time.
@@ -253,7 +258,7 @@ public class SettlementJobService {
 
     @Transactional
     public void runDailySettlement(LocalDate settlementDate) {
-        boolean acquired = lockRepository.tryAcquireTransactionLock(SETTLEMENT_LOCK_KEY);
+        boolean acquired = advisoryLocks.tryAcquireTransactionLock(SETTLEMENT_LOCK_KEY);
         if (!acquired) {
             log.info("Settlement already running on another instance — skipping");
             return;
@@ -264,53 +269,62 @@ public class SettlementJobService {
 }
 ```
 
-For long-running processing that spans multiple transactions, use a session-scoped advisory lock:
+For long-running processing that spans multiple transactions, use a session-scoped advisory lock. A session lock belongs to one *database connection*, so lock and unlock must happen on the same connection — never through a pooled call per statement, which may hand you a different connection each time:
 
 ```java
-@Transactional(propagation = Propagation.NOT_SUPPORTED) // runs outside any transaction
-public void processPaymentFile(UUID fileId) {
+// Runs outside any transaction; holds ONE dedicated connection for the lock
+public void processPaymentFile(UUID fileId) throws SQLException {
     long lockKey = fileId.getMostSignificantBits() ^ fileId.getLeastSignificantBits();
 
-    boolean acquired = lockRepository.tryAcquireSessionLock(lockKey);
-    if (!acquired) {
-        log.warn("File {} is already being processed on another instance", fileId);
-        return;
+    try (Connection lockConn = dataSource.getConnection()) {
+        if (!tryLock(lockConn, "SELECT pg_try_advisory_lock(?)", lockKey)) {
+            log.warn("File {} is already being processed on another instance", fileId);
+            return;
+        }
+        try {
+            fileProcessor.process(fileId); // may span several internal transactions
+        } finally {
+            // Unlock on the SAME connection that took the lock
+            tryLock(lockConn, "SELECT pg_advisory_unlock(?)", lockKey);
+        }
     }
-    try {
-        fileProcessor.process(fileId); // may span several internal transactions
-    } finally {
-        lockRepository.releaseSessionLock(lockKey); // must always be called
+}
+
+private static boolean tryLock(Connection c, String sql, long key) throws SQLException {
+    try (PreparedStatement ps = c.prepareStatement(sql)) {
+        ps.setLong(1, key);
+        try (ResultSet rs = ps.executeQuery()) {
+            rs.next();
+            return rs.getBoolean(1);
+        }
     }
 }
 ```
 
 > [!NOTE]
-> Session-scoped advisory locks are **not** released by transaction rollback. If the application crashes before the `finally` block executes, the lock remains held until the database connection is closed. For this reason, prefer transaction-scoped advisory locks whenever the work fits inside a single transaction boundary.
+> Session-scoped advisory locks are **not** released by transaction rollback — only by an explicit unlock or by closing the connection. If the process dies, its connections close and the locks go with them. The dangerous case is a pooled connection: if the unlock is skipped, or runs on a different connection, the lock stays held by a connection that lives on in the pool, possibly for hours. For this reason, prefer transaction-scoped advisory locks whenever the work fits inside a single transaction boundary.
 
 ## Monitoring Lock Contention
 
 Two PostgreSQL system views are essential for diagnosing lock problems in production.
 
-**`pg_locks`** shows every lock currently held or awaited across all sessions:
+**`pg_locks`** shows every lock currently held or awaited across all sessions; together with the function `pg_blocking_pids()` it tells you who is blocking whom:
 
 ```sql
--- Find all blocked transactions and the query that is blocking them
+-- Find all blocked sessions and the sessions blocking them.
+-- pg_blocking_pids() covers every lock type (row, table, advisory).
 SELECT
-    blocked.pid                              AS blocked_pid,
-    blocked_activity.query                   AS blocked_query,
-    blocking.pid                             AS blocking_pid,
-    blocking_activity.query                  AS blocking_query,
-    blocked_activity.wait_event              AS wait_event,
-    now() - blocked_activity.query_start     AS blocked_duration
-FROM pg_locks           AS blocked
-JOIN pg_stat_activity   AS blocked_activity
-    ON blocked_activity.pid = blocked.pid
-JOIN pg_locks           AS blocking
-    ON  blocking.transactionid = blocked.transactionid
-    AND blocking.pid           <> blocked.pid
-JOIN pg_stat_activity   AS blocking_activity
-    ON blocking_activity.pid = blocking.pid
-WHERE NOT blocked.granted
+    blocked.pid                          AS blocked_pid,
+    left(blocked.query, 120)             AS blocked_query,
+    blocking.pid                         AS blocking_pid,
+    left(blocking.query, 120)            AS blocking_query,
+    blocking.state                       AS blocking_state,   -- 'idle in transaction' is a red flag
+    blocked.wait_event                   AS wait_event,
+    now() - blocked.query_start          AS blocked_duration
+FROM pg_stat_activity AS blocked
+JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+JOIN pg_stat_activity AS blocking
+    ON blocking.pid = b.pid
 ORDER BY blocked_duration DESC;
 ```
 
@@ -335,11 +349,20 @@ Add an alert when any transaction has been waiting longer than 5 seconds. In a h
 
 ```java
 @Component
-@RequiredArgsConstructor
 public class LockWaitMetrics {
 
     private final JdbcTemplate jdbc;
-    private final MeterRegistry meterRegistry;
+    private final AtomicInteger waiting = new AtomicInteger();
+
+    public LockWaitMetrics(JdbcTemplate jdbc, MeterRegistry meterRegistry) {
+        this.jdbc = jdbc;
+        // Register the gauge ONCE; it reads the AtomicInteger on every scrape.
+        // (Re-registering inside the scheduled method would return the first
+        //  gauge again, frozen on its first value.)
+        Gauge.builder("db.lock.waiting_transactions", waiting, AtomicInteger::get)
+             .description("Transactions currently waiting for a lock")
+             .register(meterRegistry);
+    }
 
     @Scheduled(fixedDelay = 10_000)
     public void recordLockWaitCount() {
@@ -348,23 +371,19 @@ public class LockWaitMetrics {
               FROM pg_stat_activity
              WHERE wait_event_type = 'Lock'
             """, Integer.class);
-
-        Gauge.builder("db.lock.waiting_transactions",
-                      () -> count != null ? count : 0)
-             .description("Transactions currently waiting for a row lock")
-             .register(meterRegistry);
+        waiting.set(count != null ? count : 0);
     }
 }
 ```
 
 > [!WARNING]
-> Never run lock diagnostic queries against a heavily loaded production database without checking query plan costs first. `pg_locks` and `pg_stat_activity` are virtual tables, but joining them on a 1,000-connection instance can consume noticeable CPU. Run these queries from a monitoring replica or via a dedicated low-priority connection pool.
+> Be careful running lock diagnostic queries against a heavily loaded production database. `pg_locks` and `pg_stat_activity` are virtual views, but joining them on a 1,000-connection instance can consume noticeable CPU. They must run on the **primary** — lock information is per server, so a replica cannot see the primary's locks — so use a dedicated small connection pool with a `statement_timeout`, and do not poll more often than every few seconds.
 
 ## Knowledge Check
 
 **Q1: A payment API endpoint must debit an account and return a response within 200 ms. The account row is currently locked by another transaction that has held it for 150 ms. Which variant should you use — `FOR UPDATE`, `FOR UPDATE NOWAIT`, or `FOR UPDATE SKIP LOCKED` — and why?**
 
-Use `FOR UPDATE NOWAIT`. The endpoint must not wait an unknown duration for the holder to release. `NOWAIT` causes PostgreSQL to raise an error immediately, which the service translates into an HTTP 409 Conflict response. The client can retry after a short backoff. `SKIP LOCKED` does not apply here because the endpoint must process *this specific* account, not any available row from a pool. Plain `FOR UPDATE` would block until the holder commits, almost certainly violating the 200 ms SLA.
+Use `FOR UPDATE NOWAIT`. The endpoint must not wait an unknown duration for the holder to release. `NOWAIT` causes PostgreSQL to raise an error immediately, which the service translates into an HTTP 409 Conflict response. The client can retry after a short backoff. `SKIP LOCKED` does not apply here because the endpoint must process *this specific* account, not any available row from a pool. Plain `FOR UPDATE` would block until the holder commits, almost certainly violating the 200 ms SLA. (A middle ground is `SET LOCAL lock_timeout = '50ms'` before the locking read: a short, bounded wait instead of none.)
 
 **Q2: Two services both use canonical lock ordering, but the transfer service sorts by UUID while the reconciliation service was recently updated to sort by `account_number` (VARCHAR). Can a deadlock still occur?**
 
@@ -411,12 +430,12 @@ A fintech startup runs a micro-lending platform. Each evening a batch job proces
       "text": "What is the correct use case for transaction-scoped advisory locks (pg_try_advisory_xact_lock) versus session-scoped advisory locks (pg_try_advisory_lock), and what is the operational risk of using session-scoped locks?",
       "options": [
         "Transaction-scoped locks are for single-row operations; session-scoped locks are for multi-table operations",
-        "Transaction-scoped locks auto-release on commit/rollback and are preferred when work fits in one transaction; session-scoped locks persist across transactions but are NOT released on rollback — if the application crashes before the finally block, the lock remains held until the connection closes",
+        "Transaction-scoped locks auto-release on commit/rollback and are preferred when work fits in one transaction; session-scoped locks persist across transactions and are NOT released on rollback — if the unlock is skipped or runs on a different pooled connection, the lock stays held by a connection that lives on in the pool",
         "Session-scoped locks are more efficient because they avoid re-acquiring the lock on each transaction retry",
         "Transaction-scoped locks can only be used with FOR UPDATE while session-scoped locks work independently"
       ],
       "correct": 1,
-      "explanation": "Transaction-scoped advisory locks (pg_try_advisory_xact_lock) are automatically released when the transaction commits or rolls back — no explicit release needed. Session-scoped locks (pg_try_advisory_lock) persist across transaction boundaries and must be explicitly released via pg_advisory_unlock. The critical risk: if the application crashes before the finally block executes, the session-scoped lock remains held until the database connection is forcibly closed. Prefer transaction-scoped locks whenever work fits in a single transaction."
+      "explanation": "Transaction-scoped advisory locks (pg_try_advisory_xact_lock) are released automatically when the transaction commits or rolls back. Session-scoped locks (pg_try_advisory_lock) belong to one database connection, persist across transactions and must be released explicitly with pg_advisory_unlock on that same connection. The critical risk is connection pooling: a skipped unlock, or an unlock sent on a different pooled connection, leaves the lock held by a connection that stays alive in the pool. Prefer transaction-scoped locks whenever work fits in a single transaction."
     }
   ]
 }

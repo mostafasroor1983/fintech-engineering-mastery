@@ -36,7 +36,9 @@ references:
   - "FATF, 'Guidance on Correspondent Banking Services', 2016"
 ---
 
-Cross-border payments — moving money from an account in one country to an account in another — are among the most complex operations in finance. Unlike domestic payments that run on a single clearing infrastructure, international transfers traverse chains of banks connected by bilateral correspondent relationships, each applying its own fees, exchange rates, and compliance controls. Despite representing only a fraction of total payment volume, cross-border payments generate a disproportionate share of operational complexity, regulatory scrutiny, and customer complaints. The G20 roadmap targets cross-border payments that are faster than 1 hour (by 2027), cheaper than 1% of transaction value (by 2030), more transparent (real-time tracking), and more accessible to unbanked populations. Engineers building the systems that process these payments must understand the full chain: from correspondent routing selection through nostro account management, FX conversion, charge deduction, to sanctions screening at every node.
+## Overview
+
+Cross-border payments — moving money from an account in one country to an account in another — are among the most complex operations in finance. Unlike domestic payments that run on a single clearing infrastructure, international transfers traverse chains of banks connected by bilateral correspondent relationships, each applying its own fees, exchange rates, and compliance controls. Despite representing only a fraction of total payment volume, cross-border payments generate a disproportionate share of operational complexity, regulatory scrutiny, and customer complaints. The G20 roadmap sets targets for the end of 2027: for wholesale and retail payments, an average cost of no more than 1%, 75% of payments credited within one hour and nearly all within one business day — plus better transparency (tracking and fee disclosure) and access. Engineers building the systems that process these payments must understand the full chain: from correspondent routing selection through nostro account management, FX conversion, charge deduction, to sanctions screening at every node.
 
 ## Learning Objectives
 
@@ -51,7 +53,7 @@ Cross-border payments — moving money from an account in one country to an acco
 
 ## Business Context
 
-In Q2 2023, a European mid-market bank analysed its cross-border payment cost structure following a client complaint campaign. The bank processed 180,000 USD-denominated cross-border payments per month on behalf of SME clients. Average transaction value was €22,000. The bank discovered that 34% of payments were routing through three correspondent hops when two hops were technically available — because the routing table had not been updated for 18 months and several bilateral corridors established with two new correspondent partners had never been activated in the payment engine. The three-hop route charged $45–$55 per payment in correspondent fees; the two-hop route charged $18–$24. The unnecessary overpayment was costing clients approximately $4.3 million per year in excess charges, and the bank was absorbing $1.1 million of that to stay competitive on advertised FX rates. Additionally, 2,100 payments per month were arriving at beneficiaries with deductions that customers had not expected (SHA charges applied mid-chain by intermediaries), triggering 800–900 manual customer service enquiries per month at a cost of $65 per enquiry. This lesson teaches you to build a routing engine and charge calculator that makes these costs visible and controllable.
+*Composite example (based on common industry patterns, not a specific bank):* after a wave of client complaints, a mid-sized bank analysed the cost of its USD cross-border payments for business clients. It found that about a third of payments were routed through three correspondent hops although two-hop routes existed — the routing table had not been updated for over a year, and corridors with two new correspondent partners had never been activated in the payment engine. The three-hop route cost roughly twice as much in correspondent fees as the two-hop route, costing clients millions a year in excess charges, part of which the bank absorbed to stay competitive. In addition, thousands of payments a month arrived with deductions that customers had not expected (SHA charges taken by intermediaries), generating hundreds of manual customer-service enquiries every month. This lesson teaches you to build a routing engine and charge calculator that make these costs visible and controllable.
 
 ## Correspondent Banking Chain
 
@@ -89,7 +91,7 @@ Each hop involves:
 6. Updating the GPI Tracker with the new status
 
 > [!NOTE]
-> The number of hops in a corridor is determined by the existence of bilateral correspondent relationships and central bank access rules. Direct USD clearing requires membership of CHIPS (US) or Fedwire. Direct EUR clearing requires access to TARGET2/TIPS or EBA EURO1/STEP2. Banks without direct access must route through a correspondent that has it. Acquiring direct access is expensive (minimum reserve requirements, compliance infrastructure, local legal entity) — many smaller banks rationally remain indirect participants.
+> The number of hops in a corridor is determined by the existence of bilateral correspondent relationships and central bank access rules. Direct USD clearing requires access to Fedwire or membership of CHIPS. Direct EUR clearing requires access to T2 (the successor of TARGET2), TIPS, or EBA Clearing's EURO1, STEP2 or RT1. Banks without direct access must route through a correspondent that has it. Acquiring direct access is expensive (minimum reserve requirements, compliance infrastructure, local legal entity) — many smaller banks rationally remain indirect participants.
 
 ## Nostro and Vostro Account Mechanics
 
@@ -111,12 +113,12 @@ sequenceDiagram
     BA->>BB: MT103 — pay $50,000 to Widgets Inc
     BB->>BB: Debit Bank A vostro $50,000
     BB->>FED: Fedwire — credit Widgets Inc bank
-    BB-->>BA: MT910 confirmation (credit advice)
+    BB-->>BA: MT900 confirmation (debit advice)
 
     Note over BA,BB: Nostro balance now $9,950,000
 ```
 
-**Netting** reduces the amount of pre-funding required. If Bank A sends 500 payments per day averaging $20,000 each = $10M outbound, but also receives $8M inbound through the same corridor, only the $2M net needs to be settled. Banks manage nostro accounts actively, sweeping excess balances and topping up when balances fall below minimum thresholds.
+**Netting** reduces the amount of pre-funding required. If Bank A sends 500 payments per day averaging $20,000 each = $10M outbound, but also receives $8M inbound into the same nostro account, the inflows replenish the balance and only the $2M net outflow needs new funding. Banks manage nostro accounts actively, sweeping excess balances and topping up when balances fall below minimum thresholds.
 
 A Java nostro balance manager:
 
@@ -171,7 +173,6 @@ GPI status codes:
 | `ACCC` | Accepted, Credit Completed | Payment delivered — final state |
 | `RJCT` | Rejected | Investigate reason code, return funds |
 | `PDNG` | Pending | Awaiting compliance clearance |
-| `PART` | Partial | Partial credit (rare, bilateral agreement) |
 
 GPI also carries **g4c (gpi for corporates) fields** that expose tracking data to corporate customers via their bank's APIs — balance of charges deducted so far, FX rates applied, and the name of each bank that processed the payment.
 
@@ -206,7 +207,9 @@ public class GpiPaymentTracker {
     }
 
     private boolean isWithinGpiSla(List<ProcessingStep> steps) {
-        // GPI SLA: credited within business day for 75% of payments, within 30 min for 25%
+        // gpi rule: credit the beneficiary on the same business day (subject to
+        // cut-off times and compliance checks). A simple 24-hour window is an
+        // approximation — production code uses each bank's business calendar
         return steps.stream()
             .filter(s -> "ACCC".equals(s.status()))
             .findFirst()
@@ -307,16 +310,16 @@ sequenceDiagram
     participant Corp as Corporate Payer
     participant OB as Originating Bank
     participant FXDesk as FX Desk / Treasury
-    participant C1 as Correspondent (USD)
+    participant C1 as Correspondent (EUR)
     participant BB as Beneficiary Bank (EUR)
 
-    Corp->>OB: Pay EUR 46,200 for invoice\n(holds USD 50,000)
-    OB->>FXDesk: Get EUR/USD spot rate
-    FXDesk-->>OB: 1 EUR = 1.0820 USD\n(spread: 0.5 bps)
-    OB->>Corp: Debit USD 50,000 (= EUR 46,210 at 1.0822)\nFX rate locked
-    OB->>C1: MT103 — USD 50,000, 71A: OUR\n(instructed amount in USD)
-    C1->>C1: Deduct $25 correspondent fee\n(OUR: invoiced to OB separately)
-    C1->>BB: MT103 — EUR 46,200\n(C1 runs nostro in EUR at BBVA)
+    Corp->>OB: Pay EUR 46,200 for invoice\n(account in USD), charges OUR
+    OB->>FXDesk: Get EUR/USD rate
+    FXDesk-->>OB: Customer rate 1 EUR = 1.0822 USD\n(bank margin built into the rate)
+    OB->>Corp: Debit USD 49,997.64 (= EUR 46,200 x 1.0822)\nFX rate locked
+    OB->>C1: pacs.008 — EUR 46,200, ChrgBr DEBT (OUR)\npaid from OB's EUR nostro
+    C1->>C1: Fee EUR 20 invoiced to OB separately\n(OUR: nothing deducted)
+    C1->>BB: pacs.008 — EUR 46,200
     BB->>BB: Credit beneficiary account EUR 46,200
 ```
 
@@ -401,31 +404,29 @@ sequenceDiagram
     participant Corp as US Corp\n(New York)
     participant OB as JP Morgan\nCHASUS33
     participant FED as Fedwire
-    participant CB as Commerzbank NY\nCBKUS33
+    participant CB as Commerzbank NY
     participant CBDE as Commerzbank DE\nCOBADEFF
-    participant ECB as TARGET2
+    participant ECB as T2 (Eurosystem)
     participant BB as Deutsche Bank\nDEUTDEDB
     participant Supp as German Supplier
 
-    Corp->>OB: Pay EUR 46,200 invoice\n(debit USD 50,000)
-    OB->>OB: FX conversion @ 1.0822\nUSDEUR → EUR 46,210
-    OB->>CB: pacs.008 (USD leg)\nUETR: abc-123\nAmount: USD 50,000
-    CB->>FED: Fedwire settlement\nJPM → Commerzbank NY\nUSD 50,000
-    CB->>CB: USD→EUR conversion\nCredit CBDE nostro EUR 46,185\n(CB deducts $25 fee)
-    CB->>CBDE: Internal transfer notification
-    CBDE->>ECB: TARGET2 settlement\nCommerzbank → Deutsche Bank\nEUR 46,185
-    ECB->>BB: EUR 46,185 credited
-    BB->>Supp: Account credited EUR 46,185\n(EUR 15 deducted by CBDE under SHA)
-    BB-->>CBDE: pacs.002 ACCC
-    CBDE-->>CB: pacs.002 forwarded
-    CB-->>OB: pacs.002 forwarded
-    OB-->>Corp: Payment confirmed EUR 46,185 delivered
-    Note over OB,BB: Total elapsed: ~4 hours\nGPI Tracker updated at each hop
+    Corp->>OB: Pay USD 50,000 to German supplier\n(charges SHA)
+    OB->>CB: pacs.008 USD 50,000, UETR abc-123
+    OB->>FED: Fedwire: JPM to Commerzbank NY, USD 50,000
+    CB->>CB: Deduct USD 25 fee (SHA)\nConvert USD 49,975 @ 1.0822 = EUR 46,179.08
+    CB->>CBDE: Forward in EUR
+    CBDE->>CBDE: Deduct EUR 15 fee (SHA)
+    CBDE->>ECB: T2 settlement: Commerzbank to Deutsche Bank\nEUR 46,164.08
+    ECB->>BB: EUR 46,164.08 credited
+    BB->>Supp: Account credited EUR 46,164.08
+    BB-->>CBDE: gpi Tracker update: ACCC
+    OB-->>Corp: Tracker shows EUR 46,164.08 delivered
+    Note over OB,BB: Each bank updates the gpi Tracker\nwith status, fees and FX rate
 ```
 
 ## SEPA for Intra-EU Payments
 
-The Single Euro Payments Area (SEPA) created a unified payment infrastructure for EUR transactions across 36 European countries. For intra-EU EUR payments, SEPA eliminates the need for a correspondent chain entirely:
+The Single Euro Payments Area (SEPA) created a unified payment infrastructure for EUR transactions across around 40 European countries and territories (the EPC publishes the current list). For intra-EU EUR payments, SEPA eliminates the need for a correspondent chain entirely:
 
 | Feature | Via Correspondent | Via SEPA SCT |
 |---------|------------------|-------------|
@@ -433,7 +434,7 @@ The Single Euro Payments Area (SEPA) created a unified payment infrastructure fo
 | Typical fees | $15–$45 | €0.00–€0.50 |
 | Settlement | Same/next day | T+1 (SCT) or <10s (SCT Inst) |
 | Transparency | Limited (no GPI on old MT) | End-to-end pacs.002 |
-| Coverage | 200+ countries | 36 SEPA countries, EUR only |
+| Coverage | 200+ countries | SEPA countries only, EUR only |
 
 The routing engine must check SEPA eligibility before considering correspondent chains. For a EUR payment from France to Poland, SEPA SCT Instant is cheaper, faster, and more transparent than any correspondent chain.
 
@@ -443,7 +444,8 @@ public class SepaEligibilityChecker {
     private static final Set<String> SEPA_COUNTRIES = Set.of(
         "AT","BE","BG","CY","CZ","DE","DK","EE","ES","FI","FR","GR","HR","HU",
         "IE","IT","LT","LU","LV","MT","NL","PL","PT","RO","SE","SI","SK",
-        "IS","LI","NO","CH","GB","MC","SM","VA","AD"
+        "IS","LI","NO","CH","GB","MC","SM","VA","AD",
+        "AL","ME","MD","MK","RS"   // newer SEPA members — load the list from the EPC, don't hard-code it
     );
 
     public SepaEligibility check(PaymentInstruction payment) {
@@ -456,7 +458,7 @@ public class SepaEligibilityChecker {
         if (!isValidIban(payment.getCreditorAccount())) {
             return SepaEligibility.NOT_ELIGIBLE_NO_IBAN;
         }
-        // Check creditor BIC is reachable on STEP2 / TIPS
+        // Check creditor bank is reachable for the scheme (e.g. via STEP2, RT1 or TIPS)
         if (!sepaReachabilityRegistry.isReachable(payment.getCreditorBic())) {
             return SepaEligibility.NOT_ELIGIBLE_NOT_REACHABLE;
         }
@@ -490,10 +492,10 @@ graph TB
     style BB fill:#2d6a4f,color:#fff
 ```
 
-A match at any hop triggers a **hold** on the payment. The holding bank must freeze funds, file a Suspicious Activity Report (SAR) or equivalent, and notify the sending bank (via MT299 / camt.056) that the payment cannot proceed. The originating bank must then:
+A potential match at any hop triggers a **hold** on the payment while it is investigated. If the match is confirmed, the bank may be legally required to **block (freeze)** the funds and report to the sanctions authority (for example OFAC in the US, OFSI in the UK); a suspicion of money laundering may also require a Suspicious Activity Report (SAR). In other cases the payment is rejected and returned (pacs.004 / MT103 return) with a carefully chosen reason. The originating bank must then:
 
 1. Notify the payer that the payment is blocked
-2. Return the funds (if already debited)
+2. Return the funds to the payer if the payment was rejected (blocked funds cannot be returned)
 3. Avoid "tipping off" the subject of the screening match (a legal prohibition in most jurisdictions)
 
 ```java
@@ -505,6 +507,8 @@ public class SanctionsScreeningService {
     private final AuditLogger auditLogger;
 
     public ScreeningResult screen(PaymentInstruction payment) {
+        // Screen EVERY party and free-text field, not just debtor and creditor:
+        // agents, intermediaries, ultimate parties, addresses, remittance text
         List<ScreeningEntity> entitiesToScreen = List.of(
             ScreeningEntity.of(payment.getDebtorName(), payment.getDebtorCountry(), EntityType.PARTY),
             ScreeningEntity.of(payment.getCreditorName(), payment.getCreditorCountry(), EntityType.PARTY),
@@ -512,10 +516,12 @@ public class SanctionsScreeningService {
         );
 
         for (ScreeningEntity entity : entitiesToScreen) {
+            // Do NOT filter candidates by the party's country: a sanctioned
+            // person is sanctioned wherever they bank. Country (and date of
+            // birth, etc.) may raise or lower the score, never exclude a hit
             List<SanctionsMatch> matches = sanctionsRepo.search(entity.getName())
                 .stream()
                 .filter(candidate -> nameMatcher.score(entity.getName(), candidate.getName()) > 0.85)
-                .filter(candidate -> countryMatches(entity.getCountry(), candidate.getJurisdiction()))
                 .toList();
 
             if (!matches.isEmpty()) {
@@ -526,12 +532,6 @@ public class SanctionsScreeningService {
 
         auditLogger.logClear(payment.getUetr(), entitiesToScreen.size());
         return ScreeningResult.clear();
-    }
-
-    private boolean countryMatches(String paymentCountry, String sanctionJurisdiction) {
-        // "GLOBAL" sanctions apply regardless of country
-        if ("GLOBAL".equals(sanctionJurisdiction)) return true;
-        return sanctionJurisdiction.equals(paymentCountry);
     }
 }
 ```
@@ -547,7 +547,7 @@ A: Correspondent A fee = $30 + ($100,000 × 0.0002) = $30 + $20 = $50. Remaining
 
 **Q2: Your `CorrespondentPaymentRouter` selects a 2-hop chain for a USD→SGD payment. The payment is submitted via SWIFT, and after 6 hours the GPI Tracker shows status `ACSP` with the last-updating bank being Correspondent A. What does `ACSP` mean, and what actions should your system take at the 6-hour and 24-hour marks?**
 
-A: `ACSP` (Accepted, Settlement in Process) means the payment has been accepted by at least one bank in the chain but has not yet been credited to the beneficiary's account — it is still in transit. At the 6-hour mark, the system should: (1) check whether this latency is within the expected p95 for the USD→SGD corridor (which may legitimately take 6–12 hours); (2) emit a monitoring alert if the GPI SLA for the corridor specifies delivery within 4 hours; (3) make the current status visible to the customer via the tracking API so they are not calling customer service. At the 24-hour mark, the GPI global SLA (business-day delivery) has been breached. The system must: (1) escalate to the payment operations team; (2) trigger a GPI tracer request (gSRP) to the last-known bank (Correspondent A) requesting an update; (3) notify the customer that the payment is delayed and provide an estimated resolution time; (4) log the SLA breach for monthly scheme performance reporting.
+A: `ACSP` (Accepted, Settlement in Process) means the payment has been accepted by at least one bank in the chain but has not yet been credited to the beneficiary's account — it is still in transit. At the 6-hour mark, the system should: (1) check whether this latency is within the expected p95 for the USD→SGD corridor (which may legitimately take 6–12 hours); (2) emit a monitoring alert if the GPI SLA for the corridor specifies delivery within 4 hours; (3) make the current status visible to the customer via the tracking API so they are not calling customer service. At the 24-hour mark, the gpi same-business-day expectation has very likely been missed. The system must: (1) escalate to the payment operations team; (2) open an enquiry with the last-known bank (Correspondent A) asking for the status — through the gpi Tracker's case management or an MT199/camt.027 investigation message (gSRP, "stop and recall", is only for cancelling a payment, not for chasing it); (3) notify the customer that the payment is delayed and provide an estimated resolution time; (4) log the SLA breach for monthly scheme performance reporting.
 
 ## Practical Challenge
 
@@ -582,7 +582,7 @@ A: `ACSP` (Accepted, Settlement in Process) means the payment has been accepted 
         "Alert, Suspicious Payment — the payment is under compliance review"
       ],
       "correct": 1,
-      "explanation": "`ACSP` (Accepted, Settlement in Process) means the payment has been accepted by at least one bank in the chain but has not yet been credited to the beneficiary's account — it is still in transit. At the 24-hour mark, the GPI global SLA (business-day delivery) has been breached and a gSRP tracer request must be initiated."
+      "explanation": "`ACSP` (Accepted, Settlement in Process) means the payment has been accepted by at least one bank in the chain but has not yet been credited to the beneficiary — it is still in transit. If it is still ACSP at the 24-hour mark, the same-business-day expectation has been missed: escalate and open an enquiry with the last bank that updated the tracker (gSRP is for stop-and-recall, not for chasing)."
     },
     {
       "text": "Under the OUR charge bearer instruction, who pays the correspondent banking fees?",

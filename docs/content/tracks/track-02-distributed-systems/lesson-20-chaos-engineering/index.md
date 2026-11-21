@@ -63,13 +63,18 @@ public class ChaosHypothesisValidator {
                                       Instant experimentStart,
                                       Instant experimentEnd) {
         // Collect metrics during the experiment window
+        // A RATIO (successes / all), not a raw rate in requests per second
         MetricSample paymentSuccessRate = metricsClient.queryRange(
-            "rate(payment_authorizations_total{result='success'}[1m])",
+            "sum(rate(payment_authorizations_total{result=\"success\"}[1m]))" +
+            " / sum(rate(payment_authorizations_total[1m]))",
             experimentStart, experimentEnd
         );
 
+        // histogram_quantile needs the per-second rate of the buckets,
+        // summed by the le label
         MetricSample p99Latency = metricsClient.queryRange(
-            "histogram_quantile(0.99, payment_authorization_duration_seconds_bucket)",
+            "histogram_quantile(0.99, sum by (le) " +
+            "(rate(payment_authorization_duration_seconds_bucket[1m])))",
             experimentStart, experimentEnd
         );
 
@@ -128,7 +133,9 @@ public class ChaosMonkeyService {
      * Terminate one random non-critical instance in the payment processor ASG.
      * Only runs during allowed hours and when the cluster is healthy.
      */
-    @Scheduled(cron = "0 */4 10-16 * * MON-FRI")  // Business hours, every 4 hours
+    // Spring cron: second minute hour day month weekday.
+    // "0 0 10-16/4" = 10:00 and 14:00. ("0 */4 10-16" would mean every 4 MINUTES.)
+    @Scheduled(cron = "0 0 10-16/4 * * MON-FRI", zone = "Europe/London")
     public void maybeTerminateInstance() {
         if (!config.isChaosEnabled()) {
             return;
@@ -204,21 +211,20 @@ The [Chaos Toolkit](https://chaostoolkit.org/) is an open-source, declarative fr
 ```json
 {
   "version": "1.0.0",
-  "title": "Payment Processor Survives Fraud Service Outage",
-  "description": "Verify payment authorization degrades gracefully when fraud detection is unavailable",
+  "title": "Payment Processor Survives Fraud Service Degradation",
+  "description": "Verify payment authorization degrades gracefully when fraud detection is slow and lossy",
   "tags": ["payments", "fraud-detection", "resilience"],
   "steady-state-hypothesis": {
     "title": "Payment system is operating normally",
     "probes": [
       {
         "type": "probe",
-        "name": "payment-success-rate-above-threshold",
-        "tolerance": true,
+        "name": "payment-processor-healthy",
+        "tolerance": 200,
         "provider": {
           "type": "http",
           "url": "http://payment-processor/actuator/health",
-          "timeout": 5,
-          "expected_status": 200
+          "timeout": 5
         }
       },
       {
@@ -266,6 +272,9 @@ The [Chaos Toolkit](https://chaostoolkit.org/) is an open-source, declarative fr
 ```
 
 ---
+
+> [!NOTE]
+> A `process` provider runs on the machine that runs Chaos Toolkit. The `tc` commands above must therefore run on the fraud-service host (for example through an SSH or Kubernetes extension), and `tc` on `eth0` slows **all** of that host's traffic. To target one connection only, use Toxiproxy or a service-mesh fault-injection rule.
 
 ## Gremlin: Enterprise Chaos Engineering
 
@@ -360,13 +369,18 @@ public class NetworkLatencyInjector {
      */
     public void injectLatency(String networkInterface, int delayMs, int jitterMs,
                                double lossPercent) {
+        // Needs root (CAP_NET_ADMIN). Validate the interface name before
+        // building a shell command, or it becomes a command-injection hole.
+        if (!networkInterface.matches("[a-zA-Z0-9_.-]{1,15}")) {
+            throw new IllegalArgumentException("Bad interface name");
+        }
         String command = String.format(
             "tc qdisc add dev %s root netem delay %dms %dms 25%% loss %.1f%%",
             networkInterface, delayMs, jitterMs, lossPercent
         );
 
         executeShellCommand(command);
-        log.warn("CHAOS: Injected {}ms +/- {}ms latency and {}%% loss on {}",
+        log.warn("CHAOS: Injected {}ms +/- {}ms latency and {}% loss on {}",
             delayMs, jitterMs, lossPercent, networkInterface);
     }
 
@@ -376,6 +390,8 @@ public class NetworkLatencyInjector {
     }
 }
 ```
+
+In an automated test, prefer Toxiproxy (with Testcontainers) between the payment service and the fraud service: it delays only that connection, whereas `tc` on `eth0` slows every connection of the host, including the database.
 
 ```java
 @SpringBootTest
@@ -442,7 +458,7 @@ public class FraudServiceLatencyTest {
 ### Scenario 2: Database Failover During Peak Load
 
 ```java
-@Test
+@SpringBootTest
 @Tag("chaos")
 public class DatabaseFailoverTest {
 
@@ -537,7 +553,7 @@ public class DiskIoSaturator {
 
 ## GameDay Planning
 
-A **GameDay** is a structured exercise where the entire engineering and operations team deliberately breaks a system in a controlled way, then practices responding and recovering. For financial institutions, GameDays are increasingly required by regulators as evidence of operational resilience (e.g., DORA compliance in the EU).
+A **GameDay** is a structured exercise where the entire engineering and operations team deliberately breaks a system in a controlled way, then practices responding and recovering. For financial institutions, GameDays are good evidence of operational resilience: the EU's DORA requires a risk-based digital operational resilience testing programme (with threat-led penetration testing for the largest firms), and well-documented GameDays help meet part of it.
 
 ### GameDay Structure
 
@@ -655,34 +671,35 @@ public class BlastRadiusCalculator {
      * If blast radius exceeds thresholds, trigger automatic rollback.
      */
     public BlastRadiusReport measure(ChaosExperiment experiment, Instant since) {
-        // Measure payment errors since experiment started
-        double errorRate = metricsClient.queryRange(
-            "rate(payment_authorizations_total{result='error'}[1m])",
-            since, Instant.now()
-        ).max();
+        String window = Duration.between(since, Instant.now()).toSeconds() + "s";
 
-        // Estimate affected customers (errors × average customers/second)
-        double avgTps = metricsClient.averageTps(since, Instant.now());
-        long estimatedAffectedCustomers = (long) (errorRate * avgTps * 60);
+        // Error RATIO now (failed / all over the last minute)
+        double errorRatio = metricsClient.queryInstant(
+            "sum(rate(payment_authorizations_total{result=\"error\"}[1m]))" +
+            " / sum(rate(payment_authorizations_total[1m]))");
 
-        // Estimate revenue impact
+        // Failed payments since the experiment started (a count, not a rate)
+        long failedPayments = (long) metricsClient.queryInstant(
+            "sum(increase(payment_authorizations_total{result=\"error\"}[" + window + "]))");
+
+        // Value of the failed payments (some will be retried successfully)
         BigDecimal avgPaymentValue = metricsClient.averagePaymentValue();
-        BigDecimal lostRevenue = avgPaymentValue
-            .multiply(BigDecimal.valueOf(estimatedAffectedCustomers));
+        BigDecimal failedValue = avgPaymentValue
+            .multiply(BigDecimal.valueOf(failedPayments));
 
         BlastRadiusReport report = BlastRadiusReport.builder()
-            .errorRate(errorRate)
-            .estimatedAffectedCustomers(estimatedAffectedCustomers)
-            .estimatedLostRevenue(lostRevenue)
+            .errorRatio(errorRatio)
+            .failedPayments(failedPayments)
+            .failedPaymentValue(failedValue)
             .experimentName(experiment.name())
             .measuredAt(Instant.now())
             .build();
 
         // Auto-rollback if blast radius is too large
-        if (errorRate > experiment.maxAcceptableErrorRate()) {
-            log.error("CHAOS AUTO-ROLLBACK: Error rate {} exceeds threshold {}. " +
+        if (errorRatio > experiment.maxAcceptableErrorRatio()) {
+            log.error("CHAOS AUTO-ROLLBACK: Error ratio {} exceeds threshold {}. " +
                 "Rolling back experiment {}.",
-                errorRate, experiment.maxAcceptableErrorRate(), experiment.name());
+                errorRatio, experiment.maxAcceptableErrorRatio(), experiment.name());
             experiment.rollback();
         }
 
@@ -808,21 +825,23 @@ public void rollbackMechanismMustBeTestedBeforeGameDay() {
 
 ### Pitfall 3: Running Chaos During Settlement Windows
 
-Payment settlement typically happens at specific times (e.g., ACH end-of-day cutoff, overnight batch runs). Running chaos experiments during these windows can cause real financial harm. Build blackout windows into your chaos orchestrator:
+Payment settlement happens at specific times — scheme cut-offs (for example same-day ACH submission deadlines, Bacs and CHAPS cut-offs), overnight batch runs, month-end. Running chaos experiments during these windows can cause real financial harm. Build blackout windows into your chaos orchestrator, from configuration rather than hard-coded times:
 
 ```java
 @Component
+@RequiredArgsConstructor
 public class SettlementWindowGuard {
 
-    private static final List<LocalTime> ACH_CUTOFF_WINDOWS = List.of(
-        LocalTime.of(17, 0), LocalTime.of(23, 0)  // EST ACH cutoffs
-    );
+    // From configuration: each payment scheme's cut-off times and time zone,
+    // kept up to date by the payments operations team
+    private final SettlementCalendar calendar;
+    private static final Duration GUARD_BAND = Duration.ofMinutes(30);
 
     public boolean isInSettlementWindow() {
-        LocalTime now = LocalTime.now(ZoneId.of("America/New_York"));
-        return ACH_CUTOFF_WINDOWS.stream()
-            .anyMatch(cutoff -> Math.abs(
-                Duration.between(now, cutoff).toMinutes()) < 30);
+        Instant now = Instant.now();
+        return calendar.cutOffsAround(now).stream()
+            .anyMatch(cutOff -> Duration.between(now, cutOff).abs()
+                                        .compareTo(GUARD_BAND) < 0);
     }
 }
 ```
@@ -841,6 +860,8 @@ The key practices:
 - **Rollback tested**: every experiment must have a verified rollback
 - **Blackout windows**: never run chaos during settlement, batch runs, or regulatory windows
 - **GameDay**: structured exercises that include incident response practice
+
+The ultimate goal of chaos engineering in a fintech context is **confidence**: the confidence to know that when a production failure occurs, the system will degrade gracefully, alerting will fire, engineers will know how to respond, and customers will experience minimal impact.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -868,17 +889,6 @@ The key practices:
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{
-  "title": "Hypothesis-Driven Chaos Experiment for a Payment Authorization Pipeline",
-  "difficulty": "advanced",
-  "estimatedMinutes": 45,
-  "tasks": [
-    {"id": "1", "description": "Write a formal chaos hypothesis for the scenario: the fraud detection service experiences 100ms of added latency. Define the steady-state metrics (p99 authorization latency < 500ms, success rate > 99.5%), the expected behavior (circuit breaker activates within 1 second), and the measurement window (10 minutes)."},
-    {"id": "2", "description": "Using Chaos Toolkit or Toxiproxy, inject 100ms network latency between the payment authorization service and the fraud detection service. Run the experiment while applying realistic load (500 TPS). Measure whether the hypothesis holds and document any deviations."},
-    {"id": "3", "description": "Implement the circuit breaker using Resilience4j on the fraud detection client. Configure the circuit to open after 5 failures in 10 seconds with a 1-second timeout. Verify via chaos experiment that the circuit opens correctly and the fallback (local rules engine) activates without additional latency."},
-    {"id": "4", "description": "Build a GameDay runbook for a pod failure scenario: define the pre-experiment checklist, success criteria, rollback procedure, and post-experiment analysis template. Run the experiment by deleting a random payment service pod under load and verify the system recovers within the SLA."}
-  ]
-}
+{"title": "Hypothesis-Driven Chaos Experiment for a Payment Authorization Pipeline", "difficulty": "advanced", "estimatedMinutes": 45, "tasks": [{"id": "1", "description": "Write a formal chaos hypothesis for the scenario: calls to the fraud detection service slow down to 2,000ms (above the client's 1-second timeout). Define the steady-state metrics (p99 authorization latency < 1.5s, success rate > 99.5%), the expected behavior (the circuit breaker opens and the local rules engine takes over), and the measurement window (10 minutes)."}, {"id": "2", "description": "Using Toxiproxy (or Chaos Toolkit with a Toxiproxy extension), inject 2,000ms latency on the connection between the payment authorization service and the fraud detection service only. Run the experiment under realistic load (500 TPS), measure whether the hypothesis holds, and document any deviations."}, {"id": "3", "description": "Implement the circuit breaker using Resilience4j on the fraud detection client. Configure the circuit to open after 5 failures in 10 seconds with a 1-second timeout. Verify via chaos experiment that the circuit opens correctly and the fallback (local rules engine) activates without additional latency."}, {"id": "4", "description": "Build a GameDay runbook for a pod failure scenario: define the pre-experiment checklist, success criteria, rollback procedure, and post-experiment analysis template. Run the experiment by deleting a random payment service pod under load and verify the system recovers within the SLA."}]}
 -->
 
-The ultimate goal of chaos engineering in a fintech context is **confidence**: the confidence to know that when a production failure occurs, the system will degrade gracefully, alerting will fire, engineers will know how to respond, and customers will experience minimal impact.

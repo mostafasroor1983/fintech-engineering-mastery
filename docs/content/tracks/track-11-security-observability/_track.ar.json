@@ -1,0 +1,378 @@
+{
+  "id": "track-11",
+  "sequence": 11,
+  "title": "الأمان والمراقبة وهندسة بيئة الإنتاج",
+  "shortTitle": "الأمان والمراقبة",
+  "slug": "security-observability",
+  "color": "#ec4899",
+  "colorMuted": "rgba(236, 72, 153, 0.15)",
+  "description": "OpenTelemetry، والتتبع الموزع، وPrometheus وGrafana، وتشخيص JVM، والهندسة الأمنية، وإدارة الحوادث، وجاهزية الأنظمة المالية لبيئة الإنتاج.",
+  "difficulty": "advanced",
+  "estimatedHours": 30,
+  "status": "published",
+  "priority": "high",
+  "lessons": [
+    {
+      "id": "track-11-lesson-01",
+      "sequence": 1,
+      "title": "OpenTelemetry — القياس والتتبّع للخدمات المالية",
+      "slug": "opentelemetry",
+      "path": "content/tracks/track-11-security-observability/lesson-01-opentelemetry/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "OpenTelemetry",
+        "OTEL",
+        "traces",
+        "metrics",
+        "logs"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-11-lesson-02",
+      "sequence": 2,
+      "title": "التتبع الموزع — السببية وأخذ العينات والتحليل",
+      "slug": "distributed-tracing",
+      "path": "content/tracks/track-11-security-observability/lesson-02-distributed-tracing/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "distributed-tracing",
+        "Jaeger",
+        "Zipkin",
+        "sampling",
+        "correlation-id"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-03",
+      "sequence": 3,
+      "title": "Prometheus وPromQL — مقاييس الأنظمة المالية",
+      "slug": "prometheus-promql",
+      "path": "content/tracks/track-11-security-observability/lesson-03-prometheus/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 85,
+      "status": "published",
+      "tags": [
+        "Prometheus",
+        "PromQL",
+        "counter",
+        "histogram",
+        "alerting"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-11-lesson-04",
+      "sequence": 4,
+      "title": "لوحات Grafana — تصوير سلامة الأنظمة المالية",
+      "slug": "grafana-dashboards",
+      "path": "content/tracks/track-11-security-observability/lesson-04-grafana/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "Grafana",
+        "dashboard",
+        "panels",
+        "variables",
+        "alerting"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-05",
+      "sequence": 5,
+      "title": "السجلات المنظّمة — الربط والبحث على نطاق واسع",
+      "slug": "structured-logging",
+      "path": "content/tracks/track-11-security-observability/lesson-05-structured-logging/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "structured-logging",
+        "JSON",
+        "correlation-id",
+        "ELK",
+        "Loki"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-11-lesson-06",
+      "sequence": 6,
+      "title": "تشخيص JVM — تفريغ الخيوط وتحليل الكومة في بيئة الإنتاج",
+      "slug": "jvm-diagnostics",
+      "path": "content/tracks/track-11-security-observability/lesson-06-jvm-diagnostics/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "JVM-diagnostics",
+        "thread-dump",
+        "heap-dump",
+        "JFR",
+        "jcmd"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-07",
+      "sequence": 7,
+      "title": "التنبيه القائم على SLO — معدل الاستهلاك وإرهاق التنبيهات",
+      "slug": "slo-alerting",
+      "path": "content/tracks/track-11-security-observability/lesson-07-slo-alerting/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "SLO",
+        "alerting",
+        "burn-rate",
+        "multi-window",
+        "alert-fatigue"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-08",
+      "sequence": 8,
+      "title": "الاستجابة للحوادث — أدلة المناوبة وكتيّبات التشغيل",
+      "slug": "incident-response",
+      "path": "content/tracks/track-11-security-observability/lesson-08-incident-response/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "incident-response",
+        "runbook",
+        "playbook",
+        "P1",
+        "escalation"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-09",
+      "sequence": 9,
+      "title": "أمان انعدام الثقة — الوصول القائم على الهوية للخدمات المصغّرة",
+      "slug": "zero-trust-security",
+      "path": "content/tracks/track-11-security-observability/lesson-09-zero-trust/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "zero-trust",
+        "mTLS",
+        "SPIFFE",
+        "identity",
+        "least-privilege"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-10",
+      "sequence": 10,
+      "title": "OAuth2 وJWT — أنماط المصادقة بالرموز",
+      "slug": "oauth2-jwt",
+      "path": "content/tracks/track-11-security-observability/lesson-10-oauth2-jwt/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "OAuth2",
+        "JWT",
+        "OIDC",
+        "token-validation",
+        "PKCE"
+      ],
+      "tier": "core"
+    },
+    {
+      "id": "track-11-lesson-11",
+      "sequence": 11,
+      "title": "أمان الواجهات البرمجية — تحديد المعدّل والتحقق من المدخلات وWAF",
+      "slug": "api-security",
+      "path": "content/tracks/track-11-security-observability/lesson-11-api-security/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "API-security",
+        "WAF",
+        "input-validation",
+        "rate-limiting",
+        "OWASP"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-12",
+      "sequence": 12,
+      "title": "mTLS عمليًا — تدوير الشهادات وSPIFFE",
+      "slug": "mtls-spiffe",
+      "path": "content/tracks/track-11-security-observability/lesson-12-mtls/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "mTLS",
+        "SPIFFE",
+        "SVID",
+        "certificate-rotation",
+        "Istio"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-13",
+      "sequence": 13,
+      "title": "OWASP Top 10 — مشهد التهديدات في الخدمات المالية",
+      "slug": "owasp-top-10",
+      "path": "content/tracks/track-11-security-observability/lesson-13-owasp/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "OWASP",
+        "injection",
+        "XSS",
+        "SSRF",
+        "broken-auth"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-14",
+      "sequence": 14,
+      "title": "اختبار الاختراق — تقييم أمان الواجهات البرمجية المالية",
+      "slug": "penetration-testing",
+      "path": "content/tracks/track-11-security-observability/lesson-14-pentest/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 80,
+      "status": "published",
+      "tags": [
+        "penetration-testing",
+        "DAST",
+        "SAST",
+        "threat-modelling",
+        "STRIDE"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-15",
+      "sequence": 15,
+      "title": "SIEM والأحداث الأمنية — ربط السجلات المالية",
+      "slug": "siem",
+      "path": "content/tracks/track-11-security-observability/lesson-15-siem/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "SIEM",
+        "security-events",
+        "correlation",
+        "Splunk",
+        "detection"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-16",
+      "sequence": 16,
+      "title": "تشفير البيانات — أثناء التخزين وأثناء النقل في القطاع المالي",
+      "slug": "data-encryption",
+      "path": "content/tracks/track-11-security-observability/lesson-16-encryption/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "encryption",
+        "AES",
+        "TLS",
+        "at-rest",
+        "in-transit"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-17",
+      "sequence": 17,
+      "title": "إدارة المفاتيح — HSM وKMS والتشفير المغلّف",
+      "slug": "key-management",
+      "path": "content/tracks/track-11-security-observability/lesson-17-key-management/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "KMS",
+        "HSM",
+        "envelope-encryption",
+        "key-rotation",
+        "AWS-KMS"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-18",
+      "sequence": 18,
+      "title": "ممارسات البرمجة الآمنة — أنماط Java الأمنية الخاطئة",
+      "slug": "secure-coding",
+      "path": "content/tracks/track-11-security-observability/lesson-18-secure-coding/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "secure-coding",
+        "SQL-injection",
+        "deserialization",
+        "XXE",
+        "Java"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-19",
+      "sequence": 19,
+      "title": "قائمة الجاهزية لبيئة الإنتاج — إطلاق الخدمات المالية",
+      "slug": "production-readiness",
+      "path": "content/tracks/track-11-security-observability/lesson-19-production-readiness/index.md",
+      "difficulty": "advanced",
+      "estimatedMinutes": 75,
+      "status": "published",
+      "tags": [
+        "production-readiness",
+        "PRR",
+        "launch-checklist",
+        "runbook",
+        "DR-test"
+      ],
+      "tier": "optional"
+    },
+    {
+      "id": "track-11-lesson-20",
+      "sequence": 20,
+      "title": "إطار المهندس الرئيسي لقرارات الأمان والمراقبة",
+      "slug": "security-observability-framework",
+      "path": "content/tracks/track-11-security-observability/lesson-20-decision-framework/index.md",
+      "difficulty": "principal",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tags": [
+        "decision-framework",
+        "security",
+        "observability",
+        "trade-offs",
+        "staff-engineer"
+      ],
+      "tier": "optional"
+    }
+  ],
+  "mainPathMinutes": 325,
+  "optionalLessonCount": 16
+}

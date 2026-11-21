@@ -21,7 +21,7 @@ topics:
   - "Payment Scheme Selection Flowchart"
   - "Banking Anti-Patterns"
   - "Principal Engineer Design Review Checklist"
-  - "Track 5 Synthesis"
+  - "Track 4 Synthesis"
 components:
   mermaid: true
   prism: true
@@ -36,6 +36,8 @@ references:
   - "FCA PS19/3 — Expectations for Firms with Complex IT Systems, 2019"
 ---
 
+## Overview
+
 A principal engineer in a banking or payments company occupies a rare intersection: deep enough in the technical stack to understand why a 50-microsecond NUMA-aware memory allocation matters for a card authorisation service, yet close enough to the business to know that the answer to "should we build our own core banking system?" is almost always no. The decisions that define a bank's technical architecture — which payment rails to connect, whether to build or buy fraud detection, how to structure a multi-jurisdiction data model — are irreversible at the time-scale of a typical engineering career. Getting them right requires a structured decision process that holds correctness, availability, latency, cost, and regulatory compliance simultaneously, without allowing any single dimension to dominate by default.
 
 ## Learning Objectives
@@ -46,12 +48,12 @@ A principal engineer in a banking or payments company occupies a rare intersecti
 - Evaluate build vs buy decisions for core banking system components using a total cost of ownership model that includes regulatory compliance, operational burden, and exit cost
 - Identify and explain the five most dangerous anti-patterns in banking system design and articulate the specific failure mode each produces
 - Apply the principal engineer design review checklist to a proposed banking system architecture, identifying gaps across correctness, compliance, operability, and scalability dimensions
-- Explain how the 22 lessons of Track 5 compose into a complete mental model of banking infrastructure
+- Explain how the 22 lessons of Track 4 compose into a complete mental model of banking infrastructure
 - Draft an Architecture Decision Record (ADR) for a payment scheme selection that explicitly documents the trade-offs, constraints, and decision rationale
 
 ## Business Context
 
-In 2019, TSB Bank in the UK completed a core banking migration that caused a 5-day outage affecting 1.9 million customers. The system was unavailable for online and mobile banking; customers could not access funds, pay bills, or view balances. The subsequent independent review identified multiple contributing factors, but the architectural root cause was the absence of a structured decision process for the migration approach. The team chose a "big bang" cutover — migrate all 5.5 million customer records and all application state in a single weekend — rather than a staged, parallel-run approach. The decision was driven primarily by cost (parallel-run would require running two systems simultaneously for months) without adequate analysis of the probability and consequence of a cutover failure. The FCA fined TSB £48.65 million. The lesson is not technical — the engineers involved were competent — it is methodological: high-consequence, irreversible architectural decisions require a formal process that makes trade-offs explicit before they are locked in.
+In April 2018, TSB Bank in the UK migrated about 5 million customers to a new core banking platform over a single weekend. Online and mobile banking failed; around 1.9 million customers were affected, many could not reach their money or make payments, and for some the problems lasted for weeks. The independent review that followed (2019) found that the platform had not been ready and that testing and readiness checks were inadequate. The migration was a "big bang" cutover — all customers and all application state at once — rather than a staged, reversible approach, and the risk of that choice was not weighed rigorously enough. In December 2022 the FCA and PRA fined TSB a total of £48.65 million. The lesson is not that the engineers were incompetent; it is methodological: high-consequence, irreversible architectural decisions need a formal process that makes the trade-offs, the probability of failure and the cost of failure explicit before they are locked in.
 
 ## The Fundamental Tension in Banking Systems
 
@@ -84,11 +86,11 @@ flowchart TD
     Q2 -->|Domestic| Q4{UK, EU, or US?}
     Q2 -->|Cross-border| SWIFT[SWIFT MT/MX\nor SWIFT gpi\nfor tracking]
 
-    Q4 -->|UK| FPS[Faster Payments\nFPS — 20s max\nISO 20022]
+    Q4 -->|UK| FPS[Faster Payments\nusually seconds\nup to £1M per payment]
     Q4 -->|EU| SEPA[SEPA Instant CT\nSEPA Inst — 10s\nor standard SCT]
     Q4 -->|US| RTP[RTP / FedNow\nor Zelle for P2P]
 
-    Q3 -->|Yes - bulk| BATCH[BACS/CHAPS UK\nSEPA CT batch EU\nFedACH US]
+    Q3 -->|Yes| BATCH[Bulk: BACS UK, SEPA CT EU, FedACH US\nHigh value: CHAPS UK, T2 EU, Fedwire US]
     Q3 -->|No - non-urgent| Q5{Card payment\nor bank transfer?}
 
     Q5 -->|Card| CARD[Visa/Mastercard\n4-party scheme\nISO 8583 / EMV]
@@ -99,18 +101,18 @@ flowchart TD
 
     SWIFT --> NOTE1[Consider SWIFT gpi\nfor tracking\nTypically T+1 to T+2]
     FPS --> NOTE2[Always prefer FPS\nfor UK consumer\npayments]
-    CARD --> NOTE3[Accept 1.5-2.2%\ninterchange cost\nor use tokenisation]
+    CARD --> NOTE3[Accept percentage\nacceptance fees\nand chargeback risk]
 ```
 
 | Scheme | Speed | Cost | Reversibility | Use when |
 |---|---|---|---|---|
-| FPS (UK) | < 20s | £0.10-0.25 | Irrevocable after 2h | Consumer P2P, payroll emergency |
-| SEPA Inst | < 10s | €0.10-0.20 | Irrevocable | EU real-time consumer/business |
-| BACS (UK) | 3 days | £0.03-0.08 | Reversible T+0 | Payroll, supplier payments |
-| CHAPS (UK) | Same day | £15-30 | Irrevocable same day | Property, high-value B2B |
-| SWIFT (intl) | T+1 to T+2 | $5-25 | Reversible with difficulty | Cross-border B2B |
-| Visa/MC | Auth 2s, settle T+1 | 1.5-2.2% | Chargeback 120 days | Retail, online payments |
-| Open Banking PISP | 10-20s | £0.10-0.25 | Irrevocable | Bank-funded e-commerce |
+| FPS (UK) | Usually seconds | Pence | Irrevocable once sent (APP fraud reimbursement applies) | Consumer P2P, urgent payroll items |
+| SEPA Inst | < 10s | Same as standard SCT (EU rule) | Irrevocable | EU real-time consumer/business |
+| BACS (UK) | 3-day cycle | Pence | Can be recalled before processing; Direct Debits covered by the DD Guarantee | Payroll, supplier payments |
+| CHAPS (UK) | Same day, real time | Tens of pounds (bank charge) | Irrevocable | Property, high-value B2B |
+| SWIFT (intl) | Often same day; up to T+2 | $5-25 + correspondent fees | Recall possible only with the receiver's agreement | Cross-border B2B |
+| Visa/MC | Auth in seconds, settle ~T+1 | Percentage fees | Chargebacks for months | Retail, online payments |
+| Open Banking PISP | Seconds (via FPS) | Small fixed fee | Irrevocable | Bank-funded e-commerce |
 
 ## Build vs Buy for Core Components
 
@@ -118,14 +120,16 @@ flowchart TD
 // The build vs buy decision should be formalised as a structured evaluation
 public record BuildVsBuyAnalysis(
     String component,
-    int buildYearOneNzd,       // Cost to build year 1 (staff + infra)
-    int buildOperationalCostYr,// Annual operational cost years 2+
-    int buySaasAnnualCost,     // SaaS licence / per-transaction cost annualised
-    int exitCostIfBuy,         // Cost to switch away from vendor in year 5
-    int regulatoryRiskIfBuild, // Estimated cost of regulatory non-compliance if built wrong
+    long buildYearOneGbp,      // Cost to build year 1 (staff + infra)
+    long buildOperationalCostYr,// Annual operational cost years 2+
+    long buySaasAnnualCost,     // SaaS licence / per-transaction cost annualised
+    long exitCostIfBuy,         // Cost to switch away from vendor in year 5
+    long regulatoryRiskIfBuild, // Estimated cost of regulatory non-compliance if built wrong
     String recommendation
 ) {}
 ```
+
+Rough, illustrative figures — every organisation must cost its own case:
 
 | Component | Build cost (Y1) | Buy (annual SaaS) | Build recommendation |
 |---|---|---|---|
@@ -136,7 +140,7 @@ public record BuildVsBuyAnalysis(
 | KYC document verification | £2M-8M | £50K-500K | **Buy** — ML models for ID verification require massive datasets |
 | FX rate engine | £300K-1M | £20K-100K | **Build** — straightforward; vendor lock-in risk is high |
 | Fraud scoring | £5M-20M | £300K-1M | **Buy** (early) → **Build** (at scale, with data advantage) |
-| Card issuer processing | £20M-80M | £1M-10M | **Buy** — scheme certification alone takes 18 months |
+| Card issuer processing | £20M-80M | £1M-10M | **Buy** — scheme certification alone takes many months |
 
 > [!IMPORTANT]
 > The "build" recommendation for a ledger does not mean build a general-purpose accounting system. It means build a narrow, purpose-specific double-entry ledger that serves your payment types and currency model. The moment you try to build a general-purpose accounting system that also handles GL accounts, depreciation schedules, and multi-entity consolidation, you are rebuilding commercial accounting software and the buy decision flips decisively.
@@ -147,33 +151,40 @@ Multi-jurisdiction banking systems must satisfy data residency requirements that
 
 | Jurisdiction | Regulation | Personal data constraint | Financial record constraint |
 |---|---|---|---|
-| European Union | GDPR Art. 44-49 | Must stay in EEA or adequacy decision country | 5-10 years retention (depends on member state) |
-| United Kingdom | UK GDPR + FCA SYSC | Must stay in UK or approved transfer country | 7 years minimum (Companies Act) |
-| India | DPDP Act 2023 | Sensitive personal data: mirror copy in India | RBI: payment data must remain in India |
-| China | PIPL + DSL | Critical data: cannot leave China | PBOC: payment data onshore only |
-| United States | No federal mandate | CCPA (California) + sector laws | BSA: 5 years minimum |
+| European Union | GDPR Art. 44-49 | Transfers outside the EEA need an adequacy decision or safeguards (SCCs, BCRs) | 5-10 years (AML, accounting and sector rules; varies by member state) |
+| United Kingdom | UK GDPR + FCA SYSC | Transfers need UK adequacy regulations or safeguards (IDTA) | 5 years (MLR) to 6 years (Companies Act / HMRC) typical |
+| India | DPDP Act 2023 | Transfers allowed except to countries the government restricts; sector rules can be stricter | RBI: payment system data must be stored only in India |
+| China | PIPL + DSL | Personal and "important" data exports need a legal basis (security assessment, standard contract or certification) | Payment data kept onshore |
+| United States | No general federal law | State laws (e.g. CCPA) + sector laws | BSA: 5 years minimum |
 
 ```java
 public record DataResidencyPolicy(
     String jurisdiction,
-    boolean personalDataMayLeave,
-    List<String> approvedDestinations,  // ISO 3166-1 alpha-2 country codes
+    boolean personalDataMayLeaveWithoutSafeguards,
+    List<String> adequacyDestinations,  // ISO 3166-1 alpha-2 country codes
     int financialRecordRetentionYears,
     boolean replicationToDisasterRecoveryAllowed,
     String regulatoryBasis
 ) {
-    public static DataResidencyPolicy EU_GDPR = new DataResidencyPolicy(
+    // All 30 EEA countries (EU 27 + Iceland, Liechtenstein, Norway)
+    static final List<String> EEA = List.of(
+        "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT",
+        "LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE","IS","LI","NO");
+
+    public static final DataResidencyPolicy EU_GDPR = new DataResidencyPolicy(
         "EU", false,
-        List.of("DE","FR","NL","IE","SE","NO","IS","LI", // EEA
-                "GB",  // UK adequacy decision post-Brexit (review pending)
-                "JP","CA","NZ","KR","IL"), // Adequacy decisions as of 2024
+        concat(EEA,
+               // A SUBSET of EU adequacy decisions — check the Commission's
+               // current list; the US is covered only for companies certified
+               // under the EU-US Data Privacy Framework
+               List.of("GB", "CH", "JP", "CA", "NZ", "KR", "IL")),
         10, true, "GDPR Art 44, Regulation (EU) 2016/679"
     );
 }
 ```
 
 > [!WARNING]
-> Data residency violations carry severe penalties: GDPR fines up to 4% of global annual turnover, plus regulatory censure that can trigger banking licence review. Replicating EU customer personal data to a US region for disaster recovery — without adequate safeguards (SCCs, BCRs) in place — is a common engineering mistake. Engage your DPO before making any cross-region replication architecture decision.
+> Data residency violations carry severe penalties: GDPR fines up to 4% of global annual turnover, plus regulatory censure that can trigger banking licence review. Replicating EU customer personal data to a region outside the EEA for disaster recovery — without an adequacy decision or safeguards such as SCCs or BCRs, plus a transfer impact assessment — is a common engineering mistake. Engage your DPO before making any cross-region replication architecture decision.
 
 ## Five-Question Architecture Checklist
 
@@ -192,7 +203,7 @@ Every mutating operation must be idempotent — submitting the same operation tw
 Before writing a line of code, enumerate: which data elements are personal data (GDPR subject rights), which transactions require AML screening, which customer interactions require audit log retention, and which API endpoints require SCA. These are not features that can be bolted on — they are constraints that shape the data model.
 
 **5. What is the disaster recovery plan and have you tested it?**
-Define RTOs (Recovery Time Objective) and RPOs (Recovery Point Objective) for the component, then verify the architecture can meet them. For payment systems: RTO ≤ 4 hours, RPO ≤ 1 minute are typical FCA expectations. Document the runbook, and run a chaos engineering exercise that tests the actual recovery path, not a theoretical one.
+Define RTOs (Recovery Time Objective) and RPOs (Recovery Point Objective) for the component, then verify the architecture can meet them. For payment systems, the RPO for committed payments is effectively zero (synchronous replication), and the RTO must fit inside the **impact tolerance** the firm has set for the important business service — UK operational resilience rules require firms to be able to stay within those tolerances in severe but plausible scenarios. Document the runbook, and run a chaos engineering exercise that tests the actual recovery path, not a theoretical one.
 
 ```java
 // Encode the checklist as a formal ADR template in code
@@ -219,7 +230,7 @@ public record ArchitectureDecisionRecord(
 | Anti-pattern | Description | Failure mode |
 |---|---|---|
 | Synchronous external call in payment path | Calling an AML service or fraud scorer synchronously while holding a DB transaction | External service latency spike causes DB connection pool exhaustion; cascading failure |
-| Shared mutable balance field | Storing account balance as a mutable column updated on every transaction | Concurrent updates cause lost updates even with transactions; balance drift over time |
+| Read-modify-write balance | Reading the balance into the application, computing the new value, and writing it back (`SET balance = :newBalance`), with no ledger entry behind the change | Concurrent requests overwrite each other (lost updates, overdrafts); balances drift with no way to prove them |
 | Missing idempotency at API boundary | No idempotency key on payment initiation endpoints | Network timeouts cause duplicate payments on retry; customer complaints; regulatory breach |
 | Big-bang migrations | Migrating all data and cutting over all traffic simultaneously | Single point of irreversibility; any defect causes full outage; TSB-pattern failure |
 | Soft-deleting financial records | Using `deleted_at` flags to "delete" ledger entries or audit logs | Regulatory violation (financial records must be immutable and retained); GDPR tension |
@@ -227,7 +238,7 @@ public record ArchitectureDecisionRecord(
 | Timezone naivety in settlement | Using `LocalDateTime` for settlement timestamps without explicit timezone | Settlement cutoffs are always in a specific timezone (UTC or local exchange time); naive datetimes cause wrong-day processing around DST transitions |
 
 > [!NOTE]
-> The "shared mutable balance field" anti-pattern is the most common root cause of financial data integrity issues in systems originally built without banking domain knowledge. The correct pattern — a double-entry ledger with immutable journal entries and a derived balance — appears more complex initially but eliminates an entire class of concurrency bugs. If you see `UPDATE accounts SET balance = balance - :amount` in a codebase, that is the first line of a production incident waiting to happen without extremely careful locking.
+> The "read-modify-write balance" anti-pattern is the most common root cause of financial data integrity issues in systems originally built without banking domain knowledge. Two separate fixes are needed. For **concurrency**, the balance check and the change must be one atomic step per account: a conditional update (`UPDATE accounts SET balance = balance - :amount WHERE id = :id AND balance >= :amount`, which is safe) or a row lock (`SELECT ... FOR UPDATE`). For **integrity**, every change must come from immutable double-entry journal entries, so any stored balance is only a cache that can be recomputed and reconciled. If you see `SET balance = :newBalance` with a value computed in application code, that is a production incident waiting to happen.
 
 ## Regulatory Incident Response Obligations
 
@@ -235,10 +246,10 @@ Banking systems are subject to mandatory incident reporting obligations that hav
 
 | Regulator | Jurisdiction | Incident type | Reporting deadline | Required data |
 |---|---|---|---|---|
-| FCA | UK | Major operational/security incident | As soon as practicable; full report ≤ 72h | Affected customers, payment types, duration, root cause |
-| ECB / NCAs | EU | PSD2 major incident | Initial ≤ 4h; final ≤ 2 weeks | Transactions affected, estimated financial impact |
-| Visa/Mastercard | Global | Card data compromise | ≤ 24h | Estimated PAN count, breach window, forensic firm engaged |
-| FCA | UK | Operational resilience breach | ≤ 72h | Duration of impact tolerance exceedance, affected services |
+| FCA / PRA | UK | Material operational or security incident | Promptly (Principle 11 / SUP 15); dedicated incident reporting rules are being phased in | Affected customers and services, duration, root cause, remediation |
+| NCA under DORA | EU (since January 2025; replaces PSD2 incident reporting) | Major ICT-related incident | Initial ≤ 4h after classification (and ≤ 24h after detection); intermediate ≤ 72h; final ≤ 1 month | Clients and transactions affected, duration, data losses, economic impact |
+| ICO / EU DPA | UK / EU | Personal data breach | ≤ 72h after becoming aware (GDPR) | Categories and number of people and records affected, likely consequences |
+| Visa / Mastercard | Global | Card data compromise | Immediately on suspicion, per scheme rules | Estimated PAN count, breach window, forensic investigator engaged |
 
 ```java
 // Every payment system component should expose a structured incident evidence endpoint
@@ -263,15 +274,19 @@ public class IncidentEvidenceController {
             @RequestParam(required = false) String paymentType) {
 
         long affectedPayments = payments.countInWindow(from, to, paymentType);
-        BigDecimal totalValue = payments.sumValueInWindow(from, to, paymentType);
+        Map<String, BigDecimal> totalValueByCurrency =
+            payments.sumValueByCurrencyInWindow(from, to, paymentType); // never add GBP to EUR
+        long affectedCustomers = payments.countDistinctCustomers(from, to, paymentType);
+        // (a sample of 1,000 ids is for investigation — its size is NOT the count)
         List<String> affectedCustomerSample = payments.sampleCustomerIds(from, to, 1000);
 
         return new IncidentImpactReport(
             from, to,
             affectedPayments,
-            totalValue,
-            affectedCustomerSample.size(),
-            auditLog.fetchWindow(from, to)
+            totalValueByCurrency,
+            affectedCustomers,
+            affectedCustomerSample,
+            auditLog.firstPage(from, to)    // paginated — a window can hold millions of rows
         );
     }
 }
@@ -285,7 +300,7 @@ public class IncidentEvidenceController {
 When reviewing a proposed banking system architecture, check each dimension:
 
 **Correctness:**
-- [ ] All balance-affecting operations use double-entry ledger (no mutable balance fields)
+- [ ] All balance changes come from double-entry ledger entries; any stored balance is a cache updated atomically in the same transaction (no read-modify-write)
 - [ ] Transactions use appropriate isolation level (SERIALIZABLE or SELECT FOR UPDATE)
 - [ ] All external calls are idempotent with client-side idempotency keys
 - [ ] Compensating transactions exist for every non-atomic multi-step operation
@@ -294,7 +309,7 @@ When reviewing a proposed banking system architecture, check each dimension:
 **Compliance:**
 - [ ] Personal data classified (PII/non-PII) in the data model; retention periods defined
 - [ ] AML screening points identified; SAR filing workflow exists
-- [ ] Audit log covers all balance-affecting events; log is immutable and retained ≥ 7 years
+- [ ] Audit log covers all balance-affecting events; log is immutable and retained for the longest applicable period (often 5–10 years)
 - [ ] SCA requirements identified for all PSP-facing endpoints
 - [ ] Data residency constraints mapped for each data element
 
@@ -312,9 +327,9 @@ When reviewing a proposed banking system architecture, check each dimension:
 - [ ] Kafka consumer lag monitored; consumer group recovery time estimated
 - [ ] Load shedding strategy defined and implemented
 
-## Track 5 Synthesis: A Complete Banking Architecture Mental Model
+## Track 4 Synthesis: A Complete Banking Architecture Mental Model
 
-The 22 lessons of Track 5 compose into a layered architecture of knowledge:
+The 22 lessons of Track 4 compose into a layered architecture of knowledge:
 
 ```mermaid
 graph TB
@@ -378,17 +393,17 @@ graph TB
 
 **The mental model in one paragraph:**
 
-A bank is fundamentally a ledger operator (Lessons 3, 4) that accepts and disburses funds via payment rails (Lessons 6-12). The ledger must be correct under concurrency (double-entry, serialisable isolation, idempotency — Lesson 5). Compliance layers (AML, KYC, sanctions, fraud — Lessons 13-16) sit across the payment path, adding decisioning latency that must be bounded and accounted for in the capacity model. Modern retail channels — card payments (Lesson 18), digital wallets (Lesson 19), and open banking APIs (Lesson 20) — are essentially well-defined protocol adapters over the same underlying ledger and payment-routing infrastructure. At scale (Lesson 21), the bottleneck is always the write path to the ledger, which is solved by consistent-hash partitioning, Kafka-buffered back-pressure, and disciplined write amplification control. The decision framework (Lesson 22) is the meta-skill: knowing which lesson's patterns apply to a given problem, and being able to articulate the trade-off clearly enough that a business stakeholder can make an informed decision.
+A bank is fundamentally a ledger operator (Lessons 3, 4) that accepts and disburses funds via payment rails (Lessons 6-12). The ledger must be correct under concurrency (holds, per-account locking or conditional updates, idempotency — Lesson 5). Compliance layers (AML, KYC, sanctions, fraud — Lessons 13-16) sit across the payment path, adding decisioning latency that must be bounded and accounted for in the capacity model. Modern retail channels — card payments (Lesson 18), digital wallets (Lesson 19), and open banking APIs (Lesson 20) — are essentially well-defined protocol adapters over the same underlying ledger and payment-routing infrastructure. At scale (Lesson 21), the bottleneck is usually the write path to the ledger, which is addressed by partitioning with single account ownership, back-pressure, and disciplined write amplification control. The decision framework (Lesson 22) is the meta-skill: knowing which lesson's patterns apply to a given problem, and being able to articulate the trade-off clearly enough that a business stakeholder can make an informed decision.
 
 ## Knowledge Check
 
 **Q1: A fintech startup is building a cross-border payments product targeting SME businesses. They are evaluating: (a) connecting directly to SWIFT as a direct participant, (b) partnering with a correspondent bank for SWIFT access, (c) building on top of a stablecoin/crypto rail. Apply the five-question framework to recommend an approach.**
 
-A: Applying the five-question framework: (1) What breaks first at 10×? For direct SWIFT participation, it is the operational complexity — SWIFT requires 24/7 payment operations, HSM infrastructure, and ISO 15022/20022 compliance at a level that typically requires a team of 10+ specialists. At 10× volume this team doesn't scale, so the bottleneck is operational capacity, not technology. For the correspondent bank model, it is the correspondent's rate limits and cutoff times. For crypto rails, it is regulatory acceptance in the destination country. (2) Partial failure recovery: SWIFT gpi provides end-to-end tracking and can identify stuck payments in the correspondent network. Crypto settlements are irreversible with no recourse on failure. (3) Idempotency boundary: SWIFT uses UETR (Unique End-to-end Transaction Reference) for idempotency — this must be generated once and preserved through the entire lifecycle. (4) Regulatory obligations: direct SWIFT participation requires a full banking or payment institution licence; a correspondent arrangement may be possible with a narrower licence. Crypto rails face uncertain regulatory status in most SME target markets. (5) Disaster recovery: correspondent banking provides built-in resilience (can switch correspondents); crypto rail availability depends on blockchain network. Recommendation for an early-stage startup: option (b), correspondent bank, with a SWIFT gpi-capable correspondent. This provides the fastest path to regulatory compliance, the most familiar experience for SME customers, and the clearest failure recovery model. Build towards direct SWIFT participation as a 2-3 year goal once volume justifies the operational investment.
+A: Applying the five-question framework: (1) What breaks first at 10×? For direct SWIFT participation, it is the operational complexity — SWIFT requires 24/7 payment operations, HSM infrastructure, and ISO 15022/20022 compliance at a level that typically requires a team of 10+ specialists. At 10× volume this team doesn't scale, so the bottleneck is operational capacity, not technology. For the correspondent bank model, it is the correspondent's rate limits and cutoff times. For crypto rails, it is regulatory acceptance in the destination country. (2) Partial failure recovery: SWIFT gpi provides end-to-end tracking and can identify stuck payments in the correspondent network. Crypto settlements are irreversible with no recourse on failure. (3) Idempotency boundary: the UETR (Unique End-to-end Transaction Reference) identifies the payment end to end — generate it once, before the first send, and reuse it on every retry and enquiry, so a resend can be recognised and tracked rather than paid twice. (4) Regulatory obligations: direct SWIFT participation requires a full banking or payment institution licence; a correspondent arrangement may be possible with a narrower licence. Crypto rails face uncertain regulatory status in most SME target markets. (5) Disaster recovery: correspondent banking provides built-in resilience (can switch correspondents); crypto rail availability depends on blockchain network. Recommendation for an early-stage startup: option (b), correspondent bank, with a SWIFT gpi-capable correspondent. This provides the fastest path to regulatory compliance, the most familiar experience for SME customers, and the clearest failure recovery model. Build towards direct SWIFT participation as a 2-3 year goal once volume justifies the operational investment.
 
 **Q2: Describe the "shared mutable balance field" anti-pattern in detail — specifically the SQL-level concurrency failure mode — and explain why a double-entry ledger with derived balances eliminates the problem rather than merely mitigating it.**
 
-A: The anti-pattern is storing account balance as a column (`balance DECIMAL(19,4)`) in the accounts table and updating it with each transaction using `UPDATE accounts SET balance = balance - :amount WHERE account_id = :id AND balance >= :amount`. The concurrency failure occurs as follows: two concurrent withdrawals both execute `SELECT balance FROM accounts WHERE account_id = X` within the same transaction snapshot under READ COMMITTED isolation. Both see balance = £100. Both pass the balance check. Both execute the UPDATE. Under READ COMMITTED, the second UPDATE sees the already-committed first UPDATE and correctly computes `£100 - £50 - £50 = £0`. But under a subtle variant — if the amount check and the update are separated by any application code, or if the check happens in a service layer before the transaction begins — both reads can return £100, both checks pass, and both updates execute, resulting in a balance of -£50. Even with `SELECT FOR UPDATE`, the problem is that the balance column is a derived aggregate (the sum of all transactions to date) stored redundantly. If a bug, crash, or replication lag corrupts it, there is no way to verify correctness without replaying every transaction. A double-entry ledger with immutable journal entries eliminates the problem structurally: there is no balance column to corrupt. Balance is always computed as `SUM(credits) - SUM(debits)` over the ledger entries for the account. Concurrent insertions into the ledger are safe because INSERT is append-only — there is no UPDATE to race on. The correctness of the balance follows from the correctness of the entries, which are verified by the double-entry invariant (total debits = total credits across all accounts at every point in time). You cannot have a data race on a computed aggregate.
+A: The anti-pattern is **read-modify-write**: the application reads the balance (`SELECT balance ...`), checks and computes the new value in code, and writes it back (`UPDATE accounts SET balance = :newBalance ...`). Under READ COMMITTED, two concurrent withdrawals of £50 and £80 can both read £100, both pass the check, and both write — the last write wins, so one debit is simply lost (or, with relative updates after a separate check, the account goes to -£30). There are two different problems here, and they need two different fixes. **Concurrency:** the check and the change must be one atomic step per account. A single conditional statement — `UPDATE accounts SET balance = balance - :amount WHERE id = :id AND balance >= :amount` — is safe: the database re-checks the condition on the latest row version, and 0 rows updated means insufficient funds. A row lock (`SELECT ... FOR UPDATE`) before the check works too. **Integrity:** a stored balance is a redundant aggregate; if a bug, a manual fix or a crash corrupts it, nothing can prove what it should be. A double-entry ledger with immutable journal entries solves *that*: every change is an entry, the balance can always be recomputed as the sum of entries, and the invariant (total debits = total credits) can be checked continuously. Note that a ledger alone does not remove the race: two transactions can both read `SUM(entries) = £100` and both insert a debit (write skew). So production systems combine both — append-only entries for integrity, plus per-account serialisation (a lock or a conditional update on a cached balance row in the same transaction) for the balance check.
 
 ## Practical Challenge
 
@@ -396,7 +411,7 @@ A: The anti-pattern is storing account balance as a column (`balance DECIMAL(19,
 
 2. **Build vs Buy TCO Model:** Implement a Java `BuildVsBuyAnalyzer` that takes as input: build year-1 cost, build annual operating cost, buy annual SaaS cost, vendor exit cost in year 5, and discount rate. It should compute net present value for both options over a 5-year horizon and output a recommendation with break-even year. Test it with the AML monitoring scenario from the lesson's table and verify it recommends "Buy" at the given cost assumptions. Then find the cross-over point where building becomes cheaper and assert the break-even year is calculated correctly.
 
-3. **Anti-Pattern Detector:** Write a static analysis tool (using JavaParser or a simple regex-based AST visitor) that scans a Java codebase and flags: (a) any `UPDATE ... SET balance =` SQL string literals (mutable balance anti-pattern), (b) any `@Transactional` methods that contain HTTP client calls or Kafka producer sends within the transaction boundary (I/O inside transaction), (c) any method named `delete*` on a repository that operates on entities with the word `Ledger`, `Entry`, `Transaction`, or `Audit` in their class name (deleting financial records). Run it against a sample codebase containing one instance of each anti-pattern and assert all three are flagged.
+3. **Anti-Pattern Detector:** Write a static analysis tool (using JavaParser or a simple regex-based AST visitor) that scans a Java codebase and flags: (a) any SQL string that sets the balance to a value computed in application code, such as `UPDATE ... SET balance = ?` or `SET balance = :newBalance` (read-modify-write anti-pattern — a relative, conditional `SET balance = balance - ? WHERE ... AND balance >= ?` is fine), (b) any `@Transactional` methods that contain HTTP client calls or Kafka producer sends within the transaction boundary (I/O inside transaction), (c) any method named `delete*` on a repository that operates on entities with the word `Ledger`, `Entry`, `Transaction`, or `Audit` in their class name (deleting financial records). Run it against a sample codebase containing one instance of each anti-pattern and assert all three are flagged.
 
 4. **Design Review Simulation:** Given the following system description, apply the Principal Engineer Design Review Checklist and produce a written review identifying at least one gap in each of the four dimensions (Correctness, Compliance, Operability, Scalability): "A new payment initiation service stores account balances in a Redis cache, refreshing from PostgreSQL every 30 seconds. When a payment is initiated, it checks the Redis balance, deducts the amount, writes a payment record to PostgreSQL, and sends a Kafka event. There is no idempotency key on the initiation endpoint. Logs are stored in ElasticSearch and rotated after 30 days." For each gap identified, write one concrete remediation recommendation with enough specificity to be actionable in a sprint.
 
@@ -446,10 +461,22 @@ A: The anti-pattern is storing account balance as a column (`balance DECIMAL(19,
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
-    {"id": "1", "description": "Write a formal Architecture Decision Record for payment scheme selection for a UK-based B2B payroll disbursement product paying 50,000 employees monthly. Evaluate BACS, CHAPS, and FPS. Document why BACS is primary with FPS as fallback, populating all five ADR checklist fields and including a risk register with mitigations."},
-    {"id": "2", "description": "Implement a Java BuildVsBuyAnalyzer that takes build year-1 cost, build annual operating cost, buy annual SaaS cost, vendor exit cost, and discount rate as inputs. Compute NPV for both options over 5 years, output a recommendation with break-even year. Test with the AML monitoring scenario and find the crossover point where building becomes cheaper."},
-    {"id": "3", "description": "Write a static analysis tool (using JavaParser or regex-based AST visitor) that flags: (a) UPDATE ... SET balance = SQL strings (mutable balance anti-pattern), (b) @Transactional methods containing HTTP client calls or Kafka sends, (c) delete* methods on Ledger/Entry/Transaction/Audit repositories. Test against sample code with one instance of each anti-pattern."},
-    {"id": "4", "description": "Apply the Principal Engineer Design Review Checklist to the following design and identify one gap per dimension (Correctness, Compliance, Operability, Scalability): a payment service stores balances in Redis (30s TTL), checks Redis before debiting, writes to PostgreSQL, sends a Kafka event, with no idempotency key on the initiation endpoint and logs rotated after 30 days."}
+    {
+      "id": "1",
+      "description": "Write a formal Architecture Decision Record for payment scheme selection for a UK-based B2B payroll disbursement product paying 50,000 employees monthly. Evaluate BACS, CHAPS, and FPS. Document why BACS is primary with FPS as fallback, populating all five ADR checklist fields and including a risk register with mitigations."
+    },
+    {
+      "id": "2",
+      "description": "Implement a Java BuildVsBuyAnalyzer that takes build year-1 cost, build annual operating cost, buy annual SaaS cost, vendor exit cost, and discount rate as inputs. Compute NPV for both options over 5 years, output a recommendation with break-even year. Test with the AML monitoring scenario and find the crossover point where building becomes cheaper."
+    },
+    {
+      "id": "3",
+      "description": "Write a static analysis tool (using JavaParser or regex-based AST visitor) that flags: (a) SQL that sets the balance to a value computed in application code (e.g. SET balance = :newBalance — read-modify-write), (b) @Transactional methods containing HTTP client calls or Kafka sends, (c) delete* methods on Ledger/Entry/Transaction/Audit repositories. Test against sample code with one instance of each anti-pattern."
+    },
+    {
+      "id": "4",
+      "description": "Apply the Principal Engineer Design Review Checklist to the following design and identify one gap per dimension (Correctness, Compliance, Operability, Scalability): a payment service stores balances in Redis (30s TTL), checks Redis before debiting, writes to PostgreSQL, sends a Kafka event, with no idempotency key on the initiation endpoint and logs rotated after 30 days."
+    }
   ]
 }
 -->

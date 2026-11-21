@@ -11,6 +11,8 @@ tags: [decision-framework, architecture, trade-offs, staff-engineer, principal-e
 java-versions: [17, 21]
 ---
 
+## Overview
+
 Concurrency is a design space with many correct answers. The difference between a senior and a principal engineer is not knowing more techniques — it is knowing which technique to reach for, when, and how to justify that choice to a team. This lesson synthesises Track 3 into a decision framework you can apply to real production problems and articulate to peers, architects, and engineering managers.
 
 ## Learning Objectives
@@ -86,14 +88,15 @@ Is the resource genuinely contested?
 ```
 Is the concurrent work primarily:
   ├── I/O-BOUND (database, HTTP, file) → Virtual threads (Java 21)
-  │   "Thread-per-request model at zero pool-exhaustion risk"
-  │   
+  │   "Thread-per-request without thread-pool exhaustion —
+  │    but bound scarce resources (DB connections) with a Semaphore"
+  │
   └── CPU-BOUND (crypto, compression, complex validation)
         ├── Divisible? → ForkJoinPool / parallel streams
-        └── Not divisible? → Bounded ThreadPoolExecutor (cores × 1.1)
+        └── Not divisible? → Bounded ThreadPoolExecutor (about one thread per core)
 ```
 
-**Common anti-pattern:** Using `CompletableFuture.supplyAsync()` with the common pool for I/O operations. The common pool has `#CPUs - 1` threads; one slow DB query blocks all futures. Use a dedicated I/O executor.
+**Common anti-pattern:** Using `CompletableFuture.supplyAsync()` with the common pool for I/O operations. The common pool has only `#CPUs - 1` threads, so a handful of slow DB queries can occupy all of them and stall every other future and parallel stream in the JVM. Use a dedicated I/O executor.
 
 ### Question 4: What is the consistency requirement?
 
@@ -107,6 +110,7 @@ Consistency requirement:
   │       OR synchronized block
   │
   ├── ATOMIC DATABASE OPERATION (business transaction)
+  │     Single row      → one conditional UPDATE (WHERE balance >= :amount)
   │     Low contention → @Version optimistic locking + retry
   │     High contention → SELECT FOR UPDATE pessimistic locking
   │
@@ -120,12 +124,13 @@ Consistency requirement:
 If the concurrent operation fails (timeout, exception, contention):
   ├── FAIL FAST (payment authorisation) → Small queue + reject with 503
   ├── RETRY (idempotent balance update) → Optimistic lock + exponential backoff
-  ├── DEGRADE GRACEFULLY (fraud check) → Return "allow" on timeout; async recheck
-  └── DROP (notification, analytics) → DiscardPolicy or DiscardOldestPolicy
+  ├── DEGRADE GRACEFULLY (fraud check) → a fallback decided by the RISK team,
+  │     e.g. allow only low amounts on timeout, refer the rest to manual review
+  └── DROP (metrics, analytics sampling) → DiscardPolicy or DiscardOldestPolicy
 ```
 
 > [!IMPORTANT]
-> Never choose `DiscardPolicy` for payment-critical operations. Silent data loss in a financial system is a regulatory and customer trust failure. Only `DiscardPolicy` for genuinely non-critical data: audit logs that have a secondary channel, analytics events, notifications.
+> Never choose `DiscardPolicy` for payment-critical operations. Silent data loss in a financial system is a regulatory and customer trust failure. Use `DiscardPolicy` only for genuinely non-critical data such as sampled metrics or analytics events — never for audit records (a gap in the audit trail is a compliance failure) or customer notifications about money movements.
 
 ## Tool Selection Matrix
 
@@ -134,12 +139,14 @@ If the concurrent operation fails (timeout, exception, contention):
 | Read-heavy shared config | `volatile` reference to immutable record | — |
 | Single counter / rate limiter | `AtomicLong` / `LongAdder` | Never for counts |
 | Multi-field atomic snapshot | `AtomicReference<Record>` | To DB if persistent |
+| Simple single-row debit | Conditional `UPDATE ... WHERE balance >= :amount` | Multi-row rules → locking below |
 | Low-contention balance | `@Version` optimistic lock | > 20% retry rate → pessimistic |
 | High-contention balance | `SELECT FOR UPDATE` | Distributed → Saga |
 | Parallel I/O pipeline | `CompletableFuture` + dedicated executor | Java 21 → virtual threads |
 | Thread-per-request (I/O) | Virtual threads | — |
 | CPU-bound parallelism | `ForkJoinPool` / parallel stream | Custom `ThreadPoolExecutor` |
-| Resource rate limiting | `Semaphore` | Resilience4j RateLimiter |
+| Concurrency limit (N in flight) | `Semaphore` | Resilience4j Bulkhead |
+| Rate limit (N per second) | Token bucket / Resilience4j RateLimiter | Distributed limiter (e.g. Redis) |
 | One-time startup gate | `CountDownLatch` | — |
 | Reusable phase barrier | `CyclicBarrier` | `Phaser` for dynamic workers |
 | Pool isolation | Separate `ThreadPoolExecutor` per concern | Virtual threads (I/O path) |
@@ -259,11 +266,11 @@ You have covered:
 
 **Q1:** A team proposes replacing all `synchronized` blocks in their payment service with `ReentrantLock` for "better performance." How do you evaluate this proposal?
 
-**A:** Ask for profiling evidence. `ReentrantLock` offers additional features (`tryLock`, `lockInterruptibly`, fair mode, multiple `Condition` variables) but does not automatically perform better than `synchronized` for uncontested locks — the JVM heavily optimises `synchronized` with biased locking and lock coarsening. For contested locks under high concurrency, `ReentrantLock` can outperform, but the question is whether the payment service is actually lock-contention-bound. Migrate only where profiling shows monitor contention (JFR `JavaMonitorEnter` events, async-profiler `-e lock`) contributes meaningfully to latency.
+**A:** Ask for profiling evidence. `ReentrantLock` offers additional features (`tryLock`, `lockInterruptibly`, fair mode, multiple `Condition` variables) but does not automatically perform better than `synchronized` for uncontested locks — the JVM heavily optimises `synchronized` (lightweight locking, lock coarsening, lock elision). (Biased locking, often quoted here, was disabled in JDK 15 and removed in JDK 18.) For contested locks under high concurrency, `ReentrantLock` can outperform, but the question is whether the payment service is actually lock-contention-bound. Migrate only where profiling shows monitor contention (JFR `JavaMonitorEnter` events, async-profiler `-e lock`) contributes meaningfully to latency.
 
 **Q2:** A new service architect proposes using `synchronized` on every balance update method, arguing it is "the safest option." A team member counters that it will kill throughput. Who is right, and what would you do?
 
-**A:** Both are partially right. `synchronized` guarantees correctness and is correct for balance management. For typical retail customer accounts (low contention), the throughput impact is negligible — JVM biased locking means uncontested `synchronized` costs ~2–5 ns. For high-contention merchant accounts, `synchronized` on a single account object serialises all access, which is exactly correct behaviour but limits throughput to `1 / lock_hold_time`. The right answer: start with `synchronized`, measure contention in production (JFR), and upgrade only the hot segments to `SELECT FOR UPDATE` with database-level queuing or to lock-free patterns with profiling evidence. Never design for theoretical worst-case without data.
+**A:** Both are partially right — and both miss a bigger point. `synchronized` is correct **only inside one JVM**. Real balances live in a database and are updated by several service instances, so a JVM lock alone does not protect them; the guard must be in the database (conditional `UPDATE`, `@Version`, or `SELECT FOR UPDATE`). Where an in-memory lock is appropriate, the throughput concern is usually overstated: an uncontested `synchronized` costs only nanoseconds. For a hot single account, any correct mechanism serialises access — throughput is limited to about `1 / lock_hold_time`, so the lever is keeping the hold time short. The right answer: put the guard where the data lives, measure contention (JFR, `pg_locks`), and optimise only the hot segments with evidence. Never design for a theoretical worst case without data.
 
 ## Practical Challenge: Architecture Review Simulation
 
@@ -304,7 +311,7 @@ Format your answer as the architecture review language template from this lesson
         "Accept for all payment-critical code, reject for batch code"
       ],
       "correct": 2,
-      "explanation": "ReentrantLock offers additional features (tryLock, lockInterruptibly, fair mode, multiple Condition variables) but does not automatically outperform synchronized for uncontested locks — the JVM heavily optimises synchronized with biased locking and lock coarsening. For contested locks under high concurrency, ReentrantLock can outperform, but only profiling (JFR JavaMonitorEnter events, async-profiler -e lock) can confirm that monitor contention is actually the bottleneck."
+      "explanation": "ReentrantLock offers additional features (tryLock, lockInterruptibly, fair mode, multiple Condition variables) but does not automatically outperform synchronized for uncontested locks — the JVM heavily optimises synchronized (lightweight locking, lock coarsening, lock elision). Under heavy contention the two are close in modern JDKs. Only profiling (JFR JavaMonitorEnter events, async-profiler -e lock) can confirm that monitor contention is actually the bottleneck."
     },
     {
       "text": "According to the Complexity Ladder in this lesson, when should you first reach for AtomicXxx operations?",
@@ -318,7 +325,7 @@ Format your answer as the architecture review language template from this lesson
       "explanation": "The Complexity Ladder requires exhausting simpler options first: (1) avoid shared state entirely, (2) make state immutable and publish safely, (3) confine mutable state to one thread. Only when you need shared mutable access across threads with single-variable atomicity should you reach for volatile/AtomicXxx (Rung 4). Reaching for atomic operations prematurely adds unnecessary complexity and maintenance burden without benefit."
     },
     {
-      "text": "A payment service processes 90% reads and 10% writes on account balance data. The constraint is read throughput. Which tool is the best first choice according to the decision framework?",
+      "text": "A payment service keeps an in-memory snapshot of account data (the database stays the source of truth): 90% reads, 10% writes. The constraint is read throughput. Which tool is the best first choice according to the decision framework?",
       "options": [
         "StampedLock with optimistic reads for maximum read throughput",
         "ConcurrentHashMap with compute operations for thread safety",

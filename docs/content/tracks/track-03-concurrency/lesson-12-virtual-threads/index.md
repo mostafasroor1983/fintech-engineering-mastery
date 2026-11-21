@@ -54,7 +54,7 @@ Virtual threads are the most significant addition to the Java concurrency model 
 
 The core insight: **the platform thread model is wasteful for I/O-bound workloads**. A thread waiting for a database response blocks an OS thread — a precious, expensive resource. Virtual threads decouple Java threads from OS threads, allowing millions of concurrent operations on a small fixed pool of OS threads.
 
-For a payment processing service making 500 concurrent database calls, platform threads require 500 OS threads (~500 MB of stack memory). Virtual threads require 500 virtual threads scheduled on ~8 OS threads (~a few MB total). The throughput improvement is not marginal — it is structural.
+For a payment processing service making 500 concurrent database calls, platform threads require 500 OS threads (~500 MB of reserved stack address space, plus kernel scheduling work). Virtual threads require 500 virtual threads scheduled on ~8 OS threads, with their stacks stored as small heap objects. The throughput improvement is not marginal — it is structural.
 
 ## Learning Objectives
 
@@ -87,11 +87,11 @@ graph TD
 ```
 
 Each blocked platform thread consumes:
-- ~1 MB of stack memory (default, configurable)
+- ~1 MB of reserved stack space (default `-Xss`; reserved up front, committed by the OS as it is used)
 - An OS thread descriptor
 - Kernel scheduler context
 
-A payment service with 500 concurrent in-flight requests = 500 OS threads = ~500 MB stack memory, constant context-switching overhead, and a hard ceiling on concurrency imposed by OS thread limits.
+A payment service with 500 concurrent in-flight requests = 500 OS threads = ~500 MB of reserved stack space, constant context-switching overhead, and a hard ceiling on concurrency imposed by OS thread limits.
 
 ## Virtual Threads: The Solution
 
@@ -119,7 +119,7 @@ graph TD
 
 **Key properties:**
 - Carrier thread pool size ≈ CPU core count (default: `Runtime.getRuntime().availableProcessors()`)
-- Virtual threads are heap objects — cost ~few hundred bytes each when parked
+- Virtual threads are heap objects — a few hundred bytes each, plus their stack frames, which are copied to the heap when they park
 - JVM automatically unmounts virtual thread on blocking I/O, parks it in heap, carrier runs other work
 - When I/O completes, the virtual thread is rescheduled on any available carrier
 
@@ -155,12 +155,17 @@ stateDiagram-v2
     Runnable --> Running: mounted on carrier
     Running --> Parked: blocking I/O / park()
     Parked --> Runnable: I/O complete / unpark()
-    Running --> Runnable: yield() / preemption
+    Running --> Runnable: Thread.yield()
     Running --> Terminated: task completes
     Terminated --> [*]
 ```
 
 The critical state transition is **Running → Parked**: this is where virtual threads deliver their benefit. A platform thread blocks its OS thread in this transition. A virtual thread releases its carrier thread to run other virtual threads.
+
+Virtual threads are **not time-sliced**: the scheduler does not preempt a running virtual thread. A virtual thread that computes for a long time without blocking keeps its carrier busy until it finishes or blocks.
+
+> [!WARNING]
+> **The carrier is NOT released in two cases (pinning):** blocking inside a `synchronized` block or method (Java 21–23; fixed in JDK 24 by JEP 491), and blocking inside a native method or foreign function. Detect pinning with the JFR event `jdk.VirtualThreadPinned` (or `-Djdk.tracePinnedThreads=full` on Java 21–23).
 
 ## Thread-Per-Request in Payment Services
 
@@ -209,7 +214,9 @@ Spring Boot 3.2 (released November 2023) makes enabling virtual threads for Tomc
 // What this does:
 // 1. Tomcat uses a virtual thread per HTTP request (replaces the platform thread pool)
 // 2. @Async methods run on virtual threads
-// 3. TaskExecutor beans default to virtual threads
+// 3. The auto-configured applicationTaskExecutor and task scheduler use virtual threads
+// Also set spring.main.keep-alive=true if the app has no other non-daemon
+// thread: virtual threads are daemon threads and do not keep the JVM alive
 
 // Manual configuration (if not using the property):
 @Configuration
@@ -272,11 +279,12 @@ Virtual threads deliver significant benefit for:
 // Virtual thread stack is stored in the heap, not in OS thread stack space
 // Stack frames are captured as heap objects when the virtual thread parks
 
-// Platform thread: 1 MB stack in OS thread stack segment (non-heap)
+// Platform thread: up to 1 MB stack in native memory (reserved, committed as used)
 // Virtual thread: stack frames in heap, reclaimed by GC when thread terminates
 
-// Practical implication:
-// Platform threads: 10,000 threads × 1 MB = 10 GB stack memory (pre-allocated)
+// Practical implication (illustrative):
+// Platform threads: 10,000 threads × 1 MB = 10 GB of reserved stack address space
+//                   (and 10,000 OS threads for the kernel to schedule)
 // Virtual threads: 10,000 parked threads × ~2 KB average stack = ~20 MB heap
 
 // The heap memory for virtual thread stacks is managed by GC
@@ -289,23 +297,21 @@ Virtual threads deliver significant benefit for:
 Virtual threads appear in thread dumps differently from platform threads:
 
 ```java21
-// Generate thread dump with virtual threads:
+// Generate a thread dump that includes virtual threads:
 // jcmd <pid> Thread.dump_to_file -format=json threads.json
-// (Standard jstack shows virtual threads in Java 21)
+// (jstack / jcmd Thread.print show platform threads only — NOT virtual threads)
 
-// Thread dump output for a parked virtual thread:
+// Simplified plain-text output for a parked virtual thread:
 /*
 #45 "" virtual
-      java.lang.Thread.State: WAITING (parking)
-        at jdk.internal.misc.Unsafe.park(Native Method)
-        at java.util.concurrent.locks.LockSupport.park(LockSupport.java:371)
-        at com.bank.payment.PaymentService.processPayment(PaymentService.java:42)
-        - blocked waiting for JDBC connection
-
-   Mounted on carrier: #12 "ForkJoinPool-1-worker-1"
+      java.base/jdk.internal.misc.Unsafe.park(Native Method)
+      java.base/java.util.concurrent.locks.LockSupport.park(LockSupport.java:371)
+      ...
+      com.bank.payment.PaymentService.processPayment(PaymentService.java:42)
 */
-
-// Key observation: the carrier thread ID is shown — useful for diagnosing pinning
+// A parked virtual thread has no carrier. In the JSON format, a virtual thread
+// that is currently MOUNTED shows its "carrier" — a mounted thread that stays
+// on its carrier while blocked is a sign of pinning
 ```
 
 ---
@@ -352,12 +358,12 @@ Virtual threads appear in thread dumps differently from platform threads:
     "question": "Why should you NOT pool virtual threads (e.g., `new ThreadPoolExecutor(10, 100, ..., virtualThreadFactory)`)?",
     "options": [
       "Virtual thread factories are not compatible with ThreadPoolExecutor",
-      "Virtual threads are heap-allocated and cheap to create; pooling prevents the JVM from reclaiming their stack memory and negates the per-request scaling model",
+      "Virtual threads are cheap to create; pooling adds no benefit, keeps idle threads (and their ThreadLocals) alive, and re-imposes the fixed-pool ceiling that virtual threads were meant to remove",
       "Virtual thread pools cause deadlocks with carrier threads",
       "ThreadPoolExecutor cannot create more than 8 virtual threads"
     ],
     "correct": 1,
-    "explanation": "Virtual threads cost ~few hundred bytes each and are designed to be created per-task and discarded. Pooling virtual threads (keeping them alive between tasks) wastes the heap memory holding their stacks and prevents GC from reclaiming it. It also reintroduces the fixed-pool ceiling that virtual threads were designed to eliminate. Use Executors.newVirtualThreadPerTaskExecutor() — it creates a new virtual thread per submitted task and discards it on completion."
+    "explanation": "Virtual threads cost a few hundred bytes each and are designed to be created per task and discarded. Pooling them saves nothing (creation is already cheap), keeps idle threads and their ThreadLocal values alive between tasks, and reintroduces the fixed-pool ceiling that virtual threads were designed to remove. If you need to limit concurrency (for example to protect a database), use a Semaphore — not a pool. Use Executors.newVirtualThreadPerTaskExecutor(): it creates a new virtual thread per submitted task."
   }
 ] -->
 

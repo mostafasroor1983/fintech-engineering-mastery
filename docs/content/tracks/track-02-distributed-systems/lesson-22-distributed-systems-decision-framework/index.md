@@ -133,7 +133,9 @@ public class PartitionBehaviorPolicy {
                 );
             }
             case FRAUD_SCORE_LOOKUP -> {
-                // AP with fallback: return a conservative default score
+                // AP with fallback: return a conservative default score.
+                // The "allow all" flag must default to OFF and be switched on
+                // only by a deliberate, logged risk decision
                 FraudScore fallback = featureFlags.isEnabled("fraud-fallback-allow-all")
                     ? FraudScore.LOW_RISK_DEFAULT
                     : FraudScore.HIGH_RISK_DEFAULT;
@@ -148,6 +150,9 @@ public class PartitionBehaviorPolicy {
                 // AP: serve from local replica even if possibly stale
                 yield PartitionResponse.serveStale(null, Duration.ofMinutes(1));
             }
+            // Anything not explicitly classified: fail safe (CP)
+            default -> PartitionResponse.reject(
+                "Temporarily unavailable. Please retry.", Duration.ofSeconds(30));
         };
     }
 }
@@ -168,10 +173,10 @@ Idempotency check              | 15ms    | Redis or Cassandra SERIAL (< 20ms)
 Fraud score lookup             | 50ms    | Pre-scored or cached, circuit breaker
 Account balance check          | 30ms    | PostgreSQL primary, indexed lookup
 Payment write (DB)             | 50ms    | Synchronous replication write
-Kafka publish (async OK)       | 10ms    | Fire-and-forget (async ack)
+Outbox insert (same DB txn)    | 2ms     | Event published later by a relay
 Response serialization         | 5ms     | -
 Network (internal)             | 20ms    | Same-region only
-Buffer / p99 headroom          | 110ms   | For GC pauses, lock contention
+Buffer / p99 headroom          | 118ms   | For GC pauses, lock contention
 -------------------------------|---------|--------------------------------
 Total                          | 300ms   | ✓ Fits budget
 ```
@@ -185,6 +190,9 @@ public class LatencyBudgetEnforcer {
     /**
      * Wraps a downstream call with a strict timeout derived from the latency budget.
      * If the call exceeds the budget, it fails fast rather than cascading the latency.
+     * Note: orTimeout() stops WAITING but does not stop the call itself, so also
+     * set the client's own timeout (HTTP read timeout, gRPC deadline). And only
+     * use a fallback where a default is safe — never for a debit.
      */
     public <T> T callWithBudget(String operationName,
                                  Duration budget,
@@ -193,7 +201,7 @@ public class LatencyBudgetEnforcer {
         Timer.Sample sample = Timer.start(meterRegistry);
         try {
             T result = CompletableFuture
-                .supplyAsync(() -> {
+                .supplyAsync(() -> {   // in production: a dedicated, bounded executor
                     try { return operation.call(); }
                     catch (Exception e) { throw new RuntimeException(e); }
                 })
@@ -246,10 +254,11 @@ public class PaymentOrchestrationService {
 
     private final FraudDetectionClient fraudClient;        // Sync: needed to authorize
     private final AccountLedgerService ledgerService;      // Sync: needed for debit
-    private final KafkaTemplate<String, Object> kafka;     // Async: post-authorization
-    private final NotificationService notificationService; // Async: OK to be eventual
+    private final OutboxRepository     outbox;             // Async: post-authorization
+    private final TransactionTemplate  tx;
 
-    @Transactional
+    // Not @Transactional as a whole: the remote fraud call must not hold a
+    // database connection (and possibly row locks) while it waits
     public AuthorizationResult authorize(PaymentRequest request) {
         // SYNCHRONOUS: fraud check is on the critical path
         // We cannot authorize without it
@@ -258,26 +267,26 @@ public class PaymentOrchestrationService {
             return AuthorizationResult.declined("Fraud risk too high");
         }
 
-        // SYNCHRONOUS: balance debit must be atomic with authorization
-        // Doing this async would create a window for race conditions
-        DebitResult debit = ledgerService.debit(
-            request.accountId(), request.amount(), request.idempotencyKey());
-        if (!debit.isSuccessful()) {
-            return AuthorizationResult.declined(debit.reason());
-        }
+        return tx.execute(status -> {
+            // SYNCHRONOUS: balance debit must be atomic with authorization
+            // Doing this async would create a window for race conditions
+            DebitResult debit = ledgerService.debit(
+                request.accountId(), request.amount(), request.idempotencyKey());
+            if (!debit.isSuccessful()) {
+                return AuthorizationResult.declined(debit.reason());
+            }
 
-        // ASYNCHRONOUS: downstream processing does not affect authorization result
-        // Publish to Kafka — consumers handle these independently with retry
-        kafka.send("payment-authorized",
-            request.paymentId(),
-            PaymentAuthorizedEvent.from(request, debit));
+            // ASYNCHRONOUS: written to the outbox in the SAME transaction as the
+            // debit; a relay publishes it to Kafka ("payment-authorized") after
+            // commit. Consumers — including the notification service — handle
+            // it independently, with retries. (Sending to Kafka or starting the
+            // notification directly here could announce a payment whose
+            // transaction then rolls back.)
+            outbox.save(OutboxEvent.of("payment-authorized", request.paymentId(),
+                PaymentAuthorizedEvent.from(request, debit)));
 
-        // ASYNCHRONOUS: notification is best-effort
-        // OK if the SMS/email arrives 1-2 seconds late
-        CompletableFuture.runAsync(() ->
-            notificationService.sendPaymentConfirmation(request));
-
-        return AuthorizationResult.approved(debit.transactionId());
+            return AuthorizationResult.approved(debit.transactionId());
+        });
     }
 }
 ```
@@ -431,7 +440,8 @@ PACELC: If Partition → (Availability vs Consistency)
 System Examples:
   DynamoDB:       PA / EL  — Available during partition, low latency normally (eventual)
   DynamoDB (SC):  PC / EC  — Consistent during partition, higher latency for consistency
-  Cassandra (Q):  PC / EC  — Quorum reads/writes: consistent, adds latency
+  Cassandra (Q):  ~PC / EC — Quorum reads/writes: closer to consistent, adds latency
+                             (Cassandra is PA/EL by design; LWT for linearizable)
   Cassandra (1):  PA / EL  — ONE read/write: available, low latency, eventual
   PostgreSQL sync: PC / EC  — Synchronous replication: consistent, adds ~1-5ms
   PostgreSQL async:PA / EL  — Async replication: available, lower latency, slight lag
@@ -459,10 +469,10 @@ public class PacelcTechnologySelector {
 
         if (pattern.requiresStrongConsistency() && pattern.isLatencySensitive()) {
             return TechnologyRecommendation.builder()
-                .primary("PostgreSQL with read replicas")
-                .alternative("Cassandra LOCAL_QUORUM")
+                .primary("PostgreSQL primary (reads on the primary or a remote_apply standby)")
+                .alternative("Cassandra LOCAL_QUORUM reads and writes")
                 .pacelc("PC/EC")
-                .note("Acceptable latency with strong consistency via synchronous replication")
+                .note("Async read replicas are NOT strongly consistent — keep these reads off them")
                 .build();
         }
 
@@ -478,7 +488,7 @@ public class PacelcTechnologySelector {
         if (pattern.requiresLinearizableCoordination() && pattern.isLowThroughput()) {
             return TechnologyRecommendation.builder()
                 .primary("etcd or ZooKeeper")
-                .alternative("Redis with RedLock")
+                .alternative("PostgreSQL advisory locks + fencing tokens")
                 .pacelc("PC/EC")
                 .note("Distributed locks, leader election, configuration")
                 .build();
@@ -516,11 +526,14 @@ Problems:
 public class PaymentApiService {
 
     public AuthorizationResult authorize(PaymentRequest request) {
-        // Run independent checks in parallel to reduce latency
+        // Run independent checks in parallel to reduce latency — on a dedicated
+        // executor, each with its own timeout
         CompletableFuture<FraudAssessment> fraudFuture =
-            CompletableFuture.supplyAsync(() -> fraudService.assess(request));
+            CompletableFuture.supplyAsync(() -> fraudService.assess(request), checksExecutor)
+                .orTimeout(200, TimeUnit.MILLISECONDS);
         CompletableFuture<RiskAssessment> riskFuture =
-            CompletableFuture.supplyAsync(() -> riskService.assess(request));
+            CompletableFuture.supplyAsync(() -> riskService.assess(request), checksExecutor)
+                .orTimeout(200, TimeUnit.MILLISECONDS);
 
         // Wait for both (parallel)
         FraudAssessment fraud = fraudFuture.join();
@@ -533,8 +546,10 @@ public class PaymentApiService {
         // Critical path: account debit (must be synchronous)
         DebitResult debit = accountService.debit(request);
 
-        // Post-authorization: fire and forget (async)
-        kafka.send("payment-authorized", PaymentAuthorizedEvent.from(request, debit));
+        // Post-authorization: async — via the outbox in production, written
+        // in the debit's transaction (see PaymentOrchestrationService above)
+        outbox.save(OutboxEvent.of("payment-authorized", request.paymentId(),
+            PaymentAuthorizedEvent.from(request, debit)));
 
         return AuthorizationResult.approved(debit.transactionId());
     }
@@ -575,17 +590,19 @@ public void processPayment(PaymentInstruction instruction) {
     ledgerService.createEntry(instruction); // May be called twice!
 }
 
-// Correct: idempotency check before processing
+// Correct: claim the key and do the work in ONE database transaction.
+// (Check -> process -> mark as separate steps still double-processes if the
+// consumer crashes between processing and marking.)
 @KafkaListener(topics = "payment-instructions")
+@Transactional
 public void processPayment(PaymentInstruction instruction) {
-    if (idempotencyStore.alreadyProcessed(instruction.idempotencyKey())) {
+    // INSERT ... ON CONFLICT DO NOTHING — false if already processed
+    if (!idempotencyStore.claim(instruction.idempotencyKey())) {
         log.info("Payment {} already processed — skipping duplicate message",
             instruction.idempotencyKey());
         return;
     }
-
-    ledgerService.createEntry(instruction);
-    idempotencyStore.markProcessed(instruction.idempotencyKey());
+    ledgerService.createEntry(instruction);   // same transaction as the claim
 }
 ```
 
@@ -645,7 +662,7 @@ public class DistributedArchitectureReview {
                     && op.isFinancialWrite()) {
                 findings.add(ReviewFinding.critical(
                     "Operation " + op.name() + " is a financial write with " +
-                    "eventual consistency — this will cause data loss"));
+                    "eventual consistency — this will cause lost updates and overdrafts"));
             }
         });
 
@@ -694,6 +711,8 @@ The five questions form a decision protocol:
 
 The common failure mode for distributed financial systems is not picking the wrong algorithm — it is making these decisions **implicitly** through default configuration, copy-pasted code, or the path of least resistance. The framework above turns implicit decisions into explicit, reviewable, testable artifacts.
 
+The hardest part of distributed systems at a financial institution is not the algorithms — it is the discipline to apply the framework consistently, under pressure, with legacy constraints, and while maintaining the trust of regulators, auditors, and customers who depend on the system being correct every single time.
+
 <!-- KNOWLEDGE-CHECK
 {
   "questions": [
@@ -733,4 +752,3 @@ The common failure mode for distributed financial systems is not picking the wro
 }
 -->
 
-The hardest part of distributed systems at a financial institution is not the algorithms — it is the discipline to apply the framework consistently, under pressure, with legacy constraints, and while maintaining the trust of regulators, auditors, and customers who depend on the system being correct every single time.

@@ -64,42 +64,55 @@ With quorums, read-your-writes is guaranteed when `R + W > N`. With weaker setti
 @Service
 public class AccountBalanceService {
 
-    private final CassandraSession session;
+    // Note: most teams keep balances in a relational database (see lesson 01).
+    // This shows how it CAN be done safely in Cassandra.
 
-    private final PreparedStatement debitStmt = session.prepare(
-        "UPDATE accounts.balances " +
-        "SET balance_cents = balance_cents - ?, " +
-        "    version = version + 1, " +
-        "    last_modified = ? " +
-        "WHERE account_id = ? " +
-        "IF balance_cents >= ?"  // Lightweight transaction — optimistic check
-    );
+    private final CqlSession session;
+    private final PreparedStatement readStmt;
+    private final PreparedStatement casDebitStmt;
 
-    private final PreparedStatement readStmt = session.prepare(
-        "SELECT account_id, balance_cents, version, last_modified " +
-        "FROM accounts.balances " +
-        "WHERE account_id = ?"
-    );
+    public AccountBalanceService(CqlSession session) {
+        this.session = session;   // prepare in the constructor, after session is set
+        this.readStmt = session.prepare(
+            "SELECT account_id, balance_cents, version, last_modified " +
+            "FROM accounts.balances WHERE account_id = ?");
+        // Cassandra cannot do SET balance = balance - ? on a normal column
+        // (only counters support arithmetic, and counters cannot be used in
+        // conditions). So: read, compute, then compare-and-set on version.
+        this.casDebitStmt = session.prepare(
+            "UPDATE accounts.balances " +
+            "SET balance_cents = ?, version = ?, last_modified = ? " +
+            "WHERE account_id = ? " +
+            "IF version = ?");   // lightweight transaction (Paxos)
+    }
 
     /**
-     * Debit an account with QUORUM write consistency.
-     * This guarantees the write is durable on a majority of replicas
-     * before we return success to the caller.
+     * Debit with an optimistic compare-and-set. The LWT is linearizable, so
+     * two concurrent debits can never both apply against the same version.
      */
     public DebitResult debit(UUID accountId, long amountCents, String idempotencyKey) {
-        BoundStatement stmt = debitStmt.bind(
-            amountCents, Instant.now(), accountId, amountCents
-        ).setConsistencyLevel(ConsistencyLevel.QUORUM);
+        for (int attempt = 0; attempt < 5; attempt++) {
+            Row current = session.execute(readStmt.bind(accountId)
+                .setConsistencyLevel(ConsistencyLevel.SERIAL)).one();   // linearizable read
+            long balance = current.getLong("balance_cents");
+            long version = current.getLong("version");
 
-        ResultSet rs = session.execute(stmt);
-        Row result = rs.one();
+            if (balance < amountCents) {
+                return DebitResult.insufficientFunds(balance, amountCents);
+            }
 
-        if (!result.getBool("[applied]")) {
-            return DebitResult.insufficientFunds(
-                result.getLong("balance_cents"), amountCents);
+            Row result = session.execute(casDebitStmt.bind(
+                    balance - amountCents, version + 1, Instant.now(), accountId, version)
+                .setConsistencyLevel(ConsistencyLevel.QUORUM)            // commit phase
+                .setSerialConsistencyLevel(ConsistencyLevel.SERIAL))     // Paxos phase
+                .one();
+
+            if (result.getBoolean("[applied]")) {
+                return DebitResult.success(balance - amountCents);
+            }
+            // Someone else changed the row first — re-read and try again
         }
-
-        return DebitResult.success(result.getLong("balance_cents"));
+        throw new ConcurrentModificationException("Too much contention on " + accountId);
     }
 
     /**
@@ -148,12 +161,12 @@ Cassandra's consistency levels are a direct expression of the R and W in the quo
 | Consistency Level | Replicas Required | R+W > N? | Use Case |
 |---|---|---|---|
 | ONE | 1 | No (1+1=2 ≤ 3) | Logging, analytics, non-critical reads |
-| TWO | 2 | Borderline | Avoid — use QUORUM instead |
-| QUORUM | 2 (⌈3/2⌉+1 = 2) | Yes (2+2=4 > 3) | Most financial operations |
+| TWO | 2 | Yes if reads and writes both use TWO (4 > 3) | Rare — QUORUM states the intent and adapts to RF |
+| QUORUM | 2 (⌊3/2⌋+1 = 2) | Yes (2+2=4 > 3) | Most financial operations |
 | ALL | 3 | Yes | Highest consistency, lowest availability |
 | LOCAL_QUORUM | 2 in local DC | Yes (within DC) | Multi-DC: consistency within DC |
 | EACH_QUORUM | 2 per DC | Yes (per DC) | Synchronous multi-DC writes |
-| SERIAL | Paxos consensus | Full linearizability | CAS operations, idempotency checks |
+| SERIAL | Paxos among a quorum | Linearizable (for LWT) | Serial level of LWTs; reads of LWT data |
 
 ```java
 @Configuration
@@ -169,7 +182,9 @@ public class CassandraConsistencyConfiguration {
     public static final ConsistencyLevel PAYMENT_WRITE_CL  = ConsistencyLevel.LOCAL_QUORUM;
     public static final ConsistencyLevel PAYMENT_READ_CL   = ConsistencyLevel.LOCAL_QUORUM;
 
-    // Idempotency key claims — requires linearizability
+    // Idempotency key claims — requires linearizability. SERIAL is used as the
+    // SERIAL consistency level of an LWT (setSerialConsistencyLevel), not as
+    // the normal consistency level of a write.
     public static final ConsistencyLevel IDEMPOTENCY_CL    = ConsistencyLevel.SERIAL;
 
     // Balance display on dashboard — eventual consistency acceptable
@@ -178,8 +193,9 @@ public class CassandraConsistencyConfiguration {
     // Transaction history query — slight staleness acceptable
     public static final ConsistencyLevel HISTORY_READ_CL   = ConsistencyLevel.LOCAL_ONE;
 
-    // Audit log writes — must be durable on all replicas
-    public static final ConsistencyLevel AUDIT_WRITE_CL    = ConsistencyLevel.ALL;
+    // Audit log writes — durable on a majority in the local DC. (ALL would
+    // block audit writes whenever any single replica is down.)
+    public static final ConsistencyLevel AUDIT_WRITE_CL    = ConsistencyLevel.LOCAL_QUORUM;
 }
 ```
 
@@ -188,17 +204,17 @@ public class CassandraConsistencyConfiguration {
 For multi-datacenter deployments, `QUORUM` counts replicas across ALL datacenters while `LOCAL_QUORUM` only counts replicas in the local DC. For a payment system with 3 replicas per DC across 2 DCs (N=6 globally, N=3 per DC):
 
 ```
-QUORUM:        requires ⌈6/2⌉+1 = 4 replicas (must cross DC boundary — adds ~20ms latency)
-LOCAL_QUORUM:  requires ⌈3/2⌉+1 = 2 replicas in local DC (stays within DC — ~1ms latency)
+QUORUM:        requires ⌊6/2⌋+1 = 4 replicas (must cross DC boundary — adds ~20ms latency)
+LOCAL_QUORUM:  requires ⌊3/2⌋+1 = 2 replicas in local DC (stays within DC — ~1ms latency)
 ```
 
-For payment processing, `LOCAL_QUORUM` is almost always the right choice: strong consistency within the datacenter, with async replication to the DR datacenter.
+For payment processing, `LOCAL_QUORUM` is almost always the right choice: strong consistency within the datacenter, with async replication to the DR datacenter. The price: if a whole datacenter is lost, its most recent writes may not have reached the DR datacenter yet.
 
 ---
 
 ## Sloppy Quorums and Hinted Handoff
 
-A **sloppy quorum** is a relaxation used by systems like Cassandra (and originally DynamoDB) to maintain write availability even when the designated replicas for a data partition are unavailable.
+A **sloppy quorum** is a relaxation used by Dynamo-style systems (the original Amazon Dynamo, Riak) to maintain write availability even when the designated replicas for a data partition are unavailable. **Cassandra does not use sloppy quorums**: it does store hints for down replicas (hinted handoff), but hints never count toward the consistency level — the only exception is the special level `ANY`.
 
 In a sloppy quorum, if one of the designated N replicas is down, another node in the cluster temporarily accepts the write on its behalf. This accepting node stores a **hint** — a note that it needs to forward this write to the original replica when it recovers.
 
@@ -208,7 +224,7 @@ Normal quorum write (N=3, W=2):
   Write: A ✓, B ✓, C (unreachable)
   Result: Write succeeds (2/3 = quorum)
 
-Sloppy quorum (W=3, A and B down):
+Sloppy quorum in a Dynamo-style store (W=3, A and B down):
   Data for token range [0, 1000] → Nodes A, B, C
   A and B unreachable → Node D accepts write with hint for A and B
   Write: C ✓, D ✓ (hint for A), E ✓ (hint for B)
@@ -224,25 +240,17 @@ Sloppy quorum (W=3, A and B down):
 @Service
 public class HintedHandoffMonitor {
 
-    private final Session cassandraSession;
-
     /**
-     * Monitor hinted handoff status. If hints accumulate
-     * faster than they are delivered, it indicates persistent
-     * replica unavailability — a risk for financial data.
+     * Monitor hinted handoff. If hints accumulate faster than they are
+     * delivered, a replica has been unavailable for a long time — and hints
+     * are only kept for max_hint_window (3 hours by default), after which
+     * only repair can bring the replica up to date.
+     * (Since Cassandra 3.0 hints live in local files, not in system.hints.)
      */
     public HintedHandoffStatus checkHintedHandoff() {
-        // Query system.hints (Cassandra 2.x) or
-        // system_distributed.hints (Cassandra 3+)
-        ResultSet rs = cassandraSession.execute(
-            "SELECT target_id, hints_in_progress, hint_count " +
-            "FROM system_distributed.view_build_status"
-        );
-
-        // For actual hint monitoring, use JMX:
-        StorageProxyMBean proxy = getStorageProxy();
+        StorageProxyMBean proxy = getStorageProxy();   // via JMX
         long totalHints = proxy.getTotalHints();
-        long hintsInProgress = proxy.getTotalHintsInProgress();
+        long hintsInProgress = proxy.getHintsInProgress();
 
         if (totalHints > 10000) {
             log.warn("High hint count: {} — indicates replica unavailability. " +
@@ -259,21 +267,18 @@ public class HintedHandoffMonitor {
 
 ### When Sloppy Quorums Are Dangerous for Financial Data
 
-Sloppy quorums prioritize availability over strict consistency. For payment systems, this creates a subtle risk: a read with `R=2` after a sloppy quorum write may not contact the hint-holding nodes, returning stale data.
+Sloppy quorums prioritize availability over strict consistency. In a store that uses them, `R + W > N` no longer guarantees overlap: a read with `R=2` after a sloppy write may not contact the hint-holding nodes, and returns stale data. In Cassandra, normal QUORUM reads and writes do overlap, because hints do not count. For read-before-write checks on data that is written with lightweight transactions, use a SERIAL (or LOCAL_SERIAL) read:
 
 ```java
 @Service
 public class FinancialDataConsistencyPolicy {
 
     /**
-     * For payment authorization, disable sloppy quorum behavior by
-     * requiring reads to contact ONLY the designated replicas.
-     * In Cassandra, this is controlled by using LOCAL_SERIAL for
-     * read-before-write patterns.
+     * A LOCAL_SERIAL read is linearizable: it runs a Paxos round on a quorum
+     * of the key's replicas in the local DC and first completes any
+     * lightweight transaction still in flight for this key.
      */
     public boolean isPaymentAmountValid(UUID paymentId, long expectedAmount) {
-        // Use SERIAL consistency to bypass the coordinator's cache
-        // and ensure we read from the Paxos quorum (not a hinted replica)
         BoundStatement stmt = readPaymentStmt.bind(paymentId)
             .setConsistencyLevel(ConsistencyLevel.LOCAL_SERIAL);
 
@@ -287,7 +292,7 @@ public class FinancialDataConsistencyPolicy {
 
 ## DynamoDB Quorums
 
-Amazon DynamoDB originally used a quorum-based replication scheme (described in the 2007 Dynamo paper). DynamoDB now abstracts this from users, but the underlying principle is the same: strong consistency reads in DynamoDB contact a quorum of replicas.
+Amazon's 2007 Dynamo paper described leaderless quorum replication. DynamoDB, the managed service, works differently: each partition has three replicas and a leader elected with Multi-Paxos; a write is acknowledged once it is durable on a majority, and a strongly consistent read is served by the leader. The quorum principle survives inside the service, hidden from users.
 
 ```java
 @Service
@@ -297,7 +302,7 @@ public class DynamoDbPaymentRepository {
     private static final String TABLE = "PaymentTransactions";
 
     /**
-     * DynamoDB strongly consistent read contacts a quorum of replicas.
+     * DynamoDB strongly consistent read is served by the partition leader.
      * For payment systems, always use strongly consistent reads for
      * authorization checks.
      */
@@ -305,7 +310,7 @@ public class DynamoDbPaymentRepository {
         GetItemRequest request = GetItemRequest.builder()
             .tableName(TABLE)
             .key(Map.of("paymentId", AttributeValue.fromS(paymentId)))
-            .consistentRead(true)   // Strongly consistent = quorum read
+            .consistentRead(true)   // Strongly consistent (leader) read
             .build();
 
         try {
@@ -338,6 +343,7 @@ public class DynamoDbPaymentRepository {
                 ":to",   AttributeValue.fromS(to.toString())
             ))
             .consistentRead(false)  // Eventually consistent — OK for history display
+                                    // (a global secondary index supports only this)
             .build();
 
         return dynamoClient.queryPaginator(request)
@@ -416,6 +422,9 @@ public class RiskParameterStore {
         CompletableFuture.allOf(writes.toArray(new CompletableFuture[0]))
             .orTimeout(5, TimeUnit.SECONDS)
             .join();  // Throws if any replica fails
+        // If one replica fails, the others ALREADY have the new value and
+        // reads disagree until it is fixed: keep retrying the failed replica
+        // (roll forward) and alert — do not report success until all have it.
 
         log.info("Risk parameter {} written to all {} replicas",
             param.key(), allReplicas.size());
@@ -450,7 +459,9 @@ public class FiveNodeQuorumPaymentLedger {
 
     private final List<LedgerReplica> replicas;
 
-    @Transactional
+    // Teaching sketch: a hand-rolled quorum. Real systems use Raft/Paxos or a
+    // quorum database instead — the "rollback" below is not safe if a reader
+    // already saw the partial write.
     public WriteReceipt writeLedgerEntry(LedgerEntry entry) {
         List<CompletableFuture<ReplicaAck>> writes = replicas.stream()
             .map(r -> CompletableFuture
@@ -599,15 +610,15 @@ public class FinancialDataConsistencyMatrix {
 
 In PostgreSQL with synchronous replication, you can configure quorum commit — requiring acknowledgment from K of N standbys before the write is confirmed:
 
-```sql
--- postgresql.conf
--- Require acknowledgment from ANY 2 of 3 standbys (quorum commit)
+```ini
+# postgresql.conf
+# Require acknowledgment from ANY 2 of 3 standbys (quorum commit)
 synchronous_standby_names = 'ANY 2 (standby1, standby2, standby3)'
 
--- This means: W = 1 (primary) + 2 (standbys) = 3
--- With a quorum read (connecting to the primary after write):
--- R = 1 (primary always has latest), W = 3
--- R + W = 4 > N (1 primary + 3 standbys = 4), so R + W > N ✓
+# This means: W = 1 (primary) + 2 (standbys) = 3
+# With a quorum read (connecting to the primary after write):
+# R = 1 (primary always has latest), W = 3
+# R + W = 4 > N (1 primary + 3 standbys = 4), so R + W > N
 ```
 
 ```java
@@ -619,15 +630,16 @@ public class PostgresQuorumPaymentWriter {
 
     /**
      * Writes to PostgreSQL primary with synchronous replication.
-     * The 'synchronous_commit = on' setting ensures the write is
-     * durable on the required number of standbys before returning.
+     * synchronous_commit = on makes COMMIT wait until the required
+     * standbys have flushed the WAL.
      */
-    @Transactional
     public PaymentRecord writePayment(PaymentRequest request) {
         try (Connection conn = primaryDataSource.getConnection()) {
-            // Set synchronous_commit for this transaction (can override per-txn)
+            conn.setAutoCommit(false);
+            // SET LOCAL applies to this transaction only — a plain SET would
+            // stay on the pooled connection for whoever uses it next
             try (PreparedStatement syncStmt = conn.prepareStatement(
-                    "SET synchronous_commit = 'on'")) {
+                    "SET LOCAL synchronous_commit = 'on'")) {
                 syncStmt.execute();
             }
 
@@ -642,11 +654,13 @@ public class PostgresQuorumPaymentWriter {
 
                 ResultSet rs = ps.executeQuery();
                 rs.next();
-
-                return PaymentRecord.builder()
+                PaymentRecord record = PaymentRecord.builder()
                     .paymentId((UUID) rs.getObject("payment_id"))
                     .createdAt(rs.getTimestamp("created_at").toInstant())
                     .build();
+
+                conn.commit();   // returns only after the standby quorum acknowledged
+                return record;
             }
         } catch (SQLException e) {
             throw new PaymentWriteException("Failed to write payment", e);
@@ -749,17 +763,12 @@ public void debit(UUID accountId, long amount) {
     // Account is now at $300 but should be $100 — $200 double-spent
 }
 
-// CORRECT — use Cassandra LWT (IF balance_cents >= :amount)
-// or PostgreSQL SELECT FOR UPDATE
+// CORRECT — compare-and-set with a Cassandra LWT on the version you read
+// (... SET balance_cents = ?, version = ? WHERE account_id = ? IF version = ?),
+// retrying on conflict — see AccountBalanceService.debit() above.
+// In PostgreSQL: SELECT ... FOR UPDATE, or UPDATE ... WHERE balance >= :amount.
 public DebitResult debitWithCas(UUID accountId, long amount) {
-    BoundStatement stmt = debitIfSufficientStmt.bind(amount, accountId, amount)
-        .setConsistencyLevel(ConsistencyLevel.QUORUM)
-        .setSerialConsistencyLevel(ConsistencyLevel.SERIAL);
-
-    ResultSet rs = session.execute(stmt);
-    return rs.one().getBool("[applied]")
-        ? DebitResult.success()
-        : DebitResult.insufficientFunds();
+    return accountBalanceService.debit(accountId, amount, idempotencyKey);
 }
 ```
 
@@ -799,7 +808,7 @@ Quorum systems provide the mathematical foundation for consistency guarantees in
 |---|---|
 | `R + W > N` | Strong consistency — reads always see latest writes |
 | `W = ALL` | ROWA — maximum consistency, low write availability |
-| `W = ⌈N/2⌉+1, R = ⌈N/2⌉+1` | Majority quorum — balanced consistency and availability |
+| `W = ⌊N/2⌋+1, R = ⌊N/2⌋+1` | Majority quorum — balanced consistency and availability |
 | `W = 1, R = 1` | No consistency guarantee — eventual only |
 
 For financial systems on Cassandra:
@@ -807,6 +816,8 @@ For financial systems on Cassandra:
 - Idempotency keys: `SERIAL` consistency (Paxos)
 - Risk rules: `ALL` writes + `ONE` reads (ROWA pattern)
 - Display/inquiry: `LOCAL_ONE` for lower latency
+
+The quorum formula is not just a theoretical construct — it directly maps to business outcomes. A payment system that uses `ONE` for authorization will eventually double-charge a customer. A system that uses `ALL` will have unacceptable availability during routine deployments. The right quorum configuration is an engineering decision with direct financial and regulatory consequences.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -847,4 +858,3 @@ For financial systems on Cassandra:
 }
 -->
 
-The quorum formula is not just a theoretical construct — it directly maps to business outcomes. A payment system that uses `ONE` for authorization will eventually double-charge a customer. A system that uses `ALL` will have unacceptable availability during routine deployments. The right quorum configuration is an engineering decision with direct financial and regulatory consequences.

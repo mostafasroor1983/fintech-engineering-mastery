@@ -11,6 +11,8 @@ tags: [JMM-advanced, VarHandle, Unsafe, fence, acquire-release]
 java-versions: [17, 21]
 ---
 
+## Overview
+
 The Java Memory Model specification is not a performance guideline — it is a formal contract between the programmer and the JVM. Most engineers know the surface rules: `volatile` gives visibility, `synchronized` gives mutual exclusion. Principal Engineers must go deeper: understanding the JMM's formal semantics around final fields, the precise fence taxonomy exposed by `VarHandle`, the role `sun.misc.Unsafe` plays in the ecosystem, and the distinction between happens-before as a partial order versus real-time causality. This lesson arms you with the tools to design truly safe lock-free data structures in payment processing systems, audit framework internals, and reason about correctness from first principles rather than folklore.
 
 ## Learning Objectives
@@ -27,7 +29,7 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-A fraud detection pipeline at a large card network processes 85,000 authorization requests per second on a 48-core host. Each request is enriched with merchant data stored in an immutable `MerchantProfile` object. These profiles are published from a background refresh thread and read by hundreds of authorization threads simultaneously. The team discovered a subtle bug: despite using an `AtomicReference` to publish profiles, some readers saw partially constructed objects whose `final` fields contained stale values. The root cause was a misunderstanding of when the JMM's final-field freeze guarantee applies — and when it does not. Fixing it correctly required understanding the difference between `VarHandle.releaseFence()` and a full `fullFence()`, and knowing exactly what `Unsafe.putOrderedObject` did under the hood. This lesson explains every piece of that puzzle.
+*Composite example (based on common industry patterns, not a specific company):* a fraud detection pipeline at a card network processes 85,000 authorization requests per second on a 48-core host. Each request is enriched with merchant data stored in a `MerchantProfile` object whose fields are all `final`. These profiles are published from a background refresh thread and read by hundreds of authorization threads simultaneously. The team discovered a subtle bug: some readers saw stale merchant attributes even though every field was `final`. The root cause: one `final` field pointed to a mutable map that the refresh thread kept changing **after** construction — and the JMM's final-field guarantee does not cover later changes. Fixing it correctly required understanding exactly what the freeze guarantees, which fences publishing needs, and what legacy code built on `Unsafe.putOrderedObject` really did. This lesson explains every piece of that puzzle.
 
 ## Final Field Semantics: The Freeze Action
 
@@ -35,11 +37,11 @@ A fraud detection pipeline at a large card network processes 85,000 authorizatio
 
 The JMM introduces a special action called a **freeze** for `final` fields. When a constructor writes to a `final` field, the JMM guarantees that:
 
-1. All writes to `final` fields in the constructor are ordered before the freeze action.
-2. The freeze action is ordered before any action that makes the reference to the constructed object available to another thread (safe publication).
-3. Any thread that reads the reference through a correctly synchronised publication channel is guaranteed to see all `final` field writes.
+1. All writes to `final` fields in the constructor are ordered before the freeze action at the end of the constructor.
+2. Any thread that obtains a reference to the object **after** the constructor finished sees the `final` fields with their constructed values — and also sees the objects reachable through them **as they were at the freeze**.
+3. This holds **even if the reference is published through a data race** (a plain, non-volatile field), as long as `this` did not escape during construction.
 
-This is stronger than what `volatile` gives you for non-final fields. The freeze action exists specifically to allow objects with only `final` fields to be safely published without any explicit synchronisation on the writer side — provided the reference is published safely.
+That third point is what makes `final` special: immutable objects with only `final` fields are thread-safe even when published carelessly. (Safe publication is still needed for two other things: making sure the reader sees the **new reference** at all, and making non-final fields visible.)
 
 ```java
 // ImmutableMerchantProfile — all fields are final
@@ -72,7 +74,7 @@ public final class ImmutableMerchantProfile {
 
 ### Safe Publication Channels
 
-The freeze guarantee only helps if the reference itself is published safely. Safe publication channels include:
+The freeze protects the object's `final` fields, but a racy reader may still see an old reference (or `null`) for a long time. To make the new reference itself visible promptly — and to cover any non-final state — publish it through a safe channel:
 
 - Storing the reference in a `volatile` field
 - Storing the reference in an `AtomicReference`
@@ -99,18 +101,18 @@ public class MerchantProfileCache {
 
 ### The Critical Limitation: Transitivity Does Not Apply to Mutable State
 
-The freeze guarantee covers only the `final` fields of the directly constructed object. It does **not** extend to objects reachable through those final fields unless those objects are themselves safely constructed.
+The freeze guarantee covers the `final` fields **and** the objects reachable through them, but only **as they were at the end of the constructor**. It does not cover changes made later, and it does not cover writes by other threads that were not ordered before the constructor finished.
 
 ```java
 // DANGEROUS: the final reference is frozen, but its contents are not
 public final class MerchantProfileUnsafe {
     private final Map<String, String> attributes; // final reference — FROZEN
-    // but Map's internal state is NOT covered by the freeze
+    // the map's contents are covered only AS THEY WERE at the freeze
 
     public MerchantProfileUnsafe(Map<String, String> attrs) {
-        // The reference 'attributes' is frozen after this constructor
-        // but if 'attrs' was modified by another thread before/after
-        // construction, those modifications are NOT guaranteed visible
+        // We store the CALLER's map. If the caller (or another thread)
+        // modifies 'attrs' after construction, those changes are NOT
+        // covered — and HashMap is not safe for concurrent modification
         this.attributes = attrs;
     }
 }
@@ -129,7 +131,7 @@ public final class MerchantProfileSafe {
 ```
 
 > [!WARNING]
-> The JMM freeze guarantee is **not transitive through mutable objects**. If a `final` field holds a reference to a mutable `List`, `Map`, or any object that was not fully constructed inside the same constructor, another thread reading through the published reference may see the mutable object in an inconsistent state. Always use `Map.copyOf()`, `List.copyOf()`, or `Collections.unmodifiableX()` wrappers that are populated entirely within the constructor.
+> The JMM freeze guarantee does **not** protect mutable objects that keep changing. If a `final` field holds a mutable `List` or `Map` that anyone (another thread, or the caller who passed it in) modifies after construction, readers may see it in an inconsistent state. Make an immutable copy inside the constructor — `Map.copyOf()`, `List.copyOf()` — so nothing can change it afterwards. (`Collections.unmodifiableX()` is only a view: the original collection can still change underneath it.)
 
 ### Constructor Escape: The Common Bug
 
@@ -172,8 +174,8 @@ public final class FraudModelSafe {
 
 | Method | Barrier Type | Effect |
 |---|---|---|
-| `VarHandle.fullFence()` | StoreLoad | All prior reads/writes complete before any subsequent read/write |
-| `VarHandle.acquireFence()` | LoadLoad + LoadStore | All subsequent reads/writes see effects of all prior reads |
+| `VarHandle.fullFence()` | All four (including StoreLoad) | All prior reads/writes are ordered before any subsequent read/write |
+| `VarHandle.acquireFence()` | LoadLoad + LoadStore | Prior reads are ordered before any subsequent read/write |
 | `VarHandle.releaseFence()` | LoadStore + StoreStore | All prior reads/writes complete before any subsequent write |
 | `VarHandle.loadLoadFence()` | LoadLoad | All prior loads complete before any subsequent load |
 | `VarHandle.storeStoreFence()` | StoreStore | All prior stores complete before any subsequent store |
@@ -183,18 +185,19 @@ public final class FraudModelSafe {
 ```
 Producer thread pattern (release semantics):
   1. Write all data fields
-  2. VarHandle.storeStoreFence()   ← ensure data writes drain before flag write
-  3. Write the flag/sequence
+  2. VarHandle.storeStoreFence()   ← ensure data writes are ordered before flag write
+  3. Write the flag/sequence       ← at least setOpaque, not a plain write
 
 Consumer thread pattern (acquire semantics):
-  1. Read the flag/sequence
+  1. Read the flag/sequence        ← at least getOpaque, or the JIT may hoist
+                                     a plain read out of a polling loop
   2. VarHandle.loadLoadFence()     ← ensure flag read completes before data reads
   3. Read all data fields
 ```
 
 ### SPSC Queue with Explicit Fences
 
-A Single-Producer Single-Consumer (SPSC) queue is the backbone of many low-latency financial systems. The key insight: on x86, StoreStore is free (TSO memory model), but on ARM it costs real instructions. Using `storeStoreFence` + `loadLoadFence` instead of `fullFence` cuts latency on ARM by ~30%:
+A Single-Producer Single-Consumer (SPSC) queue is the backbone of many low-latency financial systems. The key insight: on x86, StoreStore and LoadLoad ordering are free (TSO memory model), but on ARM they cost real instructions — still far less than a full fence. So use the weakest ordering that is correct:
 
 ```java
 import java.lang.invoke.MethodHandles;
@@ -219,15 +222,12 @@ public final class SpscPaymentQueue {
     private static final int CAPACITY = 1024; // must be power of two
     private static final int MASK     = CAPACITY - 1;
 
-    // Padding to prevent false sharing between producer and consumer state
-    // 64-byte cache line; long is 8 bytes; 8 longs = 64 bytes
-    private final long[] producerPadding = new long[8];
+    // NOTE on false sharing: these two counters will often share a cache line.
+    // A `long[] pad = new long[8]` field would NOT help — an array is a separate
+    // heap object; the field is just a 4–8 byte reference. Real implementations
+    // pad through class inheritance (as JCTools does) or with @Contended
     private volatile long producerSequence = 0;
-    private final long[] producerPadding2 = new long[8];
-
-    private final long[] consumerPadding = new long[8];
     private volatile long consumerSequence = 0;
-    private final long[] consumerPadding2 = new long[8];
 
     // Payload slots — each slot holds one PaymentEvent reference
     private final PaymentEvent[] slots = new PaymentEvent[CAPACITY];
@@ -263,8 +263,9 @@ public final class SpscPaymentQueue {
         int slot = (int) (pSeq & MASK);
         slots[slot] = event; // write payload
 
-        // storeStoreFence ensures payload write is visible before
-        // the producerSequence increment that signals "slot ready"
+        // storeStoreFence: payload write ordered before the sequence write.
+        // (setRelease below already gives this ordering — the explicit fence
+        //  only makes the intent visible to readers of the code)
         VarHandle.storeStoreFence();
 
         // Release write: makes producerSequence visible to consumer
@@ -286,7 +287,8 @@ public final class SpscPaymentQueue {
             return null; // empty
         }
 
-        // loadLoadFence: ensure pSeq read is committed before we read the slot
+        // loadLoadFence: pSeq read ordered before the slot read
+        // (getAcquire above already guarantees this — explicit for clarity)
         VarHandle.loadLoadFence();
 
         int slot = (int) (cSeq & MASK);
@@ -301,7 +303,7 @@ public final class SpscPaymentQueue {
 ```
 
 > [!NOTE]
-> On x86 (TSO model), `storeStoreFence()` and `loadLoadFence()` are essentially no-ops — the hardware guarantees store ordering already. On ARM (weakly ordered), they emit `dmb ishst` (store-store) and `dmb ishld` (load-load) respectively. Using the minimum required fence instead of `fullFence()` can save 15–40 ns per operation on ARM-based cloud instances, which matters at 85,000 TPS.
+> On x86 (TSO model), `storeStoreFence()` and `loadLoadFence()` emit no instruction — they only stop the JIT from reordering. On ARM (weakly ordered), they emit `dmb ishst` (store-store) and `dmb ishld` (load-load) respectively, which are cheaper than the full `dmb ish` that `fullFence()` needs. At tens of thousands of operations per second the saving is measurable — benchmark on your target hardware.
 
 ### Acquire-Release Pairing
 
@@ -353,15 +355,15 @@ public class UnsafeAccessor {
 Unsafe unsafe = UnsafeAccessor.getUnsafe();
 
 // Full fence: equivalent to VarHandle.fullFence()
-// Emits MFENCE on x86, dmb ish on ARM
+// On x86 HotSpot emits a lock-prefixed instruction (lock addl); on ARM dmb ish
 unsafe.fullFence();
 
-// Store fence: equivalent to VarHandle.storeStoreFence() + storeFence
-// On x86: SFENCE (usually a no-op for normal writes)
+// Store fence: equivalent to VarHandle.releaseFence() (LoadStore + StoreStore)
+// On x86: no instruction — only a compiler barrier
 unsafe.storeFence();
 
-// Load fence: equivalent to VarHandle.loadLoadFence() on most platforms
-// On x86: LFENCE
+// Load fence: equivalent to VarHandle.acquireFence() (LoadLoad + LoadStore)
+// On x86: no instruction — only a compiler barrier
 unsafe.loadFence();
 ```
 
@@ -428,7 +430,7 @@ public final class Sequence {
 ```
 
 > [!WARNING]
-> `sun.misc.Unsafe` is **not part of the public Java API**. Its field offsets are platform-specific. JEP 471 (Java 23+) deprecates many `Unsafe` methods for removal. Any application code using `Unsafe` directly will break across JDK major versions. Use `VarHandle` (available since Java 9) or `java.util.concurrent.atomic` classes instead. Only framework and JDK authors should ever touch `Unsafe`.
+> `sun.misc.Unsafe` is **not part of the public Java API**. Its field offsets are platform-specific. JEP 471 (Java 23) deprecates its memory-access methods for removal, and JEP 498 (Java 24) makes the JVM print a warning when they are first used. Any application code using `Unsafe` directly will break across JDK major versions. Use `VarHandle` (available since Java 9) or `java.util.concurrent.atomic` classes instead. Only framework and JDK authors should ever touch `Unsafe`.
 
 ### The Migration Path
 
@@ -436,7 +438,8 @@ public final class Sequence {
 Java 1.5–8:   sun.misc.Unsafe (field offsets, putOrdered*, CAS methods)
 Java 9–:      java.lang.invoke.VarHandle (typed, access-mode based, public API)
 Java 9–:      java.util.concurrent.atomic.* (high-level wrappers)
-Java 23+:     Unsafe memory-ordering methods deprecated for removal (JEP 471)
+Java 23:      Unsafe memory-access methods deprecated for removal (JEP 471)
+Java 24:      runtime warning on first use of those methods (JEP 498)
 ```
 
 ## Happens-Before Is Not Causality
@@ -449,12 +452,12 @@ The JMM defines happens-before (HB) as a **partial order** over actions (reads, 
 - **Program order**: within a single thread, all actions are ordered by HB.
 - **Not total**: two actions A and B may have neither A HB B nor B HB A. These are **concurrent** actions.
 
-The critical insight: **HB does not mean "earlier in real time"**. Two actions A and B can have A HB B even if B completes on the CPU before A starts, as long as the JMM can guarantee B sees the effects of A.
+The critical insight: **HB is about visibility, not wall-clock time**. "A HB B" means B is guaranteed to see A's effects. Two actions that happen one after the other in real time, but with no HB chain between them, carry **no** visibility guarantee — and the JIT and CPU are free to reorder them as long as each thread's own result is unchanged.
 
 ```
 // Three threads, two HB edges:
 Thread 1: write x=1 → volatile write flag=true   (1) HB (2) by program order
-Thread 2: volatile read flag → read x            (2) HB (3) by volatile semantics
+Thread 2: volatile read flag → read x            (2) HB (3) — if the read SEES true
 Thread 3: (independent) write y=2                 no HB relationship with 1,2,3
 
 // Real-time ordering might be:
@@ -487,7 +490,7 @@ balance = balance - 100; // read + write, no HB with Thread 2
 
 // Thread 2 (no synchronisation)
 balance = balance + 50;  // read + write, no HB with Thread 1
-// balance may end up as 900, 1050, or any other value
+// balance may end up as 950, 900 or 1050 — one update can be lost
 // The JMM allows the JIT to cache balance in a register permanently
 
 // DRF — all accesses synchronised
@@ -571,9 +574,9 @@ AtomicLong counter = new AtomicLong(0);
 counter.compareAndSet(0L, 1L);
 
 // x86-64 assembly emitted by JIT (via intrinsic):
-lock cmpxchg qword ptr [rax+0x10], rcx
+lock cmpxchg qword ptr [rdx+0x10], rcx
 // LOCK prefix: atomic bus lock (or cache-line lock on modern CPUs)
-// CMPXCHG: compare RAX with [rax+0x10]; if equal, write RCX
+// CMPXCHG: compare RAX (expected value) with [rdx+0x10]; if equal, write RCX
 
 // Without intrinsic (hypothetical naive implementation):
 // 1. Load value from memory
@@ -611,7 +614,7 @@ public class CasBenchmark {
         }
     }
 
-    // Typical results on x86-64, single thread:
+    // Illustrative results on x86-64 (vary by CPU), single thread:
     // intrinsicCas:    ~4 ns   (LOCK CMPXCHG + memory ordering)
     // lockedIncrement: ~12 ns  (monitor enter + exit overhead)
     //
@@ -629,17 +632,17 @@ VarHandle access mode → JIT intrinsic → hardware instruction (x86-64)
 get()                 → plain load     → MOV (no barrier)
 getOpaque()          → opaque load    → MOV (no compiler reorder)
 getAcquire()         → acquire load   → MOV + implicit barrier (x86 TSO: free)
-getVolatile()        → volatile load  → MOV + LFENCE (compiler barrier on x86)
+getVolatile()        → volatile load  → MOV (x86 TSO already orders it)
 set()                → plain store    → MOV
 setOpaque()          → opaque store   → MOV (no compiler reorder)
 setRelease()         → release store  → MOV + implicit barrier (x86 TSO: free)
-setVolatile()        → volatile store → XCHG (implies MFENCE on x86)
+setVolatile()        → volatile store → MOV + lock addl (or XCHG) — the StoreLoad fence
 compareAndSet()      → CAS            → LOCK CMPXCHG
 getAndAdd()          → fetch-add      → LOCK XADD
 ```
 
 > [!NOTE]
-> On x86 (TSO), acquire loads and release stores are "free" — the hardware already provides stronger ordering than these modes require. This is why `setRelease` is as fast as a plain store on x86, while on ARM it emits a `stlr` instruction (store-release). Choosing `setRelease` over `setVolatile` saves the StoreLoad fence on ARM, which can be measured as 20–60 ns on modern ARM cores.
+> On x86 (TSO), acquire loads and release stores are "free" — the hardware already provides stronger ordering than these modes require. This is why `setRelease` is as fast as a plain store on x86, while on ARM it emits an `stlr` instruction (store-release). Choosing `setRelease` over `setVolatile` avoids the StoreLoad fence — the lock-prefixed instruction on x86, and extra ordering on ARM — which is measurable on hot paths.
 
 ## Safe Construction: Final Fields + VarHandle Release
 
@@ -815,7 +818,7 @@ sequenceDiagram
 
 **Q: Why does `VarHandle.setRelease()` not emit a `StoreLoad` fence, and when does the absence of that fence matter?**
 
-**A:** `setRelease()` emits a **LoadStore + StoreStore** fence, which ensures all prior reads and writes drain before the store. It does **not** emit a `StoreLoad` fence, which is the most expensive barrier (it flushes the store buffer and blocks until the store is visible to all cores). The absence matters when you need to prevent a later load from being reordered before this store — that is, when a consuming thread needs to see the store **and then** immediately see subsequent stores too. The only access mode that provides `StoreLoad` semantics is `setVolatile()`. For the producer/consumer hand-off pattern (write data, then set flag), `setRelease` on the producer and `getAcquire` on the consumer is always sufficient and avoids the expensive StoreLoad fence.
+**A:** `setRelease()` gives **LoadStore + StoreStore** ordering: all earlier reads and writes are ordered before the store. It does **not** add a `StoreLoad` fence — the most expensive barrier, which drains the store buffer before any later load. The absence matters when the **writing thread's own later loads** must not move before this store. The classic case is Dekker-style mutual exclusion: thread 1 sets `flag1` then reads `flag2`; thread 2 sets `flag2` then reads `flag1`. With release/acquire only, both threads can read the other's old `false` and both enter. Among plain accesses, `setVolatile()` (or a `fullFence()`) provides StoreLoad. For the producer/consumer hand-off pattern (write data, then set flag), `setRelease` on the producer and `getAcquire` on the consumer is sufficient and avoids the expensive fence.
 
 ## Practical Challenge
 
@@ -869,7 +872,7 @@ Expected deliverable: a working Java module with the cache implementation, the `
         "No, the freeze guarantee only applies to primitive final fields, not reference fields"
       ],
       "correct": 1,
-      "explanation": "The JMM freeze action occurs at the end of the constructor and covers all writes that happen during the constructor's execution. Since the List was fully populated inside the constructor, those writes are covered by the freeze. Any thread that obtains a reference to the object (via the volatile write) is guaranteed to see the complete List contents. This guarantee applies to all final fields, not just primitives."
+      "explanation": "The JMM freeze happens at the end of the constructor. Any thread that obtains the object reference afterwards sees the final fields — and the objects reachable through them — at least as up to date as they were at the freeze. Since the List was fully populated inside the constructor, its contents are visible. This applies to all final fields, not just primitives. It does NOT cover changes made to the List after construction."
     },
     {
       "text": "What specific JMM violations exist in a class where two threads concurrently access a plain (non-volatile, non-synchronized) HashMap field — one calling clear()+putAll() and the other calling get()?",
@@ -880,18 +883,18 @@ Expected deliverable: a working Java module with the cache implementation, the `
         "No JMM violation because HashMap is a final field reference"
       ],
       "correct": 1,
-      "explanation": "Without synchronisation, the concurrent access to HashMap's internal array, size field, and modCount are all data races. The JMM explicitly allows the JIT to cache any of these reads permanently, never refreshing from main memory. The reader can see the old size, the new array, or any combination of old and new internal state. Additionally, HashMap itself is not thread-safe and can enter an infinite loop on concurrent structural modification."
+      "explanation": "Without synchronisation, the concurrent accesses to HashMap's internal table, size field and modCount are all data races. The JMM allows the JIT to cache these reads, and the reader can see the old size with the new table, or any mix of old and new internal state. In addition, HashMap is not thread-safe: concurrent structural modification can corrupt it (lost entries, broken buckets, and in older JDKs even infinite loops)."
     },
     {
       "text": "VarHandle.setRelease() does not emit a StoreLoad fence. When does the absence of a StoreLoad fence matter for correctness?",
       "options": [
         "It always matters — setRelease() is never safe for multi-threaded use",
-        "It matters when you need a reader to see this store AND then immediately see the results of subsequent loads by the writer — only setVolatile() provides StoreLoad ordering",
+        "It matters when the writing thread's own later loads must not move before this store — for example Dekker-style 'set my flag, then read your flag'; setVolatile() or fullFence() provides StoreLoad ordering",
         "It matters only on ARM hardware, not on x86",
         "It matters only when the field stores a primitive type, not an object reference"
       ],
       "correct": 1,
-      "explanation": "setRelease() emits a StoreStore+LoadStore fence (release semantics), ensuring all prior writes drain before this store. It does NOT emit a StoreLoad fence, which would prevent subsequent loads from being reordered before the store. The absence of StoreLoad matters when a consuming thread needs to observe this store AND then have its subsequent loads see values written after this store. For the standard producer-consumer handoff (write data, then set a flag), setRelease on the writer paired with getAcquire on the reader is always sufficient."
+      "explanation": "setRelease() gives release ordering (LoadStore + StoreStore): all earlier writes are ordered before this store. It does NOT add a StoreLoad fence, so a LATER load by the same thread may be performed before this store becomes visible to others. That matters for Dekker-style protocols — set my flag, then read yours — where both threads could read the other's old value. For the standard producer-consumer handoff (write data, then set a flag), setRelease on the writer paired with getAcquire on the reader is sufficient, on x86 and ARM alike."
     }
   ]
 }

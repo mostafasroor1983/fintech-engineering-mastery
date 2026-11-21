@@ -89,7 +89,7 @@ public class NaiveBenchmark {
 | Pitfall | Description | JMH Fix |
 |---|---|---|
 | **Dead code elimination** | JIT removes code with no observable effect | `Blackhole.consume()` |
-| **Constant folding** | JIT precomputes expressions at compile time | Use `@State` fields, not literals |
+| **Constant folding** | JIT precomputes expressions at compile time | Use non-final `@State` fields, not literals or `final` fields |
 | **JIT warmup** | First iterations run interpreted, not compiled | Warmup iterations before measurement |
 | **JIT deoptimisation** | Code profile changes invalidate optimisations mid-run | Multiple forks, steady-state measurement |
 | **GC interference** | GC pauses distort latency measurements | Multiple iterations, percentile reporting |
@@ -116,6 +116,12 @@ public class NaiveBenchmark {
 <plugin>
     <groupId>org.apache.maven.plugins</groupId>
     <artifactId>maven-shade-plugin</artifactId>
+    <executions>
+        <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+        </execution>
+    </executions>
     <configuration>
         <finalName>benchmarks</finalName>
         <transformers>
@@ -129,6 +135,9 @@ public class NaiveBenchmark {
 
 ```bash
 # Build and run
+# (JDK 23+ no longer runs annotation processors by default: list
+#  jmh-generator-annprocess in maven-compiler-plugin <annotationProcessorPaths>
+#  or pass -proc:full, otherwise the jar contains no benchmarks)
 mvn clean package -DskipTests
 java -jar target/benchmarks.jar
 
@@ -143,6 +152,7 @@ java -jar target/benchmarks.jar ".*CounterBenchmark.*" -wi 5 -i 10 -f 2 -t 8
 ## Core JMH Annotations
 
 ```java17
+// Choose ONE mode per benchmark (or list several: @BenchmarkMode({...}))
 @BenchmarkMode(Mode.Throughput)      // ops/second
 @BenchmarkMode(Mode.AverageTime)     // average time per op
 @BenchmarkMode(Mode.SampleTime)      // samples latency distribution (percentiles)
@@ -212,7 +222,8 @@ public class CounterBenchmark {
         adderCounter.increment();
     }
 }
-// Typical results on 8 cores, 8 threads (ops/ms — higher is better):
+// Illustrative results on 8 cores, 8 threads (ops/ms — higher is better;
+// real numbers vary widely by CPU and JDK):
 // volatile_increment:       ~40,000  (data race — incorrect but fast for comparison)
 // synchronized_increment:   ~18,000  (global lock — serialised)
 // reentrantLock_increment:  ~20,000  (similar to synchronized — overhead comparable)
@@ -226,8 +237,8 @@ public class CounterBenchmark {
 @State(Scope.Thread) // Each thread gets its own instance
 public class ExchangeRateBenchmark {
 
-    private final ExchangeRateCache cache = new ExchangeRateCache();
-    private final CurrencyPair pair = CurrencyPair.of("GBP", "USD");
+    private ExchangeRateCache cache = new ExchangeRateCache();
+    private CurrencyPair pair = CurrencyPair.of("GBP", "USD"); // non-final: avoids constant folding
 
     // WRONG: JIT may eliminate the getRate() call if result is unused
     @Benchmark
@@ -263,6 +274,8 @@ public class ThreadLocalStateBenchmark {
 }
 
 @State(Scope.Group)     // Per-group instance — for producer/consumer benchmarks
+// Caution: blocking put()/take() can hang at the end of an iteration when one
+// side stops first; offer()/poll() with a short timeout is safer in practice
 public class ProducerConsumerBenchmark {
     BlockingQueue<Payment> queue = new ArrayBlockingQueue<>(1000);
 
@@ -331,7 +344,7 @@ public class LockScalingBenchmark {
         return volatileVal;
     }
 }
-// Results (read-heavy, 8 threads, ops/ms — higher is better):
+// Illustrative results (read-heavy, 8 threads, ops/ms — higher is better):
 // volatile_read:            ~850,000  (fastest — single memory barrier)
 // atomicLong_get:           ~820,000  (essentially volatile read)
 // stampedLock_optimistic:   ~700,000  (validate() adds a small cost)
@@ -349,8 +362,10 @@ public class LockScalingBenchmark {
 @Fork(2)
 public class VirtualThreadBenchmark {
 
+    // The pool is SMALLER than the number of tasks — the realistic case:
+    // a platform pool is sized for steady load, not for every burst
     private static final ExecutorService PLATFORM_POOL =
-        Executors.newFixedThreadPool(200);
+        Executors.newFixedThreadPool(50);
     private static final ExecutorService VIRTUAL_EXEC =
         Executors.newVirtualThreadPerTaskExecutor();
 
@@ -379,9 +394,11 @@ public class VirtualThreadBenchmark {
         for (Future<?> f : futures) f.get();
     }
 }
-// Typical result (200 concurrent 10ms I/O tasks):
-// platformThreads_ioSimulated: ~8 ops/sec  (200 threads × 10ms = all block simultaneously)
-// virtualThreads_ioSimulated: ~95 ops/sec  (carrier threads stay busy scheduling)
+// Illustrative result (200 concurrent 10ms I/O tasks):
+// platformThreads_ioSimulated: ~24 ops/sec  (50 threads → 4 waves × 10ms ≈ 40ms per op)
+// virtualThreads_ioSimulated: ~95 ops/sec  (all 200 sleep at once ≈ 10ms per op)
+// Note: a 200-thread platform pool would score about the same as virtual
+// threads here — the difference appears when tasks outnumber pool threads
 ```
 
 ## Reading JMH Output
@@ -395,9 +412,9 @@ CounterBenchmark.synchronized_incr  thrpt   20  18234.123 ± 234.789  ops/ms
 
 **How to read this:**
 - `Score`: the measured value (ops/ms for throughput)
-- `Error`: 99.9% confidence interval — results overlap if error ranges overlap
-- `Cnt`: total samples (warmup × forks + measurement × forks)
-- If `longAdder Score ± Error` and `atomicLong Score ± Error` overlap → **not statistically significant**
+- `Error`: half-width of the 99.9% confidence interval
+- `Cnt`: number of measured samples (measurement iterations × forks — warmup is not counted)
+- If `longAdder Score ± Error` and `atomicLong Score ± Error` overlap → treat the difference as **not proven** (a rule of thumb, not a formal test)
 
 ```java17
 // Always check: are the differences outside the error bounds?
@@ -454,7 +471,7 @@ CounterBenchmark.synchronized_incr  thrpt   20  18234.123 ± 234.789  ops/ms
     "question": "A benchmark runs in a single JVM process (`@Fork(0)`). After 5 warmup iterations, results stabilise. Is this sufficient for a valid benchmark?",
     "options": [
       "Yes — warmup iterations ensure the JIT is compiled before measurement",
-      "No — a single JVM fork means JIT profile pollution from previous benchmarks may affect results; use @Fork(2) minimum for independent JVM processes",
+      "No — without a fork, benchmarks run inside the JMH harness JVM and share JIT profiles; use @Fork(2) or more for independent JVM processes",
       "No — @Fork(0) disables benchmarking entirely",
       "Yes — multiple forks only matter for multi-threaded benchmarks"
     ],
