@@ -112,7 +112,7 @@ spec:
       targetPort: 8080
 ```
 
-Traffic switch (zero downtime — Service selector update is atomic):
+Traffic switch. The selector change itself is one API update, but it reaches each node's kube-proxy within a few seconds, and existing keep-alive connections stay on blue until they close — so keep blue running (and ready) until its traffic has drained:
 ```bash
 # Switch to green
 kubectl patch service payment-service -n payments \
@@ -141,7 +141,7 @@ Traffic Split Progression:
 
 ```yaml
 # 90% stable v1, 10% canary v2
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: payment-service-canary
@@ -160,7 +160,7 @@ spec:
             subset: canary
           weight: 10
 ---
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: payment-service-subsets
@@ -227,10 +227,11 @@ spec:
         istio:
           virtualService:
             name: payment-service-vs
-          destinationRule:
-            name: payment-service-dr
-            canarySubsetName: canary
-            stableSubsetName: stable
+            routes:
+              - primary          # the VirtualService http route to manage
+      # (canary pods are reached via payment-service-canary, stable pods via
+      #  payment-service-stable; Argo Rollouts rewrites the weights of the
+      #  two routes in the VirtualService -- host-level traffic splitting)
       steps:
         - setWeight: 5          # Step 1: route 5% to canary
         - pause:
@@ -248,12 +249,17 @@ spec:
             templates:
               - templateName: payment-error-rate
               - templateName: payment-latency-p99
+            args:                 # both templates require service-name
+              - name: service-name
+                value: payment-service-canary
         - setWeight: 50         # Step 3: increase to 50%
         - pause: {}             # Step 4: indefinite pause — requires manual promotion
+                                # (kubectl argo rollouts promote payment-service)
         - setWeight: 100        # Step 5: full rollout (after manual approval)
-      autoPromotionEnabled: false   # require manual promotion at indefinite pause
-      maxSurge: "25%"
-      maxUnavailable: 0            # zero downtime during rollout
+      # (autoPromotionEnabled is a blue-green setting; in a canary the
+      #  indefinite pause above is the manual gate. With trafficRouting,
+      #  pod counts follow the weights, so maxSurge/maxUnavailable matter
+      #  only for the final scale-up.)
 ```
 
 ---
@@ -278,11 +284,16 @@ spec:
       interval: 60s
       count: 5                 # run 5 measurements
       failureLimit: 1          # allow at most 1 failure before aborting rollout
+      # With no traffic the division yields NaN (no data): neither condition
+      # is met and the measurement is "Inconclusive" -- make sure the canary
+      # actually receives traffic during analysis
       successCondition: result[0] < 0.01   # error rate < 1%
       failureCondition: result[0] >= 0.05  # abort if error rate >= 5%
       provider:
         prometheus:
           address: http://prometheus.monitoring.svc.cluster.local:9090
+          # "service" label: added by the Prometheus scrape config from the
+          # Kubernetes Service name (Micrometer itself does not set it)
           query: |
             sum(rate(
               http_server_requests_seconds_count{
@@ -330,7 +341,7 @@ spec:
 
 ### 4.3 Automatic Rollback on Analysis Failure
 
-When an AnalysisRun fails (failure condition exceeded), Argo Rollouts automatically:
+When an AnalysisRun fails (failure condition met more than `failureLimit` times, or more than `consecutiveErrorLimit` measurement errors — default 4), Argo Rollouts automatically aborts the rollout:
 1. Stops routing traffic to the canary
 2. Removes canary pods
 3. Marks the Rollout as `Degraded`
@@ -382,19 +393,21 @@ Feature toggles and deployment strategies solve different problems and are frequ
 
 ```java
 // Feature toggle for new payment routing algorithm
-// LaunchDarkly or Unleash SDK
+// LaunchDarkly Java SDK v6+ (contexts replace the old LDUser); Unleash,
+// Flagsmith or OpenFeature work the same way
 @Service
 public class PaymentRouter {
 
     private final LDClient ldClient;
 
     public PaymentProcessingResult route(PaymentRequest request) {
-        LDUser user = new LDUser.Builder(request.getCustomerId())
-            .country(request.getCountry())
+        LDContext context = LDContext.builder(request.getCustomerId())
+            .set("country", request.getCountry())
             .build();
 
+        // default false: if the flag service is unreachable, use the old path
         boolean useNewRouter = ldClient.boolVariation(
-            "new-payment-routing-algorithm", user, false);
+            "new-payment-routing-algorithm", context, false);
 
         if (useNewRouter) {
             return newRoutingAlgorithm.process(request);
@@ -416,9 +429,11 @@ Blue-green and canary deployments require the new application version to be back
 ```
 Phase 1 — Expand (run with old + new code simultaneously):
   - Add column: ALTER TABLE payments ADD COLUMN new_processor_id VARCHAR(50);
-  - Both v1.5.0 and v1.6.0 can read from either column
+  - v1.5.0 keeps using processor_id; v1.6.0 WRITES BOTH columns and reads
+    COALESCE(new_processor_id, processor_id) -- rows written by v1.5.0
+    during the overlap only have the old column
 
-Phase 2 — Migrate (backfill data):
+Phase 2 — Migrate (backfill data, in batches on a large table):
   - UPDATE payments SET new_processor_id = processor_id WHERE new_processor_id IS NULL;
 
 Phase 3 — Contract (after full rollout to v1.6.0):
@@ -426,13 +441,15 @@ Phase 3 — Contract (after full rollout to v1.6.0):
   - Only safe after v1.5.0 is fully retired
 ```
 
-```java
-// V3__add_new_processor_id.sql — Flyway migration (Phase 1: Expand)
-// This migration is safe to run while v1.5.0 is still in production
+```sql
+-- V3__add_new_processor_id.sql — Flyway migration (Phase 1: Expand)
+-- This migration is safe to run while v1.5.0 is still in production
 ALTER TABLE payments
 ADD COLUMN IF NOT EXISTS new_processor_id VARCHAR(50);
 
--- Backfill for existing rows
+-- Backfill for existing rows. On a big payments table run this as a
+-- separate batched job (e.g. 10,000 rows per transaction) -- one huge
+-- UPDATE holds locks and bloats the table
 UPDATE payments
 SET new_processor_id = processor_id
 WHERE new_processor_id IS NULL
@@ -453,8 +470,8 @@ WHERE new_processor_id IS NULL
 
 **Wrong approach**: Running Flyway migrations in the application startup without backward compatibility consideration.
 
-```java
-// V3__rename_column.sql — DANGEROUS for blue-green
+```sql
+-- V3__rename_column.sql — DANGEROUS for blue-green
 -- This rename immediately breaks all blue (v1.5.0) pods
 -- because v1.5.0 still SELECT processor_id which no longer exists
 ALTER TABLE payments RENAME COLUMN processor_id TO legacy_processor_id;
@@ -467,64 +484,62 @@ ALTER TABLE payments RENAME COLUMN processor_id TO legacy_processor_id;
 ALTER TABLE payments ADD COLUMN legacy_processor_id VARCHAR(50);
 UPDATE payments SET legacy_processor_id = processor_id;
 
--- Application v1.6.0 reads from BOTH columns:
+-- Application v1.6.0 writes BOTH columns and reads:
 SELECT COALESCE(legacy_processor_id, processor_id) AS effective_processor_id
 FROM payments WHERE id = ?;
 
+-- Phase 2: backfill rows written by blue during the overlap, then release
+-- a version that reads only legacy_processor_id
+
 -- Phase 3 (after blue is fully drained and retired):
 ALTER TABLE payments DROP COLUMN processor_id;
-ALTER TABLE payments RENAME COLUMN legacy_processor_id TO processor_id;
+-- (Do NOT rename legacy_processor_id back to processor_id here: the running
+--  version reads legacy_processor_id, and a rename would break it -- that
+--  would need another full expand-contract cycle)
 ```
 
 ---
 
 ### Pitfall 2: Canary Traffic Split Not Working for gRPC Services
 
-**Problem**: Istio's HTTP weight-based routing (via VirtualService `weight:`) works for HTTP/1.1 and HTTP/2 connections but requires the connection to be established per-request. gRPC clients typically establish a single long-lived connection and multiplex all calls over it. The initial connection is routed to either stable or canary based on the weight, but all subsequent calls go to the same destination — effectively bypassing the canary split.
+**Problem**: gRPC clients open one long-lived HTTP/2 connection and multiplex all calls over it. If that connection is balanced only at L4 — at connect time — every call on it goes to the same backend, and the canary weight is effectively ignored. This happens when the traffic is **not** handled by an L7 proxy: the calling pod has no sidecar, the Service port is not declared as gRPC/HTTP2 (so Istio treats it as plain TCP), or traffic passes a TCP pass-through load balancer. With a client-side Envoy sidecar and a gRPC-declared port, Envoy routes and weights **each request** independently, and the split works.
 
-**Symptoms**: 100% of gRPC traffic consistently goes to stable despite a 10% canary weight configured.
+**Symptoms**: almost all gRPC traffic stays on stable (or on whichever backend each client connected to first) despite a 10% canary weight.
 
 **Diagnosis**:
 ```bash
-# Check actual traffic distribution in Kiali or Prometheus
-kubectl port-forward -n istio-system svc/kiali 20001:20001
-# In Kiali: Graph → payment-service → check canary vs stable percentages
-# If canary shows 0%, the gRPC multiplexing issue is confirmed
+# Is the calling pod in the mesh, and does Istio see the port as gRPC?
+istioctl x describe pod <client-pod> -n payments
+istioctl proxy-config cluster <client-pod> -n payments | grep payment-service
+# "TCP" instead of "http2"/"grpc" -> the port protocol is not declared
+# Kiali: Graph -> payment-service -> compare canary vs stable request rates
 ```
 
-**Fix**: Configure the Kubernetes Service with `sessionAffinity: None` and ensure the gRPC client creates a new connection (or uses a client-side load balancer like `grpc.NewClient` with round-robin). Additionally, Istio's `DestinationRule` can force connection pool limits that cause the client to open new connections more frequently:
+**Fix**: declare the protocol on the Service port and make sure callers are in the mesh:
 
 ```yaml
-apiVersion: networking.istio.io/v1alpha3
-kind: DestinationRule
+apiVersion: v1
+kind: Service
 metadata:
-  name: payment-service-grpc
+  name: payment-service
   namespace: payments
 spec:
-  host: payment-service
-  trafficPolicy:
-    connectionPool:
-      http:
-        # Force new connections to enable per-connection routing
-        h2UpgradePolicy: UPGRADE
-        http2MaxRequests: 100    # limit concurrent streams per connection
-        http1MaxPendingRequests: 1
-  subsets:
-    - name: stable
-      labels:
-        version: v1.5.0
-    - name: canary
-      labels:
-        version: v1.6.0
+  selector:
+    app: payment-service
+  ports:
+    - name: grpc
+      appProtocol: grpc        # Istio applies L7 (per-request) routing
+      port: 9090
+      targetPort: 9090
 ```
 
-For gRPC-only services, consider using gRPC's native client-side load balancing with DNS-based discovery rather than relying solely on Istio service-mesh routing.
+For callers outside the mesh, use gRPC client-side load balancing (round-robin over a headless Service) or recycle connections regularly (server-side `MAX_CONNECTION_AGE`), so that new connections — and thus new routing decisions — happen often enough for the weights to take effect.
 
 ---
 
 ### Pitfall 3: Not Testing AnalysisTemplate Before Production Canary
 
-**Problem**: An AnalysisTemplate with a Prometheus query error (wrong metric name, wrong label selector) fails immediately when the first AnalysisRun is created. This causes the canary rollout to roll back before any traffic is even analyzed — appearing as a false deployment failure. Worse, if `failureLimit` is set to 0, the rollback is instantaneous and the team assumes the canary code has bugs when the real problem is the analysis query.
+**Problem**: An AnalysisTemplate with a Prometheus query error (wrong metric name, wrong label selector) errors on every measurement as soon as the first AnalysisRun is created; after `consecutiveErrorLimit` errors (default 4) the run fails. This causes the canary rollout to roll back before any traffic is even analyzed — appearing as a false deployment failure. Worse, if `failureLimit` is set to 0, the rollback is instantaneous and the team assumes the canary code has bugs when the real problem is the analysis query.
 
 **Diagnosis**:
 ```bash
@@ -547,20 +562,13 @@ curl 'http://localhost:9090/api/v1/query' \
   --data-urlencode 'query=sum(rate(http_server_requests_seconds_count{service="payment-service"}[2m]))'
 # Verify: returns a valid numeric result, not an error
 
-# Step 2: Create a dry-run AnalysisRun to validate the template
-kubectl create -f - <<EOF
-apiVersion: argoproj.io/v1alpha1
-kind: AnalysisRun
-metadata:
-  name: payment-analysis-test
-  namespace: payments
-spec:
-  templates:
-    - templateName: payment-error-rate
-  args:
-    - name: service-name
-      value: payment-service
-EOF
+# Step 2: Run the template once on its own (an AnalysisRun created from
+# the template) to validate it end to end
+kubectl argo rollouts create analysisrun \
+  --from payment-error-rate \
+  --name payment-analysis-test \
+  --argument service-name=payment-service \
+  -n payments
 
 # Watch for success or error
 kubectl get analysisrun payment-analysis-test -n payments --watch
@@ -576,16 +584,16 @@ kubectl get analysisrun payment-analysis-test -n payments --watch
 - [ ] Both blue and green environments are deployed before traffic switch
 - [ ] Smoke tests run against green environment before traffic switch (not after)
 - [ ] Database migrations are backward compatible — expand-contract pattern applied
-- [ ] Service selector toggle script tested and timed (should be < 1 second)
+- [ ] Service selector toggle script tested; endpoint propagation and connection draining observed (seconds, not instant)
 - [ ] Rollback procedure documented and tested (switch selector back to blue)
 - [ ] Blue pods retained for at least 30 minutes after green cutover before termination
 
 ### Canary Deployments
 - [ ] AnalysisTemplate queries tested against Prometheus manually before production use
 - [ ] Dry-run AnalysisRun created in staging to validate template before production canary
-- [ ] gRPC services use connection pool limits or client-side load balancing for effective canary split
-- [ ] `maxUnavailable: 0` set in Rollout strategy to prevent downtime during steps
-- [ ] `autoPromotionEnabled: false` for all production Rollouts requiring human approval
+- [ ] gRPC services: port declared as gRPC and callers in the mesh (per-request routing), or client-side load balancing / connection recycling
+- [ ] Every analysis step passes the args its templates require
+- [ ] Indefinite `pause: {}` step before 100% for all production Rollouts requiring human approval
 - [ ] AnalysisTemplate `failureLimit` set to allow transient metric gaps (not `failureLimit: 0`)
 
 ### Argo Rollouts
@@ -604,7 +612,7 @@ kubectl get analysisrun payment-analysis-test -n payments --watch
 ---
 
 <!-- KNOWLEDGE-CHECK
-{"questions":[{"text":"Why does the expand-contract database migration pattern matter for blue-green deployments?","options":["a) It prevents Flyway from running migrations on both the blue and green database instances simultaneously","b) Since both old and new application versions run simultaneously during the cutover window, the database schema must remain compatible with both; removing or renaming columns before blue is drained breaks in-flight requests","c) The contract phase must run before the blue-green switch to ensure green has the correct schema","d) Expand-contract is only needed for canary deployments, not blue-green"],"correct":1,"explanation":"During a blue-green cutover, both v1 (blue) and v2 (green) may be handling requests simultaneously (old in-flight requests continuing on blue while new requests go to green). If a schema change breaks v1's queries (e.g., renaming a column v1 reads), those in-flight requests on blue pods will fail. The expand-contract pattern ensures the schema is compatible with both versions throughout the cutover window."},{"text":"An Argo Rollouts canary immediately rolls back every time it starts. kubectl describe analysisrun shows 'Prometheus error: unknown metric name'. What is the most likely cause and fix?","options":["a) The Prometheus server is not reachable from the payments namespace — add a NetworkPolicy egress rule","b) The AnalysisTemplate was not tested before production deployment; the Prometheus query contains a typo or references a non-existent metric name — test with a dry-run AnalysisRun in staging first","c) The canary pods have not generated enough traffic for the metric to exist yet — increase the failureLimit to 10","d) AnalysisTemplates do not support parameterized queries with args; use hardcoded metric selectors"],"correct":1,"explanation":"An AnalysisTemplate with a Prometheus query error fails immediately on the first measurement, causing an instant rollback that looks like a code defect. The fix is to test the AnalysisTemplate query directly against Prometheus before the production canary, and to validate it with a dry-run AnalysisRun in staging."},{"text":"Why does Istio's HTTP weight-based canary routing often fail to produce the expected traffic split for gRPC services?","options":["a) Istio does not support gRPC traffic routing — only HTTP/1.1 is supported by VirtualService","b) gRPC clients typically establish one long-lived connection and multiplex all calls over it; the initial connection is routed once by weight, so all subsequent calls on that connection go to the same destination","c) The DestinationRule subset labels must use 'grpc' as the protocol name for gRPC routing","d) gRPC services require Envoy filters instead of VirtualService for canary routing"],"correct":1,"explanation":"gRPC uses HTTP/2 multiplexing — a single TCP connection carries many RPC calls. Istio routes at connection establishment time (applying the canary weight), but all subsequent calls on that connection bypass the weight decision. Limiting the connection pool size (http2MaxRequests) forces the client to open new connections more frequently, making each subject to the weight-based routing."}]}
+{"questions": [{"text": "Why does the expand-contract database migration pattern matter for blue-green deployments?", "options": ["a) It prevents Flyway from running migrations on both the blue and green database instances simultaneously", "b) Since both old and new application versions run simultaneously during the cutover window, the database schema must remain compatible with both; removing or renaming columns before blue is drained breaks in-flight requests", "c) The contract phase must run before the blue-green switch to ensure green has the correct schema", "d) Expand-contract is only needed for canary deployments, not blue-green"], "correct": 1, "explanation": "During a blue-green cutover, both v1 (blue) and v2 (green) may be handling requests simultaneously (old in-flight requests continuing on blue while new requests go to green). If a schema change breaks v1's queries (e.g., renaming a column v1 reads), those in-flight requests on blue pods will fail. The expand-contract pattern ensures the schema is compatible with both versions throughout the cutover window."}, {"text": "An Argo Rollouts canary immediately rolls back every time it starts. kubectl describe analysisrun shows 'Prometheus error: unknown metric name'. What is the most likely cause and fix?", "options": ["a) The Prometheus server is not reachable from the payments namespace — add a NetworkPolicy egress rule", "b) The AnalysisTemplate was not tested before production deployment; the Prometheus query contains a typo or references a non-existent metric name — test with a dry-run AnalysisRun in staging first", "c) The canary pods have not generated enough traffic for the metric to exist yet — increase the failureLimit to 10", "d) AnalysisTemplates do not support parameterized queries with args; use hardcoded metric selectors"], "correct": 1, "explanation": "An AnalysisTemplate with a Prometheus query error fails immediately on the first measurement, causing an instant rollback that looks like a code defect. The fix is to test the AnalysisTemplate query directly against Prometheus before the production canary, and to validate it with a dry-run AnalysisRun in staging."}, {"text": "Why can Istio's weight-based canary routing fail to produce the expected traffic split for gRPC services?", "options": ["a) Istio does not support gRPC traffic routing — only HTTP/1.1 is supported by VirtualService", "b) gRPC clients keep one long-lived HTTP/2 connection; if it is balanced only at L4 (caller without a sidecar, or a port Istio treats as TCP), the backend is chosen once at connect time and all calls on that connection go there", "c) The DestinationRule subset labels must use 'grpc' as the protocol name for gRPC routing", "d) gRPC services require Envoy filters instead of VirtualService for canary routing"], "correct": 1, "explanation": "gRPC multiplexes many calls over a single HTTP/2 connection. When an Envoy sidecar on the calling side handles the traffic at L7 (the port declared as grpc/http2), Envoy applies the route weights to each request and the split works. When the connection is only balanced at L4 — the caller is outside the mesh, the port is treated as TCP, or a TCP pass-through balancer sits in between — the backend is picked once per connection and the weights are effectively ignored. Fix: declare the port protocol, put callers in the mesh, or use client-side load balancing / connection recycling."}]}
 -->
 
 <!-- PRACTICAL-CHALLENGE

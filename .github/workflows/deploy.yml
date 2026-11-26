@@ -1,10 +1,12 @@
 name: Deploy to GitHub Pages
 
+# The site is published with Settings -> Pages -> "Deploy from a branch"
+# (branch v1, folder /docs), which needs no workflow. This workflow is only
+# for the alternative setup "Source: GitHub Actions"; it runs manually so the
+# two methods don't compete. To switch: set Source = GitHub Actions and add
+#   push:
+#     branches: [v1]
 on:
-  push:
-    # The repository's working branch is v1 (there is no main branch);
-    # main is kept in case the branch is renamed later
-    branches: [v1, main]
   workflow_dispatch:
 
 permissions:

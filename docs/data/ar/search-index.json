@@ -4426,7 +4426,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Canary and Blue-Green Deployments — Zero-Downtime Releases Payment services cannot afford downtime during deployments. A single minute of payment processing outage at a card-issuing bank can mean millions in lost transactions and regulatory exposure. Blue-green and canary deployment strategies provide the control mechanisms to release new versions safely, validate them under real production traffic, and roll back instantly when anomalies are detected. Blue-Green Deployment Blue-green maintains t"
+      "body": "--- id: track-10-lesson-14 title: \"نشر Canary وBlue-Green — إصدارات بدون توقف\" slug: canary-blue-green track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 14 difficulty: advanced estimatedMinutes: 70 status: published tags: - canary - blue-green - zero-downtime - Argo-Rollouts - feature-toggle - rollback --- نشرات الكناري والأزرق-الأخضر — إصدارات دون توقف لا تحتمل خدمات الدفع التوقف أثناء النشر. فدقيقة واحدة من انقطاع معالجة المدفوعات في بنك مُصدِر للبطاقات قد تعني ملاي"
     },
     {
       "id": "track-10-lesson-15",
