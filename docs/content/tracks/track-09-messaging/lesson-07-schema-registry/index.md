@@ -96,7 +96,7 @@ Apache Avro is the most common format for Kafka in financial services. It provid
                 "precision": 18,
                 "scale": 2
             },
-            "doc": "Payment amount with 2 decimal places"
+            "doc": "Payment amount with 2 decimal places (exact decimal -- never float/double for money; currencies with 0 or 3 minor digits need their own scale, or use integer minor units)"
         },
         {
             "name": "currency",
@@ -105,7 +105,7 @@ Apache Avro is the most common format for Kafka in financial services. It provid
                 "name": "Currency",
                 "symbols": ["GBP", "USD", "EUR", "JPY"]
             },
-            "doc": "ISO 4217 currency code"
+            "doc": "ISO 4217 currency code. Careful: adding a symbol later breaks old readers unless the enum declares a default symbol (Avro 1.9+) -- a plain string is often the safer choice for currencies"
         },
         {
             "name": "status",
@@ -153,6 +153,8 @@ Using the Avro Maven plugin to generate Java classes from `.avsc` files:
             <configuration>
                 <sourceDirectory>${project.basedir}/src/main/avro</sourceDirectory>
                 <outputDirectory>${project.build.directory}/generated-sources/avro</outputDirectory>
+                <!-- generate BigDecimal (not ByteBuffer) for decimal logical types -->
+                <enableDecimalLogicalType>true</enableDecimalLogicalType>
             </configuration>
         </execution>
     </executions>
@@ -170,11 +172,11 @@ The compatibility mode is configured per **subject** (a schema identity in the r
 New schema can be used to read data written with the previous schema.
 
 ```
-Old producers write:              New consumer reads:
-  { paymentId, accountId, amount }  { paymentId, accountId, amount, [referenceId=null] }
+Old producers write:                   New consumer reads:
+  { paymentId, accountId, amountMinor }  { paymentId, accountId, amountMinor, [referenceId=null] }
 ```
 
-**Rule:** New fields must have default values. Old fields cannot be removed.
+**Rule:** You may add fields **with** default values and delete fields (the new reader simply ignores them). Upgrade **consumers first**, then producers.
 
 ```json
 // V1 — Original schema
@@ -183,7 +185,7 @@ Old producers write:              New consumer reads:
     "fields": [
         {"name": "paymentId", "type": "string"},
         {"name": "accountId", "type": "string"},
-        {"name": "amount", "type": "double"}
+        {"name": "amountMinor", "type": "long"}
     ]
 }
 
@@ -193,7 +195,7 @@ Old producers write:              New consumer reads:
     "fields": [
         {"name": "paymentId", "type": "string"},
         {"name": "accountId", "type": "string"},
-        {"name": "amount", "type": "double"},
+        {"name": "amountMinor", "type": "long"},
         {
             "name": "referenceId",
             "type": ["null", "string"],
@@ -208,7 +210,7 @@ Old producers write:              New consumer reads:
 
 Old consumers can read data written with the new schema.
 
-**Rule:** New fields may have no default (old consumers skip unknown fields). Old fields must keep their defaults.
+**Rule:** You may add fields (old readers skip unknown fields, so no default is needed) and delete only fields that **have** a default in the old schema (old readers fill them in). Upgrade **producers first**, then consumers.
 
 ```json
 // V2 — FORWARD compatible: old consumer reads V2 data, ignores new field
@@ -217,7 +219,7 @@ Old consumers can read data written with the new schema.
     "fields": [
         {"name": "paymentId", "type": "string"},
         {"name": "accountId", "type": "string"},
-        {"name": "amount", "type": "double"},
+        {"name": "amountMinor", "type": "long"},
         {"name": "region", "type": "string"}  // No default — old consumers skip it
     ]
 }
@@ -225,7 +227,7 @@ Old consumers can read data written with the new schema.
 
 ### FULL Compatibility
 
-Both BACKWARD and FORWARD. The safest option for financial systems. Only allows adding optional fields with defaults. Field removal and renaming are both prohibited.
+Both BACKWARD and FORWARD. The safest option for financial systems: you may only add or delete fields that have default values, and producers and consumers can be upgraded in any order.
 
 ### NONE
 
@@ -249,11 +251,11 @@ Default: FULL_TRANSITIVE
 ```json
 // V1
 {"name": "paymentId", "type": "string"},
-{"name": "amount", "type": "double"}
+{"name": "amountMinor", "type": "long"}
 
 // V2 — BACKWARD and FORWARD compatible
 {"name": "paymentId", "type": "string"},
-{"name": "amount", "type": "double"},
+{"name": "amountMinor", "type": "long"},
 {"name": "merchantId", "type": ["null", "string"], "default": null}
 ```
 
@@ -270,18 +272,20 @@ New consumers reading V1 data: `merchantId` is null (default applied).
 {"name": "region", "type": ["string", "null"], "default": "UNKNOWN"}
 ```
 
-### Breaking: Removing a Required Field
+### Breaking for Old Consumers: Removing a Field Without a Default
 
 ```json
 // V1
 {"name": "paymentId", "type": "string"},
 {"name": "accountId", "type": "string"},
-{"name": "amount", "type": "double"}
+{"name": "amountMinor", "type": "long"}
 
 // V2 — BREAKING: removed "accountId"
 {"name": "paymentId", "type": "string"},
-{"name": "amount", "type": "double"}
-// Old consumers expect accountId — they will fail or receive null
+{"name": "amountMinor", "type": "long"}
+// Old consumers (still on V1) need accountId and have no default for it
+// -> they fail. FORWARD/FULL reject this change; BACKWARD accepts it, which
+// is only safe if ALL consumers were upgraded before the producers
 ```
 
 ### Breaking: Renaming a Field
@@ -295,6 +299,8 @@ New consumers reading V1 data: `merchantId` is null (default applied).
 {"name": "sourceAccountId", "type": "string"}
 ```
 
+Avro readers can declare `"aliases": ["accountId"]` on the new field, so a NEW reader can still read OLD data — but an old reader cannot find the new name in new data.
+
 **Rename strategy:** Add the new field (with default), deprecate the old field, migrate consumers, then remove the old field across two separate schema versions.
 
 ---
@@ -304,7 +310,8 @@ New consumers reading V1 data: `merchantId` is null (default applied).
 Protocol Buffers offer better evolution semantics than Avro because they use **field numbers** rather than field names. Renaming a field is safe as long as the number stays the same.
 
 ```protobuf
-// payment_created.proto
+// payment_created.proto  (V1 and V2 shown together for comparison --
+// they are two versions of the same file, not one file)
 syntax = "proto3";
 
 package com.fintech.payments.proto;
@@ -312,7 +319,7 @@ package com.fintech.payments.proto;
 message PaymentCreated {
     string payment_id = 1;        // Field number 1 — never change this
     string account_id = 2;         // Field number 2
-    double amount = 3;             // Field number 3
+    int64 amount_minor = 3;        // Field number 3 (minor units, never double)
     string currency = 4;
     int64 created_at_millis = 5;
 
@@ -324,7 +331,7 @@ message PaymentCreated {
 message PaymentCreated {
     string payment_id = 1;
     string account_id = 2;
-    double amount = 3;
+    int64 amount_minor = 3;
     string currency = 4;
     int64 created_at_millis = 5;
     string merchant_id = 6;         // New field — old consumers ignore field 6
@@ -335,7 +342,7 @@ message PaymentCreated {
 **Protobuf evolution rules:**
 - Never reuse a field number (even for deleted fields — use `reserved`)
 - Never change a field's type
-- Renaming is safe — field numbers are what matters on the wire
+- Renaming is safe for the binary wire format — field numbers are what matters there (but not for the JSON mapping of Protobuf, which uses names)
 
 ```protobuf
 message PaymentCreated {
@@ -369,7 +376,7 @@ Schema class: com.fintech.payments.avro.PaymentCreated
 Subject: com.fintech.payments.avro.PaymentCreated
 ```
 
-The schema is registered under its fully-qualified class name. Multiple event types can be published to the same topic without conflict. Required for event-sourcing patterns where a single topic contains heterogeneous events.
+The schema is registered under its fully-qualified class name. Multiple event types can be published to the same topic without conflict — useful for event-sourcing topics that carry several event types of one aggregate (`TopicRecordNameStrategy` below works too; another option is a union schema with schema references under the default strategy).
 
 ```java
 // Producer configuration for RecordNameStrategy
@@ -567,10 +574,10 @@ curl -X PUT http://schema-registry:8081/config/payments.events-value \
 
 - Schema Registry stores versioned schemas and enforces compatibility rules before publishing new versions.
 - Every Kafka message contains a 4-byte schema ID, allowing consumers to always deserialise correctly.
-- **BACKWARD** compatibility (the default) requires new fields to have default values — old consumers can read new data.
-- **FORWARD** compatibility allows consumers to skip unknown fields — new consumers can read old data.
+- **BACKWARD** compatibility (the default): new consumers can read data written with the old schema — add fields only with defaults; upgrade consumers first.
+- **FORWARD** compatibility: old consumers can read data written with the new schema — they skip unknown fields; upgrade producers first.
 - **FULL** compatibility requires both — the safest choice for financial production systems.
-- **Renaming fields is always a breaking change in Avro** — use the add-then-remove migration pattern.
+- **Renaming a field breaks old Avro consumers** (aliases only help new readers) — use the add-then-remove migration pattern.
 - Protobuf handles field renaming safely because the wire format uses field numbers, not names.
 - `RecordNameStrategy` is required for heterogeneous topics (multiple event types on one topic).
 - Disable `AUTO_REGISTER_SCHEMAS` in production — schemas must be reviewed and registered via CI/CD.
@@ -582,15 +589,15 @@ curl -X PUT http://schema-registry:8081/config/payments.events-value \
       "text": "What does BACKWARD compatibility mode require for Avro schema evolution?",
       "options": [
         "New fields can be added without defaults; old fields can be removed freely",
-        "New fields must have default values; old fields cannot be removed",
+        "New fields must have default values; fields may be deleted (the new reader simply ignores them) — so consumers are upgraded first",
         "The schema must be identical to the previous version",
         "Only field types can be changed; field names and counts must stay the same"
       ],
       "correct": 1,
-      "explanation": "BACKWARD compatibility means new consumers can read data written with the old schema. This requires that any new field has a default value (so old data missing the field can be read) and that existing required fields are not removed."
+      "explanation": "BACKWARD compatibility means new consumers can read data written with the old schema. Any new field needs a default value (old data does not contain it), while deleting a field is allowed because the new reader just ignores it. Because old consumers are not protected, consumers are upgraded before producers."
     },
     {
-      "text": "Why is renaming a field always a breaking change in Avro but safe in Protobuf?",
+      "text": "Why does renaming a field break old Avro consumers but not old Protobuf consumers?",
       "options": [
         "Avro uses field indexes while Protobuf uses field names on the wire",
         "Avro uses field names on the wire for matching; Protobuf uses field numbers",
@@ -598,10 +605,10 @@ curl -X PUT http://schema-registry:8081/config/payments.events-value \
         "Avro does not support optional fields while Protobuf does"
       ],
       "correct": 1,
-      "explanation": "Avro serializes and deserializes by matching field names. Renaming a field breaks all consumers looking for the old name. Protobuf uses field numbers on the wire — the field name is only used in generated code, so renaming is safe as long as the number stays the same."
+      "explanation": "Avro resolves fields by NAME when reading. After a rename, an old reader looks for the old name and does not find it (a new reader can declare an alias for the old name, but old readers have no such alias). Protobuf identifies fields by NUMBER on the wire — the name only appears in generated code — so renaming is safe for the binary format as long as the number stays the same."
     },
     {
-      "text": "Which subject naming strategy is required when multiple event types are published to the same Kafka topic?",
+      "text": "Which subject naming strategy lets multiple event types share one Kafka topic by registering each schema under its fully-qualified record name?",
       "options": [
         "TopicNameStrategy — it handles multiple types by default",
         "TopicRecordNameStrategy only",
@@ -609,7 +616,7 @@ curl -X PUT http://schema-registry:8081/config/payments.events-value \
         "DefaultNamingStrategy — no configuration needed"
       ],
       "correct": 2,
-      "explanation": "TopicNameStrategy registers a single schema per topic and enforces that all messages on a topic use the same schema. RecordNameStrategy registers schemas under the fully-qualified class name, allowing multiple different event types on the same topic without conflict."
+      "explanation": "TopicNameStrategy registers one subject per topic (topic-value), so all messages on the topic must be compatible versions of one schema. RecordNameStrategy registers schemas under the fully-qualified record name, allowing several event types on one topic. (TopicRecordNameStrategy also allows it, scoping the subject per topic; unions with schema references are another option.)"
     }
   ]
 }

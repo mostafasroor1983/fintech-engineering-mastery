@@ -21,8 +21,8 @@ prerequisites: []
 
 Gatling offers three advantages over alternatives (JMeter, k6, Locust) for payment system load testing:
 
-1. **Scala/Java DSL** — simulations are code, version-controlled alongside the service
-2. **High efficiency** — Gatling's Akka/Netty engine handles 50,000+ concurrent virtual users on a single machine
+1. **Code DSL (Java, Kotlin, Scala; JavaScript/TypeScript in recent versions)** — simulations are code, version-controlled alongside the service
+2. **High efficiency** — Gatling's non-blocking, Netty-based engine can drive tens of thousands of concurrent virtual users from one machine
 3. **Statistical reports** — built-in percentile analysis (p50, p75, p95, p99) critical for SLA validation
 
 ---
@@ -126,9 +126,12 @@ public class PaymentApiSimulation extends Simulation {
         .contentTypeHeader("application/json")
         .header("Authorization", "Bearer " + System.getProperty("api.token", "test-token"))
         .header("X-Client-Id", "gatling-load-test")
-        .enableHttp2()
         .shareConnections()
-        .connectionHeader("keep-alive");
+        // .enableHttp2() works only over TLS (https://, negotiated with ALPN) --
+        // Gatling has no cleartext HTTP/2 (h2c). And never send a
+        // "Connection: keep-alive" header over HTTP/2: connection-specific
+        // headers are forbidden there and servers may reject the request.
+        ;
 
     // ── Feeders ───────────────────────────────────────────────────────────
 
@@ -163,7 +166,8 @@ public class PaymentApiSimulation extends Simulation {
                         }
                         """))
                     .check(status().is(200))
-                    .check(jsonPath("$.authorizationCode").exists())
+                    // A DECLINED response has no authorization code -- so only
+                    // check the status here, or declines would count as errors
                     .check(jsonPath("$.status").in("AUTHORIZED", "DECLINED"))
                     .check(responseTimeInMillis().lte(500))
             )
@@ -222,7 +226,9 @@ public class PaymentApiSimulation extends Simulation {
             global().responseTime().percentile(99).lte(500),
             global().responseTime().percentile(95).lte(300),
             global().responseTime().mean().lte(150),
-            global().requestsPerSec().gte(300.0),
+            // Mean over the WHOLE run, ramps included: 300 req/s only at
+            // steady state, so the run average is about 249 req/s
+            global().requestsPerSec().gte(240.0),
             details("Authorize Payment").responseTime().percentile(99).lte(400),
             details("Authorize Payment").successfulRequests().percent().gte(99.9)
         );
@@ -255,8 +261,9 @@ public class LoadProfiles {
 
     /**
      * PROFILE 2: End-of-Month Salary Spike
-     * Volumes spike 5x as salary payments and bill pay concentrate.
-     * Common on the 1st of each month in retail banking.
+     * Volumes spike (here 5x) as salary payments and bill pay concentrate.
+     * Common around month-end and the 1st in retail banking -- use your
+     * own production peak ratio, not this example's.
      */
     public static OpenInjectionStep[] endOfMonthSpike(int baseRps) {
         int peakRps = baseRps * 5;
@@ -314,6 +321,12 @@ public class IdempotencySimulation extends Simulation {
      * 2. Wait 50ms (simulates timeout + retry)
      * 3. Resubmit identical payment
      * 4. Assert both responses have identical authorization code
+     *
+     * Use a test account with a very large balance: thousands of users all
+     * debit ACC-10001, and declines (no auth code) would break the checks.
+     * Also test the HARDER case separately: both submissions in flight at
+     * the same time (no pause), where only a database UNIQUE constraint or
+     * lock prevents a double payment.
      */
     private final ScenarioBuilder idempotencyScenario = scenario("Idempotency Check")
         .exec(session -> session
@@ -353,8 +366,10 @@ public class IdempotencySimulation extends Simulation {
                     }
                     """))
                 .check(status().in(200, 201))
-                .check(jsonPath("$.authorizationCode").is("#{firstAuthCode}"))
-                .check(jsonPath("$.status").is("#{firstStatus}"))
+                // Java DSL: is("...") compares with the LITERAL text;
+                // isEL("#{...}") resolves Gatling Expression Language
+                .check(jsonPath("$.authorizationCode").isEL("#{firstAuthCode}"))
+                .check(jsonPath("$.status").isEL("#{firstStatus}"))
         );
 
     {
@@ -403,14 +418,15 @@ public class PaymentStressTestSimulation extends Simulation {
                       "reference": "#{reference}"
                     }
                     """))
-                .check(status().in(200, 503))  // accept 503 during stress
+                .check(status().in(200, 503))  // accept 503 during stress (note: 503s then
+                                               // count as "successful" in the report)
         );
 
     /**
      * Staircase stress: add 100 req/s every 2 minutes.
      * Breaking point typically shows as: p99 > 2s AND error rate > 5%.
      *
-     * Typical results:
+     * Illustrative results:
      *   100-300 req/s:  p99 < 100ms, errors 0%     (healthy)
      *   300-500 req/s:  p99 < 200ms, errors < 0.1% (nominal)
      *   500-700 req/s:  p99 < 500ms, errors < 1%   (stressed)
@@ -428,6 +444,8 @@ public class PaymentStressTestSimulation extends Simulation {
         )
         .protocols(httpProtocol)
         .maxDuration(Duration.ofMinutes(35))
+        // These assertions fail the run only if the service breaks BELOW the
+        // capacity you expect -- finding the ceiling is the goal, not passing
         .assertions(
             global().responseTime().percentile(99).lte(2000),
             global().successfulRequests().percent().gte(95.0)
@@ -486,13 +504,16 @@ jobs:
         run: |
           # Gatling exits with code 2 if assertions fail
           # Maven build already fails — this step adds human-readable output
-          STATS=$(find target/gatling -name stats.json | head -1)
+          # (Shared GitHub runners are noisy: treat absolute numbers with care,
+          #  or run the load test on dedicated hardware)
+          STATS=$(find target/gatling -path '*/js/stats.json' | head -1)
+          # stats.json has percentiles1..4 = p50, p75, p95, p99 by default
           P99=$(python3 -c "
           import json, sys
           data = json.load(open('$STATS'))
-          print(int(data['stats']['global']['percentiles99']['total']))
+          print(int(data['stats']['percentiles4']['total']))
           ")
-          echo "Payment authorization p99: ${P99}ms"
+          echo "Global p99: ${P99}ms"
           [ "$P99" -le 500 ] || (echo "REGRESSION: p99 ${P99}ms > 500ms"; exit 1)
 ```
 
@@ -588,7 +609,7 @@ public class PerformanceRegressionDetector {
 1. **Model realistic traffic patterns** — payment volumes spike at end of month, paydays, and during promotions. Test these patterns explicitly with ramp-up and spike scenarios
 2. **Use realistic data distributions** — 60% of transactions are small (<$50); uniform distribution misrepresents real fraud scoring and limit checking behaviour
 3. **Validate idempotency under load** — retries are common in payment systems; verify that duplicate submissions return identical results even under concurrent load
-4. **Assert on percentiles, not averages** — p99 is what your worst-off customers experience; mean latency can look fine while 1% of payments take 10 seconds
+4. **Assert on percentiles, not averages** — p99 and p99.9 describe the slow tail that many customers actually hit; mean latency can look fine while 1% of payments take 10 seconds
 5. **Keep assertions strict** — `successfulRequests >= 99.9%` is not optional for payments; even 0.1% errors means 1,000 failed payments per million
 6. **Run nightly in CI** — catch performance regressions before they reach production; a 20% p99 increase is much easier to debug in one commit than after weeks of changes
 7. **Separate stress tests from SLA tests** — stress tests find breaking points; SLA simulations validate normal operation. Mixing them produces misleading reports

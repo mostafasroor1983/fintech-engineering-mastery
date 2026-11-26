@@ -51,7 +51,7 @@ def main(lesson_dir, draft_path):
     missing = sorted(set(range(1, len(blocks) + 1)) - set(used))
     if missing:
         sys.exit('code blocks not used in draft: %s' % missing)
-    if '@@' in re.sub(FENCE, '', out):
+    if re.search(r'@@(CODE \d+|FRONTMATTER)@@', re.sub(FENCE, '', out)):
         sys.exit('unreplaced @@ marker left in draft')
     for m in BLOCK.finditer(out):
         json.loads(m.group(2))

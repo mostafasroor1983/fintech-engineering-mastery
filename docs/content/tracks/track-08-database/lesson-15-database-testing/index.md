@@ -36,7 +36,7 @@ The solution is a testing pyramid where integration tests run against an ephemer
 
 ## Testcontainers for PostgreSQL
 
-Testcontainers spins up a Docker container for each test class (or test suite), applies Flyway migrations, and tears it down after the test. The container is isolated from other test runs.
+Testcontainers starts a real PostgreSQL in Docker for the tests; Spring Boot then runs the Flyway migrations against it at context start. With `@Container` fields the container lives for one test class; for a whole suite, use the **singleton container** pattern below (start it once per JVM; Testcontainers' Ryuk sidecar removes it when the JVM exits).
 
 ```xml
 <!-- pom.xml -->
@@ -60,38 +60,35 @@ Testcontainers spins up a Docker container for each test class (or test suite), 
 ```
 
 ```java
-// Base class for all database integration tests
-// Shared container reduces startup overhead to once per test suite
+// Base class for all database integration tests.
+// Singleton container: started ONCE per JVM in a static initializer.
+// (A static @Container field in a base class would be started and stopped
+//  again for every test class. withReuse(true) is an opt-in convenience for
+//  local development only -- it needs testcontainers.reuse.enable=true in
+//  ~/.testcontainers.properties and should not be relied on in CI.)
 @SpringBootTest
-@Testcontainers
 @ActiveProfiles("test")
 public abstract class DatabaseIntegrationTest {
 
-    @Container
+    @ServiceConnection   // Spring Boot 3.1+: sets spring.datasource.* for us
     static final PostgreSQLContainer<?> POSTGRES =
         new PostgreSQLContainer<>("postgres:16-alpine")
             .withDatabaseName("fintech_test")
             .withUsername("test_user")
             .withPassword("test_pass")
-            .withInitScript("sql/extensions.sql")  // CREATE EXTENSION IF NOT EXISTS...
-            .withReuse(true);  // reuse container across test classes for speed
+            .withInitScript("sql/extensions.sql");  // runs before Flyway
 
-    @DynamicPropertySource
-    static void configureDataSource(DynamicPropertyRegistry registry) {
-        registry.add("spring.datasource.url",     POSTGRES::getJdbcUrl);
-        registry.add("spring.datasource.username", POSTGRES::getUsername);
-        registry.add("spring.datasource.password", POSTGRES::getPassword);
-        registry.add("spring.flyway.enabled",      () -> "true");
-        registry.add("spring.flyway.clean-on-validation-error", () -> "false");
+    static {
+        POSTGRES.start();
     }
 }
 ```
 
-```java
-// extensions.sql (applied before Flyway migrations)
--- extensions.sql
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+```sql
+-- src/test/resources/sql/extensions.sql (applied before Flyway migrations)
+-- (better: create extensions in a Flyway migration, so prod and tests match)
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- gen_random_uuid() is built in since PostgreSQL 13 -- uuid-ossp not needed
 ```
 
 ---
@@ -104,20 +101,13 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE) // use real DB, not H2
 @Testcontainers
-class PaymentRepositoryTest {
+class PaymentRepositoryTest {   // @DataJpaTest: each test runs in a rolled-back transaction
 
     @Container
+    @ServiceConnection
     static final PostgreSQLContainer<?> POSTGRES =
         new PostgreSQLContainer<>("postgres:16-alpine")
-            .withDatabaseName("test")
-            .withReuse(true);
-
-    @DynamicPropertySource
-    static void props(DynamicPropertyRegistry r) {
-        r.add("spring.datasource.url",      POSTGRES::getJdbcUrl);
-        r.add("spring.datasource.username", POSTGRES::getUsername);
-        r.add("spring.datasource.password", POSTGRES::getPassword);
-    }
+            .withDatabaseName("test");
 
     @Autowired
     private PaymentRepository paymentRepository;
@@ -126,7 +116,6 @@ class PaymentRepositoryTest {
     private TestEntityManager entityManager;
 
     @Test
-    @Transactional
     void should_persist_and_retrieve_payment() {
         // Arrange
         Payment payment = new Payment();
@@ -152,11 +141,12 @@ class PaymentRepositoryTest {
     void should_enforce_positive_amount_constraint() {
         Payment payment = aPayment().withAmountMinor(-100L).build();
 
-        // The DB-level CHECK constraint should reject this
-        assertThatThrownBy(() -> {
-            paymentRepository.save(payment);
-            entityManager.flush();
-        }).isInstanceOf(ConstraintViolationException.class);
+        // The DB-level CHECK constraint should reject this. saveAndFlush()
+        // goes through Spring's exception translation, so we get Spring's
+        // DataIntegrityViolationException (not a Hibernate- or
+        // Bean-Validation-specific ConstraintViolationException).
+        assertThatThrownBy(() -> paymentRepository.saveAndFlush(payment))
+            .isInstanceOf(DataIntegrityViolationException.class);
     }
 }
 ```
@@ -167,7 +157,7 @@ class PaymentRepositoryTest {
 
 Each test should run in isolation without leaving state that affects other tests. There are two patterns:
 
-**Pattern 1: `@Transactional` on the test** — the test runs in a transaction that is rolled back after the test. This is the fastest approach. Its limitation: tests cannot verify behaviour that depends on transaction boundaries (e.g., testing that a deadlock is handled correctly).
+**Pattern 1: `@Transactional` on the test** — the test runs in a transaction that is rolled back after the test. This is the fastest approach. Its limitation: tests cannot verify behaviour that depends on transaction boundaries (commit-time constraint checks, `REQUIRES_NEW`, other threads or connections, deadlock handling) — work on other connections cannot even see the test's uncommitted rows.
 
 **Pattern 2: `@Sql` truncation before each test** — explicitly clean up between tests. Use this when you need to test across transaction boundaries.
 
@@ -223,16 +213,9 @@ Every schema migration must be tested in isolation before it is merged. Test thr
 class FlywayMigrationTest {
 
     @Container
+    @ServiceConnection
     static final PostgreSQLContainer<?> POSTGRES =
-        new PostgreSQLContainer<>("postgres:16-alpine").withReuse(true);
-
-    @DynamicPropertySource
-    static void props(DynamicPropertyRegistry r) {
-        r.add("spring.datasource.url",      POSTGRES::getJdbcUrl);
-        r.add("spring.datasource.username", POSTGRES::getUsername);
-        r.add("spring.datasource.password", POSTGRES::getPassword);
-        r.add("spring.flyway.enabled",      () -> "true");
-    }
+        new PostgreSQLContainer<>("postgres:16-alpine");
 
     @Autowired
     private Flyway flyway;
@@ -268,11 +251,27 @@ class FlywayMigrationTest {
 
     @Test
     void migration_V20_backfills_existing_rows() {
-        // If migration V20 backfills fraud_score_cache from risk_data JSONB,
-        // verify no NULLs were left in rows that had the source data
+        // A backfill can only be tested with rows that exist BEFORE it runs
+        // (after a full migration the test database is empty). So: migrate a
+        // separate schema up to V19, insert rows, then apply V20.
+        FluentConfiguration config = Flyway.configure()
+            .dataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())
+            .schemas("backfill_test");                 // not the app's schema
+        config.target(MigrationVersion.fromVersion("19")).load().migrate();
+
+        jdbcTemplate.update("""
+            INSERT INTO backfill_test.payments (tenant_id, amount_minor, currency_code,
+                                                status, risk_data)
+            VALUES (gen_random_uuid(), 1000, 'GBP', 'PENDING',
+                    '{"fraud_score": 42}'::jsonb)
+            """);
+
+        config.target(MigrationVersion.fromVersion("20")).load().migrate();
+
+        // V20 must have filled fraud_score_cache from risk_data
         int nullCount = jdbcTemplate.queryForObject("""
             SELECT COUNT(*)
-            FROM payments
+            FROM backfill_test.payments
             WHERE (risk_data ->> 'fraud_score') IS NOT NULL
               AND fraud_score_cache IS NULL
             """, Integer.class);
@@ -288,7 +287,8 @@ class FlywayMigrationTest {
 
 Property-based testing generates hundreds of random inputs to verify invariants that must hold for all valid inputs. For financial systems, the most critical invariants are:
 
-- Account balance is never negative
+- Account balance is never negative (the service refuses overdrafts)
+- Money is conserved: transfers move money but never create or destroy it
 - The sum of all debit ledger entries equals the sum of all credit ledger entries (double-entry invariant)
 - A payment's amount in the ledger matches the original authorised amount
 - Status transitions are only forward (PENDING -> AUTHORISED -> SETTLED, never backward)
@@ -301,16 +301,22 @@ Property-based testing generates hundreds of random inputs to verify invariants 
     <version>1.8.1</version>
     <scope>test</scope>
 </dependency>
+<!-- jqwik is its own test engine: Spring's JUnit extension and
+     Testcontainers' @Container do not work in @Property methods.
+     jqwik-spring adds Spring support. -->
+<dependency>
+    <groupId>net.jqwik</groupId>
+    <artifactId>jqwik-spring</artifactId>
+    <version><!-- release matching your jqwik + Spring version --></version>
+    <scope>test</scope>
+</dependency>
 ```
 
 ```java
-@SpringBootTest
-@Testcontainers
-class LedgerInvariantsTest {
-
-    @Container
-    static final PostgreSQLContainer<?> POSTGRES =
-        new PostgreSQLContainer<>("postgres:16-alpine").withReuse(true);
+// Uses the singleton container from DatabaseIntegrationTest (no @Container:
+// jqwik does not run the Testcontainers JUnit extension)
+@JqwikSpringSupport
+class LedgerInvariantsTest extends DatabaseIntegrationTest {
 
     @Autowired
     private LedgerService ledgerService;
@@ -321,32 +327,37 @@ class LedgerInvariantsTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
-    // Property: balance is always non-negative after any sequence of valid transactions
+    // Property: the service refuses every transfer that would overdraw the
+    // account, and applies every other one exactly. (Checking the balance in
+    // the TEST before calling the service would make this property trivially
+    // true -- the service itself must be exercised with too-large amounts.)
     @Property(tries = 200)
-    void account_balance_never_goes_negative(
+    void transfers_never_overdraw_the_account(
         @ForAll @LongRange(min = 1000, max = 1_000_000) long initialBalance,
-        @ForAll @Size(min = 1, max = 10) List<@LongRange(min = 1, max = 100) Long> transferAmounts
+        @ForAll @Size(min = 1, max = 10) List<@LongRange(min = 1, max = 500_000) Long> transferAmounts
     ) {
-        // Arrange
+        // Arrange: fresh accounts per try, so tries never share rows
         UUID accountId = createAccountWithBalance(initialBalance, "GBP");
         UUID destId    = createAccountWithBalance(0L, "GBP");
 
-        // Act: apply each transfer if it would not overdraw the account
         for (long amount : transferAmounts) {
-            long currentBalance = getBalance(accountId);
-            if (currentBalance >= amount) {
+            long before = getBalance(accountId);
+            if (amount > before) {
+                assertThatThrownBy(() -> ledgerService.transfer(accountId, destId, amount, "GBP"))
+                    .isInstanceOf(InsufficientFundsException.class);
+                assertThat(getBalance(accountId)).isEqualTo(before);   // unchanged
+            } else {
                 ledgerService.transfer(accountId, destId, amount, "GBP");
+                assertThat(getBalance(accountId)).isEqualTo(before - amount);
             }
         }
 
-        // Assert: balance is never negative
-        long finalBalance = getBalance(accountId);
-        assertThat(finalBalance).isGreaterThanOrEqualTo(0L);
+        assertThat(getBalance(accountId)).isGreaterThanOrEqualTo(0L);
     }
 
-    // Property: double-entry invariant — debits always equal credits
+    // Property: money is conserved (and the ledger stays balanced)
     @Property(tries = 100)
-    void ledger_maintains_double_entry_invariant(
+    void transfers_conserve_money(
         @ForAll @Size(min = 1, max = 20) List<@LongRange(min = 1, max = 50000) Long> amounts
     ) {
         // Arrange
@@ -375,12 +386,21 @@ class LedgerInvariantsTest {
         // Total should equal initial balances (no money created or destroyed)
         long expectedTotal = (long) accounts.size() * 1_000_000L;
         assertThat(totalMoney).isEqualTo(expectedTotal);
+
+        // Double-entry check over the whole ledger: debits = credits
+        // (assuming ledger_entries(entry_type 'DEBIT'/'CREDIT', amount_minor))
+        long imbalance = jdbcTemplate.queryForObject("""
+            SELECT COALESCE(SUM(CASE entry_type WHEN 'DEBIT' THEN amount_minor
+                                                ELSE -amount_minor END), 0)
+            FROM ledger_entries
+            """, Long.class);
+        assertThat(imbalance).isZero();
     }
 
     // Property: payment status can only advance, never retreat
     @Property(tries = 50)
     void payment_status_transitions_are_forward_only(
-        @ForAll("validPaymentTransitions") List<String> statusSequence
+        @ForAll("randomStatusSequences") List<String> statusSequence
     ) {
         UUID paymentId = createPayment("PENDING");
 
@@ -406,7 +426,7 @@ class LedgerInvariantsTest {
     }
 
     @Provide
-    Arbitrary<List<String>> validPaymentTransitions() {
+    Arbitrary<List<String>> randomStatusSequences() {   // valid AND invalid steps
         return Arbitraries.of("PENDING", "AUTHORISED", "CAPTURED", "SETTLED", "REFUNDED")
                           .list().ofMinSize(1).ofMaxSize(8);
     }
@@ -425,15 +445,19 @@ Concurrency bugs are among the most dangerous in financial systems and the harde
 class ConcurrentOperationsTest {
 
     @Container
+    @ServiceConnection
     static PostgreSQLContainer<?> POSTGRES =
-        new PostgreSQLContainer<>("postgres:16-alpine").withReuse(true);
+        new PostgreSQLContainer<>("postgres:16-alpine");
 
     @Autowired
     private LedgerService ledgerService;
 
+    // NOT @Transactional: every thread needs its own committed transaction
     @Test
     void concurrent_debits_should_not_overdraw_account() throws InterruptedException {
         // Create an account with exactly £100.00
+        // (the latch makes the race very likely, not certain -- run such
+        //  tests repeatedly, e.g. @RepeatedTest(20))
         UUID accountId = createAccountWithBalance(10000L, "GBP");
 
         int numThreads = 20;
@@ -486,6 +510,7 @@ class ConcurrentOperationsTest {
 
         ExecutorService executor = Executors.newFixedThreadPool(10);
         CountDownLatch done = new CountDownLatch(numTransfers);
+        Queue<Throwable> unexpected = new ConcurrentLinkedQueue<>();
 
         for (int i = 0; i < numTransfers; i++) {
             final int idx = i;
@@ -494,16 +519,23 @@ class ConcurrentOperationsTest {
                     UUID from = accounts.get(idx % numAccounts);
                     UUID to   = accounts.get((idx + 1) % numAccounts);
                     ledgerService.transfer(from, to, transferAmount, "GBP");
-                } catch (Exception e) {
-                    // Some may fail due to insufficient funds — that is acceptable
+                } catch (InsufficientFundsException e) {
+                    // acceptable (cannot happen with these amounts, but harmless)
+                } catch (Throwable t) {
+                    // Deadlocks, serialization failures etc. are BUGS here:
+                    // a ring of transfers deadlocks unless transfer() locks
+                    // both accounts in a fixed order -- swallowing them would
+                    // hide exactly the problem this test exists to find
+                    unexpected.add(t);
                 } finally {
                     done.countDown();
                 }
             });
         }
 
-        done.await(30, TimeUnit.SECONDS);
+        assertThat(done.await(30, TimeUnit.SECONDS)).isTrue();
         executor.shutdown();
+        assertThat(unexpected).isEmpty();
 
         // Total money in system must equal initial total — conservation law
         long totalBalance = accounts.stream()
@@ -525,7 +557,9 @@ Readable test data builders prevent tests from being brittle and unreadable. The
 // Builder pattern for financial test entities
 public class PaymentBuilder {
 
-    private UUID id              = UUID.randomUUID();
+    // No id: the entity's @GeneratedValue assigns it. Setting an id on a new
+    // entity makes Spring Data treat it as existing (merge instead of
+    // persist), which fails on recent Hibernate versions.
     private UUID tenantId        = UUID.randomUUID();
     private Long amountMinor     = 10000L;         // £100.00
     private String currencyCode  = "GBP";
@@ -579,7 +613,6 @@ public class PaymentBuilder {
 
     public Payment build() {
         Payment p = new Payment();
-        p.setId(id);
         p.setTenantId(tenantId);
         p.setAmountMinor(amountMinor);
         p.setCurrencyCode(currencyCode);
@@ -622,10 +655,10 @@ Include a performance test layer that verifies key queries execute within accept
 class QueryPerformanceTest {
 
     @Container
+    @ServiceConnection
     static final PostgreSQLContainer<?> POSTGRES =
         new PostgreSQLContainer<>("postgres:16-alpine")
-            .withCommand("postgres -c shared_buffers=256MB -c max_connections=100")
-            .withReuse(false);  // fresh DB for each performance test run
+            .withCommand("postgres -c shared_buffers=256MB -c max_connections=100");
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -655,10 +688,13 @@ class QueryPerformanceTest {
 
     @Test
     void explain_analyze_shows_index_scan_not_seq_scan() {
+        // Fresh statistics, otherwise the planner guesses. And use a SELECTIVE
+        // value: if most rows match, a Seq Scan is the correct plan.
+        jdbcTemplate.execute("ANALYZE payments");
         String plan = jdbcTemplate.queryForObject("""
             EXPLAIN (ANALYZE, FORMAT JSON)
             SELECT * FROM payments
-            WHERE processor_data @> '{"processor": "stripe"}'::jsonb
+            WHERE processor_data @> '{"processor_ref": "pi_rare_test_ref"}'::jsonb
             LIMIT 100
             """, String.class);
 
@@ -690,7 +726,7 @@ spring:
   flyway:
     enabled: true
     locations: classpath:db/migration
-    clean-on-validation-error: false  # never drop data in tests
+    clean-disabled: true   # never allow flyway clean (the default in recent Flyway)
     validate-on-migrate: true
   datasource:
     hikari:
@@ -709,10 +745,10 @@ logging:
 ## Key Takeaways
 
 1. **Never use H2 or mocked repositories** for database integration tests in financial systems — schema differences, type handling, and locking behaviour differ critically from PostgreSQL.
-2. **Testcontainers with `withReuse(true)`** amortises container startup cost across the test suite — a fresh PostgreSQL container starts in ~2 seconds, reusable ones start in milliseconds.
+2. **A singleton Testcontainers instance** (started once per JVM) amortises container startup — a few seconds — across the whole suite. `withReuse(true)` can additionally keep it between local runs, but is opt-in and not meant for CI.
 3. **`@DataJpaTest` with `Replace.NONE`** is the right slice for repository-layer tests; `@SpringBootTest` for service-layer tests that cross transaction boundaries.
 4. **Property-based tests** (jqwik) are more valuable than example-based tests for financial invariants — they generate edge cases you would not think to write manually.
-5. **Concurrent tests with `CountDownLatch`** reproduce race conditions reliably by forcing all threads to start simultaneously.
+5. **Concurrent tests with `CountDownLatch`** make race conditions far more likely by starting all threads at once — not certain, so repeat them, and never swallow unexpected exceptions.
 6. **Test data builders** make tests self-documenting and resilient to schema evolution.
 7. **EXPLAIN ANALYZE assertions** in tests prevent index regressions — if a migration drops an index, the performance test fails before production deployment.
 8. **Flyway migration tests** must be part of the CI pipeline, not an afterthought — they catch incompatible schema changes before they reach production.
@@ -722,19 +758,34 @@ logging:
   "questions": [
     {
       "text": "A test class annotated with @DataJpaTest uses the default configuration. A developer runs the tests and finds that a custom PostgreSQL-specific CHECK constraint is silently ignored. What is the root cause and the correct fix?",
-      "options": ["@DataJpaTest auto-configures an H2 in-memory database which does not support PostgreSQL CHECK constraint syntax; fix by adding @AutoConfigureTestDatabase(replace = Replace.NONE) and providing a Testcontainers PostgreSQL datasource", "The CHECK constraint needs to be annotated with @Column(columnDefinition = ...) to be picked up by the test slice", "JPA ignores CHECK constraints by design; use a @PrePersist listener instead", "Add spring.jpa.hibernate.ddl-auto=validate to force constraint validation in tests"],
+      "options": [
+        "@DataJpaTest auto-configures an H2 in-memory database which does not support PostgreSQL CHECK constraint syntax; fix by adding @AutoConfigureTestDatabase(replace = Replace.NONE) and providing a Testcontainers PostgreSQL datasource",
+        "The CHECK constraint needs to be annotated with @Column(columnDefinition = ...) to be picked up by the test slice",
+        "JPA ignores CHECK constraints by design; use a @PrePersist listener instead",
+        "Add spring.jpa.hibernate.ddl-auto=validate to force constraint validation in tests"
+      ],
       "correct": 0,
       "explanation": "@DataJpaTest by default replaces the configured datasource with an embedded H2 database. H2 either ignores or misinterprets PostgreSQL-specific DDL including CHECK constraints, custom types, and PostgreSQL functions. The fix is @AutoConfigureTestDatabase(replace = Replace.NONE) combined with a Testcontainers PostgreSQL container as the test datasource, which runs the actual Flyway migrations against real PostgreSQL."
     },
     {
       "text": "A property-based test using jqwik verifies that PaymentService.transfer(from, to, amount) never produces a negative balance. The test generates 1,000 random transfer scenarios. The test passes on the developer's laptop but fails intermittently in CI. What is the most likely cause?",
-      "options": ["jqwik uses a different random seed in CI than on the developer's laptop", "The test has a concurrency race condition: multiple generated test cases run in parallel and share the same database state, causing balance inconsistencies between test cases", "jqwik is not compatible with Testcontainers in CI environments", "Property-based tests require a fixed @Seed annotation to be deterministic in CI"],
+      "options": [
+        "jqwik uses a different random seed in CI than on the developer's laptop",
+        "The generated cases share database state: tries run one after another, but rows left behind by earlier tries (or by other test classes running in parallel against the same database in CI) change the balances a later try depends on",
+        "jqwik is not compatible with Testcontainers in CI environments",
+        "Property-based tests require a fixed @Seed annotation to be deterministic in CI"
+      ],
       "correct": 1,
-      "explanation": "Property-based tests with jqwik can run test cases in parallel by default. If multiple generated transfer scenarios operate on the same accounts concurrently, they can interfere with each other's balance state. The fix is either @Property(edgeCases = EdgeCasesMode.NONE) with sequential execution, or ensuring each generated test case uses isolated account IDs (e.g., generated UUIDs) so test cases never share database rows."
+      "explanation": "jqwik runs the tries of a property sequentially, but every try writes committed data. If tries reuse the same accounts, or other test classes run in parallel against the same database in CI, a later try sees balances changed by someone else — results then depend on ordering and timing, which differ between laptop and CI. The fix is to give every try its own freshly created accounts (new UUIDs) and to assert only on those rows, or to isolate the database per test class. A fixed seed only makes the generated inputs repeatable; it does not remove shared state."
     },
     {
       "text": "A concurrent test uses CountDownLatch to verify that two simultaneous SELECT FOR UPDATE transactions on the same payment row do not both proceed — one must wait. The test creates two threads, both call latch.await() before executing the query, then releases the latch. The test passes locally but always passes even when the SELECT FOR UPDATE is accidentally removed. What is wrong with the test design?",
-      "options": ["CountDownLatch does not work with database operations", "The test does not assert that one thread was blocked — it only asserts that both threads completed without exception, which also passes when there is no locking", "The two threads need to use different database connections for locking to work", "SELECT FOR UPDATE requires SERIALIZABLE isolation level to function correctly"],
+      "options": [
+        "CountDownLatch does not work with database operations",
+        "The test does not assert that one thread was blocked — it only asserts that both threads completed without exception, which also passes when there is no locking",
+        "The two threads need to use different database connections for locking to work",
+        "SELECT FOR UPDATE requires SERIALIZABLE isolation level to function correctly"
+      ],
       "correct": 1,
       "explanation": "A test that only asserts no exceptions were thrown passes whether or not locking occurs. To correctly test SELECT FOR UPDATE serialisation, the test must assert the temporal ordering: thread 2 must not complete before thread 1 releases the lock. This requires capturing timestamps or using a second CountDownLatch that thread 1 signals only after completing its transaction, then asserting that thread 2's start time is after thread 1's commit time."
     }
@@ -750,11 +801,11 @@ logging:
   "tasks": [
     {
       "id": "1",
-      "description": "Configure a shared Testcontainers PostgreSQL instance for the entire test suite using a static @Container field with @Testcontainers on an abstract base class. Enable withReuse(true) and configure Spring datasource properties via @DynamicPropertySource. Verify that the same container is reused across two test classes by checking that both classes see the same Docker container ID. Add a Flyway migration test that asserts all migrations in db/migration apply cleanly from V1 to current version."
+      "description": "Configure a shared Testcontainers PostgreSQL instance for the entire test suite using the singleton pattern: a static container on an abstract base class, started once in a static initializer (not a @Container field), with @ServiceConnection or @DynamicPropertySource for the Spring datasource. Verify that the same container is used by two test classes by checking that both see the same Docker container ID. Add a Flyway migration test that asserts all migrations in db/migration apply cleanly from V1 to current version."
     },
     {
       "id": "2",
-      "description": "Write a property-based test using jqwik for PaymentService.transfer(UUID from, UUID to, BigDecimal amount) that verifies three invariants across 500 generated scenarios: (a) the sum of all account balances is preserved, (b) no account balance goes below zero, (c) the transfer is idempotent given the same idempotency key. Use @ForAll @BigRange(min = 1, max = 10000) for amounts and ensure each scenario uses isolated accounts to avoid inter-scenario interference."
+      "description": "Write a property-based test using jqwik (with jqwik-spring / @JqwikSpringSupport) for PaymentService.transfer(UUID from, UUID to, BigDecimal amount) that verifies three invariants across 500 generated scenarios: (a) the sum of all account balances is preserved, (b) no account balance goes below zero, (c) the transfer is idempotent given the same idempotency key. Use @ForAll @BigRange(min = 1, max = 10000) for amounts and ensure each scenario uses isolated accounts to avoid inter-scenario interference."
     },
     {
       "id": "3",

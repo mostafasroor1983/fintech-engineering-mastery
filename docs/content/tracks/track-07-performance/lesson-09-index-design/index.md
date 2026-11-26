@@ -40,7 +40,7 @@ A B-tree index maintains sorted key values in a balanced tree where:
 **Properties**:
 - O(log N) for point lookups
 - O(log N + K) for range scans (K = result rows)
-- Supports `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `LIKE 'prefix%'`
+- Supports `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, and `LIKE 'prefix%'` (the last only with the `C` collation or a `text_pattern_ops` index)
 - Supports `ORDER BY` without an additional sort
 - Supports `IS NULL` and `IS NOT NULL`
 
@@ -101,9 +101,9 @@ CREATE INDEX idx_transactions_account_status_date
 ### Range Query Performance Comparison
 
 ```sql
--- Benchmark: 10M row transactions table, one account with 50K transactions
+-- Illustrative: 10M row transactions table, one account with 50K transactions
 
--- Without account_id+created_at composite index:
+-- With NO index usable for account_id:
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM transactions
 WHERE account_id = 'acct-001' AND created_at > NOW() - INTERVAL '30 days'
@@ -111,7 +111,7 @@ LIMIT 50;
 -- Seq Scan: actual time=1823.456..1891.234 ms
 
 -- With composite index:
--- Index Scan: actual time=0.043..0.312 ms  (~6000x faster)
+-- Index Scan: actual time=0.043..0.312 ms  (thousands of times faster)
 ```
 
 ## 2. Hash Indexes — Equality-Only, Faster for Point Lookups
@@ -119,26 +119,29 @@ LIMIT 50;
 Hash indexes map each key to a hash bucket. They are optimal for equality lookups but cannot support range queries or sorting.
 
 ```sql
--- Hash index on idempotency key (pure equality, never range)
-CREATE INDEX idx_transactions_idempotency_hash
-    ON transactions USING HASH (idempotency_key);
+-- Hash index on an external gateway reference (pure equality, never range,
+-- long values, no uniqueness needed)
+CREATE INDEX idx_transactions_gateway_ref_hash
+    ON transactions USING HASH (external_reference);
 
 -- Verify hash index usage
 EXPLAIN SELECT id FROM transactions
-WHERE idempotency_key = 'idem-abc123-xyz';
--- Index Scan using idx_transactions_idempotency_hash
+WHERE external_reference = 'gw-7f3a9c-000123';
+-- Index Scan using idx_transactions_gateway_ref_hash
 
--- Hash is faster than B-tree for equality: O(1) vs O(log N)
--- But B-tree is typically preferred because:
--- 1. Hash indexes are larger in practice due to bucket collisions
--- 2. Hash indexes do not support range, IS NULL, ordering
--- 3. UNIQUE constraints require B-tree
--- Use hash only when you have measured that equality lookups are the bottleneck
+-- Hash lookups can be slightly faster than B-tree for equality, and a hash
+-- index stores only a 4-byte hash per row, so it can be smaller for long keys.
+-- But B-tree is usually preferred because hash indexes:
+-- 1. cannot enforce UNIQUE constraints
+-- 2. do not support range, ordering, IS NULL or multi-column keys
+-- 3. cannot be used for index-only scans
+-- (They are crash-safe and replicated only since PostgreSQL 10.)
+-- Use hash only when you have measured a benefit
 ```
 
 **When to use hash indexes in fintech**:
-- Idempotency key lookups (pure equality, very high frequency)
-- External reference number lookups (payment gateway transaction IDs)
+- External reference number lookups (payment gateway transaction IDs) where duplicates are allowed
+- **Not** for idempotency keys: those need a `UNIQUE` constraint (a B-tree) — that constraint is what stops a retried request from creating a second payment
 - Never for `created_at`, `amount`, or any range-queried column
 
 ## 3. Partial Indexes — Indexing a Subset of Rows
@@ -166,11 +169,13 @@ WHERE account_id = 'acct-001'
 -- Index is tiny because only ~0.1% of transactions are PENDING
 ```
 
+The planner uses a partial index only when it can prove the query's `WHERE` implies the index predicate. Write `status = 'PENDING'` as a literal: with a bind parameter (`status = ?`) a generic prepared plan cannot use it.
+
 ### Account Status Partial Index
 
 ```sql
--- Active accounts are a small subset of all accounts
--- Fraud checks and velocity rules only apply to active accounts
+-- Useful when closed/frozen accounts are a LARGE share of all rows
+-- (e.g. after years of churn) and the hot queries only want active ones
 CREATE INDEX idx_accounts_active_number
     ON accounts (account_number)
     WHERE status = 'ACTIVE';
@@ -245,9 +250,9 @@ LIMIT 50;
 
 **INCLUDE vs index key columns**:
 - INCLUDE columns are stored only in leaf nodes, not internal nodes — index is smaller
-- INCLUDE columns cannot be used in WHERE conditions or ORDER BY
+- INCLUDE columns cannot be used to search the index or to provide ORDER BY (in an index-only scan they can only be checked as a filter)
 - INCLUDE columns are not part of the uniqueness constraint
-- Use INCLUDE for columns you project but never filter/sort on
+- Use INCLUDE for columns you project but never filter/sort on — and avoid frequently updated columns: any indexed column (INCLUDE too) prevents cheap HOT updates
 
 ```sql
 -- Pattern: minimal key for filtering + project-only columns in INCLUDE
@@ -268,14 +273,19 @@ CREATE INDEX idx_accounts_number_lower
 -- Query must use the same expression
 SELECT * FROM accounts WHERE LOWER(account_number) = LOWER($1);
 
--- Date-only index (strip time component for day-level queries)
-CREATE INDEX idx_transactions_date
-    ON transactions (DATE(created_at));
+-- Date-only index (strip time component for day-level queries).
+-- DATE(created_at) on a TIMESTAMPTZ is NOT allowed in an index: its result
+-- depends on the session TimeZone. Fix the time zone explicitly:
+CREATE INDEX idx_transactions_date_utc
+    ON transactions (((created_at AT TIME ZONE 'UTC')::date));
 
--- Query using date truncation
-SELECT COUNT(*) FROM transactions WHERE DATE(created_at) = '2024-01-15';
+-- Query must use the same expression
+SELECT COUNT(*) FROM transactions
+WHERE (created_at AT TIME ZONE 'UTC')::date = '2024-01-15';
+-- (A plain range on created_at with the normal B-tree index is often simpler:
+--  created_at >= '2024-01-15 00:00Z' AND created_at < '2024-01-16 00:00Z')
 
--- JSONB expression index for metadata column
+-- JSONB expression index for a metadata column (metadata JSONB)
 CREATE INDEX idx_transactions_metadata_type
     ON transactions ((metadata->>'payment_method'));
 
@@ -289,7 +299,7 @@ SELECT * FROM transactions WHERE metadata->>'payment_method' = 'CARD';
 
 Index-only scans skip the heap entirely. They require:
 1. All projected columns are in the index (as key or INCLUDE)
-2. The visibility map shows the page as "all visible" (no dead tuples)
+2. The visibility map shows the page as "all visible" (set by VACUUM when every row on the page is visible to all transactions)
 
 ```sql
 -- Check visibility map coverage
@@ -303,11 +313,14 @@ SELECT
 FROM pg_stat_user_tables
 WHERE relname = 'transactions';
 
--- High dead_pct means visibility map is stale -> index-only scans fall back to heap
--- Solution: vacuum more aggressively
+-- Many changes since the last vacuum mean many pages are not all-visible
+-- -> index-only scans fall back to the heap ("Heap Fetches" grows)
+-- Solution: vacuum more often
 ALTER TABLE transactions SET (
-    autovacuum_vacuum_scale_factor = 0.01,  -- vacuum at 1% dead tuples (default 20%)
-    autovacuum_analyze_scale_factor = 0.005 -- analyze at 0.5% changes
+    autovacuum_vacuum_scale_factor = 0.01,         -- vacuum at 1% dead tuples (default 20%)
+    autovacuum_vacuum_insert_scale_factor = 0.01,  -- PG13+: also after inserts (append-heavy
+                                                   -- tables otherwise rarely get vacuumed)
+    autovacuum_analyze_scale_factor = 0.005        -- analyze at 0.5% changes (default 10%)
 );
 ```
 
@@ -316,45 +329,42 @@ ALTER TABLE transactions SET (
 Indexes accumulate dead entries as rows are updated and deleted. Index bloat increases scan time and wastes disk space.
 
 ```sql
--- Monitor index bloat
+-- Monitor index size and usage
+-- (pg_stat_user_indexes names its columns relname / indexrelname)
 SELECT
     schemaname,
-    tablename,
-    indexname,
+    relname      AS tablename,
+    indexrelname AS indexname,
     pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
     idx_scan,
     idx_tup_read,
     idx_tup_fetch,
     CASE WHEN idx_scan = 0 THEN 'UNUSED' ELSE 'USED' END AS usage
 FROM pg_stat_user_indexes
-WHERE tablename IN ('transactions', 'accounts')
+WHERE relname IN ('transactions', 'accounts')
 ORDER BY pg_relation_size(indexrelid) DESC;
 ```
 
 ```sql
--- Detailed bloat estimation using pgstattuple extension
+-- Detailed B-tree bloat check: pgstatindex() from the pgstattuple extension
+-- (it reads the whole index -- run it off-peak)
 CREATE EXTENSION IF NOT EXISTS pgstattuple;
 
 SELECT
-    indexname,
-    pg_size_pretty(index_size) AS index_size,
-    ROUND(avg_leaf_density, 1) AS fill_pct,
-    leaf_fragmentation
-FROM (
-    SELECT
-        c.relname AS indexname,
-        pg_relation_size(c.oid) AS index_size,
-        (pgstattuple(c.oid)).avg_leaf_density,
-        (pgstattuple(c.oid)).leaf_fragmentation
-    FROM pg_class c
-    JOIN pg_index i ON i.indexrelid = c.oid
-    JOIN pg_class t ON t.oid = i.indrelid
-    WHERE t.relname = 'transactions'
-) sub
-ORDER BY leaf_fragmentation DESC;
+    c.relname AS indexname,
+    pg_size_pretty(pg_relation_size(c.oid)) AS index_size,
+    ROUND(s.avg_leaf_density::numeric, 1)   AS fill_pct,
+    s.leaf_fragmentation
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_class t ON t.oid = i.indrelid
+JOIN pg_am am   ON am.oid = c.relam AND am.amname = 'btree'
+CROSS JOIN LATERAL pgstatindex(c.oid) s
+WHERE t.relname = 'transactions'
+ORDER BY s.avg_leaf_density;
 
 -- avg_leaf_density < 50% = significant bloat -> consider REINDEX
--- leaf_fragmentation > 30% = heavy fragmentation
+-- (a fresh B-tree is ~90% full by default)
 ```
 
 ### REINDEX CONCURRENTLY
@@ -373,31 +383,34 @@ FROM pg_stat_progress_create_index
 WHERE relid = 'transactions'::regclass;
 ```
 
-**Important**: `REINDEX CONCURRENTLY` requires extra disk space (builds new index before dropping old), and it cannot be run inside a transaction block.
+**Important**: `REINDEX CONCURRENTLY` requires extra disk space (builds new index before dropping old), takes longer than a plain `REINDEX`, and cannot be run inside a transaction block. If it fails, it can leave an `INVALID` index (suffix `_ccnew`) that you must drop.
 
 ## 8. Unused Index Detection and Removal
 
 ```sql
--- Find indexes never used since last statistics reset
+-- Find indexes never used since the last statistics reset
 SELECT
-    schemaname,
-    tablename,
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS wasted_size,
-    idx_scan AS scans_since_reset
-FROM pg_stat_user_indexes
-WHERE idx_scan = 0
-  AND indexname NOT LIKE '%_pkey'       -- keep primary keys
-  AND indexname NOT LIKE '%_unique%'    -- keep unique constraints
-ORDER BY pg_relation_size(indexrelid) DESC;
+    s.schemaname,
+    s.relname      AS tablename,
+    s.indexrelname AS indexname,
+    pg_size_pretty(pg_relation_size(s.indexrelid)) AS wasted_size,
+    s.idx_scan AS scans_since_reset
+FROM pg_stat_user_indexes s
+JOIN pg_index i ON i.indexrelid = s.indexrelid
+WHERE s.idx_scan = 0
+  AND NOT i.indisunique        -- keep primary keys and UNIQUE constraints
+ORDER BY pg_relation_size(s.indexrelid) DESC;
 ```
 
 ```sql
--- Be cautious: statistics reset on restart; check uptime first
-SELECT NOW() - pg_postmaster_start_time() AS uptime;
+-- Be cautious: statistics can be reset (pg_stat_reset(), crash recovery,
+-- and on restart before PostgreSQL 15). Check how old they are:
+SELECT stats_reset FROM pg_stat_database WHERE datname = current_database();
 
--- Only trust zero-scan results if uptime > 2 weeks (covers all business cycles)
--- Before dropping, verify the index isn't used by a weekly/monthly report
+-- Only trust zero-scan results if the statistics cover > 2 weeks AND a full
+-- business cycle (month-end, quarter-end reports).
+-- idx_scan counts only THIS server: an index used only by queries on a read
+-- replica shows 0 on the primary -- check every replica before dropping.
 ```
 
 Dropping an unused index:
@@ -408,6 +421,9 @@ DROP INDEX CONCURRENTLY IF EXISTS idx_transactions_old_reference;
 
 -- Flyway migration
 -- V20240115__drop_unused_transactions_reference_index.sql
+-- CONCURRENTLY cannot run inside a transaction: tell Flyway with a script
+-- config file V20240115__drop_unused_transactions_reference_index.sql.conf
+-- containing: executeInTransaction=false
 DROP INDEX CONCURRENTLY IF EXISTS idx_transactions_reference_old;
 ```
 
@@ -423,15 +439,15 @@ Here is a complete, production-ready index set for the payment core tables:
 -- PK already creates: btree on id
 -- UNIQUE constraint already creates: btree on account_number
 
--- Covering index for balance lookup (most frequent read path)
-CREATE INDEX idx_accounts_balance_lookup
-    ON accounts (account_number)
-    INCLUDE (id, balance, currency, status, version);
+-- OPTIONAL covering index for balance lookup -- only if measurements show the
+-- heap visit matters. balance/version change on every payment, so this index
+-- turns every balance update into a non-HOT update (see lesson 08).
+-- CREATE INDEX idx_accounts_balance_lookup
+--     ON accounts (account_number)
+--     INCLUDE (id, balance, currency, status, version);
 
--- Active account lookup (partial: excludes CLOSED/FROZEN)
-CREATE INDEX idx_accounts_active
-    ON accounts (account_number)
-    WHERE status = 'ACTIVE';
+-- (No separate "active accounts" index: the UNIQUE index on account_number
+--  already finds any account in a few page reads.)
 
 -- Customer's accounts list
 CREATE INDEX idx_accounts_customer
@@ -443,10 +459,9 @@ CREATE INDEX idx_accounts_customer
 -- =============================================
 
 -- PK already creates: btree on id
--- UNIQUE constraint on idempotency_key (use HASH for equality-only)
-CREATE INDEX idx_transactions_idempotency
-    ON transactions USING HASH (idempotency_key)
-    WHERE idempotency_key IS NOT NULL;
+-- UNIQUE constraint on idempotency_key already creates a B-tree -- it is what
+-- guarantees a retried request cannot insert a second payment. Do not add
+-- a second (hash) index on the same column: it only adds write cost.
 
 -- Primary access pattern: account history (most frequent)
 CREATE INDEX idx_transactions_account_history
@@ -463,7 +478,7 @@ CREATE INDEX idx_transactions_pending
     ON transactions (account_id, created_at)
     WHERE status = 'PENDING';
 
--- External reference lookup (payment gateway IDs)
+-- External reference lookup (payment gateway IDs; external_reference column)
 CREATE INDEX idx_transactions_external_ref
     ON transactions (external_reference)
     WHERE external_reference IS NOT NULL;
@@ -483,14 +498,15 @@ public class TransactionRepository {
     private final JdbcTemplate jdbc;
     private final MeterRegistry metrics;
 
-    // Uses idx_transactions_account_history (covering)
-    public Page<TransactionSummary> findByAccountId(
+    // Uses idx_transactions_account_history (covering).
+    // First page only -- see lesson 08 for the keyset cursor on later pages.
+    public List<TransactionSummary> findByAccountId(
             UUID accountId,
             Instant from,
             Instant to,
             Pageable pageable) {
 
-        // Keyset pagination — avoids OFFSET scan degradation
+        // No OFFSET: later pages continue from the last (created_at, id)
         return jdbc.query(
             """
             SELECT id, amount, currency, status, type, reference, created_at
@@ -500,14 +516,9 @@ public class TransactionRepository {
             ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
-            rs -> {
-                List<TransactionSummary> results = new ArrayList<>();
-                while (rs.next()) {
-                    results.add(mapRow(rs));
-                }
-                return new PageImpl<>(results, pageable, results.size());
-            },
-            accountId, from, to, pageable.getPageSize()
+            (rs, row) -> mapRow(rs),
+            // pgjdbc does not bind java.time.Instant directly
+            accountId, Timestamp.from(from), Timestamp.from(to), pageable.getPageSize()
         );
     }
 
@@ -525,15 +536,15 @@ public class TransactionRepository {
                 rs.getInt("cnt"),
                 rs.getBigDecimal("total")
             ),
-            accountId, since
+            accountId, Timestamp.from(since)
         );
     }
 
-    // Uses idx_transactions_idempotency (hash) — O(1) lookup
+    // Uses the UNIQUE (B-tree) index on idempotency_key
     public Optional<UUID> findIdByIdempotencyKey(String key) {
         List<UUID> results = jdbc.query(
             "SELECT id FROM transactions WHERE idempotency_key = ?",
-            (rs, row) -> UUID.fromString(rs.getString("id")),
+            (rs, row) -> rs.getObject("id", UUID.class),
             key
         );
         return results.isEmpty() ? Optional.empty() : Optional.of(results.get(0));
@@ -550,31 +561,40 @@ public class IndexHealthMonitor {
 
     private final JdbcTemplate jdbc;
     private final MeterRegistry metrics;
+    // One holder per index: a gauge is registered ONCE and then reads the
+    // holder. (Calling metrics.gauge(..., rs.getLong(...)) every minute would
+    // register a boxed number once and never update it.)
+    private final Map<String, AtomicLong> scans = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> hitPctTimes10 = new ConcurrentHashMap<>();
+
+    public IndexHealthMonitor(JdbcTemplate jdbc, MeterRegistry metrics) {
+        this.jdbc = jdbc;
+        this.metrics = metrics;
+    }
 
     @Scheduled(fixedRate = 60_000)
     public void reportIndexStats() {
-        // Report cache hit ratio per index
         jdbc.query(
             """
-            SELECT indexname, idx_scan, idx_blks_hit, idx_blks_read,
-                   ROUND(idx_blks_hit::numeric /
-                       NULLIF(idx_blks_hit + idx_blks_read, 0) * 100, 1) AS hit_pct
-            FROM pg_stat_user_indexes
-            JOIN pg_statio_user_indexes USING (indexrelid)
-            WHERE tablename IN ('transactions', 'accounts')
+            SELECT s.indexrelname AS indexname, s.idx_scan,
+                   ROUND(io.idx_blks_hit::numeric /
+                       NULLIF(io.idx_blks_hit + io.idx_blks_read, 0) * 100, 1) AS hit_pct
+            FROM pg_stat_user_indexes s
+            JOIN pg_statio_user_indexes io USING (indexrelid)
+            WHERE s.relname IN ('transactions', 'accounts')
             """,
-            rs -> {
-                while (rs.next()) {
-                    String indexName = rs.getString("indexname");
-                    metrics.gauge("db.index.scans",
-                        Tags.of("index", indexName),
-                        rs.getLong("idx_scan"));
-                    metrics.gauge("db.index.cache_hit_pct",
-                        Tags.of("index", indexName),
-                        rs.getDouble("hit_pct"));
-                }
+            (RowCallbackHandler) rs -> {
+                String index = rs.getString("indexname");
+                holder(scans, "db.index.scans", index).set(rs.getLong("idx_scan"));
+                holder(hitPctTimes10, "db.index.cache_hit_pct_x10", index)
+                    .set(Math.round(rs.getDouble("hit_pct") * 10));
             }
         );
+    }
+
+    private AtomicLong holder(Map<String, AtomicLong> map, String name, String index) {
+        return map.computeIfAbsent(index, i ->
+            metrics.gauge(name, Tags.of("index", i), new AtomicLong()));
     }
 }
 ```
@@ -597,7 +617,7 @@ public class IndexHealthMonitor {
 2. Partial indexes for status columns with low cardinality
 3. Covering indexes for the top 5 most frequent query shapes
 4. Never index every column "just in case" — monitor `pg_stat_user_indexes`
-5. REINDEX CONCURRENTLY quarterly or after major bulk loads
+5. REINDEX CONCURRENTLY when measured bloat calls for it (e.g. leaf density well below ~50%), not on a fixed schedule
 
 > [!WARNING]
 > Each index adds latency to every INSERT, UPDATE, and DELETE. A transaction table with 20 indexes will process writes significantly slower than one with 8 well-designed indexes. Profile write throughput when adding indexes to high-volume tables.
@@ -614,7 +634,7 @@ public class IndexHealthMonitor {
         "When the table is partitioned by range on the same column"
       ],
       "correct": 1,
-      "explanation": "Hash indexes are optimized for equality comparisons only (column = value). They cannot support range queries, ORDER BY, or LIKE prefix matching. Use them for pure equality lookups on high-cardinality columns like idempotency keys or payment references. B-tree remains the right choice for any query requiring range, sort, or multi-operator access."
+      "explanation": "Hash indexes support equality comparisons only (column = value). They cannot support range queries, ORDER BY, LIKE prefix matching, uniqueness or index-only scans. Consider them for pure equality lookups on long, high-cardinality values such as gateway references — not for idempotency keys, which need a UNIQUE B-tree index to block duplicate payments. B-tree remains the right choice for any query requiring range, sort, or multi-operator access."
     },
     {
       "text": "What is a covering index and when does it eliminate a heap fetch?",
@@ -625,7 +645,7 @@ public class IndexHealthMonitor {
         "A covering index uses more disk space but is otherwise identical to a regular index"
       ],
       "correct": 1,
-      "explanation": "When an index contains all columns needed by a query (key columns in the index predicate plus non-key columns in INCLUDE), PostgreSQL can return results directly from the index pages without fetching the corresponding heap (table) pages. For a read-heavy transaction history query fetching amount, currency, and status, including those in the index eliminates the heap fetch on every row."
+      "explanation": "When an index contains all columns needed by a query (key columns plus non-key columns in INCLUDE), PostgreSQL can return results from the index pages without fetching the heap (table) pages — as long as those heap pages are marked all-visible by VACUUM. For a read-heavy transaction history query fetching amount, currency, and status, including those in the index removes most heap fetches."
     },
     {
       "text": "Why should you use CREATE INDEX CONCURRENTLY in production instead of CREATE INDEX?",
@@ -648,10 +668,22 @@ public class IndexHealthMonitor {
   "difficulty": "advanced",
   "estimatedMinutes": 50,
   "tasks": [
-    {"id": "1", "description": "Design a complete index strategy for a transactions table (100M rows, 5000 TPS writes) that supports: account history queries by date range, pending transaction queues by account, deduplication by reference_id, and monthly settlement reports."},
-    {"id": "2", "description": "Write all CREATE INDEX CONCURRENTLY statements for the designed indexes, including appropriate INCLUDE columns and partial index WHERE clauses."},
-    {"id": "3", "description": "Write a Spring Boot ApplicationRunner that queries pg_stat_user_indexes and logs any index with idx_scan = 0 after the service has been running for 7+ days, flagging candidates for removal."},
-    {"id": "4", "description": "Write a SQL query that identifies index bloat on the transactions table using pg_stat_user_indexes and pg_statio_user_indexes, and explain when REINDEX CONCURRENTLY should be scheduled."}
+    {
+      "id": "1",
+      "description": "Design a complete index strategy for a transactions table (100M rows, 5000 TPS writes) that supports: account history queries by date range, pending transaction queues by account, deduplication by reference_id, and monthly settlement reports."
+    },
+    {
+      "id": "2",
+      "description": "Write all CREATE INDEX CONCURRENTLY statements for the designed indexes, including appropriate INCLUDE columns and partial index WHERE clauses."
+    },
+    {
+      "id": "3",
+      "description": "Write a Spring Boot ApplicationRunner that queries pg_stat_user_indexes and logs any index with idx_scan = 0 after the service has been running for 7+ days, flagging candidates for removal."
+    },
+    {
+      "id": "4",
+      "description": "Write a SQL query that identifies index bloat on the transactions table using pgstatindex() (pgstattuple extension) together with pg_stat_user_indexes, and explain when REINDEX CONCURRENTLY should be scheduled."
+    }
   ]
 }
 -->

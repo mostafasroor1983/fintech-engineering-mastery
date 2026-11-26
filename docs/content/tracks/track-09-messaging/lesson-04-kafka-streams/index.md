@@ -91,7 +91,7 @@ public class KafkaStreamsConfig {
         // State store directory for RocksDB
         props.put(StreamsConfig.STATE_DIR_CONFIG, "/var/kafka-streams/payment-aggregator");
 
-        // Exactly-once semantics (v2 uses epochs, not fencing)
+        // Exactly-once semantics (v2: one transactional producer per thread)
         props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG,
             StreamsConfig.EXACTLY_ONCE_V2);
 
@@ -101,7 +101,8 @@ public class KafkaStreamsConfig {
         // Number of stream processing threads per instance
         props.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, 4);
 
-        // Commit interval for state stores and offsets
+        // Commit interval for state stores and offsets (100 ms is already the
+        // default under exactly-once; at-least-once defaults to 30 s)
         props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 100L);
 
         return new KafkaStreamsConfiguration(props);
@@ -161,14 +162,15 @@ public class PaymentStreamTopology {
 
 ### Rekeying Streams
 
-Rekeying triggers a repartition, which changes the partition an event belongs to. This is necessary before aggregating on a different key:
+Rekeying marks the stream for repartitioning: before the next key-based operation (aggregation, join), Kafka Streams writes the records to an internal repartition topic so that all records with the new key end up in the same partition:
 
 ```java
 // Rekey from account_id to merchant_id for merchant-level aggregations
 KStream<String, PaymentEvent> rekeyedByMerchant = paymentStream
     .selectKey((accountId, event) -> event.getMerchantId());
-// This triggers an internal repartition topic
-// All events with the same merchantId now go to the same partition
+// The next groupByKey()/join() creates an internal repartition topic
+// (extra write + read through Kafka); after it, all events with the same
+// merchantId are in the same partition
 ```
 
 ---
@@ -186,7 +188,7 @@ KTable<String, AccountBalance> balanceTable = streamsBuilder
 
 // KTable from a KStream aggregation
 KTable<String, BigDecimal> runningTotals = paymentStream
-    .groupByKey()
+    .groupByKey(Grouped.with(Serdes.String(), paymentEventSerde()))  // value serde
     .aggregate(
         () -> BigDecimal.ZERO,                              // Initializer
         (accountId, payment, currentTotal) ->              // Aggregator
@@ -206,7 +208,7 @@ runningTotals.toStream()
 
 ## 5. GlobalKTable — Broadcast Lookup Table
 
-A `GlobalKTable` is replicated across ALL stream task instances, making it ideal for enrichment lookups that don't require partitioning:
+A `GlobalKTable` is fully copied to EVERY application instance (all partitions of the topic, read by a dedicated global thread and loaded completely at startup), making it ideal for enrichment lookups that don't require co-partitioning:
 
 ```java
 // GlobalKTable for account metadata (small dataset, needs to be on every node)
@@ -267,18 +269,26 @@ props.put(StreamsConfig.ROCKSDB_CONFIG_SETTER_CLASS_CONFIG,
 
 public class PaymentRocksDbConfigSetter implements RocksDBConfigSetter {
 
+    // setConfig runs for EVERY store instance (one per store per task/partition).
+    // A 256 MB cache per instance would multiply quickly (20 stores x 12
+    // tasks = 60 GB!), so share ONE cache and ONE write-buffer budget.
+    private static final long TOTAL_OFF_HEAP = 512 * 1024 * 1024L;     // 512 MB
+    private static final long TOTAL_MEMTABLES = 128 * 1024 * 1024L;    // 128 MB of it
+    private static final Cache SHARED_CACHE = new LRUCache(TOTAL_OFF_HEAP);
+    private static final WriteBufferManager WRITE_BUFFER_MANAGER =
+        new WriteBufferManager(TOTAL_MEMTABLES, SHARED_CACHE);
+
     @Override
     public void setConfig(String storeName, Options options,
                           Map<String, Object> configs) {
-        // Configure block cache size (default 50 MB per store — increase for large datasets)
-        BlockBasedTableConfig tableConfig = new BlockBasedTableConfig();
-        tableConfig.setBlockCacheSize(256 * 1024 * 1024L); // 256 MB
-        tableConfig.setBlockSize(16 * 1024L);               // 16 KB blocks
+        // Modify the table config Kafka Streams already set up -- creating a
+        // new BlockBasedTableConfig would drop its defaults (e.g. bloom filters)
+        BlockBasedTableConfig tableConfig = (BlockBasedTableConfig) options.tableFormatConfig();
+        tableConfig.setBlockCache(SHARED_CACHE);
+        tableConfig.setCacheIndexAndFilterBlocks(true);   // count them in the budget
+        tableConfig.setBlockSize(16 * 1024L);              // 16 KB blocks
         options.setTableFormatConfig(tableConfig);
-
-        // Write buffer size
-        options.setWriteBufferSize(64 * 1024 * 1024L); // 64 MB
-        options.setMaxWriteBufferNumber(3);
+        options.setWriteBufferManager(WRITE_BUFFER_MANAGER);
 
         // Compression for on-disk storage
         options.setCompressionType(CompressionType.LZ4_COMPRESSION);
@@ -286,7 +296,7 @@ public class PaymentRocksDbConfigSetter implements RocksDBConfigSetter {
 
     @Override
     public void close(String storeName, Options options) {
-        // Release any native resources
+        // Shared static cache: do NOT close it here (other stores still use it)
     }
 }
 ```
@@ -302,7 +312,7 @@ Windows aggregate events within bounded time intervals.
 ```java
 // Sum payment amounts per account per hour (non-overlapping 1-hour windows)
 KTable<Windowed<String>, BigDecimal> hourlyPaymentSums = paymentStream
-    .groupByKey()
+    .groupByKey(Grouped.with(Serdes.String(), paymentEventSerde()))
     .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofHours(1)))
     .aggregate(
         () -> BigDecimal.ZERO,
@@ -331,13 +341,15 @@ hourlyPaymentSums.toStream()
 ```java
 // 1-hour window, advancing every 15 minutes (overlapping windows for real-time dashboards)
 KTable<Windowed<String>, BigDecimal> rollingPaymentSums = paymentStream
-    .groupByKey()
+    .groupByKey(Grouped.with(Serdes.String(), paymentEventSerde()))
     .windowedBy(TimeWindows.ofSizeAndGrace(Duration.ofHours(1), Duration.ofMinutes(5))
         .advanceBy(Duration.ofMinutes(15)))
     .aggregate(
         () -> BigDecimal.ZERO,
         (accountId, payment, sum) -> sum.add(payment.getAmount()),
-        Materialized.as("rolling-payment-sums")
+        Materialized.<String, BigDecimal, WindowStore<Bytes, byte[]>>as("rolling-payment-sums")
+            .withKeySerde(Serdes.String())
+            .withValueSerde(bigDecimalSerde())
     );
 ```
 
@@ -346,13 +358,15 @@ KTable<Windowed<String>, BigDecimal> rollingPaymentSums = paymentStream
 ```java
 // Group payments into sessions (burst of activity) with 30-minute inactivity gap
 KTable<Windowed<String>, SessionSummary> paymentSessions = paymentStream
-    .groupByKey()
+    .groupByKey(Grouped.with(Serdes.String(), paymentEventSerde()))
     .windowedBy(SessionWindows.ofInactivityGapWithNoGrace(Duration.ofMinutes(30)))
     .aggregate(
         SessionSummary::empty,
         (accountId, payment, session) -> session.addPayment(payment), // Aggregator
         (key, session1, session2) -> session1.merge(session2),         // Merger
-        Materialized.as("payment-sessions")
+        Materialized.<String, SessionSummary, SessionStore<Bytes, byte[]>>as("payment-sessions")
+            .withKeySerde(Serdes.String())
+            .withValueSerde(sessionSummarySerde())
     );
 ```
 
@@ -361,7 +375,7 @@ KTable<Windowed<String>, SessionSummary> paymentSessions = paymentStream
 ```java
 // Allow events up to 5 minutes late (they can arrive out-of-order due to network delays)
 KTable<Windowed<String>, BigDecimal> hourlyWithGrace = paymentStream
-    .groupByKey()
+    .groupByKey(Grouped.with(Serdes.String(), paymentEventSerde()))
     .windowedBy(TimeWindows.ofSizeAndGrace(
         Duration.ofHours(1),
         Duration.ofMinutes(5)  // Grace period for late-arriving events
@@ -369,8 +383,13 @@ KTable<Windowed<String>, BigDecimal> hourlyWithGrace = paymentStream
     .aggregate(
         () -> BigDecimal.ZERO,
         (key, payment, total) -> total.add(payment.getAmount()),
-        Materialized.as("hourly-with-grace")
+        Materialized.<String, BigDecimal, WindowStore<Bytes, byte[]>>as("hourly-with-grace")
+            .withKeySerde(Serdes.String())
+            .withValueSerde(bigDecimalSerde())
     );
+// Events later than window end + grace are DROPPED (counted in the
+// dropped-records metric) -- monitor it; with ofSizeWithNoGrace any
+// out-of-order event after the window closes is dropped
 ```
 
 ---
@@ -380,7 +399,11 @@ KTable<Windowed<String>, BigDecimal> hourlyWithGrace = paymentStream
 ### Stream-Table Join (Enrich Events with Latest State)
 
 ```java
-// Enrich payment events with the current account balance
+// Enrich payment events with the current account balance.
+// Both topics must be CO-PARTITIONED: same key (account id), same number
+// of partitions, same partitioner. The join uses the table's value at
+// processing time (versioned stores, Kafka 3.5+, allow timestamp-accurate
+// lookups).
 KTable<String, AccountBalance> balanceTable = streamsBuilder
     .table("account-balances", Consumed.with(Serdes.String(), balanceSerde()));
 
@@ -397,7 +420,9 @@ KStream<String, PaymentWithBalance> enrichedPayments = paymentStream
 ### Stream-Stream Join (Correlate Two Event Streams)
 
 ```java
-// Correlate payment authorizations with payment captures (must arrive within 24 hours)
+// Correlate payment authorizations with payment captures (must arrive within
+// 24 hours). Both streams keyed by payment id and co-partitioned; the join
+// keeps 24h of both sides in window stores
 KStream<String, Authorization> authStream = streamsBuilder
     .stream("payment-authorizations",
         Consumed.with(Serdes.String(), authSerde()));
@@ -418,15 +443,18 @@ KStream<String, AuthCapturePair> correlatedPayments = authStream
 
 ## 9. Interactive Queries — Serving State Store Data
 
-Kafka Streams exposes state stores for interactive queries — useful for real-time balance APIs:
+Kafka Streams exposes state stores for interactive queries — useful for real-time balance APIs. Two caveats: each instance holds only the stores of ITS partitions (use `queryMetadataForKey(...)` to find the instance that owns a key and forward the request there), and stores are unavailable during rebalances and restoration (`InvalidStateStoreException` — retry or return 503).
 
 ```java
 @Service
 public class PaymentStateQueryService {
 
+    // With Spring: StreamsBuilderFactoryBean#getKafkaStreams()
     private final KafkaStreams kafkaStreams;
 
     public Optional<BigDecimal> getRunningTotal(String accountId) {
+        // (production: first check queryMetadataForKey(...) -- if another
+        //  instance owns this key, call that instance's endpoint instead)
         ReadOnlyKeyValueStore<String, BigDecimal> store =
             kafkaStreams.store(StoreQueryParameters.fromNameAndType(
                 "running-totals-store",
@@ -514,30 +542,38 @@ public class PaymentAggregationTopology {
                         .withRetention(Duration.ofDays(2))
                 );
 
-        // Stream aggregation results
-        KStream<String, HourlyPaymentAggregation> aggregationStream =
-            hourlyAggregation.toStream()
-                .map((windowedKey, agg) -> KeyValue.pair(windowedKey.key(), agg));
+        // NOTE: a windowed aggregation emits an UPDATE for every incoming
+        // payment (modulo caching), not one result per window.
 
-        // Sink: publish aggregations
-        aggregationStream.to("hourly-payment-aggregations",
-            Produced.with(Serdes.String(), aggregationSerde));
+        // Sink 1: FINAL hourly totals only -- suppress until the window
+        // (plus grace) has closed, then emit exactly one record per window
+        hourlyAggregation
+            .suppress(Suppressed.untilWindowCloses(Suppressed.BufferConfig.unbounded()))
+            .toStream()
+            .map((windowedKey, agg) -> KeyValue.pair(windowedKey.key(),
+                agg.withWindow(windowedKey.window().startTime(),   // real window bounds
+                               windowedKey.window().endTime())))
+            .to("hourly-payment-aggregations",
+                Produced.with(Serdes.String(), aggregationSerde));
 
-        // Fraud detection: alert if hourly total exceeds threshold
-        aggregationStream
-            .filter((accountId, agg) ->
-                agg.getTotalAmount().compareTo(FRAUD_THRESHOLD) > 0)
-            .mapValues((accountId, agg) -> FraudAlert.builder()
-                .alertId(UUID.randomUUID().toString())
-                .accountId(accountId)
+        // Sink 2: fraud alerts EARLY, from the running updates. The same
+        // window will produce further updates above the threshold, so the
+        // alert id is DETERMINISTIC (account + window start): downstream
+        // consumers de-duplicate on it instead of receiving N random alerts.
+        hourlyAggregation.toStream()
+            .filter((windowedKey, agg) ->
+                agg != null && agg.getTotalAmount().compareTo(FRAUD_THRESHOLD) > 0)
+            .map((windowedKey, agg) -> KeyValue.pair(windowedKey.key(), FraudAlert.builder()
+                .alertId(windowedKey.key() + ":" + windowedKey.window().start())
+                .accountId(windowedKey.key())
                 .alertType(FraudAlertType.VELOCITY_BREACH)
                 .detectedAmount(agg.getTotalAmount())
                 .threshold(FRAUD_THRESHOLD)
-                .windowStart(agg.getWindowStart())
-                .windowEnd(agg.getWindowEnd())
+                .windowStart(windowedKey.window().startTime())
+                .windowEnd(windowedKey.window().endTime())
                 .paymentCount(agg.getPaymentCount())
                 .detectedAt(Instant.now())
-                .build())
+                .build()))
             .to("fraud-alerts", Produced.with(Serdes.String(), alertSerde));
 
         log.info("Payment aggregation topology built successfully");
@@ -545,13 +581,13 @@ public class PaymentAggregationTopology {
 }
 
 @Value
-@Builder
+@Builder(toBuilder = true)
 public class HourlyPaymentAggregation {
 
     String accountId;
     BigDecimal totalAmount;
     int paymentCount;
-    Instant windowStart;
+    Instant windowStart;   // set from the Windowed key when emitting
     Instant windowEnd;
 
     public static HourlyPaymentAggregation empty() {
@@ -562,14 +598,15 @@ public class HourlyPaymentAggregation {
     }
 
     public HourlyPaymentAggregation addPayment(PaymentEvent payment) {
-        return HourlyPaymentAggregation.builder()
+        return toBuilder()
             .accountId(payment.getAccountId())
             .totalAmount(this.totalAmount.add(payment.getAmount()))
             .paymentCount(this.paymentCount + 1)
-            .windowStart(this.windowStart != null
-                ? this.windowStart : payment.getEventTime())
-            .windowEnd(payment.getEventTime())
             .build();
+    }
+
+    public HourlyPaymentAggregation withWindow(Instant start, Instant end) {
+        return toBuilder().windowStart(start).windowEnd(end).build();
     }
 }
 ```
@@ -583,22 +620,28 @@ public class HourlyPaymentAggregation {
 props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG,
     StreamsConfig.EXACTLY_ONCE_V2);
 
-// EOS v2 is more efficient than EOS v1:
-// - Uses one transactional producer per stream thread (not per task)
-// - Uses epoch-based fencing instead of zombie fencing
+// EOS v2 is more efficient than EOS v1 (removed in Kafka 4.0):
+// - Uses one transactional producer per stream THREAD (not per task)
+// - Zombie fencing via the consumer group metadata (KIP-447) instead of
+//   one transactional.id per input partition
 // - Lower overhead, better throughput
 ```
 
-**EOS Performance Cost**: Enabling exactly-once reduces throughput by approximately 20-30% due to transactional overhead. For financial systems where correctness is non-negotiable, this is acceptable. For high-throughput analytics topics, consider at-least-once with idempotent consumers.
+**EOS cost**: transactions cost some throughput, and output becomes visible to `read_committed` consumers only when a transaction commits — every `commit.interval.ms` (100 ms by default under EOS), which adds end-to-end latency. How much throughput you lose depends heavily on the workload and the commit interval; measure it (it is often modest). For financial systems where correctness is non-negotiable, this is usually acceptable. For high-throughput analytics topics, consider at-least-once with idempotent consumers.
 
 ---
 
 ## 12. Error Handling in Kafka Streams
 
 ```java
+// For PAYMENT streams, skipping a record silently loses a payment: fail,
+// or use a handler that sends the raw record to a dead-letter topic.
+// (Config names: DEFAULT_... in 3.x; Kafka 4.0 renamed them without the
+//  DEFAULT_ prefix.)
 props.put(StreamsConfig.DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG,
-    LogAndContinueExceptionHandler.class);
-// Options: LogAndContinueExceptionHandler (skip), LogAndFailExceptionHandler (crash)
+    LogAndFailExceptionHandler.class);
+// Options: LogAndContinueExceptionHandler (skip -- OK for metrics/analytics),
+//          LogAndFailExceptionHandler (stop -- default)
 
 props.put(StreamsConfig.DEFAULT_PRODUCTION_EXCEPTION_HANDLER_CLASS_CONFIG,
     DefaultProductionExceptionHandler.class);
@@ -614,16 +657,20 @@ public class PaymentStreamProductionExceptionHandler
             ProducerRecord<byte[], byte[]> record,
             Exception exception) {
 
+        String key = record.key() == null ? "null"
+            : new String(record.key(), StandardCharsets.UTF_8);
         log.error("Production error for record key={}: {}",
-            new String(record.key()), exception.getMessage(), exception);
+            key, exception.getMessage(), exception);
 
         if (exception instanceof RecordTooLargeException) {
-            // Skip oversized records — alert and continue
+            // A payment output that cannot be written must not vanish:
+            // alert and FAIL (CONTINUE would drop it and commit past it).
+            // CONTINUE is only acceptable for non-critical outputs.
             alertingService.sendAlert("Kafka Streams: record too large", exception);
-            return ProductionExceptionHandlerResponse.CONTINUE;
         }
 
-        // For all other errors, fail the stream — requires operator intervention
+        // Fail the stream — requires operator intervention
+        // (Kafka 3.9+ also offers a handle(ErrorHandlerContext, ...) variant)
         return ProductionExceptionHandlerResponse.FAIL;
     }
 }
@@ -670,18 +717,18 @@ public class PaymentStreamProductionExceptionHandler
         "When windowing aggregations are required"
       ],
       "correct": 2,
-      "explanation": "GlobalKTable replicates the entire table to every stream task instance, making it ideal for small reference datasets (account metadata, merchant data) that need to be available for enrichment lookups without requiring co-partitioning."
+      "explanation": "A GlobalKTable copies the whole table (all partitions) to every application instance, making it ideal for small reference datasets (account metadata, merchant data) that need to be available for enrichment lookups without requiring co-partitioning."
     },
     {
-      "text": "What is the performance cost of enabling exactly-once semantics (EOS v2) in Kafka Streams?",
+      "text": "What is the main cost of enabling exactly-once semantics (EOS v2) in Kafka Streams?",
       "options": [
-        "No measurable cost — EOS v2 is fully optimized",
-        "Approximately 20-30% throughput reduction due to transactional overhead",
+        "No cost at all — EOS v2 is free",
+        "Some throughput loss from transactions and extra end-to-end latency, because results become visible to read_committed consumers only at each commit (every commit.interval.ms, 100 ms by default); the size depends on the workload — measure it",
         "Exactly 50% throughput reduction",
-        "EOS v2 increases latency but not throughput cost"
+        "It disables state stores, so stateful operations must be moved to a database"
       ],
       "correct": 1,
-      "explanation": "Enabling EOS v2 reduces throughput by approximately 20-30% due to the overhead of coordinating transactions. For financial systems where correctness is non-negotiable, this trade-off is acceptable."
+      "explanation": "EOS v2 wraps each commit interval's output and offsets in a Kafka transaction. That costs some throughput (often modest, but workload-dependent) and delays visibility of results for read_committed consumers until the transaction commits, every commit.interval.ms (100 ms by default under EOS). For financial systems where correctness is non-negotiable, this trade-off is usually acceptable."
     }
   ]
 }

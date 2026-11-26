@@ -44,13 +44,19 @@ Kafka exposes all internal metrics via JMX (Java Management Extensions). Every b
 ### Enabling JMX on Brokers
 
 ```bash
-# In kafka-server-start.sh or Kafka environment variables
-export JMX_PORT=9999
-export KAFKA_JMX_OPTS="-Dcom.sun.management.jmxremote \
-    -Dcom.sun.management.jmxremote.authenticate=false \
-    -Dcom.sun.management.jmxremote.ssl=false \
-    -Dcom.sun.management.jmxremote.port=9999 \
-    -Djava.rmi.server.hostname=broker1.kafka.internal"
+# Recommended: run the Prometheus JMX exporter as a Java AGENT inside the
+# broker JVM -- it reads the MBeans in-process and serves /metrics on 9404,
+# so no remote JMX port has to be opened at all
+export KAFKA_OPTS="-javaagent:/opt/jmx_prometheus_javaagent.jar=9404:/etc/jmx-exporter/config.yml"
+
+# If you must open remote JMX (e.g. for a sidecar or jconsole), never do it
+# unauthenticated and unencrypted outside a locked-down network:
+# export JMX_PORT=9999
+# export KAFKA_JMX_OPTS="-Dcom.sun.management.jmxremote \
+#     -Dcom.sun.management.jmxremote.authenticate=true \
+#     -Dcom.sun.management.jmxremote.ssl=true \
+#     -Dcom.sun.management.jmxremote.port=9999 \
+#     -Djava.rmi.server.hostname=broker1.kafka.internal"
 ```
 
 ### Prometheus JMX Exporter Configuration
@@ -87,7 +93,8 @@ rules:
 ```
 
 ```yaml
-# Kubernetes deployment for JMX exporter sidecar
+# Alternative: JMX exporter as a sidecar (needs remote JMX from the broker,
+# see the note above -- the in-process agent is simpler and safer)
 apiVersion: v1
 kind: Pod
 spec:
@@ -128,11 +135,16 @@ Immediate action: Check broker logs, check network connectivity,
 ```
 kafka.controller:type=KafkaController,name=ActiveControllerCount
 
-Healthy value: 1 (exactly one controller per cluster)
-Alert threshold: != 1
+Healthy value: 1 for the whole cluster — each node reports 1 if it is the
+active controller, else 0, so alert on the SUM across nodes
+(KRaft: the controller nodes report it)
+Alert threshold: sum != 1
 
-Value = 0: No controller — cluster is unavailable
-Value > 1: Split brain — multiple controllers (critical failure)
+Sum = 0: No active controller — existing partition leaders keep serving,
+         but no metadata changes are possible: no leader elections (a
+         failed broker's partitions stay offline), no topic changes
+Sum > 1: Multiple controllers (critical failure; with KRaft quorum
+         this should only appear briefly during an election)
 ```
 
 ### RequestHandlerAvgIdlePercent
@@ -160,8 +172,20 @@ import org.springframework.scheduling.annotation.Scheduled;
 public class KafkaBrokerHealthChecker {
 
     @Autowired private AdminClient adminClient;
-    @Autowired private MeterRegistry meterRegistry;
     @Autowired private AlertService alertService;
+
+    // Gauges registered ONCE on holders (meterRegistry.gauge(name, number)
+    // called on every run would keep reporting the first value only)
+    private final AtomicInteger brokerCount = new AtomicInteger();
+    private final AtomicInteger underReplicatedHolder = new AtomicInteger();
+    private final AtomicInteger offlineHolder = new AtomicInteger();
+
+    @Autowired
+    void registerGauges(MeterRegistry registry) {
+        Gauge.builder("kafka.cluster.broker.count", brokerCount, AtomicInteger::get).register(registry);
+        Gauge.builder("kafka.partitions.under_replicated", underReplicatedHolder, AtomicInteger::get).register(registry);
+        Gauge.builder("kafka.partitions.offline", offlineHolder, AtomicInteger::get).register(registry);
+    }
 
     @Scheduled(fixedDelay = 60_000)
     public void checkBrokerHealth() throws Exception {
@@ -169,7 +193,7 @@ public class KafkaBrokerHealthChecker {
         DescribeClusterResult cluster = adminClient.describeCluster();
         Collection<Node> nodes = cluster.nodes().get();
 
-        meterRegistry.gauge("kafka.cluster.broker.count", nodes.size());
+        brokerCount.set(nodes.size());
 
         // Check topic partition health
         ListTopicsResult topics = adminClient.listTopics();
@@ -193,8 +217,8 @@ public class KafkaBrokerHealthChecker {
             }
         }
 
-        meterRegistry.gauge("kafka.partitions.under_replicated", underReplicated);
-        meterRegistry.gauge("kafka.partitions.offline", offlinePartitions);
+        underReplicatedHolder.set(underReplicated);
+        offlineHolder.set(offlinePartitions);
 
         if (underReplicated > 0) {
             alertService.sendAlert(AlertSeverity.HIGH,
@@ -226,17 +250,15 @@ Example:
 
 ### Spring Boot Consumer Lag Metrics
 
-Micrometer (via Spring Kafka) exposes consumer lag automatically:
+Spring Boot binds the Kafka client metrics of the consumers it creates to Micrometer automatically (KafkaClientMetrics) — nothing to enable. Each consumer reports the lag of the partitions IT currently owns:
 
-```properties
-# application.properties
-management.metrics.enable.kafka.consumer=true
+```
+kafka.consumer.fetch.manager.records.lag{client.id="...", topic="...", partition="..."}
+kafka.consumer.fetch.manager.records.lag.max{client.id="..."}
+# Prometheus: kafka_consumer_fetch_manager_records_lag, ...
 ```
 
-The metric name is:
-```
-kafka.consumer.fetch-manager-metrics.records-lag{client-id="...", topic="...", partition="..."}
-```
+Because a stopped or crashed consumer reports nothing, also compute lag from the outside (committed offsets vs end offsets), as below. And remember that lag in **messages** needs context: 1,000 messages behind at 10,000 msg/s is 0.1 s, at 10 msg/s it is 100 s — alert on estimated time lag (lag ÷ consume rate) where possible.
 
 ### Manual Lag Monitoring
 
@@ -252,6 +274,17 @@ public class ConsumerLagMonitor {
     @Autowired private AdminClient adminClient;
     @Autowired private MeterRegistry meterRegistry;
     @Autowired private AlertService alertService;
+
+    // One holder per meter id -- each gauge registered once, then updated
+    private final Map<String, AtomicLong> holders = new ConcurrentHashMap<>();
+
+    private void setGauge(String name, Tags tags, long value) {
+        holders.computeIfAbsent(name + tags, k -> {
+            AtomicLong h = new AtomicLong();
+            Gauge.builder(name, h, AtomicLong::get).tags(tags).register(meterRegistry);
+            return h;
+        }).set(value);
+    }
 
     private static final Map<String, Long> LAG_ALERT_THRESHOLDS = Map.of(
             "settlement-service", 1_000L,       // Alert if 1000+ messages behind
@@ -272,10 +305,8 @@ public class ConsumerLagMonitor {
                     .orElse(0L);
 
             // Record metrics
-            meterRegistry.gauge("kafka.consumer.group.lag.total",
-                    Tags.of("group", groupId), totalLag);
-            meterRegistry.gauge("kafka.consumer.group.lag.max.partition",
-                    Tags.of("group", groupId), maxPartitionLag);
+            setGauge("kafka.consumer.group.lag.total", Tags.of("group", groupId), totalLag);
+            setGauge("kafka.consumer.group.lag.max.partition", Tags.of("group", groupId), maxPartitionLag);
 
             // Alert if threshold exceeded
             if (totalLag > alertThreshold) {
@@ -284,15 +315,13 @@ public class ConsumerLagMonitor {
                                 groupId, totalLag, alertThreshold));
             }
 
-            // Per-partition breakdown for debugging
-            lag.forEach((tp, partLag) -> {
-                if (partLag > 0) {
-                    meterRegistry.gauge("kafka.consumer.partition.lag",
-                            Tags.of("group", groupId, "topic", tp.topic(),
-                                    "partition", String.valueOf(tp.partition())),
-                            partLag);
-                }
-            });
+            // Per-partition breakdown for debugging (always set -- also back
+            // to 0 -- so a recovered partition does not keep its old value)
+            lag.forEach((tp, partLag) ->
+                setGauge("kafka.consumer.partition.lag",
+                        Tags.of("group", groupId, "topic", tp.topic(),
+                                "partition", String.valueOf(tp.partition())),
+                        partLag));
         }
     }
 
@@ -321,8 +350,9 @@ public class ConsumerLagMonitor {
                         e -> e.getValue().offset()
                 ));
 
-        // Calculate lag per partition
+        // Calculate lag per partition (skip partitions without a commit)
         return committedOffsets.entrySet().stream()
+                .filter(e -> e.getValue() != null)
                 .collect(Collectors.toMap(
                         Map.Entry::getKey,
                         e -> Math.max(0, endOffsets.getOrDefault(e.getKey(), 0L)
@@ -354,7 +384,7 @@ kafka-consumer-groups.sh \
 
 ## Burrow for Consumer Lag Monitoring
 
-LinkedIn's **Burrow** is a dedicated Kafka consumer monitoring tool that evaluates consumer group health over time:
+LinkedIn's **Burrow** is a dedicated Kafka consumer monitoring tool that evaluates consumer group health over time, instead of using fixed thresholds. (Check the project's current activity before adopting it; widely used alternatives are the Prometheus *Kafka Exporter* plus alert rules, or the lag views of managed Kafka services and Kafka UIs.)
 
 ```yaml
 # burrow.toml — Burrow configuration
@@ -484,7 +514,7 @@ groups:
 - **Consumer lag** is the most critical operational metric — a consumer falling behind is a silent failure that becomes a business incident.
 - Expose JMX metrics via Prometheus JMX Exporter; use Micrometer in Spring Boot for automatic consumer metrics.
 - **UnderReplicatedPartitions=0** must hold at all times — any value above 0 reduces data durability.
-- **ActiveControllerCount=1** exactly — 0 means the cluster is unavailable, >1 means split brain.
+- **ActiveControllerCount** summed over the cluster must be exactly 1 — 0 means no metadata changes are possible (no leader elections), >1 is a controller conflict.
 - **RequestHandlerAvgIdlePercent > 0.3** — below 20% the broker is overloaded and needs capacity.
 - Use `kafka-consumer-groups.sh` for quick lag checks; build automated monitoring for continuous alerting.
 - Set lag alert thresholds per consumer group based on the business SLA: settlement (strict), notifications (lenient), archival (very lenient).
@@ -505,15 +535,15 @@ groups:
       "explanation": "Consumer lag = end offset - committed offset. For a payment settlement consumer, lag directly means 'this many payments are waiting to be processed.' A growing lag is a silent failure — no exception is thrown, but payment settlement is falling behind, which becomes a business incident."
     },
     {
-      "text": "What does ActiveControllerCount != 1 indicate about a Kafka cluster?",
+      "text": "What does a cluster-wide sum of ActiveControllerCount != 1 indicate about a Kafka cluster?",
       "options": [
         "The cluster has too many brokers for the current load",
-        "ActiveControllerCount=0 means the cluster has no active controller and is unavailable; >1 indicates split-brain",
+        "A sum of 0 means there is no active controller, so no metadata changes (leader elections, topic changes) can happen; a sum > 1 indicates conflicting controllers",
         "The monitoring agent is not reading JMX metrics correctly",
         "One broker is performing leader election which is normal"
       ],
       "correct": 1,
-      "explanation": "Exactly one Kafka broker must be the active controller at all times. ActiveControllerCount=0 means no broker has been elected controller — the cluster cannot accept producer or consumer connections. ActiveControllerCount>1 would indicate split-brain (a catastrophic state). Both are critical alerts requiring immediate response."
+      "explanation": "Exactly one node must be the active controller. With none, partitions whose leader is still alive keep serving producers and consumers, but no metadata change is possible: if a broker fails, its partitions get no new leader and stay offline, and topics cannot be created or changed. More than one active controller would be a conflict (split brain). Both are critical alerts requiring immediate response."
     },
     {
       "text": "Why should lag alert thresholds differ between consumer groups like settlement-service and compliance-archival?",
@@ -536,10 +566,22 @@ groups:
   "difficulty": "advanced",
   "estimatedMinutes": 55,
   "tasks": [
-    {"id": "1", "description": "Implement a ConsumerLagMonitor that uses AdminClient to calculate lag per partition for three consumer groups (settlement-service threshold: 1,000; notification-service: 5,000; compliance-archival: 50,000). Register Prometheus gauges for total lag and max partition lag per group. Send HIGH severity alerts when thresholds are exceeded."},
-    {"id": "2", "description": "Expose JMX broker metrics via the Prometheus JMX Exporter for UnderReplicatedPartitions, ActiveControllerCount, OfflinePartitionsCount, and RequestHandlerAvgIdlePercent. Configure Prometheus scraping and implement alert rules: UnderReplicatedPartitions>0 (warning), ActiveControllerCount!=1 (critical), OfflinePartitions>0 (critical), RequestHandlerAvgIdlePercent<0.2 (warning)."},
-    {"id": "3", "description": "Build a Grafana dashboard with four panels: (1) consumer lag time-series by group, (2) under-replicated partitions stat with red threshold at 1, (3) broker request handler idle % time-series with 20% alert line, (4) messages in per second by topic. Export the dashboard JSON for GitOps deployment."},
-    {"id": "4", "description": "Configure Burrow to monitor the payment-cluster, categorise consumer groups as OK/WARNING/ERROR, and expose health status via its HTTP API. Implement a Spring Boot health indicator that queries Burrow's API and reports DOWN if any monitored consumer group is in ERROR state for more than 5 minutes."}
+    {
+      "id": "1",
+      "description": "Implement a ConsumerLagMonitor that uses AdminClient to calculate lag per partition for three consumer groups (settlement-service threshold: 1,000; notification-service: 5,000; compliance-archival: 50,000). Register Prometheus gauges for total lag and max partition lag per group. Send HIGH severity alerts when thresholds are exceeded."
+    },
+    {
+      "id": "2",
+      "description": "Expose JMX broker metrics via the Prometheus JMX Exporter java agent for UnderReplicatedPartitions, ActiveControllerCount, OfflinePartitionsCount, and RequestHandlerAvgIdlePercent. Configure Prometheus scraping and implement alert rules: UnderReplicatedPartitions>0 (warning), sum(ActiveControllerCount)!=1 (critical), OfflinePartitions>0 (critical), RequestHandlerAvgIdlePercent<0.2 (warning)."
+    },
+    {
+      "id": "3",
+      "description": "Build a Grafana dashboard with four panels: (1) consumer lag time-series by group, (2) under-replicated partitions stat with red threshold at 1, (3) broker request handler idle % time-series with 20% alert line, (4) messages in per second by topic. Export the dashboard JSON for GitOps deployment."
+    },
+    {
+      "id": "4",
+      "description": "Configure Burrow to monitor the payment-cluster, categorise consumer groups as OK/WARNING/ERROR, and expose health status via its HTTP API. Implement a Spring Boot health indicator that queries Burrow's API and reports DOWN if any monitored consumer group is in ERROR state for more than 5 minutes."
+    }
   ]
 }
 -->

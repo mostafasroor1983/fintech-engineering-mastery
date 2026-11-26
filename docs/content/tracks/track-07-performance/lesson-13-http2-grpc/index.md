@@ -53,13 +53,13 @@ HTTP/1.1 sends headers as plain text on every request. A typical Authorization h
 
 ### 1.3 No Server Push
 
-The server cannot proactively send data the client will predictably need. Every interaction is strictly client-initiated.
+The server cannot proactively send data the client will predictably need. Every interaction is strictly client-initiated. (HTTP/2 added "server push", but browsers have since dropped it and gRPC does not use it; gRPC's streaming RPCs are the practical answer for server-initiated data.)
 
 ---
 
 ## 2. HTTP/2 Mechanics
 
-HTTP/2 solves all three problems with a binary framing layer over the same TCP connection.
+HTTP/2 solves the first two problems with a binary framing layer over a single TCP connection.
 
 ### 2.1 Multiplexed Streams
 
@@ -94,11 +94,11 @@ Request 2: Authorization: Bearer eyJhbGc...  → 2 bytes (index reference)
            Content-Type: application/grpc    → 2 bytes (index reference)
 ```
 
-In a payment service making thousands of calls per second to the same downstream, HPACK compression reduces header overhead by 85-95%.
+In a payment service making thousands of calls per second to the same downstream, HPACK compression typically removes most of the header overhead. (Implementations may deliberately mark sensitive headers such as `authorization` as "never indexed" for security; they are then sent in full each time.)
 
 ### 2.3 HTTP/2 Flow Control
 
-Each stream and the overall connection has a receive window (default 65535 bytes). Senders must not exceed the window. Receivers issue WINDOW_UPDATE frames to increase capacity. This prevents a fast producer from overwhelming a slow consumer — the same concept as TCP flow control but at the HTTP layer.
+Each stream and the overall connection has a receive window (65,535 bytes by the HTTP/2 specification; grpc-java starts with a larger window and can auto-tune it). Senders must not exceed the window. Receivers issue WINDOW_UPDATE frames to increase capacity. This prevents a fast producer from overwhelming a slow consumer — the same concept as TCP flow control but at the HTTP layer.
 
 ---
 
@@ -123,9 +123,9 @@ Protobuf is a language-neutral binary serialisation format. Compared to JSON:
 
 - **Size:** Protobuf messages are typically 3-10x smaller. A payment message with 15 fields: JSON ~450 bytes, Protobuf ~90 bytes.
 - **Speed:** Protobuf parse/serialise is 5-10x faster than JSON. No string parsing, no field name lookup.
-- **Schema enforcement:** The `.proto` file is the contract. Breaking changes are detected at compile time.
+- **Schema enforcement:** The `.proto` file is the contract and generates typed code. Wire-breaking changes (reusing or renumbering a field, changing a type) are NOT caught by the compiler — add a schema check such as `buf breaking` to CI.
 
-**Benchmark (1 million payment message encode/decode cycles, Java):**
+**Illustrative benchmark (1 million payment message encode/decode cycles, Java):**
 
 ```
 JSON (Jackson):
@@ -162,7 +162,9 @@ message PaymentRequest {
   string payment_id       = 1;
   string source_account   = 2;
   string target_account   = 3;
-  int64  amount_cents      = 4;   // avoid floating point
+  int64  amount_cents      = 4;   // minor units; avoid floating point
+                                  // (JPY has 0 decimals, BHD has 3 -- the
+                                  //  currency defines the scale)
   string currency          = 5;   // ISO 4217
   string idempotency_key   = 6;
   map<string, string> metadata = 7;
@@ -227,11 +229,20 @@ message BatchSummary {
 
 ```xml
 <dependencies>
-    <!-- gRPC Spring Boot Starter -->
+    <!-- gRPC Spring Boot Starter (community project; 3.x for Spring Boot 3).
+         Alternative: the official Spring gRPC project (org.springframework.grpc). -->
     <dependency>
         <groupId>net.devh</groupId>
         <artifactId>grpc-spring-boot-starter</artifactId>
-        <version>2.15.0.RELEASE</version>
+        <version>3.1.0.RELEASE</version>
+    </dependency>
+
+    <!-- Generated stubs use @javax.annotation.Generated -->
+    <dependency>
+        <groupId>org.apache.tomcat</groupId>
+        <artifactId>annotations-api</artifactId>
+        <version>6.0.53</version>
+        <scope>provided</scope>
     </dependency>
 
     <!-- Protobuf runtime -->
@@ -296,6 +307,10 @@ grpc:
     max-inbound-metadata-size: 8KB
     keep-alive-time: 30s
     keep-alive-timeout: 10s
+    # Clients below ping every 30s; the server must PERMIT pings that often.
+    # The default (5 min) makes the server close such connections with
+    # GOAWAY "too_many_pings".
+    permit-keep-alive-time: 20s
     permit-keep-alive-without-calls: true
 ```
 
@@ -347,14 +362,17 @@ public class PaymentGrpcService extends PaymentServiceImplBase {
                 request.getIdempotencyKey()
             );
 
-            PaymentResponse response = PaymentResponse.newBuilder()
+            PaymentResponse.Builder builder = PaymentResponse.newBuilder()
                 .setPaymentId(result.paymentId())
                 .setStatus(result.approved()
                     ? PaymentStatus.PAYMENT_STATUS_APPROVED
                     : PaymentStatus.PAYMENT_STATUS_DECLINED)
-                .setAuthCode(result.authCode())
-                .setProcessedAt(toProtoTimestamp(result.processedAt()))
-                .build();
+                .setProcessedAt(toProtoTimestamp(result.processedAt()));
+            // Protobuf setters reject null -- a declined payment has no auth code
+            if (result.authCode() != null) {
+                builder.setAuthCode(result.authCode());
+            }
+            PaymentResponse response = builder.build();
 
             responseObserver.onNext(response);
             responseObserver.onCompleted();
@@ -387,11 +405,18 @@ public class PaymentGrpcService extends PaymentServiceImplBase {
         String accountId = request.getAccountId();
         Instant since = toInstant(request.getSince());
 
-        // Stream events — each onNext() sends one HTTP/2 DATA frame
+        var serverObserver = (ServerCallStreamObserver<PaymentEvent>) responseObserver;
+
+        // Stream events — each onNext() queues one message for the client.
+        // Note: onNext() never blocks; if the client reads slowly, messages pile
+        // up in memory. For large streams, send only while
+        // serverObserver.isReady() and continue in setOnReadyHandler(...).
         try (var eventStream = eventRepository.streamByAccount(accountId, since)) {
             eventStream.forEach(event -> {
-                // Check if the client has cancelled (deadline exceeded, etc.)
-                // gRPC will throw StatusRuntimeException if the call is already done
+                // Stop work for a client that has gone away (cancel, deadline)
+                if (serverObserver.isCancelled()) {
+                    throw Status.CANCELLED.asRuntimeException();
+                }
                 PaymentEvent protoEvent = PaymentEvent.newBuilder()
                     .setPaymentId(event.paymentId())
                     .setStatus(toProtoStatus(event.status()))
@@ -581,35 +606,47 @@ public class TracingInterceptor implements ServerInterceptor {
         String traceId = Optional.ofNullable(headers.get(TRACE_ID_KEY))
             .orElse(UUID.randomUUID().toString());
 
-        // Inject into MDC for log correlation
-        MDC.put("traceId", traceId);
+        // Add the trace ID to the response headers when the service sends them.
+        // (Calling call.sendHeaders() here would make the service's own
+        //  first onNext() fail: headers may only be sent once.)
+        ServerCall<ReqT, RespT> tracedCall =
+            new ForwardingServerCall.SimpleForwardingServerCall<>(call) {
+                @Override
+                public void sendHeaders(Metadata responseHeaders) {
+                    responseHeaders.put(TRACE_ID_KEY, traceId);
+                    super.sendHeaders(responseHeaders);
+                }
+            };
 
-        // Propagate trace ID in response headers
-        Metadata responseHeaders = new Metadata();
-        responseHeaders.put(TRACE_ID_KEY, traceId);
-        call.sendHeaders(responseHeaders);
-
-        try {
-            return next.startCall(call, headers);
-        } finally {
-            MDC.remove("traceId");
-        }
+        // The handler runs LATER, in listener callbacks, often on another
+        // thread -- so set the MDC around each callback, not just here.
+        ServerCall.Listener<ReqT> delegate = next.startCall(tracedCall, headers);
+        return new ForwardingServerCallListener.SimpleForwardingServerCallListener<>(delegate) {
+            private void withMdc(Runnable r) {
+                MDC.put("traceId", traceId);
+                try { r.run(); } finally { MDC.remove("traceId"); }
+            }
+            @Override public void onMessage(ReqT message) { withMdc(() -> super.onMessage(message)); }
+            @Override public void onHalfClose() { withMdc(super::onHalfClose); }
+            @Override public void onCancel() { withMdc(super::onCancel); }
+            @Override public void onComplete() { withMdc(super::onComplete); }
+        };
     }
 }
+// In production, prefer OpenTelemetry's gRPC instrumentation and the W3C
+// "traceparent" header over a home-made x-trace-id.
 ```
 
 ---
 
 ## 7. gRPC Channel and Connection Pooling
 
-A gRPC `ManagedChannel` already multiplexes streams over a single HTTP/2 connection. However, for extremely high throughput you may need multiple underlying connections.
+A gRPC `ManagedChannel` already multiplexes streams over a single HTTP/2 connection. For very high throughput you may need more connections: grpc-java has no "pool size" setting, so either create a few channels and spread calls across them, or use client-side load balancing (`defaultLoadBalancingPolicy("round_robin")` with a name that resolves to several backends).
 
 ```java
 package com.fintech.payment.grpc.client;
 
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import net.devh.boot.grpc.client.channelfactory.GrpcChannelFactory;
+import io.grpc.*;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -618,36 +655,55 @@ import java.util.concurrent.TimeUnit;
 @Configuration
 public class GrpcClientConfiguration {
 
-    @Bean
-    public ManagedChannel fraudServiceChannel() {
+    // shutdown() is a ManagedChannel method -- the channel is what must be closed
+    @Bean(destroyMethod = "shutdown")
+    public ManagedChannel paymentServiceChannel() {
         return ManagedChannelBuilder
-            .forAddress("fraud-service.internal", 9090)
-            // TLS in production — use .useTransportSecurity() with proper certs
-            .useTransportSecurity()
-            // HTTP/2 keep-alive: send PING frame every 30s to keep the connection alive
+            .forAddress("payment-service.internal", 9090)
+            .useTransportSecurity()                  // TLS with proper certs
+            // HTTP/2 keep-alive: PING every 30s (server must permit this rate)
             .keepAliveTime(30, TimeUnit.SECONDS)
             .keepAliveTimeout(10, TimeUnit.SECONDS)
             .keepAliveWithoutCalls(true)
-            // Max message size
             .maxInboundMessageSize(10 * 1024 * 1024)
-            // Connection pool: use multiple sub-channels for very high throughput
-            // Each sub-channel is one HTTP/2 connection
-            // Default is 1; increase only if single connection CPU is saturated
+            // Default deadline applied to EACH call (see interceptor below)
+            .intercept(new DefaultDeadlineInterceptor(5, TimeUnit.SECONDS))
             .build();
     }
 
-    @Bean(destroyMethod = "shutdown")
+    // Do NOT do this: newBlockingStub(ch).withDeadlineAfter(5, SECONDS) in a
+    // bean. A deadline is an absolute point in time, computed when the stub is
+    // created -- five seconds after start-up, EVERY call would fail.
+    @Bean
     public PaymentServiceGrpc.PaymentServiceBlockingStub paymentServiceBlockingStub(
-            ManagedChannel fraudServiceChannel) {
-        return PaymentServiceGrpc.newBlockingStub(fraudServiceChannel)
-            // Default deadline for all calls from this stub
-            .withDeadlineAfter(5, TimeUnit.SECONDS);
+            ManagedChannel paymentServiceChannel) {
+        return PaymentServiceGrpc.newBlockingStub(paymentServiceChannel);
     }
 
-    @Bean(destroyMethod = "shutdown")
+    @Bean
     public PaymentServiceGrpc.PaymentServiceStub paymentServiceAsyncStub(
-            ManagedChannel fraudServiceChannel) {
-        return PaymentServiceGrpc.newStub(fraudServiceChannel);
+            ManagedChannel paymentServiceChannel) {
+        return PaymentServiceGrpc.newStub(paymentServiceChannel);
+    }
+}
+
+/** Gives every call a deadline unless the caller already set one. */
+class DefaultDeadlineInterceptor implements ClientInterceptor {
+    private final long duration;
+    private final TimeUnit unit;
+
+    DefaultDeadlineInterceptor(long duration, TimeUnit unit) {
+        this.duration = duration;
+        this.unit = unit;
+    }
+
+    @Override
+    public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+            MethodDescriptor<ReqT, RespT> method, CallOptions options, Channel next) {
+        if (options.getDeadline() == null) {
+            options = options.withDeadlineAfter(duration, unit);   // fresh per call
+        }
+        return next.newCall(method, options);
     }
 }
 ```
@@ -670,37 +726,49 @@ public class PaymentOrchestrator {
         // automatically if you use the same context.
         // Here we set a per-call deadline explicitly.
 
+        FraudCheckResponse fraud;
         try {
-            FraudCheckResponse fraud = fraudStub
+            fraud = fraudStub
                 .withDeadlineAfter(1500, TimeUnit.MILLISECONDS)
                 .checkFraud(FraudCheckRequest.newBuilder()
                     .setPaymentId(request.getPaymentId())
                     .setAmountCents(request.getAmountCents())
                     .build());
 
-            if (fraud.getRiskScore() > 80) {
-                return PaymentResult.declined("HIGH_FRAUD_RISK");
-            }
+        } catch (StatusRuntimeException e) {
+            // Nothing has been debited yet: declining is safe here
+            log.warn("Fraud check failed for payment {}: {}",
+                request.getPaymentId(), e.getStatus().getCode());
+            return PaymentResult.declined("FRAUD_CHECK_UNAVAILABLE");
+        }
 
+        if (fraud.getRiskScore() > 80) {
+            return PaymentResult.declined("HIGH_FRAUD_RISK");
+        }
+
+        try {
             LedgerResponse ledger = ledgerStub
                 .withDeadlineAfter(2000, TimeUnit.MILLISECONDS)
                 .debitAccount(DebitRequest.newBuilder()
                     .setAccountId(request.getSourceAccount())
                     .setAmountCents(request.getAmountCents())
+                    .setIdempotencyKey(request.getIdempotencyKey())  // safe to retry/query
                     .build());
 
             return PaymentResult.approved(ledger.getAuthCode());
 
         } catch (StatusRuntimeException e) {
             return switch (e.getStatus().getCode()) {
-                case DEADLINE_EXCEEDED -> {
-                    log.warn("Downstream timeout for payment {}", request.getPaymentId());
-                    yield PaymentResult.declined("TIMEOUT");
+                // The debit MAY have happened: the request can reach the ledger
+                // even though our call timed out. Never report "declined" here --
+                // record PENDING and resolve it by querying the ledger with the
+                // idempotency key (or retrying with the same key).
+                case DEADLINE_EXCEEDED, UNAVAILABLE, UNKNOWN, INTERNAL -> {
+                    log.warn("Ledger outcome unknown for payment {}: {}",
+                        request.getPaymentId(), e.getStatus().getCode());
+                    yield PaymentResult.pending("LEDGER_OUTCOME_UNKNOWN");
                 }
-                case UNAVAILABLE -> {
-                    log.error("Downstream service unavailable for payment {}", request.getPaymentId());
-                    yield PaymentResult.declined("SERVICE_UNAVAILABLE");
-                }
+                case FAILED_PRECONDITION -> PaymentResult.declined("INSUFFICIENT_FUNDS");
                 default -> {
                     log.error("gRPC error for payment {}", request.getPaymentId(), e);
                     yield PaymentResult.declined("PROCESSING_ERROR");
@@ -718,7 +786,7 @@ public class PaymentOrchestrator {
 | OK | Success | — |
 | INVALID_ARGUMENT | Bad request | Validation failure |
 | NOT_FOUND | Resource missing | Unknown account |
-| ALREADY_EXISTS | Duplicate | Idempotency key collision |
+| ALREADY_EXISTS | Duplicate | Same idempotency key reused with a DIFFERENT request (a true retry should get the original result back) |
 | FAILED_PRECONDITION | Business rule violation | Insufficient funds |
 | UNAUTHENTICATED | Missing/invalid credentials | Expired JWT |
 | PERMISSION_DENIED | Authorised but not allowed | Wrong scope |
@@ -752,13 +820,16 @@ public class PaymentOrchestrator {
 |   (fraud-service:9090)             |
 +------------------------------------+
 
-Without HTTP/2 (HTTP/1.1 + 5 connections):
-  Total time = 5 + 180 + 3 + 12 + 8 = 208ms (best case with 5 parallel conns)
-  TCP overhead = 5 × (3-way HS + TLS HS) = ~25ms extra on cold start
+HTTP/1.1, ONE connection (requests wait for each other):
+  Total time = 5 + 180 + 3 + 12 + 8 = 208ms
 
-With HTTP/2 (1 connection, 5 streams):
+HTTP/1.1, 5 parallel connections:
+  Total time = max(...) = 180ms -- but 5 connections to open, keep warm
+  and pool per downstream (5 × TCP + TLS handshakes on a cold start)
+
+HTTP/2 (1 connection, 5 streams):
   Total time = max(5, 180, 3, 12, 8) = 180ms
-  TCP overhead = 1 × (3-way HS + TLS HS) = ~5ms, amortised to near zero
+  One handshake, amortised to near zero; far fewer sockets per instance
 ```
 
 ---
@@ -767,7 +838,7 @@ With HTTP/2 (1 connection, 5 streams):
 
 ### Pitfall 1: Not Setting Deadlines — Creating Zombie RPCs
 
-**The problem:** Without a deadline, a hung downstream service causes the calling goroutine/thread to wait indefinitely. Under load, thread pools exhaust and the entire service freezes.
+**The problem:** Without a deadline, a hung downstream service causes the calling thread to wait indefinitely. Under load, thread pools exhaust and the entire service freezes.
 
 **Wrong approach:**
 
@@ -792,7 +863,7 @@ PaymentResponse response = paymentStub
 
 ### Pitfall 2: Sharing a Single Channel for Blocking and Async Calls
 
-**The problem:** gRPC channels have a default executor (the shared `ForkJoinPool`). If you do long-running blocking work in a streaming callback on the same executor that handles the event loop, you can starve the event loop.
+**The problem:** By default grpc-java runs your callbacks on a shared cached thread pool (separate from Netty's network event loop). Callbacks for one call run one at a time, so blocking work in `onNext` stalls that stream, and many such streams can tie up many threads.
 
 **Wrong approach:**
 
@@ -811,6 +882,8 @@ paymentStub.streamAccountPayments(request, new StreamObserver<PaymentEvent>() {
 
 ```java
 // Offload blocking work to a dedicated executor
+// (Bounded pool. For long streams also use flow control -- request(n) on
+//  the call -- so a fast server cannot fill this executor's queue.)
 ExecutorService dbExecutor = Executors.newFixedThreadPool(20);
 
 paymentStub.streamAccountPayments(request, new StreamObserver<PaymentEvent>() {
@@ -834,7 +907,7 @@ ManagedChannel channel = ManagedChannelBuilder
 
 ### Pitfall 3: Ignoring gRPC-Web and Load Balancer Compatibility
 
-**The problem:** Standard gRPC uses HTTP/2 trailers to signal call completion. Many load balancers (AWS ALB, nginx in proxy mode, Cloudflare) do not forward HTTP/2 trailers correctly, causing calls to hang or fail silently. Additionally, gRPC uses chunked encoding that some LBs do not handle well.
+**The problem:** Standard gRPC needs end-to-end HTTP/2 and uses HTTP/2 trailers to carry the call status. Load balancers or proxies that are not configured for gRPC (for example, ones that talk HTTP/1.1 to the backend) drop the trailers or the HTTP/2 framing, so calls hang or fail.
 
 **Symptoms:**
 - gRPC calls succeed in direct service-to-service tests but fail when routed through the LB.
@@ -848,7 +921,7 @@ ManagedChannel channel = ManagedChannelBuilder
 # annotation on Service in Kubernetes:
 # alb.ingress.kubernetes.io/backend-protocol-version: GRPC
 
-# Option 2: Use Envoy or nginx-plus as the gRPC-aware proxy
+# Option 2: Use a gRPC-aware proxy: Envoy, or nginx (grpc_pass, 1.13.10+)
 # nginx.conf for gRPC:
 server {
     listen 443 http2 ssl;
@@ -875,19 +948,19 @@ ManagedChannel channel = ManagedChannelBuilder
 ## 11. Performance Comparison Summary
 
 ```
-Scenario: Payment Gateway calling 5 downstream services per transaction
+Illustrative scenario: Payment Gateway calling 5 downstream services per transaction
 Throughput target: 10,000 transactions/second
 
 HTTP/1.1 (connection pool, 10 conns per service):
   Connections: 5 services × 10 = 50 TCP connections per gateway instance
-  Header overhead at 10k TPS: ~200 MB/s (uncompressed headers)
-  P99 latency: ~350ms (HOL blocking under load)
+  Header overhead at 10k TPS: ~25 MB/s (50k calls/s × ~500 bytes of headers)
+  P99 latency: higher under load (requests queue for free connections)
 
 gRPC/HTTP/2:
   Connections: 5 services × 1-2 TCP connections per gateway instance
-  Header overhead at 10k TPS: ~8 MB/s (HPACK compressed)
-  P99 latency: ~95ms (parallel streams, no HOL blocking)
-  Payload reduction: 4.9x (protobuf vs JSON)
+  Header overhead at 10k TPS: a few MB/s (HPACK compressed)
+  P99 latency: lower (parallel streams, no request queueing per connection)
+  Payload reduction: several times smaller (protobuf vs JSON)
 ```
 
 ---
@@ -895,7 +968,7 @@ gRPC/HTTP/2:
 ## Checklist
 
 - [ ] `.proto` file defines all messages and services with field numbers that are stable (never reuse a field number)
-- [ ] All gRPC stubs have explicit deadlines set
+- [ ] Every gRPC call has a deadline, set per call (never once on a long-lived stub)
 - [ ] Authentication interceptor validates JWT on every call
 - [ ] Tracing interceptor propagates `x-trace-id` through the call chain
 - [ ] Streaming observers offload blocking work to a separate executor
@@ -904,11 +977,11 @@ gRPC/HTTP/2:
 - [ ] Money amounts are represented as integer cents, not floating-point
 - [ ] `INTERNAL` status codes do not leak internal error messages to callers
 - [ ] gRPC reflection is disabled in production (exposes your API surface)
-- [ ] Keep-alive settings are consistent between client and server to prevent silent connection drops
+- [ ] Keep-alive settings are consistent between client and server (server `permitKeepAliveTime` ≤ client `keepAliveTime`) to prevent `too_many_pings` disconnects
 - [ ] Protobuf `reserved` keyword used for deprecated field numbers to prevent accidental reuse
 
 ---
 
 <!-- KNOWLEDGE-CHECK {"questions":[{"text":"What is the primary mechanism by which HTTP/2 eliminates HTTP/1.1 head-of-line blocking at the application layer?","options":["Using multiple TCP connections per host","Multiplexing independent streams over a single TCP connection so a slow stream does not block others","Compressing response bodies with gzip","Pipelining requests on the same connection in strict order"],"correct":1,"explanation":"HTTP/2 introduces the concept of streams — independent bidirectional byte sequences multiplexed over one TCP connection. Each stream gets its own flow control, so a slow stream (e.g., a fraud check taking 200ms) does not delay a fast stream (e.g., a balance lookup taking 3ms). HTTP/1.1 pipelining still requires responses in order, which reintroduces HOL blocking."},{"text":"In gRPC, which status code should be returned when a payment is declined due to insufficient funds (a valid, expected business outcome)?","options":["INTERNAL","NOT_FOUND","FAILED_PRECONDITION","INVALID_ARGUMENT"],"correct":2,"explanation":"FAILED_PRECONDITION indicates that the operation was rejected because the system is not in the required state — in this case, the account does not have sufficient funds. INVALID_ARGUMENT is for malformed requests. INTERNAL is for unexpected server errors. NOT_FOUND is for missing resources. FAILED_PRECONDITION is the correct code for business rule violations on otherwise valid requests."},{"text":"Why should money amounts in protobuf messages be represented as integer cents (int64) rather than a double or float field?","options":["Protobuf does not support floating-point types","Floating-point arithmetic is slower to serialise in protobuf","Floating-point types cannot represent all decimal values exactly, leading to rounding errors in financial calculations","Integer fields compress better with HPACK"],"correct":2,"explanation":"IEEE 754 floating-point cannot represent many decimal fractions exactly (e.g., 0.1 + 0.2 != 0.3). In financial systems this causes accumulating rounding errors. The standard solution is to store amounts as the smallest currency unit (cents, pence, etc.) in an integer field. HPACK compresses HTTP headers, not protobuf body. Protobuf supports double and float but their use in money fields is a known source of financial bugs."}]} -->
 
-<!-- PRACTICAL-CHALLENGE {"title":"gRPC Payment Service Implementation","difficulty":"advanced","estimatedMinutes":90,"tasks":[{"id":"task-1","description":"Define a complete payment.proto file with a PaymentService that supports unary AuthorisePayment, server-streaming StreamAccountPayments, and client-streaming UploadBatch RPCs. Include a PaymentRequest with idempotency_key, PaymentResponse with an enum PaymentStatus, and proper proto3 package/option declarations. Compile the proto with protoc and verify generated Java stubs are present in target/generated-sources."},{"id":"task-2","description":"Implement the PaymentGrpcService server with the AuthorisePayment RPC. Add input validation that returns INVALID_ARGUMENT for missing payment_id or non-positive amount, FAILED_PRECONDITION for insufficient funds, and INTERNAL (without leaking internals) for unexpected errors. Write an integration test using the grpc-testing InProcessChannelBuilder to verify each error path."},{"id":"task-3","description":"Implement a GrpcGlobalServerInterceptor that extracts a Bearer JWT from the Authorization metadata header, validates it using a JwtValidator, stores the principal in a gRPC Context key, and closes the call with UNAUTHENTICATED if the token is missing or invalid. Write a unit test with a mock ServerCall that asserts the call is closed with UNAUTHENTICATED when no header is present."},{"id":"task-4","description":"Configure a ManagedChannel pointing to a local InProcessServer. Create a PaymentServiceBlockingStub with a 400ms default deadline. Demonstrate cancellation propagation by injecting an artificial 500ms delay in the server implementation and verifying that the client receives DEADLINE_EXCEEDED. Measure the difference in payload size between a JSON-serialised PaymentRequest (Jackson) and the protobuf-serialised equivalent with 15 fields populated and document the size ratio."}]} -->
+<!-- PRACTICAL-CHALLENGE {"title": "gRPC Payment Service Implementation", "difficulty": "advanced", "estimatedMinutes": 90, "tasks": [{"id": "task-1", "description": "Define a complete payment.proto file with a PaymentService that supports unary AuthorisePayment, server-streaming StreamAccountPayments, and client-streaming UploadBatch RPCs. Include a PaymentRequest with idempotency_key, PaymentResponse with an enum PaymentStatus, and proper proto3 package/option declarations. Compile the proto with protoc and verify generated Java stubs are present in target/generated-sources."}, {"id": "task-2", "description": "Implement the PaymentGrpcService server with the AuthorisePayment RPC. Add input validation that returns INVALID_ARGUMENT for missing payment_id or non-positive amount, FAILED_PRECONDITION for insufficient funds, and INTERNAL (without leaking internals) for unexpected errors. Write an integration test using the grpc-testing InProcessChannelBuilder to verify each error path."}, {"id": "task-3", "description": "Implement a GrpcGlobalServerInterceptor that extracts a Bearer JWT from the Authorization metadata header, validates it using a JwtValidator, stores the principal in a gRPC Context key, and closes the call with UNAUTHENTICATED if the token is missing or invalid. Write a unit test with a mock ServerCall that asserts the call is closed with UNAUTHENTICATED when no header is present."}, {"id": "task-4", "description": "Configure a ManagedChannel pointing to a local InProcessServer and apply a 400ms deadline to each call (with withDeadlineAfter per call or a ClientInterceptor — never once on a long-lived stub, because deadlines are absolute). Demonstrate cancellation propagation by injecting an artificial 500ms delay in the server implementation and verifying that the client receives DEADLINE_EXCEEDED. Measure the difference in payload size between a JSON-serialised PaymentRequest (Jackson) and the protobuf-serialised equivalent with 15 fields populated and document the size ratio."}]} -->

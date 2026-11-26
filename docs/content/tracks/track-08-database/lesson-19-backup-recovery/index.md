@@ -38,7 +38,7 @@ RTO (Recovery Time Objective):
 ```
 
 **Financial institution typical targets**:
-- Core payment processing: RPO = 0 (zero data loss), RTO = 15 minutes
+- Core payment processing: RPO = 0 (zero data loss), RTO = 15 minutes — RPO 0 cannot come from backups alone; it needs synchronous replication to a standby (Lesson 08), with backups as the second line of defence
 - Reporting databases: RPO = 1 hour, RTO = 4 hours
 - Archive databases: RPO = 24 hours, RTO = 48 hours
 
@@ -47,41 +47,44 @@ RTO (Recovery Time Objective):
 `pg_basebackup` creates a consistent snapshot of the entire PostgreSQL cluster directory.
 
 ```bash
-# Full base backup to S3 (streamed through compression)
-# This backup can be used as the starting point for PITR
+# Full base backup (tar format, compressed), later uploaded to S3.
+# This backup can be used as the starting point for PITR.
+set -euo pipefail
+BACKUP_DIR=$(date +%Y%m%d_%H%M%S)
 
+# --wal-method=stream: WAL needed to make the backup consistent is streamed
+#   alongside it (PG10+ uses a TEMPORARY replication slot for this, so no
+#   permanent slot is left behind to retain WAL forever)
+# No --write-recovery-conf: that would make the restored copy a STANDBY
+#   of the primary, which is not what a PITR backup should do
 pg_basebackup \
   --host=db-primary.internal \
   --port=5432 \
   --username=backup_user \
-  --pgdata=/var/backups/postgresql/$(date +%Y%m%d_%H%M%S) \
+  --pgdata="/var/backups/postgresql/${BACKUP_DIR}" \
   --format=tar \
   --gzip \
-  --compress=9 \
   --checkpoint=fast \
   --progress \
-  --write-recovery-conf \
-  --slot=base_backup_slot \  # use replication slot to track WAL needed
-  --wal-method=stream        # stream WAL during backup (reduces post-backup WAL gap)
+  --wal-method=stream
 
 # Upload to S3
-aws s3 sync /var/backups/postgresql/${BACKUP_DIR} \
-  s3://company-db-backups/postgresql/base/${BACKUP_DIR}/ \
-  --server-side-encryption aws:kms \
-  --sse-kms-key-id ${KMS_KEY_ARN}
+aws s3 sync "/var/backups/postgresql/${BACKUP_DIR}" \
+  "s3://company-db-backups/postgresql/base/${BACKUP_DIR}/" \
+  --sse aws:kms \
+  --sse-kms-key-id "${KMS_KEY_ARN}"
 
-# Verify backup
-aws s3 ls s3://company-db-backups/postgresql/base/${BACKUP_DIR}/ --recursive
+# Verify the upload (a real check is a test RESTORE -- see Section 10)
+aws s3 ls "s3://company-db-backups/postgresql/base/${BACKUP_DIR}/" --recursive
 ```
 
 ```sql
--- Create a dedicated backup user (principle of least privilege)
-CREATE USER backup_user WITH REPLICATION LOGIN PASSWORD 'strong_backup_password';
-GRANT SELECT ON pg_catalog.pg_tablespace TO backup_user;
+-- Create a dedicated backup user (principle of least privilege):
+-- REPLICATION is all pg_basebackup needs
+CREATE ROLE backup_user WITH REPLICATION LOGIN PASSWORD 'from-your-secret-store';
 
--- Create a replication slot for base backup
--- This ensures WAL isn't cleaned up before the base backup completes
-SELECT pg_create_physical_replication_slot('base_backup_slot', true);
+-- pg_hba.conf on the primary must allow it to use the replication protocol:
+-- hostssl replication backup_user 10.0.5.0/24 scram-sha-256
 ```
 
 ## 3. Continuous WAL Archiving to S3
@@ -93,15 +96,18 @@ PITR requires both a base backup AND the WAL segments generated after the base b
 
 wal_level = replica                           # minimum for archiving
 archive_mode = on
-archive_command = 'aws s3 cp %p s3://company-db-backups/postgresql/wal/%f \
-                   --server-side-encryption aws:kms \
-                   --sse-kms-key-id ${KMS_KEY_ARN} \
-                   && echo "Archived: %p -> %f"'
-# %p = absolute path to WAL segment
-# %f = filename of WAL segment
+archive_command = 'aws s3 cp %p s3://company-db-backups/postgresql/wal/%f --sse aws:kms'
+# %p = path to WAL segment, %f = its file name
+# archive_command must return non-zero on ANY failure (PostgreSQL then
+# keeps the segment and retries) and should never overwrite an existing
+# archived file. Starting the AWS CLI per 16MB segment is also slow; in
+# production prefer a purpose-built tool: pgBackRest (archive-push, below)
+# or WAL-G, which handle retries, parallelism, compression and checksums.
 
-archive_timeout = 60     # force WAL segment switch every 60 seconds
-                         # ensures RPO <= 60 seconds even during low activity
+archive_timeout = 60     # switch to a new segment if any WAL was written in
+                         # the last 60 s -> archived WAL is at most ~60 s
+                         # (plus upload time) behind; costs more, partly
+                         # empty 16MB files in the archive
 
 # Restore command (used during PITR)
 restore_command = 'aws s3 cp s3://company-db-backups/postgresql/wal/%f %p'
@@ -133,39 +139,48 @@ FROM pg_stat_archiver;
 public class WalArchiveMonitor {
 
     private final JdbcTemplate jdbcTemplate;
-    private final MeterRegistry metrics;
+    // Gauges are registered ONCE on these holders; the job only updates them
+    private final AtomicLong failedCount = new AtomicLong();
+    private final AtomicLong secondsSinceArchive = new AtomicLong();
+
+    public WalArchiveMonitor(JdbcTemplate jdbcTemplate, MeterRegistry metrics) {
+        this.jdbcTemplate = jdbcTemplate;
+        Gauge.builder("wal.archive.failed_count", failedCount, AtomicLong::get)
+            .register(metrics);
+        Gauge.builder("wal.archive.seconds_since_last", secondsSinceArchive, AtomicLong::get)
+            .baseUnit("seconds")
+            .register(metrics);
+    }
 
     @Scheduled(fixedRate = 60_000)
     public void monitorArchiving() {
-        jdbcTemplate.queryForObject(
-            """
-            SELECT archived_count, failed_count,
-                   EXTRACT(EPOCH FROM (NOW() - last_archived_time)) AS seconds_since_archive
+        Map<String, Object> row = jdbcTemplate.queryForMap("""
+            SELECT failed_count,
+                   EXTRACT(EPOCH FROM (NOW() - last_archived_time))::BIGINT
+                       AS seconds_since_archive
             FROM pg_stat_archiver
-            """,
-            (rs, row) -> {
-                long failed = rs.getLong("failed_count");
-                double secondsSince = rs.getDouble("seconds_since_archive");
+            """);
 
-                metrics.gauge("wal.archive.failed_count", failed);
-                metrics.gauge("wal.archive.seconds_since_last", secondsSince);
+        long failed = ((Number) row.get("failed_count")).longValue();
+        // NULL = nothing archived yet since the stats were reset
+        Number since = (Number) row.get("seconds_since_archive");
+        long secondsSince = since == null ? Long.MAX_VALUE : since.longValue();
 
-                if (failed > 0) {
-                    log.error("WAL archiving failures detected: {} segments failed", failed);
-                }
-                if (secondsSince > 180) {
-                    log.warn("WAL archiving stalled: {} seconds since last archive", secondsSince);
-                }
-                return null;
-            }
-        );
+        failedCount.set(failed);
+        secondsSinceArchive.set(secondsSince);
+
+        // failed_count is cumulative: alert on its INCREASE (or on
+        // last_failed_time > last_archived_time), not on "> 0" forever
+        if (secondsSince > 180) {
+            log.warn("WAL archiving stalled: {} seconds since last archive", secondsSince);
+        }
     }
 }
 ```
 
 ## 4. PITR Configuration and Recovery
 
-Point-in-Time Recovery allows restoring the database to any moment in history, up to the resolution of `archive_timeout`.
+Point-in-Time Recovery allows restoring the database to any moment between the oldest base backup and the newest archived WAL. `archive_timeout` decides how far the newest archived WAL can lag behind the live database.
 
 ### Recovery Configuration
 
@@ -190,8 +205,9 @@ cat > /var/lib/postgresql/16/main/recovery.signal << 'EOF'
 # This file triggers recovery mode on startup
 EOF
 
-# Step 5: Configure postgresql.conf for recovery
-cat >> /var/lib/postgresql/16/main/postgresql.conf << 'EOF'
+# Step 5: Configure recovery (Debian/Ubuntu keep postgresql.conf in /etc;
+# remove these settings again once recovery is finished)
+cat >> /etc/postgresql/16/main/postgresql.conf << 'EOF'
 restore_command = 'aws s3 cp s3://company-db-backups/postgresql/wal/%f %p'
 
 # Recover to a specific point in time (PITR)
@@ -208,6 +224,9 @@ systemctl start postgresql
 tail -f /var/log/postgresql/postgresql-16-main.log
 # Look for: "recovery stopping before commit of transaction ..."
 # Then: "database system is ready to accept connections"
+# After promotion the server runs on a NEW timeline. Make sure the restored
+# server does not archive into the same WAL location as the old primary
+# unless that is intended (pgBackRest/WAL-G track timelines for you).
 ```
 
 ### Recovery Target Options
@@ -240,15 +259,16 @@ repo1-type=s3
 repo1-s3-bucket=company-db-backups
 repo1-s3-endpoint=s3.amazonaws.com
 repo1-s3-region=us-east-1
-repo1-s3-key=/run/secrets/s3-access-key
-repo1-s3-key-secret=/run/secrets/s3-secret-key
+repo1-s3-key-type=auto          # credentials from the instance's IAM role
 repo1-cipher-type=aes-256-cbc
-repo1-cipher-pass=strong_encryption_passphrase
+# repo1-cipher-pass: do not keep it in this file -- set it from a secret
+# store via the PGBACKREST_REPO1_CIPHER_PASS environment variable
 
-# Retention: keep 7 full backups, 14 days of WAL
-repo1-retention-full=7
-repo1-retention-diff=4
-repo1-retention-archive=14
+# Retention: keep full backups (and the WAL needed to restore them) for
+# 14 days; without -type=time, retention values are COUNTS of backups
+repo1-retention-full-type=time
+repo1-retention-full=14
+repo1-retention-diff=4           # keep the last 4 differential backups
 
 # Logging
 log-level-console=info
@@ -279,11 +299,12 @@ pgbackrest --stanza=payments restore
 
 # Restore to specific time (PITR)
 pgbackrest --stanza=payments restore \
-  --target="2024-01-15 14:32:00" \
+  --target="2024-01-15 14:32:00+00" \
   --target-action=promote \
   --type=time
 
-# Restore specific database only (tablespace restore)
+# Restore one database only: the other databases are restored as empty
+# placeholders and must be dropped afterwards
 pgbackrest --stanza=payments restore --db-include=payments_reporting
 ```
 
@@ -330,39 +351,45 @@ aws s3api put-bucket-encryption --bucket company-db-backups \
 ```bash
 #!/bin/bash
 # measure_rto.sh — Run quarterly in a production-like staging environment
+set -euo pipefail
 
 START_TIME=$(date +%s)
 echo "Recovery test started at $(date -u)"
 
 # Step 1: Note the target recovery time
-TARGET_TIME="2024-01-15 14:30:00 UTC"
+TARGET_TIME="2024-01-15 14:30:00+00"
 echo "Target recovery time: ${TARGET_TIME}"
 
-# Step 2: Restore base backup
-pgbackrest --stanza=payments restore \
+# Step 2: Restore base backup (PostgreSQL must be stopped; --delta reuses
+# matching files in the existing data directory)
+systemctl stop postgresql
+pgbackrest --stanza=payments restore --delta \
   --target="${TARGET_TIME}" \
   --target-action=promote \
   --type=time
 RESTORE_CMD_TIME=$(date +%s)
 echo "Base backup restored at $(date -u). Elapsed: $((RESTORE_CMD_TIME - START_TIME))s"
 
-# Step 3: Wait for PostgreSQL to start and replay WAL
+# Step 3: Start PostgreSQL and wait until WAL replay is FINISHED.
+# pg_isready alone is not enough: with hot_standby = on the server accepts
+# read-only connections while it is still replaying.
 systemctl start postgresql
-while ! pg_isready -h localhost -U postgres; do
+until [ "$(psql -h localhost -U postgres -XAtq -c 'SELECT pg_is_in_recovery()' 2>/dev/null)" = "f" ]; do
   sleep 5
 done
 READY_TIME=$(date +%s)
-echo "Database ready at $(date -u). Total RTO: $((READY_TIME - START_TIME))s"
+echo "Database promoted at $(date -u). Total RTO: $((READY_TIME - START_TIME))s"
 
 # Step 4: Verify data integrity
-ROW_COUNT=$(psql -h localhost -U postgres -d payments \
-  -t -c "SELECT COUNT(*) FROM transactions WHERE created_at < '${TARGET_TIME}'")
+ROW_COUNT=$(psql -h localhost -U postgres -d payments -XAtq \
+  -c "SELECT COUNT(*) FROM transactions WHERE created_at < '${TARGET_TIME}'")
 echo "Transactions recovered: ${ROW_COUNT}"
 
-# Step 5: Verify no transactions after target time (RPO validation)
-FUTURE_ROWS=$(psql -h localhost -U postgres -d payments \
-  -t -c "SELECT COUNT(*) FROM transactions WHERE created_at >= '${TARGET_TIME}'")
-echo "Transactions after target (should be 0): ${FUTURE_ROWS}"
+# Step 5: Rows after the target time (approximate RPO check: created_at is
+# set by the application, recovery stops on COMMIT time)
+FUTURE_ROWS=$(psql -h localhost -U postgres -d payments -XAtq \
+  -c "SELECT COUNT(*) FROM transactions WHERE created_at >= '${TARGET_TIME}'")
+echo "Transactions after target (should be ~0): ${FUTURE_ROWS}"
 
 echo "Recovery test complete. RTO: $((READY_TIME - START_TIME)) seconds"
 ```
@@ -371,14 +398,16 @@ echo "Recovery test complete. RTO: $((READY_TIME - START_TIME)) seconds"
 
 ```
 AWS RDS Automated Backups:
-  - Daily full backup (taken during maintenance window)
-  - Continuous transaction log backup (every 5 minutes)
-  - Retention: 1-35 days (configure based on RPO requirements)
-  - PITR granularity: 5 minutes
-  - Cost: storage for backup = same as database storage
+  - Daily snapshot (taken during the backup window)
+  - Transaction logs uploaded to S3 every 5 minutes
+  - Retention: 1-35 days (configure based on recovery needs)
+  - PITR: restore to any second within the retention period; the
+    "latest restorable time" is usually within the last 5 minutes
+  - Cost: backup storage up to the size of the provisioned database
+    storage (per region) is included; beyond that it is billed
 
 AWS RDS Manual Snapshots:
-  - Triggered manually or via automation
+  - Triggered manually or via automation (or AWS Backup plans)
   - Persist until explicitly deleted
   - Used for pre-migration snapshots, long-term retention
   - Cross-region copy for DR
@@ -391,61 +420,40 @@ Best practice: RDS automated backups + manual snapshot before every migration
 @Slf4j
 public class RdsBackupService {
 
-    private final AmazonRDS rdsClient;
+    private final RdsClient rdsClient;   // AWS SDK v2 (v1 is end-of-support)
 
     /**
      * Create a manual snapshot before schema migration.
      * Naming convention: pre-migration-{version}-{timestamp}
      */
     public String createPreMigrationSnapshot(String dbInstanceId, String migrationVersion) {
+        // Snapshot ids: letters, digits and hyphens only
         String snapshotId = String.format("pre-migration-%s-%s",
-            migrationVersion,
-            Instant.now().toString().replace(":", "-").replace(".", "-")
-        );
+            migrationVersion.replaceAll("[^A-Za-z0-9-]", "-"),
+            DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
+                .withZone(ZoneOffset.UTC).format(Instant.now()));
 
-        CreateDBSnapshotRequest request = new CreateDBSnapshotRequest()
-            .withDBSnapshotIdentifier(snapshotId)
-            .withDBInstanceIdentifier(dbInstanceId)
-            .withTags(
-                new Tag().withKey("migration-version").withValue(migrationVersion),
-                new Tag().withKey("created-by").withValue("payment-deployment"),
-                new Tag().withKey("auto-delete-after").withValue(
-                    LocalDate.now().plusDays(30).toString()
-                )
-            );
+        rdsClient.createDBSnapshot(CreateDbSnapshotRequest.builder()
+            .dbSnapshotIdentifier(snapshotId)
+            .dbInstanceIdentifier(dbInstanceId)
+            .tags(
+                Tag.builder().key("migration-version").value(migrationVersion).build(),
+                Tag.builder().key("created-by").value("payment-deployment").build(),
+                Tag.builder().key("auto-delete-after")
+                    .value(LocalDate.now(ZoneOffset.UTC).plusDays(30).toString()).build())
+            .build());
 
-        DBSnapshot snapshot = rdsClient.createDBSnapshot(request);
+        log.info("Creating pre-migration snapshot: {}", snapshotId);
 
-        log.info("Created pre-migration snapshot: {} (status: {})",
-            snapshotId, snapshot.getStatus());
+        // SDK waiter: polls until "available"; throws if the snapshot fails
+        // or the waiter times out -- the migration must not start then
+        rdsClient.waiter().waitUntilDBSnapshotAvailable(
+            DescribeDbSnapshotsRequest.builder()
+                .dbSnapshotIdentifier(snapshotId)
+                .build());
 
-        // Wait for snapshot to complete
-        waitForSnapshot(snapshotId);
-
+        log.info("Snapshot {} is available", snapshotId);
         return snapshotId;
-    }
-
-    private void waitForSnapshot(String snapshotId) {
-        while (true) {
-            DescribeDBSnapshotsResult result = rdsClient.describeDBSnapshots(
-                new DescribeDBSnapshotsRequest()
-                    .withDBSnapshotIdentifier(snapshotId)
-            );
-
-            String status = result.getDBSnapshots().get(0).getStatus();
-
-            if ("available".equals(status)) {
-                log.info("Snapshot {} is available", snapshotId);
-                return;
-            }
-
-            if ("failed".equals(status)) {
-                throw new RuntimeException("Snapshot failed: " + snapshotId);
-            }
-
-            log.info("Snapshot {} status: {}", snapshotId, status);
-            try { Thread.sleep(30_000); } catch (InterruptedException e) { break; }
-        }
     }
 }
 ```
@@ -474,13 +482,14 @@ public class RdsBackupService {
 
 ```java
 @Component
-@Scheduled(cron = "0 0 6 * * *")  // 06:00 UTC daily
 @Slf4j
 public class BackupHealthCheck {
 
     private final JdbcTemplate jdbcTemplate;
     private final AlertService alertService;
 
+    // @Scheduled belongs on the METHOD; zone set explicitly
+    @Scheduled(cron = "0 0 6 * * *", zone = "UTC")  // 06:00 UTC daily
     public void verifyBackupHealth() {
         // Check WAL archiving is current
         jdbcTemplate.queryForObject(
@@ -546,7 +555,7 @@ Annual comprehensive test:
 ```
 
 > [!WARNING]
-> RDS automated backups are retained for a maximum of 35 days. For the 7-year regulatory retention requirement, automated backups are NOT sufficient. You must separately export database dumps or snapshots to S3 with an appropriate retention policy, or use pgBackRest configured for long-term S3 retention. The regulatory requirement for 7-year retention must be explicitly configured — it will not happen automatically.
+> RDS automated backups are retained for a maximum of 35 days. For multi-year record retention they are NOT sufficient. Retention rules are about keeping the *records*: the usual answer is an archival pipeline (Lesson 18), optionally plus long-lived snapshots (manual snapshots or AWS Backup plans with multi-year retention). Note that old full-database backups also complicate GDPR erasure, because deleted personal data lives on in them. Long-term retention must be designed and configured explicitly — it will not happen automatically.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -555,12 +564,12 @@ Annual comprehensive test:
       "text": "A payment database has archive_timeout = 300 (5 minutes). A burst of 10,000 transactions is processed at 09:00, then no transactions occur until 15:00. What is the worst-case RPO (data loss window) during the quiet period?",
       "options": [
         "0 seconds — WAL is archived immediately when each transaction commits",
-        "5 minutes — archive_timeout forces a WAL segment switch every 5 minutes even without writes, ensuring WAL is archived at that interval",
+        "About 5 minutes — archive_timeout forces a segment switch at most 5 minutes after WAL was written, so the burst's WAL is archived by about 09:05; during the idle period nothing new is written, so nothing more can be lost",
         "6 hours — the entire quiet period between 09:00 and 15:00 is at risk",
         "It depends on the archive_command execution time"
       ],
       "correct": 1,
-      "explanation": "WAL segments are archived when they are full (16MB by default) OR when archive_timeout expires. During low-activity periods, a WAL segment may remain partially filled for a long time before being archived. archive_timeout = 300 forces PostgreSQL to switch to a new WAL segment every 300 seconds, even if the current segment is not full, ensuring the last segment is archived within 5 minutes. For RPO = 5 minutes, set archive_timeout = 300. For RPO = 1 minute, set archive_timeout = 60 (at the cost of more small WAL files in S3)."
+      "explanation": "WAL segments are archived when they are full (16MB by default) OR when archive_timeout expires — but a switch only happens if some WAL was written since the last switch. So the partly filled segment holding the 09:00 burst is switched and archived within about 5 minutes (plus upload time). During the quiet period no WAL is written, no switches happen, and there is no new data at risk. For an RPO of about 1 minute, set archive_timeout = 60 (at the cost of more, mostly empty 16MB files in the archive); for RPO 0, use synchronous replication."
     },
     {
       "text": "During a PITR recovery, you set recovery_target_time = '2024-01-15 14:32:00 UTC' and recovery_target_inclusive = false. A malicious DELETE statement executed at exactly 14:32:00. Will this row be recovered?",
@@ -582,7 +591,7 @@ Annual comprehensive test:
         "The gap is covered by the application-level transaction logs stored in Kafka"
       ],
       "correct": 1,
-      "explanation": "RDS automated backups have a maximum retention of 35 days — this is a hard limit in the AWS API. For 7-year BSA/AML retention, a completely separate archival strategy is required. Options include: (1) monthly RDS snapshot exports to S3 with explicit S3 lifecycle configured for 7-year retention, (2) pgBackRest with repo1-retention-full configured and S3 as the repository, (3) the tiered archival approach from Lesson 18 (partition + export to Parquet). The key point is that BSA compliance requires explicit engineering effort — it does not happen by default with any managed database service."
+      "explanation": "RDS automated backups have a maximum retention of 35 days — a hard limit. Multi-year BSA/AML retention needs a separate, explicit strategy: (1) the tiered archival pipeline from Lesson 18 (partition + export to Parquet with an S3 lifecycle and Object Lock), (2) long-lived snapshots — manual snapshots or AWS Backup plans with multi-year retention, and/or (3) pgBackRest with a long time-based repository retention. The key point: compliance retention requires explicit engineering effort — it does not happen by default with any managed database service."
     }
   ]
 }
@@ -594,10 +603,22 @@ Annual comprehensive test:
   "difficulty": "advanced",
   "estimatedMinutes": 55,
   "tasks": [
-    {"id": "1", "description": "Configure a complete PITR setup for a Testcontainers PostgreSQL 16 instance: set wal_level=replica, enable archive_mode=on, write an archive_command that copies WAL segments to a local directory (simulating S3), and set archive_timeout=60. Insert 1,000 transactions, capture a restore point with pg_create_restore_point('before_delete'), then DELETE 100 transactions. Perform a full PITR to the named restore point and verify the 100 deleted transactions are restored."},
-    {"id": "2", "description": "Implement the quarterly RTO measurement script from this lesson as a runnable shell script. The script should: provision a fresh PostgreSQL instance, restore a pgBackRest backup to a specified target time, wait for database readiness, verify row counts at the recovery point, and output a JSON report with measured RTO in seconds, RPO accuracy in seconds, and rows recovered. Add assertions that fail if measured RTO > 1800 seconds or RPO > 300 seconds."},
-    {"id": "3", "description": "Build the WAL archive monitoring service from this lesson as a production-ready Spring Boot component: schedule it to run every 60 seconds, expose the archive status as Micrometer gauges (wal.archive.failed_count, wal.archive.seconds_since_last), define alert conditions for failed_count > 0 and lag > 180 seconds, and write unit tests with a mocked JdbcTemplate that verify the correct alerts fire for each condition."},
-    {"id": "4", "description": "Design the backup governance policy for a payment platform with these requirements: RPO = 5 minutes for the core payments database, RPO = 1 hour for the reporting database, 7-year retention for transaction data, 90-day retention for session and rate-limit data. Write the pgBackRest and S3 lifecycle configurations for each database, calculate the monthly storage cost for each tier, and document the runbook for each recovery scenario (single table corruption, full instance failure, region failure)."}
+    {
+      "id": "1",
+      "description": "Configure a complete PITR setup for a Testcontainers PostgreSQL 16 instance: set wal_level=replica, enable archive_mode=on, write an archive_command that copies WAL segments to a local directory (simulating S3), and set archive_timeout=60. Insert 1,000 transactions, capture a restore point with pg_create_restore_point('before_delete'), then DELETE 100 transactions. Perform a full PITR to the named restore point and verify the 100 deleted transactions are restored."
+    },
+    {
+      "id": "2",
+      "description": "Implement the quarterly RTO measurement script from this lesson as a runnable shell script. The script should: provision a fresh PostgreSQL instance, restore a pgBackRest backup to a specified target time, wait for database readiness, verify row counts at the recovery point, and output a JSON report with measured RTO in seconds, RPO accuracy in seconds, and rows recovered. Add assertions that fail if measured RTO > 1800 seconds or RPO > 300 seconds."
+    },
+    {
+      "id": "3",
+      "description": "Build the WAL archive monitoring service from this lesson as a production-ready Spring Boot component: schedule it to run every 60 seconds, expose the archive status as Micrometer gauges registered once (wal.archive.failed_count, wal.archive.seconds_since_last), define alert conditions for an increase of failed_count and for lag > 180 seconds, and write unit tests with a mocked JdbcTemplate that verify the correct alerts fire for each condition."
+    },
+    {
+      "id": "4",
+      "description": "Design the backup governance policy for a payment platform with these requirements: RPO = 5 minutes for the core payments database, RPO = 1 hour for the reporting database, 7-year retention for transaction data, 90-day retention for session and rate-limit data. Write the pgBackRest and S3 lifecycle configurations for each database, calculate the monthly storage cost for each tier, and document the runbook for each recovery scenario (single table corruption, full instance failure, region failure)."
+    }
   ]
 }
 -->

@@ -51,9 +51,11 @@ Without consistent tagging, cost allocation is guesswork. Define tags before res
 
 ### Mandatory Tag Policy
 
-```yaml
-# OPA (Open Policy Agent) policy: enforce mandatory tags on all resources
-# Applied via AWS Config, Terraform Sentinel, or OPA Gatekeeper
+```rego
+# OPA (Open Policy Agent) policy: enforce mandatory tags on all resources.
+# Run it against Terraform plans in CI (e.g. with conftest); similar rules
+# exist as AWS Config rules, AWS Organizations tag policies, or Sentinel
+# (Terraform Cloud's own policy language). Rego v1 syntax (OPA 1.0+).
 package aws_resource_tags
 
 required_tags := {
@@ -64,7 +66,7 @@ required_tags := {
     "DataClassification"
 }
 
-deny[msg] {
+deny contains msg if {
     resource := input.resource
     missing := required_tags - {tag | resource.tags[tag]}
     count(missing) > 0
@@ -72,7 +74,7 @@ deny[msg] {
 }
 ```
 
-```bash
+```hcl
 # Terraform: enforce tags on all AWS resources via default_tags
 terraform {
   required_providers {
@@ -137,19 +139,21 @@ metadata:
 
 ## Kubecost: Cost Visibility Per Service
 
-Kubecost provides per-namespace, per-deployment, and per-label cost visibility within Kubernetes clusters.
+Kubecost (owned by IBM since 2024) provides per-namespace, per-deployment, and per-label cost visibility within Kubernetes clusters. **OpenCost**, the CNCF project Kubecost is built on, offers the core allocation model as open source.
 
 ### Installing Kubecost
 
 ```bash
-# Install Kubecost on each cluster
+# Install Kubecost on each cluster (global.prometheus.enabled=false: reuse
+# the existing Prometheus. Never put a comment after a trailing backslash --
+# it ends the command)
 helm repo add kubecost https://kubecost.github.io/cost-analyzer
 helm install kubecost kubecost/cost-analyzer \
   --namespace kubecost \
   --create-namespace \
   --set kubecostToken="your-token-here" \
   --set global.prometheus.fqdn=http://prometheus.monitoring.svc.cluster.local:9090 \
-  --set global.prometheus.enabled=false  # use existing Prometheus \
+  --set global.prometheus.enabled=false \
   --set costAnalyzer.defaultClusterID=payment-prod-us-east-1 \
   --set global.podAnnotations."cluster-autoscaler\.kubernetes\.io/safe-to-evict"=true
 ```
@@ -159,7 +163,7 @@ helm install kubecost kubecost/cost-analyzer \
 ```bash
 # Get cost summary via Kubecost API
 # Cost per namespace for the last 30 days
-curl "http://kubecost.kubecost.svc.cluster.local:9090/model/allocation?window=30d&aggregate=namespace&accumulate=false" \
+curl "http://kubecost-cost-analyzer.kubecost.svc.cluster.local:9090/model/allocation?window=30d&aggregate=namespace&accumulate=false" \
   | jq '.data[0] | to_entries | map({namespace: .key, monthlyCost: .value.totalCost}) | sort_by(-.monthlyCost)'
 
 # Example output:
@@ -171,10 +175,10 @@ curl "http://kubecost.kubecost.svc.cluster.local:9090/model/allocation?window=30
 # ]
 
 # Cost per deployment within payments namespace
-curl "http://kubecost.kubecost.svc.cluster.local:9090/model/allocation?window=30d&aggregate=deployment&namespace=payments"
+curl "http://kubecost-cost-analyzer.kubecost.svc.cluster.local:9090/model/allocation?window=30d&aggregate=deployment&namespace=payments"
 
 # Right-sizing recommendations
-curl "http://kubecost.kubecost.svc.cluster.local:9090/savings/requestSizing?targetCPUUtilization=0.7&targetMemUtilization=0.7"
+curl "http://kubecost-cost-analyzer.kubecost.svc.cluster.local:9090/model/savings/requestSizingV2?targetCPUUtilization=0.7&targetRAMUtilization=0.7"
 ```
 
 ### Unit Economics Dashboard
@@ -218,17 +222,15 @@ kubectl get vpa -n payments -o json | jq '
 '
 
 # Step 2: Get Kubecost right-sizing recommendations
-curl "http://kubecost.kubecost.svc.cluster.local:9090/savings/requestSizing?
-  namespace=payments&
-  targetCPUUtilization=0.7&
-  targetMemUtilization=0.8&
-  window=7d" | jq '.recommendations[] | {
-    deployment: .deployment,
-    currentCPURequest: .currentCPURequest,
-    recommendedCPURequest: .recommendedCPURequest,
-    cpuSavingsPercent: .cpuSavingsPercent,
-    monthlySavings: .monthlySavings
-  }'
+# (-G + --data-urlencode builds the query string; a URL split over several
+#  lines inside quotes would contain newlines and break)
+curl -sG "http://kubecost-cost-analyzer.kubecost.svc.cluster.local:9090/model/savings/requestSizingV2" \
+  --data-urlencode "filter=namespace:\"payments\"" \
+  --data-urlencode "targetCPUUtilization=0.7" \
+  --data-urlencode "targetRAMUtilization=0.8" \
+  --data-urlencode "window=7d" | jq .
+# The response lists, per container, the current and recommended requests
+# and the estimated monthly savings
 ```
 
 ### Applying Right-Sizing Recommendations
@@ -249,10 +251,15 @@ resources:
     cpu: "1920m"    # 4x request (burst headroom)
     memory: "2Gi"   # 2x request
 
-# Monthly savings calculation:
+# Monthly savings calculation (requested CPU priced per vCPU-hour):
 # Before: 10 replicas * 2 CPU * $0.0464/vCPU-hr * 730hr = $677/month
 # After:  10 replicas * 0.48 CPU * $0.0464/vCPU-hr * 730hr = $162/month
-# Saving: $515/month per deployment, just from right-sizing
+# Saving: up to $515/month per deployment -- real money only once the
+# autoscaler packs pods onto FEWER nodes (requests free capacity, the
+# node bill drops when nodes are removed).
+# For latency-critical payment pods consider memory request == limit
+# (see the scheduling lesson); the 2x memory limit here suits batch-like
+# services better.
 ```
 
 ---
@@ -285,8 +292,8 @@ Spot ELIGIBLE (interruption acceptable):
 ### Spot Node Group with Karpenter
 
 ```yaml
-# Karpenter NodePool for Spot batch workloads
-apiVersion: karpenter.sh/v1beta1
+# Karpenter NodePool for Spot batch workloads (Karpenter v1 API)
+apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
   name: batch-spot-workers
@@ -311,16 +318,22 @@ spec:
         - key: topology.kubernetes.io/zone
           operator: In
           values: [us-east-1a, us-east-1b, us-east-1c]
-
-      # Spot interruption handling: drain before termination
+      # Karpenter does not taint Spot nodes by itself -- add a taint so
+      # only pods that tolerate interruption land here
+      taints:
+        - key: karpenter.sh/capacity-type
+          value: spot
+          effect: NoSchedule
+      # Spot interruption handling: Karpenter watches the interruption
+      # notices (via an SQS queue) and drains the node before termination
       nodeClassRef:
-        apiVersion: karpenter.k8s.aws/v1beta1
+        group: karpenter.k8s.aws
         kind: EC2NodeClass
         name: batch-node-class
 
   # Only scale down batch nodes aggressively — they're cheap anyway
   disruption:
-    consolidationPolicy: WhenUnderutilized
+    consolidationPolicy: WhenEmptyOrUnderutilized
     consolidateAfter: 5m
 
 ---
@@ -346,8 +359,10 @@ spec:
         workload-type: batch
         spot: "true"
 
-      # Handle Spot interruption: save checkpoint before 2min window
-      terminationGracePeriodSeconds: 120  # 2 minutes = Spot interruption notice
+      # Handle Spot interruption: save a checkpoint within the 2-minute
+      # notice. The drain starts a little after the notice arrives, so keep
+      # the grace period below 120s
+      terminationGracePeriodSeconds: 90
 
       containers:
         - name: fraud-trainer
@@ -376,11 +391,11 @@ For predictable base load (the minimum number of pods always running), Reserved 
 ```
 AWS Savings Plans for fintech:
 
-  Compute Savings Plans:
-    - 1 year, no upfront:  ~20% discount
-    - 1 year, all upfront: ~30% discount
-    - 3 year, all upfront: ~40-50% discount
-    - Applies to any EC2 instance family, region, or OS
+  Compute Savings Plans (indicative discounts -- they vary by instance):
+    - 1 year, no upfront:  ~20-30% discount
+    - 1 year, all upfront: ~30-35% discount
+    - 3 year, all upfront: ~45-55% discount (up to 66%)
+    - Applies to any EC2 instance family, region, or OS (and Fargate, Lambda)
     - Best for Kubernetes: Compute Savings Plans (most flexible)
 
   EC2 Instance Savings Plans:
@@ -400,12 +415,14 @@ AWS Savings Plans for fintech:
     Batch:      0-10 Spot nodes for batch processing
 
     Recommendation:
-      Purchase 14x c6i.4xlarge Savings Plan (3yr no-upfront)
-      Keep 6x On-Demand as buffer
+      Savings Plans are an HOURLY SPEND commitment, not instances:
+      commit about the discounted hourly cost of 14 c6i.4xlarge
+      (3yr no-upfront Compute Savings Plan)
+      Keep ~6 nodes' worth On-Demand as buffer
       All batch on Spot
 
-    Monthly savings vs all On-Demand:
-      14 nodes * $0.68/hr * 730hr * (1 - 0.60 Savings Plan discount) = $2,850/month savings
+    Monthly savings vs all On-Demand (assuming ~45% discount):
+      14 nodes * $0.68/hr * 730hr * 0.45 ≈ $3,130/month savings
 ```
 
 ### AWS CLI: Purchase Savings Plans
@@ -418,12 +435,15 @@ aws ce get-savings-plans-purchase-recommendation \
   --payment-option NO_UPFRONT \
   --lookback-period-in-days THIRTY_DAYS
 
-# Step 2: Review recommendation, then purchase
+# Step 2: Review the recommendation, find the offering, then purchase
+# (commitment = $ per HOUR; offering = plan type + term + payment option)
+OFFERING_ID=$(aws savingsplans describe-savings-plans-offerings \
+  --plan-types Compute --durations 31536000 --payment-options "No Upfront" \
+  --query 'searchResults[0].offeringId' --output text)
+
 aws savingsplans create-savings-plan \
-  --savings-plan-type ComputeSavingsPlans \
-  --commitment 500.00 \          # $500/hour commitment
-  --term-duration-in-seconds 31536000 \  # 1 year
-  --payment-option NO_UPFRONT
+  --savings-plan-offering-id "$OFFERING_ID" \
+  --commitment 500.00
 
 # Step 3: Monitor Savings Plan utilization
 aws ce get-savings-plans-utilization \
@@ -438,7 +458,10 @@ aws ce get-savings-plans-utilization \
 Development and staging environments often run 24/7 but are only used during business hours. Automating shutdown saves significant cost.
 
 ```yaml
-# CronJob: scale down non-production namespaces at 20:00 UTC (3pm US East)
+# CronJob: scale down non-production namespaces at 20:00 UTC (15:00/16:00 US East)
+# Note: if Argo CD / Flux with self-heal manages these namespaces, they will
+# scale the workloads straight back up -- exclude replicas from sync or use
+# a tool like kube-downscaler that GitOps tools know about
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -453,16 +476,21 @@ spec:
           serviceAccountName: namespace-scaler
           containers:
             - name: scaler
-              image: bitnami/kubectl:1.28
+              image: registry.internal/tools/kubectl:1.33   # internally mirrored image
               command:
                 - /bin/sh
                 - -c
                 - |
-                  # Scale down all deployments in dev namespaces
+                  # Remember each workload's replica count, then scale to 0
                   for ns in $(kubectl get namespaces -l environment=dev -o name | cut -d/ -f2); do
                     echo "Scaling down namespace: $ns"
-                    kubectl scale deployment --all --replicas=0 -n $ns
-                    kubectl scale statefulset --all --replicas=0 -n $ns
+                    for w in $(kubectl get deployment,statefulset -n "$ns" -o name); do
+                      r=$(kubectl get "$w" -n "$ns" -o jsonpath='{.spec.replicas}')
+                      if [ "$r" -gt 0 ]; then
+                        kubectl annotate --overwrite "$w" -n "$ns" fintech.io/original-replicas="$r"
+                        kubectl scale "$w" -n "$ns" --replicas=0
+                      fi
+                    done
                   done
                   echo "Scale-down complete: $(date)"
           restartPolicy: OnFailure
@@ -482,17 +510,21 @@ spec:
           serviceAccountName: namespace-scaler
           containers:
             - name: scaler
-              image: bitnami/kubectl:1.28
+              image: registry.internal/tools/kubectl:1.33
               command:
                 - /bin/sh
                 - -c
                 - |
-                  # Restore deployments from their desired replica count
-                  # (stored in annotations set before scale-down)
+                  # Restore each workload to the replica count saved at scale-down
+                  # (a rollout restart would NOT bring a 0-replica workload back)
                   for ns in $(kubectl get namespaces -l environment=dev -o name | cut -d/ -f2); do
-                    kubectl annotate --overwrite ns $ns \
-                      fintech.io/last-scaleup="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-                    kubectl rollout restart deployment --all -n $ns 2>/dev/null || true
+                    for w in $(kubectl get deployment,statefulset -n "$ns" -o name); do
+                      r=$(kubectl get "$w" -n "$ns" \
+                          -o jsonpath='{.metadata.annotations.fintech\.io/original-replicas}')
+                      if [ -n "$r" ]; then
+                        kubectl scale "$w" -n "$ns" --replicas="$r"
+                      fi
+                    done
                   done
           restartPolicy: OnFailure
 ```
@@ -536,10 +568,10 @@ Chargeback architecture for fintech:
 MONTH_START=$(date -d "$(date +%Y-%m-01)" +%Y-%m-%d)
 MONTH_END=$(date -d "$(date +%Y-%m-01) +1 month" +%Y-%m-%d)
 
-curl -s "http://kubecost.kubecost.svc.cluster.local:9090/model/allocation?
-  window=${MONTH_START}T00:00:00Z,${MONTH_END}T00:00:00Z&
-  aggregate=label:team&
-  accumulate=true" | jq '
+curl -sG "http://kubecost-cost-analyzer.kubecost.svc.cluster.local:9090/model/allocation" \
+  --data-urlencode "window=${MONTH_START}T00:00:00Z,${MONTH_END}T00:00:00Z" \
+  --data-urlencode "aggregate=label:team" \
+  --data-urlencode "accumulate=true" | jq '
   .data[0] | to_entries | map({
     team: .key,
     totalCostUSD: (.value.totalCost | round),
@@ -560,9 +592,11 @@ Financial services have additional compliance requirements that affect cost gove
 Governance requirements unique to fintech:
 
 1. Data retention costs:
-   PCI-DSS:    1-year active + 2-year archive minimum
+   PCI-DSS:    audit logs 12 months, the last 3 months immediately available
    GDPR:       Delete EU PII data when no longer needed (cost benefit)
-   SOX:        7-year financial record retention
+   SOX / local banking law: often 7 years for financial records
+   (check the actual obligations with your compliance team -- they vary
+    by country and record type)
    
    Cost implication: S3 lifecycle policies must balance compliance vs cost
    Solution: S3 Intelligent-Tiering for data where access is unpredictable,
@@ -570,8 +604,10 @@ Governance requirements unique to fintech:
 
 2. Audit logging:
    CloudTrail, VPC Flow Logs, Kubernetes audit logs must be retained
-   Cost: ~$5-15/month per account for CloudTrail alone
-   Cannot be disabled — it is a compliance requirement
+   Cost: the first CloudTrail management-event trail is free; data events,
+   extra trails, Flow Logs and log storage can add up to a large line item
+   Cannot be disabled — it is a compliance requirement; tune volume
+   (sampling of flow logs, filters) instead
 
 3. Multi-region backup:
    RTO/RPO requirements mandate cross-region backups
@@ -584,6 +620,8 @@ Governance requirements unique to fintech:
 ```
 
 ### S3 Lifecycle Policy for Compliance Archives
+
+Audit logs should also be immutable: enable S3 Object Lock (compliance mode) on the bucket so that not even an administrator can delete them before the retention date.
 
 ```json
 {
@@ -633,7 +671,9 @@ Governance requirements unique to fintech:
 ## Budget Alerts and Cost Anomaly Detection
 
 ```bash
-# Create AWS Budget with alert for payments team
+# Create AWS Budget with alert for payments team.
+# The tag key is case-sensitive ("Team", as set by Terraform default_tags),
+# and must be ACTIVATED as a cost allocation tag in the Billing console
 aws budgets create-budget \
   --account-id 123456789 \
   --budget '{
@@ -642,7 +682,7 @@ aws budgets create-budget \
     "TimeUnit": "MONTHLY",
     "BudgetType": "COST",
     "CostFilters": {
-      "TagKeyValue": ["user:team$payments-platform"]
+      "TagKeyValue": ["user:Team$payments-platform"]
     }
   }' \
   --notifications-with-subscribers '[
@@ -675,7 +715,13 @@ aws ce create-anomaly-subscription \
     "Subscribers": [
       {"Address": "arn:aws:sns:us-east-1:123456789:cost-alerts", "Type": "SNS"}
     ],
-    "Threshold": 500,
+    "ThresholdExpression": {
+      "Dimensions": {
+        "Key": "ANOMALY_TOTAL_IMPACT_ABSOLUTE",
+        "Values": ["500"],
+        "MatchOptions": ["GREATER_THAN_OR_EQUAL"]
+      }
+    },
     "Frequency": "DAILY"
   }'
 ```
@@ -690,7 +736,7 @@ aws ce create-anomaly-subscription \
 
 3. **Savings Plans for predictable base load, Spot for variable peaks** — the payment API always runs at least 3 replicas. Those 3 replicas should be under a Savings Plan. The 0-47 additional replicas that scale with traffic should be On-Demand or Spot.
 
-4. **Right-sizing is the highest-ROI FinOps activity** — most Kubernetes workloads are over-provisioned by 3-5x based on initial estimates. Run VPA in Off mode for a week, apply the recommendations with 20% headroom. This alone typically reduces compute costs by 40-60%.
+4. **Right-sizing is the highest-ROI FinOps activity** — Kubernetes workloads are often heavily over-provisioned, because initial requests are guesses. Run VPA in Off mode for a week, apply the recommendations with 20% headroom, and let the autoscaler remove the freed nodes. Large compute savings are common.
 
 5. **Unit economics matter more than absolute cost** — a payment platform processing 10x more transactions at 2x the cost is a win. Track cost per 1,000 payments processed. If this metric is declining, you are scaling efficiently.
 
@@ -700,20 +746,35 @@ aws ce create-anomaly-subscription \
 {
   "questions": [
     {
-      "text": "An OPA Gatekeeper policy denies creation of any AWS resource without a mandatory cost-center tag. A developer tries to create an RDS instance without the tag and the Terraform apply fails. The developer argues the tag requirement slows down development. What is the principal engineer's response?",
-      "options": ["Exempt development environments from the tagging requirement to unblock engineers", "The tagging policy is non-negotiable because without consistent tagging, cost attribution to teams and products is impossible; provide a Terraform module that includes the required tags by default so engineers never need to remember them", "Create a separate OPA policy for production only; development resources do not need cost tracking", "Allow engineers to submit a tag exemption request that is manually approved within 24 hours"],
+      "text": "A policy check in the Terraform pipeline (OPA with conftest) rejects any AWS resource without a mandatory cost-center tag. A developer tries to create an RDS instance without the tag and the pipeline fails. The developer argues the tag requirement slows down development. What is the principal engineer's response?",
+      "options": [
+        "Exempt development environments from the tagging requirement to unblock engineers",
+        "The tagging policy is non-negotiable because without consistent tagging, cost attribution to teams and products is impossible; provide a Terraform module that includes the required tags by default so engineers never need to remember them",
+        "Create a separate OPA policy for production only; development resources do not need cost tracking",
+        "Allow engineers to submit a tag exemption request that is manually approved within 24 hours"
+      ],
       "correct": 1,
       "explanation": "Retroactively tagging cloud resources is extremely difficult — resources get renamed, ownership changes, and engineers forget context. The correct response is to enforce tagging universally AND make compliance the path of least resistance by providing Terraform modules and Backstage templates that include required tags automatically. The developer's objection is about friction, not the policy itself; the solution is to remove the friction while keeping the policy."
     },
     {
       "text": "A Kubernetes workload has actual CPU usage of 200m but requests = 2000m (10x over-provisioned). VPA in Off mode recommends requests = 250m. The team applies the VPA recommendation. What is the immediate cost impact and what risk must be managed?",
-      "options": ["Immediate 87.5% reduction in compute cost for this workload; risk is under-provisioning during traffic spikes if the VPA recommendation does not include adequate headroom", "No cost reduction; Kubernetes charges for actual usage not requests", "Immediate cost reduction but the pod will be evicted and rescheduled which causes a brief service interruption", "Cost reduction only takes effect at the next node replacement cycle"],
+      "options": [
+        "Up to 87.5% less requested CPU for this workload — the bill drops once the autoscaler packs pods onto fewer nodes; risk is under-provisioning during traffic spikes if the recommendation does not include adequate headroom",
+        "No cost reduction; Kubernetes charges for actual usage not requests",
+        "Immediate cost reduction but the pod will be evicted and rescheduled which causes a brief service interruption",
+        "Cost reduction only takes effect at the next node replacement cycle"
+      ],
       "correct": 0,
-      "explanation": "Kubernetes node scheduling uses requests (not actual usage) to determine how many pods fit on a node. Over-provisioned requests cause nodes to appear full while still having unused capacity, forcing more nodes to be provisioned than necessary. Reducing requests from 2000m to 250m (with 20% headroom = 300m) allows more pods per node, potentially eliminating entire nodes from the cluster. The risk is insufficient headroom for traffic spikes — VPA recommendations should be applied with 20-30% buffer and monitored with HPA for burst traffic handling."
+      "explanation": "Kubernetes scheduling uses requests (not actual usage) to decide how many pods fit on a node. Over-provisioned requests make nodes look full while their CPUs sit idle, so more nodes are provisioned than necessary. Reducing requests from 2000m to 250m (with 20% headroom ≈ 300m) lets more pods share a node, and the cluster autoscaler can then remove whole nodes — that is when the saving appears on the bill. The risk is insufficient headroom for traffic spikes — apply VPA recommendations with a 20-30% buffer and keep HPA for bursts."
     },
     {
       "text": "A payment platform runs a nightly fraud model training job that takes 4 hours. The team is evaluating Spot instances for this workload. The job currently uses 20x m5.4xlarge On-Demand instances at $0.768/hour each. Spot price is $0.23/hour with 15% interruption probability. What architecture makes this workload Spot-safe?",
-      "options": ["Use Spot instances without modification; a 15% interruption probability means the job will complete 85% of the time", "Implement checkpointing so the job saves progress every 30 minutes; on Spot interruption (2-minute notice), save checkpoint and restart from last checkpoint on new instances — total cost: $0.23 * 20 * 4 = $18.40 vs $0.768 * 20 * 4 = $61.44 On-Demand", "Use Reserved Instances instead of Spot for predictable batch workloads", "Split the job across 100 smaller instances to reduce per-instance interruption risk"],
+      "options": [
+        "Use Spot instances without modification; a 15% interruption probability means the job will complete 85% of the time",
+        "Implement checkpointing so the job saves progress every 30 minutes; on Spot interruption (2-minute notice), save checkpoint and restart from last checkpoint on new instances — total cost: $0.23 * 20 * 4 = $18.40 vs $0.768 * 20 * 4 = $61.44 On-Demand",
+        "Use Reserved Instances instead of Spot for predictable batch workloads",
+        "Split the job across 100 smaller instances to reduce per-instance interruption risk"
+      ],
       "correct": 1,
       "explanation": "The 2-minute Spot interruption notice is sufficient for jobs that checkpoint correctly. With 30-minute checkpoints the worst case is losing 30 minutes of work, not 4 hours. The savings are substantial: $18.40 vs $61.44 (70% reduction). The architecture requires: (a) the ML framework to support checkpoint/resume (most do: PyTorch, TensorFlow, XGBoost), (b) checkpoints written to S3 or EFS (not instance-local storage), and (c) a job queue (SQS or Kubernetes Job) to automatically requeue interrupted work."
     }
@@ -737,7 +798,7 @@ aws ce create-anomaly-subscription \
     },
     {
       "id": "3",
-      "description": "Design a Spot-safe Kubernetes Job spec for the nightly fraud model training workload: use spot-instance node selector, configure tolerations for spot interruption taint, set a preStop hook that calls the model's /checkpoint endpoint (allowing 90 seconds grace), configure restartPolicy=OnFailure with backoffLimit=5. Add a Spot interruption handler DaemonSet using the AWS Node Termination Handler that detects the 2-minute termination notice and triggers the preStop hook early. Document the expected cost saving versus On-Demand."
+      "description": "Design a Spot-safe Kubernetes Job spec for the nightly fraud model training workload: Spot node selector and a toleration for the Spot taint of the NodePool, a preStop hook that calls the trainer's /checkpoint endpoint (terminationGracePeriodSeconds 90), restartPolicy=OnFailure with backoffLimit=5, and checkpoints on S3 or EFS. Configure interruption handling — Karpenter's built-in interruption queue, or the AWS Node Termination Handler with Cluster Autoscaler — so the node is drained as soon as the 2-minute notice arrives. Document the expected cost saving versus On-Demand."
     },
     {
       "id": "4",

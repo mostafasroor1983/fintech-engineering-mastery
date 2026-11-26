@@ -37,17 +37,22 @@ A **request** is the amount of CPU/memory the scheduler uses to find a node. A *
 
 | Setting | Effect |
 |---|---|
-| `requests.cpu` | Scheduler uses this for bin-packing; CFS quota proportional share |
-| `limits.cpu` | Container is CPU-throttled if it exceeds this |
-| `requests.memory` | Scheduler reservation; OOM killer considers this |
+| `requests.cpu` | Scheduler uses this for bin-packing; under contention, CPU time is shared in proportion to requests (cgroup CPU weight) |
+| `limits.cpu` | CFS quota: the container is throttled once it uses this much in a period |
+| `requests.memory` | Scheduler reservation; pods using more than their request are the first candidates for eviction under node memory pressure |
 | `limits.memory` | Container is OOM-killed if it exceeds this |
 
-For financial services, the golden rule is:
+For financial services, a sound starting rule is:
 
 ```
-requests = p50 steady-state usage
-limits.cpu = p99 burst (or omit to allow burstable)
-limits.memory = p99.9 usage + 20% headroom (OOM kill is fatal for in-flight transactions)
+requests.cpu    = p90–p95 of observed usage (p50 under-reserves: at peak the
+                  pod competes for CPU it never reserved)
+limits.cpu      = equal to the request (Guaranteed QoS, predictable), or
+                  omitted to allow bursting -- a low CPU limit throttles the
+                  JVM (GC, JIT threads) and shows up as latency spikes
+requests.memory = limits.memory
+limits.memory   = p99.9 usage + ~20% headroom (an OOM kill is fatal for
+                  in-flight transactions)
 ```
 
 ### Quality of Service Classes
@@ -60,7 +65,7 @@ Burstable:   requests < limits (or partial spec)
 BestEffort:  no requests/limits specified
 ```
 
-For payment services, always target **Guaranteed** QoS. This protects them from the OOM killer and gives them the highest scheduling priority during node pressure.
+For payment services, prefer **Guaranteed** QoS — or at least set memory request == limit. Guaranteed pods are the last to be evicted under node memory pressure and get the lowest OOM-kill score. QoS does **not** change scheduling order or preemption — that is what PriorityClass (section 5) is for. Some teams deliberately keep payment pods Burstable on CPU (no CPU limit) to avoid throttling; memory stays request == limit either way.
 
 ### Production Resource Spec for a Payment Service
 
@@ -90,22 +95,27 @@ spec:
         image: payments-registry.internal/payment-processor:v2.4.1
         resources:
           requests:
-            cpu: "500m"        # p50: 480m measured over 30 days
-            memory: "512Mi"    # p50: 490Mi
+            cpu: "500m"        # ~p95 of 30 days of measurements
+            memory: "1Gi"      # == limit: no memory overcommit
           limits:
-            cpu: "2000m"       # allow 4x burst for settlement spikes
-            memory: "1Gi"      # hard cap: OOM kill better than OOM node
+            cpu: "2000m"       # allow burst for settlement spikes (-> Burstable QoS;
+                               #  set cpu limit = request for Guaranteed)
+            memory: "1Gi"      # hard cap: OOM kill of the pod rather than an OOM node
+        startupProbe:              # covers JVM start-up, then hands over
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          periodSeconds: 5
+          failureThreshold: 30
         readinessProbe:
           httpGet:
             path: /actuator/health/readiness
             port: 8080
-          initialDelaySeconds: 10
           periodSeconds: 5
         livenessProbe:
           httpGet:
             path: /actuator/health/liveness
             port: 8080
-          initialDelaySeconds: 30
           periodSeconds: 10
 ```
 
@@ -122,6 +132,7 @@ metadata:
 spec:
   parallelism: 10
   completions: 100
+  backoffLimit: 6
   template:
     spec:
       restartPolicy: OnFailure
@@ -137,11 +148,13 @@ spec:
             memory: "6Gi"
         env:
         - name: JAVA_OPTS
-          value: "-Xms3g -Xmx5g -XX:+UseG1GC"
+          # heap max ~70% of the limit: the JVM also needs metaspace,
+          # thread stacks, code cache and direct buffers outside the heap
+          value: "-XX:MaxRAMPercentage=70 -XX:InitialRAMPercentage=50 -XX:+UseG1GC"
 ```
 
 > [!WARNING]
-> Never set `requests.memory` lower than your JVM `-Xms`. The JVM will allocate heap at startup, and if the container exceeds its memory request on a pressure node, it may be evicted mid-calculation — causing a data inconsistency in your risk ledger.
+> Never set `requests.memory` lower than what the JVM really uses — the heap (at least `-Xms`) plus non-heap memory. A container using more than its request is among the first evicted when the node runs short of memory, so the job can die mid-calculation. And keep `-Xmx` + non-heap below `limits.memory`, or the kernel OOM-kills the container. Make batch jobs restartable from checkpoints so a killed pod never leaves a half-written result in the risk ledger.
 
 ---
 
@@ -218,7 +231,7 @@ spec:
 
 ### Spreading Payment Services Across Zones
 
-For a 99.99% uptime SLA (52 minutes downtime per year), no single availability zone failure should take down the payment service. Pod anti-affinity enforces this:
+For a 99.99% uptime SLA (about 52 minutes of downtime per year), no single availability zone failure should take down the payment service. Pod anti-affinity can express this:
 
 ```yaml
 apiVersion: apps/v1
@@ -271,7 +284,7 @@ spec:
 ```
 
 > [!NOTE]
-> Using `requiredDuringScheduling` for hostname anti-affinity and `preferredDuringScheduling` for zone is deliberate. The hard node-level spread guarantees no single node is a SPOF. The soft zone spread is preferred but won't block scheduling if a zone is depleted — which matters during rolling updates.
+> Using `requiredDuringScheduling` for hostname anti-affinity and `preferredDuringScheduling` for zone is deliberate: the hard node-level rule guarantees no node holds two replicas, and the soft zone rule won't block scheduling if a zone is depleted. The price of the hard rule: you need at least as many eligible nodes as pods — including surge pods during a rolling update and HPA scale-out — or new pods stay Pending. Topology spread constraints (section 6) are usually the better tool for both levels.
 
 ### Co-locating Services for Latency
 
@@ -337,16 +350,18 @@ spec:
         operator: "Equal"
         value: "payments"
         effect: "NoSchedule"
-      # Tolerate temporary node NotReady (give 5 minutes before rescheduling)
+      # NotReady / unreachable tolerations: Kubernetes adds these with
+      # 300s automatically. Setting them explicitly lets you SHORTEN the
+      # wait -- e.g. 30-60s, so pods on a dead node move faster
       - key: "node.kubernetes.io/not-ready"
         operator: "Exists"
         effect: "NoExecute"
-        tolerationSeconds: 300
-      # Tolerate node unreachable (network partition tolerance)
+        tolerationSeconds: 60
+      # Node unreachable (e.g. network partition)
       - key: "node.kubernetes.io/unreachable"
         operator: "Exists"
         effect: "NoExecute"
-        tolerationSeconds: 300
+        tolerationSeconds: 60
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -376,7 +391,9 @@ spec:
 | `PreferNoSchedule` | Scheduler avoids the node but will use it if necessary |
 | `NoExecute` | Existing pods are evicted; new pods won't schedule |
 
-For dedicated payment nodes, use `NoSchedule`. Use `NoExecute` only when the node has a problem (e.g., disk pressure, memory pressure) — Kubernetes applies these taints automatically.
+For dedicated payment nodes, use `NoSchedule`. `NoExecute` evicts running pods, so use it with care — Kubernetes itself applies it automatically for node problems such as `not-ready` and `unreachable` (pressure conditions like memory or disk pressure get `NoSchedule` taints).
+
+Note that a taint only keeps *other* pods off the dedicated nodes; it does not pull the payment pods onto them. That is why the example combines the toleration with node affinity.
 
 ---
 
@@ -387,16 +404,14 @@ For dedicated payment nodes, use `NoSchedule`. Use `NoExecute` only when the nod
 When the cluster is full, a pod with higher priority can evict lower-priority pods to make room.
 
 ```yaml
----
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
 metadata:
   name: payment-critical
 value: 1000000
 globalDefault: false
-description: "Real-time payment processing — must never be preempted"
+description: "Real-time payment processing — highest user priority, preempts lower classes"
 preemptionPolicy: PreemptLowerPriority
-
 ---
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
@@ -406,17 +421,15 @@ value: 900000
 globalDefault: false
 description: "Settlement and reconciliation — high priority, may preempt batch"
 preemptionPolicy: PreemptLowerPriority
-
 ---
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
 metadata:
   name: batch-normal
 value: 500000
-globalDefault: true
+globalDefault: true      # pods without priorityClassName get this one
 description: "Batch jobs — default priority, preemptable"
 preemptionPolicy: PreemptLowerPriority
-
 ---
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
@@ -426,6 +439,8 @@ value: 100000
 globalDefault: false
 description: "Development/staging workloads — lowest priority"
 preemptionPolicy: Never
+# Values above 1,000,000,000 are reserved for system classes such as
+# system-cluster-critical -- keep application classes below that
 ```
 
 ### Applying PriorityClass to Deployments
@@ -460,7 +475,7 @@ spec:
 ```
 
 > [!WARNING]
-> Preemption causes brief service interruptions for the evicted pod. For risk calculation batch jobs with long-running checkpoints, combine PriorityClass with graceful shutdown handling so a preempted job saves state before exiting.
+> Preemption causes brief service interruptions for the evicted pod. For risk calculation batch jobs with long-running checkpoints, combine PriorityClass with graceful shutdown handling so a preempted job saves state before exiting. A PodDisruptionBudget on the victims is respected only on a best-effort basis during preemption.
 
 ---
 
@@ -527,7 +542,7 @@ For payment services with strict HA requirements, use `DoNotSchedule` for zone s
 
 ## 7. Vertical Pod Autoscaler (VPA) Recommendations
 
-VPA can automatically right-size resource requests. In financial platforms, run VPA in **Off** or **Initial** mode — never `Auto` on payment-critical pods — to avoid disruptive pod restarts during live transaction processing.
+VPA can automatically right-size resource requests. In financial platforms, run VPA in **Off** or **Initial** mode — never `Auto` on payment-critical pods — to avoid disruptive pod restarts during live transaction processing. Also do not let VPA act on CPU/memory of a Deployment that an HPA scales on the same metrics: the two controllers fight each other.
 
 ```yaml
 apiVersion: autoscaling.k8s.io/v1
@@ -631,7 +646,6 @@ spec:
 ## 9. Complete Production Example: Payment Processing Namespace
 
 ```yaml
----
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -641,7 +655,6 @@ metadata:
     compliance: pci-dss
     team: payments-platform
     cost-center: "CC-PAYMENTS-001"
-
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -679,12 +692,9 @@ spec:
               - key: compliance
                 operator: In
                 values: [pci-dss]
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-          - labelSelector:
-              matchLabels:
-                app: payment-processor
-            topologyKey: kubernetes.io/hostname
+      # Spread: zones strictly balanced, nodes as evenly as possible.
+      # (A required hostname anti-affinity would need 12 PCI nodes during
+      # a rollout: 9 replicas + 3 surge pods)
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: topology.kubernetes.io/zone
@@ -693,6 +703,12 @@ spec:
           matchLabels:
             app: payment-processor
         minDomains: 3
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: payment-processor
       terminationGracePeriodSeconds: 60
       containers:
       - name: payment-processor
@@ -702,32 +718,38 @@ spec:
           name: http
         resources:
           requests:
-            cpu: "500m"
-            memory: "512Mi"
+            cpu: "1000m"
+            memory: "1Gi"
           limits:
-            cpu: "2000m"
+            cpu: "1000m"      # requests == limits -> Guaranteed QoS
             memory: "1Gi"
         env:
         - name: JAVA_OPTS
-          value: "-Xms400m -Xmx800m -XX:+UseG1GC -XX:MaxGCPauseMillis=100"
+          # heap ~70% of the 1Gi limit; the rest for metaspace, threads,
+          # code cache and buffers (a fixed -Xmx800m in 1Gi risks OOM kills)
+          value: "-XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:MaxGCPauseMillis=100"
+        startupProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          periodSeconds: 5
+          failureThreshold: 30
         readinessProbe:
           httpGet:
             path: /actuator/health/readiness
             port: 8080
-          initialDelaySeconds: 15
           periodSeconds: 5
           failureThreshold: 3
         livenessProbe:
           httpGet:
             path: /actuator/health/liveness
             port: 8080
-          initialDelaySeconds: 30
           periodSeconds: 10
           failureThreshold: 3
         lifecycle:
           preStop:
-            exec:
-              command: ["/bin/sh", "-c", "sleep 15"]
+            sleep:              # native sleep action, Kubernetes 1.30+
+              seconds: 15
 ```
 
 ---
@@ -742,23 +764,24 @@ kubectl get pods -n payments -o wide \
 # Check which nodes are in which zones
 kubectl get nodes --label-columns=topology.kubernetes.io/zone
 
-# Verify no two replicas share a node
-kubectl get pods -n payments -o wide | awk '{print $7}' | sort | uniq -d
+# Find nodes running more than one replica (prints nothing if all differ)
+kubectl get pods -n payments -l app=payment-processor \
+  -o custom-columns=NODE:.spec.nodeName --no-headers | sort | uniq -d
 
 # If a pod is stuck Pending, describe shows scheduling failure reason
 kubectl describe pod payment-processor-xxx -n payments | grep -A 20 "Events:"
 
 # Verify ResourceQuota consumption
-kubectl describe resourcequota payments-quota -n payments
+kubectl describe resourcequota payments-namespace-quota -n payments
 ```
 
 ---
 
 ## Production Checklist
 
-- [ ] All payment-critical pods have explicit `requests` and `limits` (Guaranteed QoS)
-- [ ] JVM `-Xms` is lower than `requests.memory` with 20% headroom
-- [ ] Pod anti-affinity prevents same-node co-location of all replicas
+- [ ] All payment-critical pods have explicit `requests` and `limits`, memory request == limit (Guaranteed QoS where CPU throttling is acceptable)
+- [ ] JVM heap sized as a percentage of the limit (`MaxRAMPercentage`), leaving room for non-heap memory
+- [ ] Replicas spread across nodes (topology spread or anti-affinity) — with enough nodes for surge and scale-out
 - [ ] Topology spread constraints enforce cross-zone distribution
 - [ ] Critical workloads have `PriorityClass: payment-critical`
 - [ ] Dedicated PCI-DSS nodes are tainted; payment pods have matching tolerations
@@ -786,7 +809,7 @@ Kubernetes scheduling is a contract between your application and the cluster. Fo
         "Critical QoS — the memory limit being higher than the request gives it priority"
       ],
       "correct": 1,
-      "explanation": "A pod is Guaranteed only when requests == limits for every resource. When requests < limits (or only limits are set), the pod is Burstable. Under memory pressure, the kubelet evicts BestEffort pods first, then Burstable pods ordered by how far over their request they are consuming, and only evicts Guaranteed pods as a last resort. For payment-critical services, set requests == limits to achieve Guaranteed QoS and avoid eviction."
+      "explanation": "A pod is Guaranteed only when requests == limits for every resource in every container. When requests < limits (or only some are set), the pod is Burstable. Under node memory pressure, the kubelet first evicts pods whose usage exceeds their requests — BestEffort pods (request 0) and Burstable pods over their request — ranked by priority and by how far over the request they are. Guaranteed pods, and Burstable pods within their requests, are evicted only as a last resort. For payment-critical services, set memory request == limit (and CPU too for full Guaranteed QoS) to minimise eviction risk."
     },
     {
       "text": "A payment API deployment uses podAntiAffinity with requiredDuringSchedulingIgnoredDuringExecution to spread replicas across availability zones. A new replica is added but all AZs already have one replica each. What happens?",
@@ -804,11 +827,11 @@ Kubernetes scheduling is a contract between your application and the cluster. Fo
       "options": [
         "The monitoring agent does not need a toleration — NoSchedule only applies to new pods",
         "Add a toleration with key=pci-dss, value=true, effect=NoSchedule to the monitoring agent's pod spec so it can be scheduled onto PCI-DSS nodes",
-        "Use a DaemonSet for the monitoring agent — DaemonSets automatically bypass all taints",
+        "Use a DaemonSet for the monitoring agent — DaemonSets automatically tolerate all taints",
         "Remove the taint and use NetworkPolicy instead to isolate PCI-DSS workloads"
       ],
       "correct": 1,
-      "explanation": "NoSchedule taints prevent pods without a matching toleration from being scheduled on the node. The monitoring agent needs an explicit toleration matching the taint key, value, and effect to be eligible for scheduling on the PCI-DSS node. DaemonSets do NOT automatically bypass taints — they also require tolerations unless tolerationSeconds is set. The correct answer is to add the specific toleration. Note: for DaemonSets that must run on every node, adding operator=Exists tolerations can bypass all taints, but that is a broad permission."
+      "explanation": "NoSchedule taints prevent pods without a matching toleration from being scheduled on the node. The monitoring agent needs an explicit toleration matching the taint key, value and effect to be eligible for the PCI-DSS node. DaemonSets do NOT automatically tolerate custom taints: the DaemonSet controller only adds tolerations for built-in node conditions (not-ready, unreachable, disk/memory/PID pressure, unschedulable). For agents that must run on every node, a toleration with operator=Exists (no key) tolerates all taints — but that is a broad permission, so prefer listing the specific taints."
     }
   ]
 }
@@ -821,7 +844,7 @@ Kubernetes scheduling is a contract between your application and the cluster. Fo
   "estimatedMinutes": 45,
   "tasks": [
     "Create a Deployment for a payment-api with: Guaranteed QoS (requests == limits: 500m CPU, 512Mi memory), requiredDuringSchedulingIgnoredDuringExecution pod anti-affinity across availability zones using topology key topology.kubernetes.io/zone, and a node affinity rule preferring nodes with label workload-type=payment. Deploy 3 replicas across a 3-AZ cluster and verify each replica lands in a different AZ using kubectl get pods -o wide.",
-    "Define a PriorityClass named payment-critical with value 1000000 and globalDefault=false. Create a second PriorityClass named background-jobs with value 100. Apply payment-critical to the payment-api Deployment and background-jobs to a batch job. Simulate node memory pressure by deploying a memory-hungry pod and verify that the batch job pod is evicted before the payment-api pod.",
+    "Define a PriorityClass named payment-critical with value 1000000 and globalDefault=false. Create a second PriorityClass named background-jobs with value 100. Apply payment-critical to the payment-api Deployment and background-jobs to a batch job. Fill the cluster with the batch job until a new payment-api replica cannot be scheduled, then scale payment-api up and verify that the scheduler preempts a batch pod to make room.",
     "Configure a ResourceQuota for the payments namespace limiting: 10 CPU total requests, 20Gi memory total requests, 20 CPU total limits, 40Gi memory total limits, and a maximum of 20 pods. Write a test that attempts to deploy a 21st pod and verifies it is rejected with a ResourceQuota exceeded error message.",
     "Use kubectl top pods and VPA in Off mode to collect CPU and memory recommendations for the payment-api over 24 hours of simulated load. Compare VPA's recommended requests against the initial configured values, adjust the Deployment, and verify the pods achieve Guaranteed QoS with the new settings using kubectl describe pod."
   ]

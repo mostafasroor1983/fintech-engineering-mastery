@@ -21,7 +21,7 @@ prerequisites:
 
 # Database Partitioning — Range, Hash, and List Strategies
 
-A fintech transaction table that accumulates one billion rows over three years is not an edge case — it is the routine. A single monolithic PostgreSQL table at that scale produces three concrete problems: query plans must scan enormous B-tree indexes, `VACUUM` and `ANALYZE` run for hours locking out maintenance windows, and dropping old data requires a full table scan via `DELETE`. Declarative partitioning, introduced as a first-class feature in PostgreSQL 10 and significantly matured in PostgreSQL 12-15, solves all three by physically dividing the data into smaller child tables while presenting a single logical table to the application.
+A fintech transaction table that accumulates one billion rows over three years is not an edge case — it is the routine. A single monolithic PostgreSQL table at that scale produces three concrete problems: query plans must scan enormous B-tree indexes, `VACUUM` and `ANALYZE` run for hours and compete with production load, and dropping old data requires a full table scan via `DELETE`. Declarative partitioning, introduced as a first-class feature in PostgreSQL 10 and significantly matured in PostgreSQL 12-15, solves all three by physically dividing the data into smaller child tables while presenting a single logical table to the application.
 
 ---
 
@@ -31,7 +31,7 @@ Before reaching for partitioning, understand the three distinct problems it solv
 
 ### 1.1 Table Bloat and Index Size
 
-A B-tree index on a 1-billion-row table occupies 20-50 GB of RAM. Queries that cannot fit the index in `shared_buffers` perform physical I/O on every lookup. Partitioning splits the index across child tables — a query filtering by `transaction_date` only loads the index for that month's partition.
+A B-tree index on a 1-billion-row table can occupy 20-50 GB on disk. When the hot part of the index does not fit in memory (`shared_buffers` plus the OS page cache), lookups turn into physical I/O. Partitioning splits the index across child tables — a query filtering by `transaction_date` only loads the index for that month's partition.
 
 ### 1.2 Query Performance via Partition Pruning
 
@@ -68,7 +68,7 @@ Do you need to co-locate data by a categorical value (region, currency, status)?
 
 ## 3. Range Partitioning by Transaction Date
 
-Range partitioning is the most common strategy for fintech. Payment and transaction tables grow over time, queries most often filter by recent dates, and old data has predictable retention requirements (7 years for PCI-DSS compliance, then drop).
+Range partitioning is the most common strategy for fintech. Payment and transaction tables grow over time, queries most often filter by recent dates, and old data has predictable retention requirements (set by financial record-keeping and AML rules — often 5 to 7+ years depending on jurisdiction — then drop).
 
 ### 3.1 Create the Partitioned Parent Table
 
@@ -114,7 +114,10 @@ CREATE TABLE transactions_2024_12
     FOR VALUES FROM ('2024-12-01') TO ('2025-01-01');
 
 -- Default partition catches rows that do not match any explicit partition
--- Use this as a safety net; monitor it and move rows to proper partitions
+-- Use this as a safety net; monitor it and move rows to proper partitions.
+-- Caveats: creating a new partition must check the default partition (and
+-- FAILS if it already holds rows for the new range), and
+-- DETACH ... CONCURRENTLY is not allowed while a default partition exists.
 CREATE TABLE transactions_default
     PARTITION OF transactions
     DEFAULT;
@@ -152,20 +155,19 @@ WHERE account_id = 42
   AND transaction_date  < '2024-12-01';
 ```
 
-Expected output excerpt:
+Expected output excerpt (only ONE partition appears in the plan):
 
 ```
-Append  (cost=0.43..8.47 rows=3 width=24)
-  ->  Index Scan using transactions_2024_11_account_id_transaction_date_idx
-        on transactions_2024_11
-        Index Cond: ((account_id = 42) AND (transaction_date >= '2024-11-01')
-                     AND (transaction_date < '2024-12-01'))
-        Buffers: shared hit=4
-
-Partitions removed: 23 (of 24 partitions)
+Index Scan using transactions_2024_11_account_id_transaction_date_idx
+      on transactions_2024_11 transactions
+  Index Cond: ((account_id = 42) AND (transaction_date >= '2024-11-01'::date)
+               AND (transaction_date < '2024-12-01'::date))
+  Buffers: shared hit=4
 ```
 
-If you see `Partitions removed: 0`, the partition key is not in the WHERE clause, or you are using a function on the partition column (`WHERE DATE(created_at) = ...` disables pruning — use range predicates directly).
+Partitions pruned at plan time simply do not appear in the plan. When pruning happens at run time (for example with bind parameters in a generic prepared plan), the plan shows `Subplans Removed: N` under the `Append` node instead.
+
+If every partition appears in the plan, the partition key is not in the WHERE clause, or a function is applied to it (`WHERE EXTRACT(MONTH FROM transaction_date) = 11` disables pruning — use range predicates directly).
 
 ---
 
@@ -249,7 +251,7 @@ ORDER BY partition;
 
 ## 5. List Partitioning by Region
 
-List partitioning assigns specific values to specific partitions. The primary fintech use case is **data residency**: GDPR requires EU customer data to reside on EU servers, and PCI-DSS mandates certain data boundaries. With list partitioning, you can ensure EU transactions never land in a US partition.
+List partitioning assigns specific values to specific partitions. Typical fintech uses are per-region operations (different retention, maintenance windows or batch jobs per region) and keeping regional data separable. Note on **data residency**: GDPR does not require EU data to be stored in the EU — it restricts *transfers* outside the EEA (adequacy decisions, standard contractual clauses). Some national or sector rules and customer contracts do require local storage; PCI DSS has no data-location rule.
 
 ### 5.1 Create List-Partitioned Table
 
@@ -291,20 +293,18 @@ CREATE TABLE customer_profiles_other
     DEFAULT;
 ```
 
-### 5.3 Tablespace Routing for Data Residency
+### 5.3 Tablespaces Are Not Data Residency
 
-Combine list partitioning with tablespaces to enforce physical data location:
+A tablespace is just a directory on the **same database server**. You can put partitions on different disks (for example, old partitions on cheaper storage), but you cannot place one partition of a table in another data centre: mounting remote storage for PostgreSQL data files is unsafe, and the server, its WAL, backups and replicas would still be in one place.
 
 ```sql
--- Create tablespaces pointing to storage in different datacentres
--- (tablespaces are created by the DBA with appropriate mount points)
-CREATE TABLESPACE eu_storage LOCATION '/mnt/eu-datacentre/pgdata';
-CREATE TABLESPACE us_storage LOCATION '/mnt/us-datacentre/pgdata';
-
--- Assign partitions to tablespaces
-ALTER TABLE customer_profiles_eu SET TABLESPACE eu_storage;
-ALTER TABLE customer_profiles_us SET TABLESPACE us_storage;
+-- Legitimate use: move cold partitions to cheaper local storage
+CREATE TABLESPACE archive_storage LOCATION '/mnt/archive-disk/pgdata';
+ALTER TABLE transactions_2021_01 SET TABLESPACE archive_storage;
+-- (SET TABLESPACE rewrites the table under an ACCESS EXCLUSIVE lock)
 ```
+
+When data really must stay in a country or region, run a **separate database cluster in that region** (with its own replicas and backups) and route customers to it in the application layer.
 
 ---
 
@@ -323,19 +323,19 @@ CREATE TABLE transactions_2025_01
 
 ### 6.2 Detaching a Partition for Archival
 
-DETACH makes the child table a standalone table instantly (atomic metadata change). It does not block the parent table for writes.
+DETACH makes the child table a standalone table (a metadata change). A plain `DETACH PARTITION` takes an `ACCESS EXCLUSIVE` lock on the parent — brief, but it blocks queries while it waits. `DETACH ... CONCURRENTLY` (PostgreSQL 14+) avoids that, but it cannot run inside a transaction block and is not allowed while the table has a default partition.
 
 ```sql
--- Step 1: Detach (non-blocking, instantaneous)
+-- Step 1: Detach (PostgreSQL 14+, no default partition on the table)
 ALTER TABLE transactions
     DETACH PARTITION transactions_2021_01 CONCURRENTLY;
 
--- PostgreSQL 14+ supports CONCURRENTLY — detach without blocking reads
--- PostgreSQL < 14 blocks briefly for the catalog update
+-- Without CONCURRENTLY (or before PostgreSQL 14) the detach takes a
+-- brief ACCESS EXCLUSIVE lock on the parent -- set a lock_timeout
 
 -- Step 2: Verify data, then archive or drop
 -- Archive to cold storage (export to Parquet/S3 first if needed)
-DROP TABLE transactions_2021_01;  -- Instantaneous, no bloat, no WAL
+DROP TABLE transactions_2021_01;  -- Near-instant, no bloat, minimal WAL
 ```
 
 ### 6.3 Attaching an Existing Table as a Partition
@@ -362,7 +362,8 @@ ALTER TABLE transactions_2019_legacy
     CHECK (transaction_date >= '2019-01-01' AND transaction_date < '2020-01-01')
     NOT VALID;
 
--- Validate without full lock
+-- Validate: this DOES scan the table, but with a weaker lock
+-- (SHARE UPDATE EXCLUSIVE), so normal reads and writes continue
 ALTER TABLE transactions_2019_legacy VALIDATE CONSTRAINT chk_date;
 
 -- Now attach without rescan (PostgreSQL trusts the validated constraint)
@@ -381,15 +382,18 @@ Manual partition creation is error-prone in production. `pg_partman` is a Postgr
 
 ```sql
 -- Install extension (requires pg_partman to be installed on the OS)
--- Ubuntu/Debian: apt install postgresql-15-partman
+-- Ubuntu/Debian: apt install postgresql-16-partman
+CREATE SCHEMA IF NOT EXISTS partman;
 CREATE EXTENSION pg_partman SCHEMA partman;
 ```
 
 ### 7.2 Configure Auto-Management
 
 ```sql
--- Set up pg_partman to manage the transactions table
--- Creates monthly partitions, premake=4 means create 4 future partitions in advance
+-- Set up pg_partman (5.x syntax) to manage the transactions table
+-- Creates monthly partitions, premake=4 means create 4 future partitions in advance.
+-- pg_partman also creates its own default partition by default -- do not
+-- create a second one by hand.
 SELECT partman.create_parent(
     p_parent_table   => 'public.transactions',
     p_control        => 'transaction_date',
@@ -462,7 +466,9 @@ PostgreSQL can query partitions in parallel using `max_parallel_workers_per_gath
 -- Enable parallel query for cross-partition aggregation
 SET max_parallel_workers_per_gather = 8;
 
--- This now launches 8 parallel workers, each scanning a subset of partitions
+-- The planner may now use up to 8 workers (also limited by
+-- max_parallel_workers and max_worker_processes), e.g. a Parallel Append
+-- that spreads partitions across workers
 SELECT
     DATE_TRUNC('month', transaction_date) AS month,
     SUM(amount_cents) AS total_volume,
@@ -532,43 +538,41 @@ END;
 $$;
 ```
 
-Also configure pg_partman with `p_premake = 4` and schedule `run_maintenance()` to run every hour, not once a day.
+Also configure pg_partman with `p_premake = 4` and schedule `run_maintenance()` to run every hour, not once a day. Remember: once rows sit in the default partition, creating the matching named partition fails until you move those rows out — so alert early.
 
 ---
 
-### Pitfall 2: Partition Key Not In WHERE Clause Disables Pruning
+### Pitfall 2: Functions on the Partition Key (or the Wrong Column) Disable Pruning
 
-**The problem:** Applying a function to the partition column prevents the planner from evaluating partition bounds at plan time. The result is a full scan across all partitions.
+**The problem:** Pruning only works on the partition key itself, used directly. Applying a function to it — or filtering on another column such as `created_at` when the table is partitioned by `transaction_date` — means the planner cannot rule partitions out. The result is a scan across all partitions.
 
 **Failing example:**
 
 ```sql
--- BAD: DATE() function applied to partition key — pruning disabled
+-- BAD: function applied to the partition key — pruning disabled
 EXPLAIN SELECT * FROM transactions
-WHERE DATE(created_at) = '2024-11-15';
+WHERE EXTRACT(MONTH FROM transaction_date) = 11
+  AND EXTRACT(YEAR  FROM transaction_date) = 2024;
 
 -- Result: Append (all 36 partitions scanned)
+
+-- ALSO BAD: created_at is not the partition key
+EXPLAIN SELECT * FROM transactions
+WHERE created_at >= '2024-11-15' AND created_at < '2024-11-16';
 ```
 
 **Correct approach:**
 
 ```sql
--- GOOD: Use a range predicate directly on the partition column
+-- GOOD: a range predicate directly on the partition column
 EXPLAIN SELECT * FROM transactions
-WHERE created_at >= '2024-11-15 00:00:00'
-  AND created_at  < '2024-11-16 00:00:00';
+WHERE transaction_date >= '2024-11-01'
+  AND transaction_date  < '2024-12-01';
 
--- Result: Append (1 partition scanned — transactions_2024_11)
+-- Result: only transactions_2024_11 is scanned
 ```
 
-This applies to all function calls: `EXTRACT(YEAR FROM ...)`, `TO_CHAR(...)`, `CAST(... AS DATE)`. Always use direct range predicates. If your application generates queries with function wrappers (e.g., via ORM), add a generated column:
-
-```sql
--- Add a generated column for the date part (can be indexed, used in partitioning)
-ALTER TABLE transactions
-    ADD COLUMN transaction_date_col DATE
-    GENERATED ALWAYS AS (created_at::date) STORED;
-```
+This applies to all function calls: `EXTRACT(YEAR FROM ...)`, `TO_CHAR(...)`, `CAST(... AS DATE)`. Always use direct range predicates on the partition key. If an ORM or report tool generates function-wrapped filters, fix the query generation — and if users mostly search by another timestamp, add the partition-key range to those queries too (for example `transaction_date` between the day before and the day after).
 
 ---
 
@@ -609,30 +613,35 @@ CREATE TABLE transaction_idempotency (
 -- This separates uniqueness enforcement from bulk storage.
 ```
 
-Application-level approach using the lookup table:
+Application-level approach using the lookup table — claim the key **first**, so two concurrent duplicates cannot both get through:
 
 ```java
 @Transactional
 public PaymentResult submitPayment(PaymentRequest request) {
-    // Check idempotency (non-partitioned table — global unique constraint works)
-    Optional<TransactionIdempotency> existing =
-        idempotencyRepository.findByKey(request.idempotencyKey());
+    long transactionId = transactionRepository.nextId();   // from the sequence
 
-    if (existing.isPresent()) {
-        return PaymentResult.duplicate(existing.get().transactionId());
+    // 1) Claim the idempotency key FIRST (non-partitioned table, so the
+    //    global UNIQUE constraint works):
+    //    INSERT INTO transaction_idempotency (idempotency_key, transaction_id)
+    //    VALUES (?, ?) ON CONFLICT (idempotency_key) DO NOTHING
+    //    A concurrent duplicate waits on the unique index until we commit,
+    //    then inserts nothing.
+    boolean claimed = idempotencyRepository.insertIfAbsent(
+        request.idempotencyKey(), transactionId);
+
+    if (!claimed) {
+        // Duplicate: return the ORIGINAL result (and, ideally, check that the
+        // request body matches the original -- same key + different payload
+        // is a client error)
+        return PaymentResult.duplicate(
+            idempotencyRepository.findTransactionId(request.idempotencyKey()));
     }
 
-    // Insert to partitioned table
-    Transaction transaction = transactionRepository.save(
-        Transaction.from(request)
-    );
+    // 2) Insert into the partitioned table -- same transaction, so if this
+    //    fails, the claimed key is rolled back too
+    transactionRepository.insert(Transaction.from(request, transactionId));
 
-    // Record idempotency key (may throw DataIntegrityViolationException on race)
-    idempotencyRepository.save(new TransactionIdempotency(
-        request.idempotencyKey(), transaction.getId()
-    ));
-
-    return PaymentResult.created(transaction.getId());
+    return PaymentResult.created(transactionId);
 }
 ```
 
@@ -647,8 +656,8 @@ public PaymentResult submitPayment(PaymentRequest request) {
 - [ ] pg_partman configured with `p_premake >= 4` to create future partitions in advance
 - [ ] `run_maintenance()` scheduled hourly (not daily) to avoid boundary gaps
 - [ ] All query templates use direct range predicates on partition columns (no functions)
-- [ ] `EXPLAIN` output verified to show `Partitions removed: N` for time-range queries
-- [ ] Partition detach uses `CONCURRENTLY` flag (PostgreSQL 14+) to avoid blocking
+- [ ] `EXPLAIN` output verified to show only the expected partitions (or `Subplans Removed: N` for run-time pruning) for time-range queries
+- [ ] Partition detach uses `CONCURRENTLY` (PostgreSQL 14+, no default partition) or a short `lock_timeout` to avoid blocking
 - [ ] Retention policy documented and automated (retention column in `part_config`)
 - [ ] Foreign keys include partition key
 - [ ] Global uniqueness requirements handled via separate non-partitioned lookup table
@@ -657,6 +666,6 @@ public PaymentResult submitPayment(PaymentRequest request) {
 
 ---
 
-<!-- KNOWLEDGE-CHECK {"questions":[{"text":"You run EXPLAIN on a query filtering by transaction_date and see 'Partitions removed: 0 out of 36'. What is the most likely cause?","options":["The table has no indexes","The partition key column is wrapped in a function (e.g., DATE(created_at)) in the WHERE clause","The query is a cross-partition aggregate","PostgreSQL version is older than 10"],"correct":1,"explanation":"Partition pruning requires the query predicate to reference the partition key column directly in a form the planner can evaluate at plan time. Applying a function such as DATE(), EXTRACT(), or TO_CHAR() to the partition key forces a sequential scan of all partitions because the planner cannot determine which partitions satisfy a function expression. Always use direct range predicates: WHERE created_at >= '2024-11-01' AND created_at < '2024-12-01'."},{"text":"Why must the primary key of a partitioned table include the partition key column?","options":["PostgreSQL requires it because unique indexes cannot span partition boundaries","It improves partition pruning performance","It is required only for hash-partitioned tables","It is a recommendation, not a hard requirement"],"correct":0,"explanation":"PostgreSQL enforces that any unique index (including the primary key) on a partitioned table must include the partition key. This is because PostgreSQL implements uniqueness per-partition: without the partition key, a row in partition A and a row in partition B could have identical values for the unique column, and PostgreSQL cannot prevent it without a global index (which does not exist for partitioned tables). If you need global uniqueness on a non-partition-key column, use a separate non-partitioned lookup table."},{"text":"What is the operationally safe way to remove old data from a range-partitioned table in PostgreSQL?","options":["DELETE FROM transactions WHERE transaction_date < '2021-01-01'","TRUNCATE TABLE transactions WHERE transaction_date < '2021-01-01'","ALTER TABLE transactions DETACH PARTITION transactions_2020_12 CONCURRENTLY, then DROP TABLE transactions_2020_12","UPDATE transactions SET deleted = true WHERE transaction_date < '2021-01-01'"],"correct":2,"explanation":"DETACH PARTITION followed by DROP TABLE is the correct approach. DETACH is a metadata operation — it is nearly instantaneous and (with CONCURRENTLY in PostgreSQL 14+) does not block concurrent reads or writes on the parent table. DROP TABLE on the detached child is also instantaneous and generates minimal WAL. In contrast, DELETE scans every old row, generates massive WAL, creates dead tuple bloat requiring VACUUM, and can lock up the table under heavy load. TRUNCATE ... WHERE is not valid SQL."}]} -->
+<!-- KNOWLEDGE-CHECK {"questions": [{"text": "A table is range-partitioned by transaction_date. You run EXPLAIN on a query that should hit one month and see all 36 partitions in the plan. What is the most likely cause?", "options": ["The table has no indexes", "The partition key is wrapped in a function in the WHERE clause (e.g. EXTRACT(MONTH FROM transaction_date) = 11), or the query filters on another column such as created_at", "The query is a cross-partition aggregate", "PostgreSQL version is older than 10"], "correct": 1, "explanation": "Partition pruning requires the query predicate to use the partition key column directly, in a form the planner can compare with the partition bounds. Applying a function such as EXTRACT(), TO_CHAR() or a cast to the partition key — or filtering only on a different column — means the planner cannot tell which partitions can match, so it must scan them all. Always use direct range predicates: WHERE transaction_date >= '2024-11-01' AND transaction_date < '2024-12-01'."}, {"text": "Why must the primary key of a partitioned table include the partition key column?", "options": ["PostgreSQL requires it because unique indexes cannot span partition boundaries", "It improves partition pruning performance", "It is required only for hash-partitioned tables", "It is a recommendation, not a hard requirement"], "correct": 0, "explanation": "PostgreSQL enforces that any unique index (including the primary key) on a partitioned table must include the partition key. This is because PostgreSQL implements uniqueness per-partition: without the partition key, a row in partition A and a row in partition B could have identical values for the unique column, and PostgreSQL cannot prevent it without a global index (which does not exist for partitioned tables). If you need global uniqueness on a non-partition-key column, use a separate non-partitioned lookup table."}, {"text": "What is the operationally safe way to remove old data from a range-partitioned table in PostgreSQL?", "options": ["DELETE FROM transactions WHERE transaction_date < '2021-01-01'", "TRUNCATE TABLE transactions WHERE transaction_date < '2021-01-01'", "ALTER TABLE transactions DETACH PARTITION transactions_2020_12 CONCURRENTLY, then DROP TABLE transactions_2020_12", "UPDATE transactions SET deleted = true WHERE transaction_date < '2021-01-01'"], "correct": 2, "explanation": "DETACH PARTITION followed by DROP TABLE is the correct approach. DETACH is a metadata operation; with CONCURRENTLY (PostgreSQL 14+, and only when the table has no default partition) it does not block concurrent reads or writes on the parent — otherwise it needs a brief ACCESS EXCLUSIVE lock. DROP TABLE on the detached child is near-instant and generates minimal WAL. In contrast, DELETE touches every old row, generates massive WAL, creates dead-tuple bloat requiring VACUUM, and competes with production load. TRUNCATE ... WHERE is not valid SQL."}]} -->
 
 <!-- PRACTICAL-CHALLENGE {"title":"PostgreSQL Partitioning Implementation","difficulty":"advanced","estimatedMinutes":90,"tasks":[{"id":"task-1","description":"Create a range-partitioned transactions table partitioned by transaction_date (DATE type). Create 12 monthly partitions for 2024, a default partition, and a composite index on (account_id, transaction_date). Run EXPLAIN ANALYZE on a query filtering for a single month and confirm that the output shows all other partitions removed. Document the EXPLAIN output in a comment in your SQL file."},{"id":"task-2","description":"Create a hash-partitioned account_balances table partitioned by account_id with 8 partitions. Insert 100,000 rows with randomly distributed account IDs (1 to 1,000,000). Run the distribution verification query and confirm that no partition has more than 15,000 more rows than any other partition. Record the row counts in a SQL comment."},{"id":"task-3","description":"Demonstrate the global uniqueness pitfall: attempt to create a unique index on transactions(reference) without including transaction_date and document the exact PostgreSQL error message. Then implement the two-table solution (transaction_idempotency lookup table + partitioned transactions table). Write a Java @Transactional method that inserts to both tables and handles DataIntegrityViolationException as a duplicate payment signal."},{"id":"task-4","description":"Install pg_partman (or simulate its logic with a PL/pgSQL function) and configure automated monthly partition creation for the transactions table with 4 months premake and 7-year retention. Write a SQL query that counts rows in the default partition and raises a WARNING if the count exceeds 500. Schedule it using pg_cron or document the cron expression that should be used to run run_maintenance() hourly."}]} -->

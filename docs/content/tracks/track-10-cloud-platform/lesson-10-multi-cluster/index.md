@@ -61,11 +61,13 @@ curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.6.0/
   -o /usr/local/bin/clusterctl
 chmod +x /usr/local/bin/clusterctl
 
-# Initialize management cluster with AWS provider
+# Initialize management cluster with the AWS provider (CAPA).
+# Use short-lived credentials (SSO / assumed role), never long-lived keys;
+# clusterawsadm encodes them for the provider
 export AWS_REGION=us-east-1
-export AWS_ACCESS_KEY_ID=<access-key>
-export AWS_SECRET_ACCESS_KEY=<secret-key>
-export AWS_SESSION_TOKEN=<session-token>  # if using STS
+clusterawsadm bootstrap iam create-cloudformation-stack   # IAM roles, once per account
+export AWS_B64ENCODED_CREDENTIALS=$(clusterawsadm bootstrap credentials encode-as-profile)
+export EKS=true                                           # enable EKS support
 
 clusterctl init --infrastructure aws
 ```
@@ -106,7 +108,8 @@ metadata:
   namespace: payment-clusters
 spec:
   region: us-east-1
-  version: v1.29.0
+  version: v1.33   # keep within EKS standard support -- older versions
+                   # move to (paid) extended support
   # EKS managed control plane
   eksClusterName: payment-prod-us-east-1
   # Enable private endpoint (security requirement for fintech)
@@ -116,8 +119,9 @@ spec:
     publicCIDRs: []
   # Enable envelope encryption for secrets with KMS
   encryptionConfig:
-    - resources: ["secrets"]
-      provider: "arn:aws:kms:us-east-1:123456789:key/eks-key"
+    resources: ["secrets"]
+    provider: "arn:aws:kms:us-east-1:123456789:key/eks-key"
+  # Add-on versions must match the Kubernetes version (illustrative values)
   addons:
     - name: vpc-cni
       version: v1.16.0
@@ -159,8 +163,9 @@ spec:
     maxSize: 50
   # Spread across all 3 AZs
   availabilityZones: [us-east-1a, us-east-1b, us-east-1c]
-  # Use latest EKS-optimized AMI
-  amiType: AL2_x86_64
+  # EKS-optimized Amazon Linux 2023 (Amazon Linux 2 AMIs are not
+  # provided for EKS 1.33+)
+  amiType: AL2023_x86_64_STANDARD
   # Disk
   diskSize: 100
   # Labels applied to all nodes
@@ -215,6 +220,7 @@ metadata:
 spec:
   generators:
     # Cluster generator: create one Application per registered cluster
+    # (the labels are set on the cluster's Secret in the argocd namespace)
     - clusters:
         selector:
           matchLabels:
@@ -322,14 +328,21 @@ AWS Global Accelerator for multi-cluster payment routing:
   (primary)             (DR standby)        (EU only)
 
 Traffic routing:
-  - us-east-1: 100% weight (primary active)
-  - us-west-2: 0% weight (DR standby — switched during failover)
-  - eu-west-1: 100% weight (EU-only traffic via geo-routing)
+  - Global Accelerator sends each client to the NEAREST healthy endpoint
+    group (by network proximity), weighted by the traffic dial
+  - us-east-1: dial 100% (primary active)
+  - us-west-2: dial 0% (DR standby). A dial of 0 means NO traffic, even if
+    us-east-1 fails -- failover is the explicit dial change in the script
+    below. For automatic failover, keep the DR dial above 0 and accept
+    that some nearby clients are served from us-west-2.
+  - eu-west-1: served under its OWN hostname / accelerator (api-eu...).
+    Proximity routing is not geo-fencing: if the EU group failed, a shared
+    accelerator would send EU clients to the US -- a data-residency breach
 
 Failover:
-  - Global Accelerator health checks every 30 seconds
-  - Automatic failover to us-west-2 if us-east-1 health checks fail
-  - Manual failover: update us-west-2 weight to 100 via AWS Console/API
+  - For NLB/ALB endpoints, GA uses the load balancer's target health;
+    detection takes roughly interval x threshold (e.g. 10s x 3 = 30s)
+  - Manual / scripted failover: set the us-west-2 dial to 100%
 ```
 
 ```bash
@@ -361,25 +374,31 @@ aws globalaccelerator create-endpoint-group \
 
 ### Cloudflare Load Balancing (Alternative)
 
-```yaml
+```hcl
 # Cloudflare Load Balancer for payment API
-# Managed via Terraform
+# Managed via Terraform (Cloudflare provider v4 syntax; v5 changed the schema)
 resource "cloudflare_load_balancer" "payment_api" {
   zone_id          = var.cloudflare_zone_id
   name             = "api.payments.fintech.com"
   default_pool_ids = [cloudflare_load_balancer_pool.us_east_1.id]
   fallback_pool_id = cloudflare_load_balancer_pool.us_west_2.id
 
-  # Route EU traffic to EU cluster
+  # Route European traffic to the EU cluster. Cloudflare regions are
+  # geographic codes (WEU = Western Europe, EEU = Eastern Europe) -- not the
+  # legal EEA; enforce residency by customer, not only by client location
   region_pools {
-    region   = "EEA"
+    region   = "WEU"
+    pool_ids = [cloudflare_load_balancer_pool.eu_west_1.id]
+  }
+  region_pools {
+    region   = "EEU"
     pool_ids = [cloudflare_load_balancer_pool.eu_west_1.id]
   }
 
   # Steering: geo-based routing
   steering_policy = "geo"
 
-  # Health checks every 30 seconds
+  # Health checks are defined in the monitor referenced by each pool
   session_affinity = "none"
   proxied          = true  # Cloudflare proxies traffic (DDoS protection)
 }
@@ -404,7 +423,7 @@ resource "cloudflare_load_balancer_pool" "us_east_1" {
 
 ## Service Discovery Across Clusters
 
-Services in different clusters cannot use standard Kubernetes DNS to find each other. You need a cross-cluster service discovery mechanism.
+Services in different clusters cannot use standard Kubernetes DNS to find each other. You need a cross-cluster service discovery mechanism. The Kubernetes **Multi-Cluster Services (MCS) API** standardises this: a service is exported with a `ServiceExport` and becomes reachable from the other clusters as `<service>.<namespace>.svc.clusterset.local`. Submariner (below), Cilium Cluster Mesh, Istio multi-cluster and cloud offerings implement such cross-cluster discovery. Pod and Service CIDRs must not overlap between connected clusters (or a translation layer such as Submariner Globalnet is needed).
 
 ### Submariner for Cross-Cluster Service Discovery
 
@@ -415,15 +434,18 @@ subctl deploy-broker --kubeconfig ~/.kube/management.yaml
 # Join us-east-1 cluster
 subctl join broker-info.subm --clusterid us-east-1 \
   --kubeconfig ~/.kube/payment-prod-us-east-1.yaml \
-  --natt=false  # VPN not needed within AWS
+  --natt=false  # no NAT traversal needed between VPCs with private routing
+                # (traffic still runs through encrypted IPsec/WireGuard tunnels)
 
 # Join eu-west-1 cluster
 subctl join broker-info.subm --clusterid eu-west-1 \
   --kubeconfig ~/.kube/payment-prod-eu-west-1.yaml
 
-# Export a service from eu-west-1 to other clusters
-# After this, eu services can be accessed as:
-# payment-api.payments.svc.eu-west-1.local from other clusters
+# Export a service from eu-west-1 to other clusters.
+# After this, other clusters reach it as
+#   payment-api.payments.svc.clusterset.local            (any exporting cluster)
+#   eu-west-1.payment-api.payments.svc.clusterset.local  (this cluster only)
+# Think twice before exporting EU services to non-EU clusters at all
 kubectl apply -f - --kubeconfig ~/.kube/payment-prod-eu-west-1.yaml <<EOF
 apiVersion: multicluster.x-k8s.io/v1alpha1
 kind: ServiceExport
@@ -574,12 +596,16 @@ aws globalaccelerator update-endpoint-group \
 
 echo "Traffic shifted: us-west-2 = 100%, us-east-1 = 0%"
 
-# Step 3: Update DNS TTLs (Cloudflare or Route53)
-# Global Accelerator handles this automatically via health checks
+# Step 3: Data tier -- traffic alone is not a failover. Promote the DR
+# database (e.g. Aurora Global Database failover / replica promotion) and
+# FENCE the old primary so it cannot accept writes (avoid split brain).
+# Usually this step runs BEFORE the traffic shift; it is the slow, risky part.
 
-# Step 4: Notify operations team
+# Step 4: Notify operations team -- via the DR region: when us-east-1 is
+# down, an SNS topic in us-east-1 may be unreachable too
 aws sns publish \
-  --topic-arn arn:aws:sns:us-east-1:123456789:payment-incidents \
+  --region "$DR_REGION" \
+  --topic-arn arn:aws:sns:us-west-2:123456789:payment-incidents \
   --message "PAYMENT FAILOVER COMPLETE: Traffic now routing to $DR_REGION. Primary region $PRIMARY_REGION is offline." \
   --subject "CRITICAL: Payment Platform Failover Activated"
 
@@ -637,7 +663,7 @@ spec:
 
 3. **GDPR data residency is an application concern, not just infrastructure** — geo-routing gets EU traffic to the EU cluster, but application code must enforce that EU customer data never crosses the network to a non-EU database. Build data residency checks into your service layer with alerting on violations.
 
-4. **Global Accelerator is worth the cost for payment APIs** — anycast routing means clients connect to the nearest AWS PoP (not your data center directly), reducing round-trip time. Health checks and automatic failover happen in <30 seconds. For a payment API, this is table stakes.
+4. **Global Accelerator is worth the cost for payment APIs** — anycast routing means clients connect to the nearest AWS edge location and then travel over the AWS backbone, reducing round-trip time; and failover does not depend on clients refreshing DNS caches. Failure detection takes roughly health-check interval × threshold (tens of seconds). Remember that proximity routing is not data-residency enforcement.
 
 5. **ApplicationSet is the right ArgoCD primitive for multi-cluster** — it generates one Application per cluster using a single template. When you add a new cluster, ArgoCD automatically deploys all applications. No manual application creation required.
 
@@ -648,21 +674,36 @@ spec:
   "questions": [
     {
       "text": "An ArgoCD ApplicationSet uses a ClusterGenerator to deploy the payment-api application to 5 clusters. A new cluster is added to the fleet and registered in ArgoCD. Without any manual intervention, what does ArgoCD do?",
-      "options": ["Nothing; ArgoCD requires a manual sync after adding a new cluster to an ApplicationSet", "ArgoCD automatically generates a new Application resource for the new cluster based on the ApplicationSet template and syncs the payment-api to it", "ArgoCD requires the ApplicationSet to be deleted and recreated to pick up the new cluster", "ArgoCD sends a notification but waits for a human to approve deployment to the new cluster"],
+      "options": [
+        "Nothing; ArgoCD requires a manual sync after adding a new cluster to an ApplicationSet",
+        "ArgoCD automatically generates a new Application resource for the new cluster based on the ApplicationSet template and syncs the payment-api to it",
+        "ArgoCD requires the ApplicationSet to be deleted and recreated to pick up the new cluster",
+        "ArgoCD sends a notification but waits for a human to approve deployment to the new cluster"
+      ],
       "correct": 1,
       "explanation": "ApplicationSet is designed for fleet management: when a new cluster matches the ClusterGenerator's selector (e.g., a label like env=production), ArgoCD automatically creates a new Application instance using the template parameters populated with the new cluster's details. This is the core value proposition — adding a cluster to the fleet automatically inherits all application deployments without manual Application creation."
     },
     {
       "text": "A payment platform has GDPR requirements that EU customer data must never be stored in non-EU regions. The platform uses a multi-cluster setup with an EU cluster and a US cluster. Geo-routing sends EU traffic to the EU cluster. Is geo-routing alone sufficient to satisfy the GDPR data residency requirement?",
-      "options": ["Yes, if AWS Global Accelerator correctly routes EU IP addresses to the EU cluster, no EU data can reach the US cluster", "No, geo-routing ensures EU requests are served by the EU cluster but does not prevent the application from making cross-cluster database calls or caching EU data in US-region services; application-layer data residency enforcement is also required", "Yes, as long as the EU cluster uses a separate VPC that cannot communicate with the US cluster", "No, GDPR requires data to be stored in the country of the customer, not just the EU region"],
+      "options": [
+        "Yes, if AWS Global Accelerator correctly routes EU IP addresses to the EU cluster, no EU data can reach the US cluster",
+        "No, geo-routing ensures EU requests are served by the EU cluster but does not prevent the application from making cross-cluster database calls or caching EU data in US-region services; application-layer data residency enforcement is also required",
+        "Yes, as long as the EU cluster uses a separate VPC that cannot communicate with the US cluster",
+        "No, GDPR requires data to be stored in the country of the customer, not just the EU region"
+      ],
       "correct": 1,
       "explanation": "Geo-routing is a network-layer control that routes incoming HTTP requests to the nearest cluster based on IP geolocation. It does not prevent the application code on the EU cluster from making API calls to US-region services, writing to a shared US database, or caching data in a US-region Redis. True data residency compliance requires application-layer enforcement: service-to-service calls must include a region header, database writes must check the data's region label, and monitoring must alert on cross-region data flow violations."
     },
     {
       "text": "A multi-cluster Kubernetes platform uses Submariner for cross-cluster service discovery. Service A in cluster-eu needs to call Service B in cluster-us. What DNS name does Service A use to reach Service B via Submariner?",
-      "options": ["The ClusterIP of Service B in cluster-us, obtained from a shared service registry", "service-b.namespace.svc.cluster-us.local using Submariner's cross-cluster DNS suffix format", "The external LoadBalancer IP of Service B in cluster-us", "An Istio ServiceEntry must be created manually; Submariner does not support DNS-based cross-cluster discovery"],
+      "options": [
+        "The ClusterIP of Service B in cluster-us, obtained from a shared service registry",
+        "service-b.namespace.svc.clusterset.local — the Multi-Cluster Services DNS name, available after Service B is exported with a ServiceExport (cluster-us.service-b.namespace.svc.clusterset.local targets that cluster specifically)",
+        "The external LoadBalancer IP of Service B in cluster-us",
+        "An Istio ServiceEntry must be created manually; Submariner does not support DNS-based cross-cluster discovery"
+      ],
       "correct": 1,
-      "explanation": "Submariner extends Kubernetes DNS to support cross-cluster service discovery using the format service-name.namespace.svc.cluster-name.local. When Service A resolves this DNS name, the Submariner lighthouse DNS plugin intercepts the request and returns the ClusterIP of the exported ServiceImport in cluster-eu, which Submariner's route agent tunnels to the actual pod in cluster-us. This abstracts the cross-cluster networking complexity behind standard Kubernetes DNS semantics."
+      "explanation": "Submariner implements the Kubernetes Multi-Cluster Services API. Once Service B is exported in cluster-us with a ServiceExport, Submariner's Lighthouse component creates a ServiceImport in the connected clusters and answers DNS queries for service-b.namespace.svc.clusterset.local (or cluster-us.service-b.namespace.svc.clusterset.local for that one cluster) with Service B's cluster IP in cluster-us. Submariner's gateways then carry the traffic through encrypted tunnels between the clusters — which requires non-overlapping Pod/Service CIDRs, or Globalnet. Standard Kubernetes DNS semantics are kept; only the clusterset.local domain is new."
     }
   ]
 }

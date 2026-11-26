@@ -56,7 +56,7 @@ A payment serialisation method that benchmarks at 2 microseconds per call may be
 This lesson covers **async-profiler** — the modern, production-safe, low-overhead CPU profiler for the JVM — and **Java Flight Recorder (JFR)**, the built-in profiling and monitoring infrastructure. You will learn to generate flame graphs, read them correctly, and act on what they reveal for payment processing workloads.
 
 > [!NOTE]
-> async-profiler uses OS-level `perf_events` (Linux) and `dtrace` (macOS) to sample stack traces without the safepoint bias that makes traditional JVMTI profilers misleading. This is critical for accurate hot-method identification.
+> async-profiler interrupts threads with OS timers or `perf_events` (Linux) and walks the Java stack with HotSpot's `AsyncGetCallTrace` (or its own stack walker), so it samples without the safepoint bias that makes traditional JVMTI profilers misleading. This is critical for accurate hot-method identification.
 
 ## Learning Objectives
 
@@ -73,7 +73,7 @@ By the end of this lesson you will be able to:
 
 ## 1. The Safepoint Bias Problem
 
-Traditional JVMTI-based profilers (JProfiler, YourKit in JVMTI mode) sample at **safepoints** — points where the JVM can safely inspect thread state. This creates systematic bias: code between safepoints (long loops, native calls) is underrepresented because the profiler cannot sample there.
+Traditional sampling profilers built on JVMTI stack dumps (for example the classic VisualVM sampler, or older commercial profilers in their default sampling mode) sample at **safepoints** — points where the JVM can safely inspect thread state. This creates systematic bias: code between safepoints (long loops, native calls) is underrepresented because the profiler cannot sample there.
 
 ```
 Traditional profiler sampling:
@@ -84,7 +84,7 @@ Traditional profiler sampling:
   WRONG: the loop is actually the bottleneck
 ```
 
-async-profiler uses `perf_events` (Linux `AsyncGetCallTrace` + kernel-level sampling) to sample at arbitrary wall-clock or CPU-time intervals, independent of safepoints. This eliminates the bias.
+async-profiler uses OS-level signals (from `perf_events` or interval timers) plus `AsyncGetCallTrace` to sample at arbitrary wall-clock or CPU-time intervals, independent of safepoints. This removes the bias.
 
 **When safepoint bias matters for payment services:**
 - Tight deserialisation loops (reading fixed-width fields from byte arrays)
@@ -111,11 +111,10 @@ jps -l
 # Attach to running JVM and collect 30 seconds of CPU samples
 ./asprof -d 30 -f /tmp/payment-cpu.html 12345
 
-# Collect as flamegraph SVG
-./asprof -d 30 -f /tmp/payment-cpu.svg --format svg 12345
-
-# Collect as JFR file (can be opened in JDK Mission Control)
-./asprof -d 30 -f /tmp/payment-cpu.jfr --format jfr 12345
+# The output format follows the file extension (.html = interactive flame
+# graph, .jfr = JFR file for JDK Mission Control). Use -o for others:
+./asprof -d 30 -o collapsed -f /tmp/payment-cpu.txt 12345   # collapsed stacks
+./asprof -d 30 -f /tmp/payment-cpu.jfr 12345
 ```
 
 ### 2.1 Profiling Modes
@@ -145,11 +144,15 @@ For payment service diagnosis:
 # Increase sampling frequency (default: 10 ms)
 ./asprof -e cpu -i 1ms -d 30 -f /tmp/cpu.html <pid>
 
-# Filter to specific threads (e.g., http-nio threads)
-./asprof -e cpu -d 30 -f /tmp/cpu.html --filter http-nio <pid>
+# Split the flame graph by thread (thread name becomes the bottom frame)
+./asprof -e cpu -d 30 -t -f /tmp/cpu.html <pid>
 
-# Include native frames (kernel, libc) for I/O-intensive services
-./asprof -e cpu -d 30 -f /tmp/cpu.html --include-native <pid>
+# Keep only stacks that contain a matching frame
+./asprof -e cpu -d 30 --include '*PaymentAuthorisationService*' -f /tmp/cpu.html <pid>
+
+# Native and kernel frames are included in cpu mode by default;
+# --cstack controls how native stacks are walked (fp, dwarf, vm, no)
+./asprof -e cpu -d 30 --cstack vm -f /tmp/cpu.html <pid>
 ```
 
 ---
@@ -186,60 +189,62 @@ Example flame graph (text representation):
 
 1. **Wide plateaus at the top**: CPU-intensive leaf methods — the actual hot code
 2. **Wide towers**: method with many deep callees — refactoring target
-3. **Jackson/reflection stacks**: serialisation overhead — consider pre-cached ObjectMapper or alternative serialisers
-4. **sun.reflect stacks**: reflection-based invocation — expensive, consider MethodHandle
-5. **Interpreted frames** (marked `Interpreter` or `~`): code not yet JIT-compiled — indicates cold code or deoptimisation
+3. **Jackson/reflection stacks**: serialisation overhead — usually a mapper created per call; share one pre-configured ObjectMapper, or consider alternative serialisers
+4. **`jdk.internal.reflect` / `DirectMethodHandleAccessor` stacks** (older JDKs: `sun.reflect`): reflection in a hot path — replace with direct calls
+5. **Interpreted frames** (async-profiler draws them in their own colour; in collapsed output they end in `_[i]`): code not yet JIT-compiled — indicates cold code or deoptimisation
 
 ---
 
 ## 4. Generating Flame Graphs Programmatically
 
 ```java
-// AsyncProfilerIntegration.java
-// Integrates async-profiler with Spring Boot for on-demand profiling
+// AsyncProfilerController.java
+// Integrates async-profiler with Spring Boot for on-demand profiling.
+// SECURITY: this endpoint runs native code in your JVM -- expose it only
+// on an internal management port, behind authentication.
 
 import one.profiler.AsyncProfiler;
-import one.profiler.Events;
 import org.springframework.web.bind.annotation.*;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @RestController
 @RequestMapping("/internal/profiler")
 public class AsyncProfilerController {
 
-    private static final AsyncProfiler profiler = AsyncProfiler.getInstance();
-    private volatile boolean profiling = false;
+    // Loads libasyncProfiler.so; pass its path if it is not on java.library.path
+    private static final AsyncProfiler profiler =
+        AsyncProfiler.getInstance("/opt/async-profiler/lib/libasyncProfiler.so");
+    private final AtomicBoolean profiling = new AtomicBoolean(false);
 
-    /**
-     * Start CPU profiling for N seconds.
-     * Restricted to internal network only -- never expose publicly.
-     */
+    /** Start CPU profiling for N seconds (both inputs validated). */
     @PostMapping("/cpu/start")
     public String startCpuProfile(@RequestParam(defaultValue = "30") int durationSeconds,
-                                   @RequestParam(defaultValue = "1ms") String interval)
+                                  @RequestParam(defaultValue = "1000") int intervalMicros)
             throws IOException {
 
-        if (profiling) {
+        // Never build the command from raw strings: "interval=1ms,file=/etc/x"
+        // would let a caller write arbitrary files
+        if (durationSeconds < 1 || durationSeconds > 300
+                || intervalMicros < 100 || intervalMicros > 100_000) {
+            throw new IllegalArgumentException("duration 1-300 s, interval 100-100000 us");
+        }
+        if (!profiling.compareAndSet(false, true)) {
             return "Profiling already in progress";
         }
 
-        Path outputFile = Path.of("/tmp/profile-" + System.currentTimeMillis() + ".html");
-        profiling = true;
+        Path outputFile = Path.of("/var/tmp/profiles/profile-" + System.currentTimeMillis() + ".html");
+        long intervalNs = intervalMicros * 1_000L;
+        profiler.execute("start,event=cpu,interval=" + intervalNs);
 
-        // Start profiling -- non-blocking
-        profiler.execute(
-            "start,event=cpu,interval=" + interval + ",file=" + outputFile + ",format=html"
-        );
-
-        // Schedule stop after duration
+        // Stop after the duration (virtual thread: cheap to park)
         Thread.startVirtualThread(() -> {
             try {
                 Thread.sleep(durationSeconds * 1000L);
-                profiler.execute("stop");
-                profiling = false;
-            } catch (InterruptedException | IOException e) {
+                stopAndDump(outputFile);
+            } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         });
@@ -248,15 +253,26 @@ public class AsyncProfilerController {
     }
 
     @PostMapping("/cpu/stop")
-    public String stopProfile() throws IOException {
-        profiler.execute("stop");
-        profiling = false;
-        return "Profiling stopped";
+    public String stopProfile() {
+        Path outputFile = Path.of("/var/tmp/profiles/profile-" + System.currentTimeMillis() + ".html");
+        return stopAndDump(outputFile) ? "Profiling stopped: " + outputFile : "Not profiling";
     }
 
     @GetMapping("/status")
     public String status() {
-        return profiling ? "profiling" : "idle";
+        return profiling.get() ? "profiling" : "idle";
+    }
+
+    private boolean stopAndDump(Path outputFile) {
+        if (!profiling.compareAndSet(true, false)) {
+            return false;                       // already stopped by the other path
+        }
+        try {
+            profiler.execute("stop,file=" + outputFile);   // writes the flame graph
+            return true;
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not write profile", e);
+        }
     }
 }
 ```
@@ -265,7 +281,7 @@ public class AsyncProfilerController {
 
 ## 5. JFR — Java Flight Recorder
 
-JFR is built into the JDK (since Java 11, free since Java 11) and provides continuous, low-overhead profiling and monitoring. It records hundreds of event types: GC, compilation, class loading, file I/O, socket I/O, exceptions, and CPU samples.
+JFR is built into the JDK (open-sourced and free to use since JDK 11, and in OpenJDK 8u262+) and provides continuous, low-overhead profiling and monitoring. It records hundreds of event types: GC, compilation, class loading, file I/O, socket I/O, exceptions, and CPU samples.
 
 ### 5.1 Starting JFR
 
@@ -279,8 +295,10 @@ jcmd <pid> JFR.start name=payment-profile duration=60s \
 java -XX:StartFlightRecording=duration=60s,filename=/tmp/startup.jfr,settings=profile \
   -jar payment-service.jar
 
-# Start continuous recording (circular buffer, dumps on demand)
-java -XX:StartFlightRecording=name=continuous,maxage=10m,maxsize=250m,settings=profile \
+# Start continuous recording (circular buffer, dumps on demand).
+# Use the 'default' settings for always-on recording (~1% overhead);
+# 'profile' collects more detail and costs more.
+java -XX:StartFlightRecording=name=continuous,maxage=10m,maxsize=250m,settings=default \
   -jar payment-service.jar
 
 # Dump the continuous recording
@@ -358,8 +376,8 @@ public class PaymentAuthorisationService {
 # View JFR recording summary
 jfr summary /tmp/payment.jfr
 
-# Print specific events
-jfr print --events CPUSample /tmp/payment.jfr | head -100
+# Print specific events (CPU samples are "jdk.ExecutionSample")
+jfr print --events jdk.ExecutionSample /tmp/payment.jfr | head -100
 
 # Print custom events
 jfr print --events com.example.payment.AuthorisationEvent /tmp/payment.jfr
@@ -375,6 +393,8 @@ jmc /tmp/payment.jfr
 The most valuable profiling is done under realistic production load. Here is a systematic approach:
 
 ### 6.1 Load Generation Setup
+
+Prefer an external load tool (Gatling, k6 — see lesson 16): a load generator inside the profiled JVM shows up in the profile and competes for the same CPU. For a quick in-process experiment, a minimal generator looks like this:
 
 ```java
 // PaymentLoadGenerator.java
@@ -399,7 +419,9 @@ public class PaymentLoadGenerator {
 
         AtomicLong successCount = new AtomicLong(0);
         AtomicLong errorCount = new AtomicLong(0);
-        List<Long> latenciesNs = new CopyOnWriteArrayList<>();
+        // HdrHistogram: constant memory, thread-safe recording.
+        // (A CopyOnWriteArrayList would copy the whole list on EVERY add.)
+        ConcurrentHistogram latenciesNs = new ConcurrentHistogram(3);
 
         while (System.currentTimeMillis() < endTime) {
             long start = System.nanoTime();
@@ -410,7 +432,7 @@ public class PaymentLoadGenerator {
                     PaymentRequest req = generateRealisticRequest();
                     authService.authorise(req);
                     successCount.incrementAndGet();
-                    latenciesNs.add(System.nanoTime() - reqStart);
+                    latenciesNs.recordValue(System.nanoTime() - reqStart);
                 } catch (Exception e) {
                     errorCount.incrementAndGet();
                     log.debug("Load gen error: {}", e.getMessage());
@@ -448,7 +470,7 @@ public class PaymentLoadGenerator {
 
 ### 6.2 Identifying Serialisation Hot Spots
 
-A common finding when profiling payment services: Jackson ObjectMapper is consuming 25-40% of CPU. Typical flame graph node:
+A common finding when profiling payment services: Jackson is consuming a large share of CPU. Illustrative flame graph breakdown:
 
 ```
 PaymentAuthorisationService.authorise (100%)
@@ -463,7 +485,7 @@ PaymentAuthorisationService.authorise (100%)
   |- Other (15%)
 ```
 
-Action: Pre-configure serialiser per type, avoid reflection at runtime:
+Jackson caches the serialiser for each type *inside an ObjectMapper*. If introspection frames (`AnnotationIntrospector`, `getDeclaredFields`) stay hot after warm-up, the usual cause is a **new ObjectMapper created per call or per request**, so every call redoes the reflection. Fix: one shared, pre-configured mapper, with a pre-built writer/reader per type:
 
 ```java
 // OptimisedPaymentSerializer.java
@@ -472,16 +494,17 @@ Action: Pre-configure serialiser per type, avoid reflection at runtime:
 public class OptimisedPaymentSerializer {
 
     private final ObjectMapper mapper;
-    // Pre-computed writer -- avoids type lookup on every call
+    // Pre-built writer -- skips the per-call root type lookup
     private final ObjectWriter paymentWriter;
     private final ObjectReader paymentReader;
 
     public OptimisedPaymentSerializer() {
-        this.mapper = new ObjectMapper()
-            .registerModule(new JavaTimeModule())
+        // ONE mapper for the whole application -- it is thread-safe once configured
+        this.mapper = JsonMapper.builder()
+            .addModule(new JavaTimeModule())
+            .addModule(new BlackbirdModule())  // optional: replaces reflection with generated accessors
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
-            // Pre-compute serialisers for all registered types at startup
-            .disable(MapperFeature.USE_ANNOTATIONS);  // faster if annotations unused
+            .build();
 
         // Pre-build typed writers/readers
         this.paymentWriter = mapper.writerFor(PaymentMessage.class);
@@ -503,7 +526,7 @@ public class OptimisedPaymentSerializer {
 ### 6.3 Identifying Reflection Overhead
 
 ```java
-// BEFORE: reflection-heavy approach (shows up as sun.reflect in flame graph)
+// BEFORE: reflection-heavy approach (shows up as jdk.internal.reflect frames)
 public class ReflectionHeavyValidator {
 
     private final Map<String, Method> validatorMethods = new HashMap<>();
@@ -575,17 +598,18 @@ public class DirectValidator {
 
 The JIT compiler can produce misleading profiling results in several ways:
 
-### 7.1 Inlined Methods are Invisible
+### 7.1 Inlined Methods
 
-When the JIT inlines a method, it disappears from the call stack. If a hot method is inlined into its caller, the flame graph shows the caller as hot, not the inlined method.
+When the JIT inlines a method, it no longer has its own machine-code frame. Good JVM profilers (async-profiler, JFR) rebuild the inlined frames from the JIT's debug information, so the method still appears — async-profiler even colours inlined frames differently. Tools that only see machine code (plain `perf` without a JIT symbol map, some APM agents) attribute the time to the caller instead.
 
 ```java
 // PaymentFeeCalculator.java -- frequently inlined methods
 
 public class PaymentFeeCalculator {
 
-    // This method will be inlined -- it won't appear in flame graphs
-    // even if it's called 10 million times per second
+    // Small and hot: the JIT will inline it into its callers.
+    // async-profiler still shows it (as an inlined frame); a profiler that
+    // only sees machine code would charge its time to the caller.
     public long calculateFee(long amountCents, int basisPoints) {
         return (amountCents * basisPoints + 5000) / 10_000;  // round half-up
     }
@@ -601,7 +625,7 @@ public class PaymentFeeCalculator {
 }
 ```
 
-**Implication**: if profiling shows a method as hot and simple, the actual work may be in its callees that have been inlined into it.
+**Implication**: if a simple method looks hot in a tool that cannot see inlined frames, the real work may be in callees inlined into it. Also remember that inlining lets the JIT optimise across method boundaries, so the cost of a method can change depending on where it is inlined.
 
 ### 7.2 Deoptimisation Events
 
@@ -611,13 +635,15 @@ JIT deoptimisation causes code to fall back to interpreted mode temporarily. Thi
 # Check for deoptimisation events in JFR
 jfr print --events Deoptimization /tmp/payment.jfr | head -50
 
-# Example output showing problematic deoptimisations:
+# Simplified example of a problematic pattern:
 # com.example.payment.PaymentValidator.validate()
-#   Reason: null_check -- a field that the JIT assumed non-null was null
-#   This causes recompilation -- expensive during high load
+#   reason: class_check   -- a call site the JIT compiled for ONE type
+#                            started receiving a second type
+#   reason: unstable_if   -- a branch never taken during profiling was taken
+#   Each one throws away compiled code and recompiles -- costly under load
 ```
 
-Fix: add `Objects.requireNonNull()` checks or `@NonNull` annotations to give the JIT stable type information.
+A few deoptimisations after warm-up are normal. **Repeated** ones for the same method are the problem. Typical fixes: warm up with realistic traffic (so rare branches and all common types are seen before compilation), and keep hot call sites monomorphic — for example, avoid sending many different implementation classes through one hot interface call. Annotations such as `@NonNull` do **not** change what the JIT does.
 
 ---
 
@@ -638,7 +664,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 mkdir -p "$OUTPUT_DIR"
 
 # Find PID
-PID=$(jps -l | grep "$SERVICE_NAME" | awk '{print $1}')
+PID=$(jps -l | grep "$SERVICE_NAME" | awk '{print $1}' | head -n1)
 if [ -z "$PID" ]; then
     echo "ERROR: $SERVICE_NAME not found"
     exit 1
@@ -646,34 +672,21 @@ fi
 
 echo "Profiling PID $PID for ${DURATION}s..."
 
-# Collect CPU flame graph
+# Collect CPU and allocation samples in ONE run (same time window), as JFR
 ./asprof -d "$DURATION" \
-  -e cpu \
-  -i 1ms \
-  -f "$OUTPUT_DIR/cpu-${TIMESTAMP}.html" \
-  --title "Payment Service CPU Profile - $TIMESTAMP" \
+  -e cpu -i 1ms \
+  --alloc 512k \
+  -f "$OUTPUT_DIR/profile-${TIMESTAMP}.jfr" \
   "$PID"
 
-echo "CPU profile: $OUTPUT_DIR/cpu-${TIMESTAMP}.html"
+# Convert to separate flame graphs (jfrconv ships with async-profiler)
+./jfrconv --cpu   "$OUTPUT_DIR/profile-${TIMESTAMP}.jfr" "$OUTPUT_DIR/cpu-${TIMESTAMP}.html"
+./jfrconv --alloc "$OUTPUT_DIR/profile-${TIMESTAMP}.jfr" "$OUTPUT_DIR/alloc-${TIMESTAMP}.html"
 
-# Collect allocation profile
-./asprof -d "$DURATION" \
-  -e alloc \
-  -f "$OUTPUT_DIR/alloc-${TIMESTAMP}.html" \
-  --title "Payment Service Allocation Profile - $TIMESTAMP" \
-  "$PID"
-
+echo "CPU profile:        $OUTPUT_DIR/cpu-${TIMESTAMP}.html"
 echo "Allocation profile: $OUTPUT_DIR/alloc-${TIMESTAMP}.html"
-
-# Collect JFR for correlation
-jcmd "$PID" JFR.start \
-  name="profile-${TIMESTAMP}" \
-  duration="${DURATION}s" \
-  settings=profile \
-  filename="$OUTPUT_DIR/jfr-${TIMESTAMP}.jfr"
-
-echo "JFR recording: $OUTPUT_DIR/jfr-${TIMESTAMP}.jfr"
-echo "Done. Open HTML files in a browser."
+echo "Raw recording (JDK Mission Control): $OUTPUT_DIR/profile-${TIMESTAMP}.jfr"
+echo "Done. Open the HTML files in a browser."
 ```
 
 ---
@@ -685,9 +698,9 @@ Before and after profiling a payment service:
 - [ ] Profile under realistic production load (not idle JVM — JIT state is different)
 - [ ] Use `-e cpu` for CPU-bound diagnosis, `-e wall` for latency/blocking diagnosis
 - [ ] Run for at least 30 seconds to get statistically meaningful samples
-- [ ] Use `@Fork(1)` JVM when profiling from JMH to allow async-profiler to attach
+- [ ] When profiling a JMH benchmark, use JMH's `-prof async` (it attaches async-profiler to each forked JVM)
 - [ ] Check for `Interpreter` frames in flame graph — indicates deoptimisation
-- [ ] Check for `sun.reflect`/`jdk.internal.reflect` — indicates reflective hot paths
+- [ ] Check for `jdk.internal.reflect` / `sun.reflect` frames — indicates reflective hot paths
 - [ ] Check ObjectMapper allocation in alloc profile — common in Spring MVC services
 - [ ] Verify JFR is enabled in production with `maxage=10m` circular buffer for reactive diagnosis
 - [ ] Correlate CPU flame graph with GC allocation profile — high allocation often drives CPU
@@ -704,7 +717,7 @@ Before and after profiling a payment service:
 
 4. The difference between `-e cpu` mode and `-e wall` mode in async-profiler: when would each be misleading for a payment service that calls an external fraud API?
 
-5. How does JIT method inlining affect what you see in a flame graph? Give an example where a hot method might be invisible.
+5. How does JIT method inlining affect what you see in a flame graph? Which tools still show inlined methods, and which charge their time to the caller?
 
 ---
 
@@ -737,18 +750,18 @@ Before and after profiling a payment service:
         "JVMTI profilers are biased toward I/O-bound methods because safepoints occur during blocking calls"
       ],
       "correct": 1,
-      "explanation": "Traditional JVMTI-based profilers (like older versions of YourKit) take samples only at JVM safepoints. Tight loops often execute for many iterations without reaching a safepoint, making them invisible in the profile. async-profiler uses OS signals (perf_events on Linux) to sample at any point, overcoming safepoint bias."
+      "explanation": "Profilers that sample through JVMTI stack dumps can only take samples at JVM safepoints. Tight loops often run for many iterations without reaching a safepoint, so their time is charged to the next safepoint location instead and they look cheaper than they are. async-profiler interrupts threads with OS signals (perf_events or timers) and walks the stack with AsyncGetCallTrace at any point, overcoming safepoint bias."
     },
     {
-      "text": "In a CPU flame graph, BeanSerializer.serialize takes 35% of CPU due to reflection. Which two Jackson changes would reduce this?",
+      "text": "In a CPU flame graph, Jackson's BeanSerializer and introspection frames take 35% of CPU even after warm-up. Which two changes would reduce this?",
       "options": [
         "Enable lazy deserialization and increase thread pool size",
-        "Pre-build ObjectWriter and ObjectReader instances per type at startup, and register module types so Jackson avoids per-call type discovery via reflection",
+        "Share one pre-configured ObjectMapper instead of creating one per call, and pre-build ObjectWriter/ObjectReader instances per type at startup so Jackson's cached serialisers are reused",
         "Switch from JSON to XML serialization and use JAXB annotations",
         "Add @JsonIgnore to all non-essential fields to reduce serialized size"
       ],
       "correct": 1,
-      "explanation": "Pre-computing ObjectWriter/ObjectReader via mapper.writerFor(Type.class) eliminates per-call type lookup. Registering JavaTimeModule and disabling annotation introspection further reduces reflection overhead. These are the two highest-impact Jackson CPU optimizations."
+      "explanation": "Jackson caches serialisers per ObjectMapper, so a mapper created per call repeats the reflection work every time — the usual reason introspection stays hot. Sharing one configured mapper and pre-building writers/readers with mapper.writerFor(Type.class) removes that repeated work. Adding a module such as Blackbird can reduce reflection further."
     },
     {
       "text": "What is the key difference between async-profiler's `-e cpu` mode and `-e wall` mode for diagnosing a payment service with slow P99 latency?",

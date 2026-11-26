@@ -21,7 +21,10 @@ prerequisites:
 
 # Time-Series Data — TimescaleDB and Hypertables
 
-Fintech platforms generate enormous volumes of time-ordered data: payment throughput metrics sampled every second, OHLCV candlestick data for every currency pair, fraud score time series per account, and system health metrics tied to business events. Vanilla PostgreSQL handles this workload poorly at scale. TimescaleDB — a PostgreSQL extension — transforms it into a first-class time-series database without sacrificing SQL compatibility or ACID guarantees.
+Fintech platforms generate enormous volumes of time-ordered data: payment throughput metrics sampled every second, OHLCV candlestick data for every currency pair, fraud score time series per account, and system health metrics tied to business events. Vanilla PostgreSQL can store this data, but at scale it needs a lot of manual work (partitions, rollups, retention jobs). TimescaleDB — a PostgreSQL extension — automates that work and adds time-series features without sacrificing SQL compatibility or ACID guarantees.
+
+> [!NOTE]
+> TimescaleDB's core (hypertables, `time_bucket`) is Apache-2.0 licensed; compression, continuous aggregates, gap-filling and the policies are under the Timescale License (free to self-host, but some cloud providers only offer the Apache subset — check before you design around them). Recent versions also rename compression to "columnstore" (`add_columnstore_policy`, etc.); the older function names used below still work.
 
 ---
 
@@ -51,13 +54,14 @@ CREATE TABLE payments_metrics (
 
 CREATE INDEX idx_payments_metrics_time ON payments_metrics (recorded_at DESC);
 
--- After 6 months at 10,000 rows/second:
--- Table size: ~500 GB
--- Index size: ~100 GB
--- INSERT performance degrades as B-tree index grows
--- Range queries require scanning the entire large B-tree
--- VACUUM and autovacuum struggle with 500 GB of hot data
--- Dropping old data: DELETE is catastrophically slow on 500 GB
+-- After months of ingestion at thousands of rows/second, one table holds
+-- billions of rows (hundreds of GB to TBs):
+-- Secondary indexes such as (service, recorded_at) no longer fit in memory,
+--   so every INSERT causes random I/O
+-- VACUUM / anti-wraparound freezing must process the whole huge table
+-- Dropping old data with DELETE is slow, writes huge amounts of WAL and
+--   leaves bloat behind
+-- Every dashboard aggregates billions of raw rows again and again
 ```
 
 ---
@@ -108,25 +112,27 @@ CREATE INDEX idx_pt_region_time
 -- Each chunk covers a 7-day time range
 
 -- Inspect existing chunks
+-- (sizes come from chunks_detailed_size(); the chunks view has no sizes)
 SELECT
-    chunk_name,
-    range_start,
-    range_end,
-    is_compressed,
-    total_bytes / (1024*1024) AS size_mb
-FROM timescaledb_information.chunks
-WHERE hypertable_name = 'payment_throughput'
-ORDER BY range_start DESC;
+    c.chunk_name,
+    c.range_start,
+    c.range_end,
+    c.is_compressed,
+    s.total_bytes / (1024*1024) AS size_mb
+FROM timescaledb_information.chunks c
+JOIN chunks_detailed_size('payment_throughput') s
+  ON s.chunk_schema = c.chunk_schema AND s.chunk_name = c.chunk_name
+ORDER BY c.range_start DESC;
 
 /*
-chunk_name                      | range_start          | range_end            | is_compressed | size_mb
-_timescaledb_internal._hyper_1_8_chunk  | 2024-01-29 00:00:00 | 2024-02-05 00:00:00 | false         | 450
-_timescaledb_internal._hyper_1_7_chunk  | 2024-01-22 00:00:00 | 2024-01-29 00:00:00 | true          | 45
-_timescaledb_internal._hyper_1_6_chunk  | 2024-01-15 00:00:00 | 2024-01-22 00:00:00 | true          | 43
+chunk_name        | range_start          | range_end            | is_compressed | size_mb
+_hyper_1_8_chunk  | 2024-01-29 00:00:00 | 2024-02-05 00:00:00 | false         | 450
+_hyper_1_7_chunk  | 2024-01-22 00:00:00 | 2024-01-29 00:00:00 | true          | 45
+_hyper_1_6_chunk  | 2024-01-15 00:00:00 | 2024-01-22 00:00:00 | true          | 43
 */
 
--- The most recent chunk is uncompressed (hot, in memory)
--- Older chunks are compressed 10:1
+-- The most recent chunk is uncompressed (hot, ideally in memory)
+-- Older chunks are compressed (here ~10:1)
 
 -- TimescaleDB query planner automatically uses the right chunk(s)
 EXPLAIN (ANALYZE)
@@ -140,7 +146,8 @@ WHERE recorded_at > NOW() - INTERVAL '1 hour'
 
 ```sql
 -- Choosing chunk_time_interval:
--- Target: each uncompressed chunk fits in ~25% of available RAM
+-- Rule of thumb: the recent (uncompressed) chunks of all busy hypertables,
+-- including their indexes, fit in ~25% of available RAM
 -- Payment metrics at 1,000 rows/second, each row ~200 bytes:
 -- Rows per 7 days = 1,000 * 86,400 * 7 = 604,800,000 rows
 -- Chunk size = 604,800,000 * 200 bytes = ~115 GB — too large!
@@ -149,21 +156,22 @@ WHERE recorded_at > NOW() - INTERVAL '1 hour'
 -- 8 GB / 200 bytes = 40,000,000 rows
 -- 40,000,000 / 86,400 seconds/day / 1,000 rows/second = 0.46 days
 
--- Use 1-day chunks for high-volume metrics tables
+-- 12-hour chunks: 1,000 * 43,200 * 200 bytes = ~8.6 GB -- close to target
+-- (use 6 hours for more margin; a 1-day chunk would be ~17 GB)
 SELECT create_hypertable(
-    'payment_throughput_hf',  -- high-frequency version
+    'payment_throughput_hf',  -- high-frequency table, same columns
     'recorded_at',
-    chunk_time_interval => INTERVAL '1 day'  -- fits in RAM
+    chunk_time_interval => INTERVAL '12 hours'
 );
 
 -- Check current chunk sizes
 SELECT
-    chunk_name,
-    pg_size_pretty(total_bytes) AS total_size,
-    num_rows
-FROM timescaledb_information.chunks
-WHERE hypertable_name = 'payment_throughput_hf'
-ORDER BY range_start DESC
+    c.chunk_name,
+    pg_size_pretty(s.total_bytes) AS total_size
+FROM timescaledb_information.chunks c
+JOIN chunks_detailed_size('payment_throughput_hf') s
+  ON s.chunk_schema = c.chunk_schema AND s.chunk_name = c.chunk_name
+ORDER BY c.range_start DESC
 LIMIT 5;
 ```
 
@@ -171,7 +179,7 @@ LIMIT 5;
 
 ## 3. time_bucket() for Aggregation
 
-`time_bucket()` is TimescaleDB's equivalent of `date_trunc()` but more flexible — it supports arbitrary bucket widths.
+`time_bucket()` is TimescaleDB's equivalent of `date_trunc()` but more flexible — it supports arbitrary bucket widths such as 5 or 15 minutes. (Plain PostgreSQL 14+ has a similar `date_bin()`.)
 
 ```sql
 -- Payments per minute for the last hour
@@ -257,7 +265,9 @@ FROM fx_rates
 GROUP BY bucket, pair
 WITH NO DATA;  -- Populate on-demand, not at creation time
 
--- Configure refresh policy: keep the view up to date within 1 minute
+-- Configure refresh policy: every minute, re-materialize the window from
+-- 10 minutes ago to 1 minute ago (ticks arriving later than 10 minutes
+-- are only picked up by a manual refresh)
 SELECT add_continuous_aggregate_policy(
     'fx_ohlcv_1m',
     start_offset  => INTERVAL '10 minutes',
@@ -363,7 +373,7 @@ ORDER BY bucket;
 
 ## 6. Compression Policy
 
-Older time-series data is queried far less frequently. TimescaleDB's native compression reduces storage by 90-95% using columnar compression on cold chunks.
+Older time-series data is queried far less frequently. TimescaleDB's native columnar compression on cold chunks often reduces storage by 90% or more (it depends on the data).
 
 ```sql
 -- Enable compression on the hypertable
@@ -406,8 +416,9 @@ SELECT compress_chunk(
     '_timescaledb_internal._hyper_1_3_chunk'
 );
 
--- Decompress if you need to INSERT into an old compressed chunk
--- (TimescaleDB 2.11+ handles this automatically)
+-- Decompress, e.g. before a LARGE backfill into an old range.
+-- (Small writes need no manual step: INSERT into compressed chunks works
+--  since TimescaleDB 2.3, UPDATE/DELETE since 2.11.)
 SELECT decompress_chunk(
     '_timescaledb_internal._hyper_1_3_chunk'
 );
@@ -426,7 +437,10 @@ SELECT add_retention_policy(
     drop_after => INTERVAL '90 days'
 );
 
--- For the OHLCV continuous aggregate, keep summarized data longer
+-- For the OHLCV continuous aggregate, keep summarized data longer.
+-- Careful: if a cagg refresh window ever covers a range whose raw data was
+-- already dropped, the refresh would delete those aggregates -- keep the
+-- refresh start_offset well inside the raw retention period.
 SELECT add_retention_policy(
     'fx_ohlcv_1m',
     drop_after => INTERVAL '1 year'
@@ -439,28 +453,30 @@ SELECT add_retention_policy(
 
 -- View all scheduled jobs (compression + retention policies)
 SELECT
-    job_id,
-    application_name,
-    schedule_interval,
-    next_start,
-    last_run_status,
-    last_run_duration
-FROM timescaledb_information.jobs
-ORDER BY job_id;
+    j.job_id,
+    j.application_name,
+    j.schedule_interval,
+    js.next_start,
+    js.last_run_status,
+    js.last_run_duration
+FROM timescaledb_information.jobs j
+LEFT JOIN timescaledb_information.job_stats js USING (job_id)
+ORDER BY j.job_id;
 
 -- Manual retention execution (useful for immediate cleanup)
 SELECT drop_chunks('payment_throughput', older_than => INTERVAL '90 days');
 
 -- View chunk boundaries before dropping (dry run)
 SELECT
-    chunk_name,
-    range_start,
-    range_end,
-    total_bytes / (1024*1024*1024) AS size_gb
-FROM timescaledb_information.chunks
-WHERE hypertable_name = 'payment_throughput'
-  AND range_end < NOW() - INTERVAL '90 days'
-ORDER BY range_end;
+    c.chunk_name,
+    c.range_start,
+    c.range_end,
+    pg_size_pretty(s.total_bytes) AS size
+FROM timescaledb_information.chunks c
+JOIN chunks_detailed_size('payment_throughput') s
+  ON s.chunk_schema = c.chunk_schema AND s.chunk_name = c.chunk_name
+WHERE c.range_end < NOW() - INTERVAL '90 days'
+ORDER BY c.range_end;
 ```
 
 ---
@@ -547,14 +563,16 @@ Continuous aggregates have a small lag (the `end_offset`). For true real-time, c
 
 ```sql
 -- Real-time query: combines pre-aggregated data + live tail
--- (TimescaleDB calls this "real-time aggregation" and enables it by default)
+-- (TimescaleDB calls this "real-time aggregation")
 
--- Enable real-time aggregation (default ON in TimescaleDB 2.x)
+-- Enable real-time aggregation. It is OFF by default for continuous
+-- aggregates created on TimescaleDB 2.13+ (it was ON in older 2.x versions)
 ALTER MATERIALIZED VIEW fx_ohlcv_1m
 SET (timescaledb.materialized_only = false);
 -- Now queries against fx_ohlcv_1m automatically combine:
 -- 1. Pre-computed data from the materialized layer
--- 2. Live data from the raw fx_rates table for the recent end_offset period
+-- 2. Live aggregation of raw fx_rates rows newer than the last
+--    materialized bucket (the "watermark")
 
 -- The query below returns all data including the last 60 seconds
 -- without any application-side stitching
@@ -580,7 +598,7 @@ graph TD
     B -->|> 10M rows/day\nretention needed\ndashboard aggregates| D[TimescaleDB\nHypertable + continuous\naggregates + compression]
     B -->|< 1M rows/day\nsimple range queries| E[PostgreSQL\nRange partitioning\nsufficient]
 
-    D -->|Storage saving?| F[Compression: 90% reduction\nRetention: DROP chunk in ms]
+    D -->|Storage saving?| F[Compression: often ~90% reduction\nRetention: DROP chunk in ms]
     D -->|Query speed?| G[Continuous aggregates:\npre-compute OHLCV, rates,\nthroughput for dashboards]
     C -->|Storage saving?| H[Manual DETACH + DROP\npartition — operational work]
     C -->|Query speed?| I[Manual MATERIALIZED VIEW\nno incremental refresh]
@@ -589,12 +607,12 @@ graph TD
 | Feature | TimescaleDB | Vanilla PostgreSQL Partitioning |
 |---------|------------|--------------------------------|
 | Chunk creation | Automatic | Manual (or pg_partman) |
-| Compression | Native columnar, 90% reduction | None (use pg_compress or tablespaces) |
+| Compression | Native columnar, often ~90% reduction | Only TOAST compression of large values (pglz/lz4); no columnar compression |
 | Retention | `add_retention_policy` — one line | DETACH + DROP — operational script |
 | Incremental aggregates | `CREATE MATERIALIZED VIEW ... continuous` | Full refresh only (`REFRESH MATERIALIZED VIEW`) |
-| Gap filling | `time_bucket_gapfill + locf` | Custom PL/pgSQL |
+| Gap filling | `time_bucket_gapfill + locf` | `generate_series` + LEFT JOIN, written by hand |
 | SQL compatibility | 100% — it is PostgreSQL | 100% |
-| Cloud managed | Available on Timescale Cloud, Aiven, AWS | Available everywhere |
+| Cloud managed | Timescale's own cloud or self-hosted; some providers offer only the Apache subset, and e.g. Amazon RDS does not offer it | Available everywhere |
 
 ---
 
@@ -653,9 +671,9 @@ A chunk interval that is too small creates thousands of chunks, overwhelming the
 
 SELECT create_hypertable('payment_audit_low_volume', 'created_at',
     chunk_time_interval => INTERVAL '1 minute');  -- DO NOT DO THIS
--- After 1 year: pg_class has 525,600 entries for this table
--- EXPLAIN on any query takes 5+ seconds for chunk exclusion
--- TimescaleDB recommends: aim for 1,000-10,000 chunks maximum
+-- After 1 year: pg_class has 525,600+ entries for this table
+-- Planning (chunk exclusion) becomes slow, lock tables fill up
+-- Keep chunk counts modest: thousands, not hundreds of thousands
 
 -- Calculate the right interval:
 -- Expected rows per day: 100,000 (for a low-volume audit table)
@@ -670,93 +688,73 @@ SELECT create_hypertable('payment_audit_low_volume', 'created_at',
 SELECT hypertable_name, num_chunks
 FROM timescaledb_information.hypertables;
 
--- If you have too many chunks already, you must recreate the hypertable:
+-- set_chunk_time_interval() changes the interval for NEW chunks only.
+-- If you have too many chunks already, recreate the hypertable:
 -- 1. Create new table with correct interval
 -- 2. INSERT INTO new_table SELECT * FROM old_table (can take hours)
 -- 3. Rename tables in a transaction
 -- Prevention is better than cure — size your interval at creation time
 ```
 
-### Pitfall 3: Compression Blocking Writes to Old Chunks
+### Pitfall 3: Expensive Writes to Compressed Chunks
 
-TimescaleDB compresses data into an immutable columnar format. Direct INSERTs or UPDATEs to a compressed chunk fail unless you first decompress it.
+Compressed chunks store data in a columnar format. Old TimescaleDB versions rejected writes to them; current versions accept them (INSERT since 2.3, UPDATE/DELETE since 2.11) but each write is more expensive: UPDATE/DELETE must decompress the affected segments, and inserted rows sit uncompressed in the chunk until the policy recompresses it. Large backfills into compressed ranges therefore need a plan.
 
 ```sql
--- WRONG — attempting to backfill historical data into a compressed chunk
-INSERT INTO payment_throughput (recorded_at, service_name, region,
-                                payments_count, total_amount)
-VALUES ('2024-01-10 12:00:00', 'payment-processor', 'eu-west-1',
-        5000, 50000000);
--- ERROR: cannot insert into chunk that is compressed
-
--- Also affected:
+-- Small correction: works directly on TimescaleDB 2.11+
 UPDATE payment_throughput
 SET error_count = 5
 WHERE recorded_at = '2024-01-10 12:00:00'
-  AND service_name = 'payment-processor';
--- ERROR: cannot update rows in a compressed chunk
+  AND service_name = 'payment-processor'
+  AND region = 'eu-west-1';
+-- Decompresses only the affected segment (service_name, region =
+-- the segmentby columns), so filtering on them keeps this cheap.
+-- On versions before 2.11: ERROR -- UPDATE on compressed chunks unsupported
 
--- FIX option 1: decompress, modify, re-compress (operational overhead)
-SELECT decompress_chunk(
-    show_chunks('payment_throughput',
+-- LARGE backfill (e.g. reloading a week of data): decompress, load,
+-- recompress -- faster than millions of row-by-row writes into
+-- compressed chunks
+SELECT decompress_chunk(c, if_compressed => true)
+FROM show_chunks('payment_throughput',
         older_than => '2024-01-15'::timestamptz,
-        newer_than => '2024-01-10'::timestamptz)
-);
+        newer_than => '2024-01-10'::timestamptz) AS c;
 
-INSERT INTO payment_throughput ...;  -- Now works
+-- (COPY / INSERT the backfill here)
 
-SELECT compress_chunk(
-    show_chunks('payment_throughput',
+SELECT compress_chunk(c, if_not_compressed => true)
+FROM show_chunks('payment_throughput',
         older_than => '2024-01-15'::timestamptz,
-        newer_than => '2024-01-10'::timestamptz)
-);
+        newer_than => '2024-01-10'::timestamptz) AS c;
 
--- FIX option 2 (TimescaleDB 2.11+): enable DML on compressed chunks
--- TimescaleDB 2.11 introduced transparent DML on compressed chunks
--- (auto-decompresses the affected rows into an internal staging area)
-ALTER TABLE payment_throughput SET (
-    timescaledb.compress_segmentby = 'service_name, region'
-    -- DML decompresses only the affected segment, not the whole chunk
-);
-
--- FIX option 3: architectural — never backfill historical data
--- Design your pipeline so data arrives in real-time
--- For corrections, insert a new row with a note field rather than updating old data
--- Time-series data is append-only by nature — treat corrections as new events
-INSERT INTO payment_throughput (
-    recorded_at, service_name, region,
-    payments_count, total_amount, error_count
-)
-VALUES (
-    NOW(),           -- correction recorded NOW, not in the past
-    'payment-processor', 'eu-west-1',
-    -50, -500000, 0  -- negative delta to correct the error
-);
+-- Design note: metrics belong to the time they describe, so corrections
+-- are written at the original timestamp (as above). For LEDGER-like data
+-- the rule is different: never rewrite history -- record a correction as
+-- a new event (Lesson 14).
 ```
 
 ---
 
 ## 12. Checklist
 
-- [ ] `create_hypertable()` called with `chunk_time_interval` sized for 1,000-10,000 total chunks over retention period
-- [ ] Chunk interval validated: target each uncompressed chunk < 25% of available RAM
+- [ ] `create_hypertable()` called with `chunk_time_interval` sized so the chunk count over the retention period stays in the thousands, not hundreds of thousands
+- [ ] Chunk interval validated: recent uncompressed chunks (with indexes) fit in ~25% of available RAM
 - [ ] Continuous aggregates created for every dashboard/reporting query that runs more than once per hour
 - [ ] `add_continuous_aggregate_policy` configured with `end_offset >= 1 minute` (do not set to zero)
-- [ ] `timescaledb.materialized_only = false` for real-time aggregation on continuous aggregate views
+- [ ] `timescaledb.materialized_only = false` set explicitly where real-time aggregation is needed (default is off since 2.13)
 - [ ] `compress_segmentby` set to the column(s) used in WHERE clauses for compressed data
 - [ ] `add_compression_policy` configured: compress after the hot retention window (e.g., 7 days)
 - [ ] `add_retention_policy` configured: drop raw data after the required retention period
 - [ ] `time_bucket_gapfill + locf` used in queries that must return a continuous time series
-- [ ] Backfill operations performed on decompressed chunks only; re-compressed after
+- [ ] Large backfills into compressed ranges planned: decompress, load, recompress (small corrections can go straight in on 2.11+)
 - [ ] Chunk count monitored with `timescaledb_information.hypertables.num_chunks`
-- [ ] TimescaleDB background jobs (`timescaledb_information.jobs`) monitored for `last_run_status = 'Failed'`
+- [ ] TimescaleDB background jobs (`timescaledb_information.job_stats`) monitored for `last_run_status = 'Failed'`
 
 ---
 
 <!-- KNOWLEDGE-CHECK
-{"questions":[{"text":"You have a hypertable storing 10,000 rows per second, each row 200 bytes. You have 64 GB of RAM and want the hot (uncompressed) chunk to fit in ~25% of RAM. What chunk_time_interval should you use?","options":["a) 1 day — 10,000 * 86,400 * 200 bytes = 165 GB, too large","b) 1 hour — 10,000 * 3,600 * 200 bytes = 6.9 GB, fits in 16 GB (25% of 64 GB)","c) 7 days — this is TimescaleDB's default and always correct","d) 1 minute — smaller chunks are always faster"],"correct":1,"explanation":"With 10,000 rows/second and 200 bytes/row: rows per hour = 36,000,000; size = 36,000,000 * 200 = 7.2 GB. 25% of 64 GB = 16 GB, so a 1-hour chunk at 7.2 GB fits comfortably. The 7-day default is for lower-volume workloads. 1-day chunks at 165 GB would exceed RAM, causing disk I/O on recent data. 1-minute chunks at 120 MB each would create 8,760 chunks per year, risking catalog bloat."},{"text":"A continuous aggregate on fx_rates computes 1-minute OHLCV candles. The policy is configured with end_offset = INTERVAL '1 minute'. A query on the continuous aggregate view returns data up to 2 minutes ago but not the last minute. How do you get truly up-to-the-second data from the view?","options":["a) Decrease the end_offset to zero seconds","b) Set timescaledb.materialized_only = false on the continuous aggregate to enable real-time aggregation, which combines pre-aggregated data with live raw data","c) Increase the schedule_interval to run more frequently","d) Query the raw table instead — continuous aggregates always have a lag"],"correct":1,"explanation":"Real-time aggregation (timescaledb.materialized_only = false, the default in TimescaleDB 2.x) makes the continuous aggregate view transparently combine its materialized data with a live query on the raw table for the recent end_offset period. This means the view returns up-to-the-second data without any lag, while still using the pre-aggregated data for older time ranges. Setting end_offset to zero is not recommended as it causes the refresh job to compete with incoming writes on the most recent chunk."},{"text":"What happens if you attempt to INSERT a row with a timestamp 2 months ago into a TimescaleDB hypertable that has compression enabled with compress_after = INTERVAL '7 days'?","options":["a) The INSERT succeeds and the row is automatically appended to the compressed chunk","b) The INSERT fails with an error because the target chunk is compressed and immutable; you must decompress the chunk first","c) The INSERT creates a new uncompressed chunk for the old timestamp","d) TimescaleDB silently drops the INSERT and returns success"],"correct":1,"explanation":"TimescaleDB compresses chunks into an immutable columnar format. Direct writes (INSERT, UPDATE, DELETE) to a compressed chunk fail with an error. To backfill data, you must first call decompress_chunk() on the target chunk, perform the write, then call compress_chunk() again. TimescaleDB 2.11+ introduced partial decompression for DML on compressed chunks, which decompresses only the affected segment rather than the entire chunk. The best architectural approach is to treat time-series data as append-only and model corrections as new events rather than updates to old rows."}]}
+{"questions": [{"text": "You have a hypertable storing 10,000 rows per second, each row 200 bytes. You have 64 GB of RAM and want the hot (uncompressed) chunk to fit in ~25% of RAM. What chunk_time_interval should you use?", "options": ["a) 1 day — 10,000 * 86,400 * 200 bytes = ~173 GB, too large", "b) 1 hour — 10,000 * 3,600 * 200 bytes = ~7.2 GB, fits in 16 GB (25% of 64 GB)", "c) 7 days — this is TimescaleDB's default and always correct", "d) 1 minute — smaller chunks are always faster"], "correct": 1, "explanation": "With 10,000 rows/second and 200 bytes/row: rows per hour = 36,000,000; size = 36,000,000 * 200 = 7.2 GB (plus indexes). 25% of 64 GB = 16 GB, so a 1-hour chunk fits comfortably. The 7-day default suits lower-volume workloads. 1-day chunks at ~173 GB would far exceed RAM, causing disk I/O on recent data. 1-minute chunks (120 MB each) would create 525,600 chunks per year — catalog bloat and slow planning; even 1-hour chunks give 8,760 per year, so combine them with a retention policy."}, {"text": "A continuous aggregate on fx_rates computes 1-minute OHLCV candles. The policy is configured with end_offset = INTERVAL '1 minute'. A query on the continuous aggregate view returns data up to 2 minutes ago but not the last minute. How do you get truly up-to-the-second data from the view?", "options": ["a) Decrease the end_offset to zero seconds", "b) Set timescaledb.materialized_only = false on the continuous aggregate to enable real-time aggregation, which combines pre-aggregated data with live raw data", "c) Increase the schedule_interval to run more frequently", "d) Query the raw table instead — continuous aggregates always have a lag"], "correct": 1, "explanation": "Real-time aggregation (timescaledb.materialized_only = false) makes the continuous aggregate view combine its materialized data with a live aggregation of the raw rows newer than the last materialized bucket. The view then returns up-to-the-second data while still using pre-aggregated data for older ranges. It is off by default for continuous aggregates created on TimescaleDB 2.13+, so set it explicitly. Setting end_offset to zero is not recommended: the refresh job would keep re-materializing the bucket that is still receiving writes."}, {"text": "What happens if you attempt to INSERT a row with a timestamp 2 months ago into a TimescaleDB hypertable that has compression enabled with compress_after = INTERVAL '7 days'?", "options": ["a) On current versions (INSERT supported since 2.3) the INSERT succeeds: the row is stored uncompressed inside that chunk and merged into the compressed data the next time the chunk is recompressed", "b) The INSERT always fails because compressed chunks are immutable; you must decompress the chunk first", "c) The INSERT creates a new uncompressed chunk for the old timestamp", "d) TimescaleDB silently drops the INSERT and returns success"], "correct": 0, "explanation": "Since TimescaleDB 2.3, INSERTs into compressed chunks are accepted: the new rows are kept uncompressed inside the chunk and folded into the columnar data when the compression policy recompresses it. UPDATE and DELETE on compressed chunks work since 2.11 (they decompress only the affected segments). Very old versions did reject such writes, which is where the 'decompress first' advice comes from. For large backfills it is still faster to decompress, load and recompress the affected chunks."}]}
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{"title":"TimescaleDB Payment Metrics: Hypertables, Continuous Aggregates, and Compression","difficulty":"advanced","estimatedMinutes":85,"tasks":[{"id":"1","description":"Install TimescaleDB (use Docker: timescale/timescaledb-ha:pg16) and create a payment_throughput hypertable with columns: recorded_at TIMESTAMPTZ, service VARCHAR(50), region VARCHAR(20), payments_count INT, error_count INT, p50_latency_ms FLOAT, p99_latency_ms FLOAT. Set chunk_time_interval to 1 day. Generate 30 days of synthetic data at 1-second resolution (simulate 10 services across 3 regions). Verify chunk creation with timescaledb_information.chunks and confirm that EXPLAIN on a 1-day range query shows only the target chunk being scanned, not all 30 chunks."},{"id":"2","description":"Create a continuous aggregate payment_throughput_1m that computes AVG, MIN, MAX for all metric columns with 1-minute buckets. Set a refresh policy with start_offset=5 minutes, end_offset=1 minute, schedule_interval=1 minute. Enable real-time aggregation (materialized_only=false). Write a query that compares response time between: (a) querying the raw hypertable with time_bucket() and (b) querying the continuous aggregate view, for a 7-day range. Record the difference in a SQL comment."},{"id":"3","description":"Enable native compression on the payment_throughput hypertable with compress_segmentby='service,region' and compress_orderby='recorded_at DESC'. Add a compression policy for data older than 3 days. Manually compress chunks older than 10 days using compress_chunk(). Query chunk_compression_stats() and report the before/after sizes and compression percentage in a SQL comment. Then attempt to INSERT a row into a compressed chunk and document the error. Demonstrate the decompress_chunk() workaround."},{"id":"4","description":"Build a gap-filled dashboard query: use time_bucket_gapfill() with a 5-minute interval over the last 24 hours, applying locf() to p99_latency_ms and interpolate() to payments_count. The result must have exactly 288 rows (24h / 5min) for each service, with no NULL values for p99_latency_ms. Add a retention policy that drops raw data older than 30 days and compressed data older than 90 days. Verify the policy is registered in timescaledb_information.jobs and manually execute it with drop_chunks() to confirm it removes the expected chunks without locking the table."}]}
+{"title": "TimescaleDB Payment Metrics: Hypertables, Continuous Aggregates, and Compression", "difficulty": "advanced", "estimatedMinutes": 85, "tasks": [{"id": "1", "description": "Install TimescaleDB (use Docker: timescale/timescaledb-ha:pg16) and create a payment_throughput hypertable with columns: recorded_at TIMESTAMPTZ, service VARCHAR(50), region VARCHAR(20), payments_count INT, error_count INT, p50_latency_ms FLOAT, p99_latency_ms FLOAT. Set chunk_time_interval to 1 day. Generate 30 days of synthetic data at 1-second resolution (simulate 10 services across 3 regions). Verify chunk creation with timescaledb_information.chunks and confirm that EXPLAIN on a 1-day range query shows only the target chunk being scanned, not all 30 chunks."}, {"id": "2", "description": "Create a continuous aggregate payment_throughput_1m that computes AVG, MIN, MAX for all metric columns with 1-minute buckets. Set a refresh policy with start_offset=5 minutes, end_offset=1 minute, schedule_interval=1 minute. Enable real-time aggregation (materialized_only=false). Write a query that compares response time between: (a) querying the raw hypertable with time_bucket() and (b) querying the continuous aggregate view, for a 7-day range. Record the difference in a SQL comment."}, {"id": "3", "description": "Enable native compression on the payment_throughput hypertable with compress_segmentby='service,region' and compress_orderby='recorded_at DESC'. Add a compression policy for data older than 3 days. Manually compress chunks older than 10 days using compress_chunk(). Query chunk_compression_stats() and report the before/after sizes and compression percentage in a SQL comment. Then INSERT and UPDATE a few rows inside a compressed chunk, check how TimescaleDB handles them (timing, chunk status), and compare with the decompress_chunk() + load + compress_chunk() approach for a backfill of one full day."}, {"id": "4", "description": "Build a gap-filled dashboard query: use time_bucket_gapfill() with a 5-minute interval over the last 24 hours, applying locf() to p99_latency_ms and interpolate() to payments_count. The result must have exactly 288 rows (24h / 5min) for each service, with no NULL values for p99_latency_ms. Add a retention policy that drops raw data older than 30 days, and one that drops the continuous aggregate's data older than 1 year. Verify the policies are registered in timescaledb_information.jobs and run drop_chunks() manually to confirm it removes only the expected chunks while queries on recent chunks keep running."}]}
 -->

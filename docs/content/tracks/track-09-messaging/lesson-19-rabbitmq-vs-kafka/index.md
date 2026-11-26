@@ -47,8 +47,11 @@ This difference in retention is the decisive factor for most architecture decisi
 | Is this a task queue (work distribution)? | Yes → RabbitMQ |
 | Do I need complex routing (direct, fanout, topic, headers)? | Yes → RabbitMQ |
 | Do I need delivery acknowledgement at the per-task level? | Yes → RabbitMQ |
-| Do I need >100k messages/second throughput? | Yes → Kafka |
+| Do I need very high throughput on one stream (hundreds of thousands of msg/s and more)? | Yes → Kafka |
 | Do I need message TTL per message? | Yes → RabbitMQ |
+| Do I need message priorities or request-reply? | Yes → RabbitMQ |
+
+For payments, declare RabbitMQ queues as **quorum queues** (`x-queue-type: quorum`, Raft-replicated). Classic mirrored queues were deprecated and removed in RabbitMQ 4.0, and a classic queue without replication loses its messages when its node is lost.
 
 ---
 
@@ -84,7 +87,9 @@ public class RabbitMQConfig {
     @Bean
     public Queue settlementQueue() {
         return QueueBuilder.durable("payments.settlement")
-                .withArgument("x-message-ttl", 3600000)       // 1 hour TTL
+                .quorum()                                       // replicated (Raft)
+                .withArgument("x-delivery-limit", 5)            // poison message -> DLX after 5 redeliveries
+                .withArgument("x-message-ttl", 3600000)         // 1 hour TTL -> then DLX
                 .withArgument("x-dead-letter-exchange", "payments.dlx")
                 .withArgument("x-dead-letter-routing-key", "settlement.dlq")
                 .build();
@@ -93,8 +98,9 @@ public class RabbitMQConfig {
     @Bean
     public Queue notificationQueue() {
         return QueueBuilder.durable("payments.notification")
-                .withArgument("x-message-ttl", 1800000)  // 30 min TTL
-                .build();
+                .quorum()
+                .withArgument("x-message-ttl", 1800000)  // 30 min TTL -- no DLX: an
+                .build();                                 // expired notification is dropped (acceptable here)
     }
 
     // Bindings: exchange routes by routing key
@@ -117,6 +123,10 @@ public class RabbitMQConfig {
 @Service
 public class PaymentEventPublisher {
 
+    // RabbitTemplate configured with publisher confirms
+    // (spring.rabbitmq.publisher-confirm-type=correlated) and returns
+    // (mandatory=true): without them a message lost on the way or routed to
+    // no queue disappears silently
     @Autowired private RabbitTemplate rabbitTemplate;
 
     public void publishPaymentCreated(Payment payment) {
@@ -166,8 +176,15 @@ public class PaymentSettlementConsumer {
             // NACK with requeue=false → goes to dead letter exchange
             channel.basicNack(deliveryTag, false, false);
         } catch (TransientException e) {
-            // NACK with requeue=true → back to queue for retry
+            // NACK with requeue=true → back to the queue for retry. Careful:
+            // redelivery is immediate (a tight retry loop) -- the quorum
+            // queue's x-delivery-limit stops it after 5 attempts and
+            // dead-letters the message; for delayed retries use a retry
+            // queue with TTL that dead-letters back to the main queue.
             channel.basicNack(deliveryTag, false, true);
+        } catch (Exception e) {
+            // Anything unexpected: never leave a message un-acked
+            channel.basicNack(deliveryTag, false, false);
         }
     }
 }
@@ -177,7 +194,7 @@ public class PaymentSettlementConsumer {
 
 ## Dead Letter Exchanges in RabbitMQ
 
-RabbitMQ's Dead Letter Exchange (DLX) is equivalent to Kafka's DLQ:
+RabbitMQ's Dead Letter Exchange (DLX) plays the role of a Kafka DLQ/DLT — but it is built into the broker: rejected, expired and over-delivery-limit messages are routed there automatically, while in Kafka the consumer application publishes to the DLT itself:
 
 ```java
 @Configuration
@@ -206,7 +223,7 @@ public class RabbitMQDlxConfig {
 
 ## RabbitMQ Streams for Replay
 
-Classic RabbitMQ queues delete messages after consumption. **RabbitMQ Streams** (introduced in 3.9) add log-based storage with replay:
+Classic RabbitMQ queues delete messages after consumption. **RabbitMQ Streams** (introduced in 3.9) add log-based storage with replay; *super streams* (3.11+) partition a stream like a Kafka topic:
 
 ```java
 import com.rabbitmq.stream.*;
@@ -218,8 +235,8 @@ public class RabbitMQStreamConfig {
     public Environment rabbitStreamEnvironment() {
         return Environment.builder()
                 .host("rabbitmq")
-                .username("admin")
-                .password("secret")
+                .username(streamUser)          // from configuration / secret store,
+                .password(streamPassword)      // never hard-coded
                 .build();
     }
 }
@@ -228,21 +245,26 @@ public class RabbitMQStreamConfig {
 public class PaymentStreamPublisher {
 
     @Autowired private Environment streamEnv;
+    private Producer producer;
 
     @PostConstruct
-    public void setupStream() {
+    public void setup() {
         streamEnv.streamCreator()
                 .stream("payments-stream")
                 .maxLengthBytes(ByteCapacity.GB(50))  // Keep 50GB of history
                 .maxAge(Duration.ofDays(30))            // Or 30 days
                 .create();
-    }
-
-    public void publish(PaymentCreatedEvent event) {
-        Producer producer = streamEnv.producerBuilder()
+        // ONE long-lived producer -- not a new one (and a leaked connection)
+        // per message
+        producer = streamEnv.producerBuilder()
                 .stream("payments-stream")
                 .build();
+    }
 
+    @PreDestroy
+    public void close() { producer.close(); }
+
+    public void publish(PaymentCreatedEvent event) {
         producer.send(
                 producer.messageBuilder()
                         .addData(event.toJson().getBytes())
@@ -250,6 +272,8 @@ public class PaymentStreamPublisher {
                         .build(),
                 confirmationStatus -> {
                     if (!confirmationStatus.isConfirmed()) {
+                        // logging alone loses the event -- retry or keep it
+                        // in an outbox until confirmed
                         log.error("Stream publish failed for payment {}", event.getPaymentId());
                     }
                 }
@@ -264,15 +288,17 @@ RabbitMQ Streams close the gap with Kafka for replay use cases, but Kafka remain
 
 ## Throughput Comparison
 
+Rough orders of magnitude only — real numbers depend heavily on message size, persistence, replication and hardware, so benchmark your own workload:
+
 | Metric | RabbitMQ | Kafka |
 |--------|---------|-------|
-| Peak throughput | ~50-100k msg/s | ~1M+ msg/s |
-| Latency (p99) | 1-10ms | 5-50ms |
-| Scaling | Vertical + federation | Horizontal (partitions) |
-| Message size | Optimal for <1MB | Optimal for <1MB, supports larger |
-| Consumer type | Push (broker-initiated) | Pull (consumer-initiated) |
+| Throughput per queue / partition | Tens of thousands of msg/s per (quorum) queue; streams go much higher | High per partition; a cluster scales to millions of msg/s |
+| Latency | Low single-digit ms at moderate load | Low ms with `linger.ms` small; batching trades latency for throughput |
+| Scaling | More queues spread over cluster nodes; super streams | Horizontal (partitions) |
+| Message size | Best for small messages (KBs) | Best for small messages; 1MB default max, configurable |
+| Consumer type | Push (broker-initiated, limited by prefetch) | Pull (consumer-initiated) |
 
-**Note:** These numbers are for well-tuned configurations. RabbitMQ can achieve higher throughput with shallow queues and minimal routing overhead; Kafka's advantage grows at very high message counts.
+A single RabbitMQ queue is processed by one Erlang process — scale by spreading work over many queues. Kafka's advantage grows with very high, sustained volume and with many independent consumers of the same data.
 
 ---
 
@@ -280,13 +306,13 @@ RabbitMQ Streams close the gap with Kafka for replay use cases, but Kafka remain
 
 | Scenario | RabbitMQ | Kafka |
 |----------|---------|-------|
-| Single queue, single consumer | Strict FIFO | N/A (use Kafka) |
-| Single queue, multiple consumers | No ordering | N/A |
-| Per-account ordering | Manual (1 queue per account) | Automatic (key-based partitioning) |
+| One queue / partition, one consumer | FIFO (but a requeued message is redelivered out of order) | Strict FIFO |
+| One queue, competing consumers | No ordering between consumers | N/A — one consumer per partition in a group |
+| Per-account ordering | Consistent-hash exchange + Single Active Consumer per queue, or super streams | Automatic (key-based partitioning) |
 | Global ordering | Single queue (bottleneck) | Single partition (bottleneck) |
 | Within consumer group | Per-queue FIFO | Per-partition FIFO |
 
-For per-entity ordering (per-account, per-payment), Kafka's partition-key mechanism is more natural and scalable than RabbitMQ's one-queue-per-entity approach.
+For per-entity ordering (per-account, per-payment), Kafka's partition-key mechanism is built in and simpler than the RabbitMQ equivalents.
 
 ---
 
@@ -313,29 +339,35 @@ Payment Platform Architecture — Hybrid
 ```
 
 ```java
-// Payment flow using both brokers
+// Payment flow using both brokers -- WITHOUT dual writes.
+// Sending to Kafka and RabbitMQ inside a DB transaction is the dual-write
+// bug: if the transaction rolls back, the messages are already out; if a
+// send fails after commit, they are lost. Write outbox rows instead.
 @Service
 public class PaymentCoordinator {
 
-    @Autowired private KafkaTemplate<String, String> kafkaTemplate;    // For event streaming
-    @Autowired private RabbitTemplate rabbitTemplate;                   // For task distribution
+    @Autowired private PaymentRepository paymentRepo;
+    @Autowired private OutboxRepository outbox;
 
     @Transactional
     public void processPayment(Payment payment) {
-        // 1. Publish domain event to Kafka for event-driven architecture
-        kafkaTemplate.send("payments.events",
-                payment.getId(),
-                PaymentCreatedEvent.from(payment).toJson());
+        paymentRepo.save(payment);
 
-        // 2. Queue fraud check as a task to RabbitMQ worker pool
-        //    (competing consumers, one fraud check per payment, task semantics)
-        rabbitTemplate.convertAndSend(
-                "fraud.exchange",
-                "fraud.check",
-                FraudCheckTask.from(payment)
-        );
+        // 1. Domain event -> relayed to Kafka (payments.events, key = paymentId)
+        //    for event-driven consumers (CDC / outbox relay, Lesson 06)
+        outbox.save(OutboxRecord.kafka("payments.events", payment.getId(),
+                PaymentCreatedEvent.from(payment).toJson()));
+
+        // 2. Fraud check task -> relayed to RabbitMQ (fraud.exchange / fraud.check)
+        //    for the competing-consumer worker pool
+        outbox.save(OutboxRecord.rabbit("fraud.exchange", "fraud.check",
+                FraudCheckTask.from(payment).toJson()));
     }
 }
+// The relay sends each row (with publisher confirms for RabbitMQ), marks it
+// sent, and retries otherwise -- consumers must be idempotent (at-least-once).
+// Alternative: publish only to Kafka and let a small bridge consumer create
+// the RabbitMQ task.
 ```
 
 ---
@@ -351,14 +383,14 @@ When to use Kafka:
   ✓ Long event retention required
   ✓ High throughput (>50k msg/s)
   ✓ Consumer groups with independent offsets
-  ✓ Exactly-once semantics needed
+  ✓ Exactly-once read-process-write between Kafka topics (transactions)
 
 When to use RabbitMQ:
   ✓ Task queue semantics (one consumer handles each task)
   ✓ Complex routing (direct, topic, fanout, headers)
   ✓ Per-message TTL required
   ✓ Request-reply pattern (RPC)
-  ✓ Small-scale system (<50k msg/s, <10 services)
+  ✓ Moderate volume where task semantics matter more than replay
   ✓ Teams familiar with AMQP but not Kafka
   ✓ Message priorities needed
   ✓ Mature dead letter exchange patterns needed
@@ -372,13 +404,16 @@ When to use both:
       point-to-point task distribution (RabbitMQ)
 ```
 
+Note: Kafka 4.x adds **share groups** ("queues for Kafka", KIP-932 — early access in 4.0, preview in 4.1): consumers share a partition and acknowledge records one by one, closer to queue semantics. Check its status in your Kafka version before relying on it; for now RabbitMQ remains the mature choice for task queues.
+
 ---
 
 ## Key Takeaways
 
 - RabbitMQ is a **queue** (message deleted after ACK); Kafka is a **log** (message retained regardless of consumption).
 - RabbitMQ's exchange/binding routing model is more flexible for per-message routing than Kafka's partition key approach.
-- Kafka scales to 1M+ messages/second horizontally; RabbitMQ peaks around 50-100k/s per cluster.
+- Kafka scales horizontally to millions of messages/second per cluster; a single RabbitMQ queue is limited to one node's process, so RabbitMQ scales by using many queues (or streams).
+- Use **quorum queues** for RabbitMQ payment queues, with publisher confirms and a delivery limit.
 - RabbitMQ Streams add replay capability to RabbitMQ, but Kafka remains more mature for high-throughput streaming.
 - For per-entity ordering (per-account), Kafka's partition key is more natural than RabbitMQ's queue-per-entity.
 - Hybrid architectures are common in fintech: Kafka for event streaming + RabbitMQ for task queues.
@@ -407,7 +442,7 @@ When to use both:
         "RabbitMQ fanout exchange — broadcasts to all 10 workers simultaneously"
       ],
       "correct": 1,
-      "explanation": "This is a task queue pattern: one task (fraud check) per message, processed by exactly one worker. RabbitMQ's competing consumer model is a natural fit — multiple consumers on the same queue compete, and the broker ensures each message is delivered to exactly one consumer. Kafka consumer groups also distribute partitions, but Kafka is better suited when multiple independent services need to consume the same events (not competing for them). A fanout exchange would send the fraud check to ALL workers, causing duplicate processing."
+      "explanation": "This is a task queue pattern: one task (fraud check) per message, handled by one worker. RabbitMQ's competing consumer model is a natural fit — multiple consumers on the same queue compete, and the broker delivers each message to one consumer at a time (if a worker dies before ACK, the message is redelivered to another, so the check must be idempotent). Kafka consumer groups also distribute work, but only per partition, so parallelism is capped by the partition count and one slow task blocks its partition; Kafka is better suited when multiple independent services need the same events. A fanout exchange would send the fraud check to ALL workers, causing duplicate processing."
     },
     {
       "text": "In a hybrid architecture (Kafka for event streaming + RabbitMQ for task queues), a PaymentCreatedEvent is published to both brokers. What is the correct design intent?",
@@ -430,8 +465,8 @@ When to use both:
   "difficulty": "advanced",
   "estimatedMinutes": 55,
   "tasks": [
-    "Implement a PaymentCoordinator that, within a single @Transactional method, publishes a PaymentCreatedEvent to Kafka (payments.events topic, key=paymentId) for downstream event-driven consumers AND sends a FraudCheckTask to RabbitMQ (fraud.check queue) for point-to-point task delivery. Use the outbox pattern to avoid dual-write inconsistency between the two brokers.",
-    "Configure a RabbitMQ direct exchange (payments.exchange) with two bound queues: payments.settlement (binding key: payment.created) and payments.notification (binding key: payment.created). Implement competing consumers on payments.settlement with concurrency=3 and manual ACK. Verify that each message is processed by exactly one consumer instance using a counter shared across consumer threads.",
+    "Implement a PaymentCoordinator that, within a single @Transactional method, saves the payment and writes two outbox rows: a PaymentCreatedEvent for Kafka (payments.events topic, key=paymentId) and a FraudCheckTask for RabbitMQ (fraud.check routing key). Implement the relay that sends them (with publisher confirms for RabbitMQ) and marks them sent — no direct broker calls inside the transaction.",
+    "Configure a RabbitMQ direct exchange (payments.exchange) with two bound quorum queues: payments.settlement (binding key: payment.created) and payments.notification (binding key: payment.created). Implement competing consumers on payments.settlement with concurrency=3 and manual ACK. Verify that each message is processed by exactly one consumer instance using a counter shared across consumer threads.",
     "Set up a RabbitMQ Dead Letter Exchange (payments.dlx) for the settlement queue. Configure x-message-ttl=3600000 and x-dead-letter-exchange on the queue. Implement a consumer that NACKs with requeue=false on BusinessException. Write a test that triggers the DLX flow and verifies the message appears in the DLQ within 100 ms.",
     "Write a comparison benchmark: publish 10,000 events to Kafka (payments.events) and 10,000 tasks to RabbitMQ (payments.settlement). Measure end-to-end latency (p50, p95, p99) for each broker. Document which broker achieves lower p99 latency and explain why based on the push vs pull model difference from the lesson."
   ]

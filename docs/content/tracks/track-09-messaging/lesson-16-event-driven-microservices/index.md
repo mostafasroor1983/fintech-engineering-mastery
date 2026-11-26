@@ -41,7 +41,7 @@ public void onPaymentCreated(PaymentCreatedNotification notification) {
 }
 ```
 
-**Problem:** Creates a synchronous dependency. If the payment service is slow, all consumers are slow. This defeats the purpose of event-driven architecture.
+**Problem:** Creates a synchronous dependency. If the payment service is slow or down, all consumers are slow or stuck — and a burst of events turns into a burst of callbacks against it. The pattern still fits when consumers rarely need the data, or must always read the very latest state anyway.
 
 ### Pattern 2: Event-Carried State Transfer
 
@@ -72,7 +72,7 @@ public void onPaymentCreated(PaymentCreatedEvent event) {
 }
 ```
 
-**Trade-off:** Events are larger. When the data model changes, all consumers see the change immediately. Use this pattern for high-throughput paths where latency matters.
+**Trade-off:** Events are larger, data is duplicated (each consumer keeps its own, possibly slightly stale copy), and the event contract carries more fields that must be evolved compatibly. In return consumers are autonomous — use this pattern for high-throughput paths where latency and availability matter.
 
 ### Pattern 3: Event Sourcing
 
@@ -147,7 +147,9 @@ public class SettlementPaymentProjection {
                 .settlementStatus(SettlementStatus.PENDING)
                 .build();
 
-        settlementPaymentRepo.save(sp);
+        // Idempotent: a redelivered event must not create a second row --
+        // payment_id is the primary key and the insert uses ON CONFLICT DO NOTHING
+        settlementPaymentRepo.insertIfAbsent(sp);
     }
 }
 ```
@@ -184,8 +186,8 @@ public class PaymentCreatedPayload {
 }
 
 public class MoneyAmount {
-    private BigDecimal value;
-    private String currency;  // ISO 4217
+    private BigDecimal value;  // serialised as a STRING ("125.50"), not a JSON float
+    private String currency;   // ISO 4217
 
     // Prevents "100 of what currency?" bugs
 }
@@ -243,15 +245,17 @@ public class PaymentCreatedEvent {
 @KafkaListener(topics = "payments.events")
 public void handlePaymentCreated(ConsumerRecord<String, String> record) {
     JsonNode json = objectMapper.readTree(record.value());
-    int version = json.get("version").asInt(1);  // Default to version 1
+    // path() instead of get(): no NullPointerException when the field is
+    // missing -- old v1 events had no version field
+    int version = json.path("version").asInt(1);
 
     PaymentCreatedEvent event = switch (version) {
         case 1 -> parseV1(json);
         case 2 -> parseV2(json);
-        default -> {
-            log.warn("Unknown event version {}— attempting V2 parsing", version);
-            yield parseV2(json);
-        }
+        // Unknown (newer) version: do NOT guess -- for payments a wrong guess
+        // silently corrupts data. Fail the record so it goes to the DLT and
+        // the consumer is upgraded.
+        default -> throw new UnsupportedEventVersionException(version);
     };
 
     processPaymentCreated(event);
@@ -262,7 +266,7 @@ public void handlePaymentCreated(ConsumerRecord<String, String> record) {
 
 ## Debugging Event-Driven Systems — Distributed Tracing
 
-When a payment event triggers 10 downstream service actions and one fails, finding the root cause requires distributed tracing.
+When a payment event triggers 10 downstream service actions and one fails, finding the root cause requires distributed tracing. With Spring Boot 3 and Micrometer Tracing, enabling observation on `KafkaTemplate` and the listener containers (`spring.kafka.template.observation-enabled=true`, `spring.kafka.listener.observation-enabled=true`) propagates the trace context through Kafka headers automatically. The manual OpenTelemetry code below shows what happens underneath:
 
 ```java
 import io.opentelemetry.api.trace.Span;

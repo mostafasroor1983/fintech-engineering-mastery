@@ -57,7 +57,7 @@ The numbers are **estimates** produced from table statistics — no SQL is execu
 **Cost notation:** `cost=startup..total`
 - `startup`: cost to produce the first row (e.g., sorting requires reading all rows before returning any)
 - `total`: cost to produce all rows
-- Cost units are arbitrary but consistent — 1.0 equals one sequential page read
+- Cost units are arbitrary but consistent — by default 1.0 equals one sequential page read (`seq_page_cost`)
 
 **Width:** average row width in bytes
 
@@ -91,7 +91,7 @@ Planning Time: 1.231 ms
 Execution Time: 413.904 ms
 ```
 
-Key differences: `actual time` and `actual rows` let you compare estimates vs reality. A large discrepancy (e.g., estimated 4,120 vs actual 5,891) indicates stale statistics.
+Key differences: `actual time` and `actual rows` let you compare estimates vs reality. A difference like 4,120 estimated vs 5,891 actual is normal. A large one (10x or more) points to stale statistics — or to correlated columns the planner treats as independent (fix those with `CREATE STATISTICS`). Note that `actual time` is in milliseconds and, for nodes with `loops > 1`, is per loop.
 
 ### EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
 
@@ -120,7 +120,7 @@ The `BUFFERS` option reveals cache behavior:
 - `Shared Read Blocks`: pages read from disk (or OS cache) — slow
 - A high read-to-hit ratio means your working set does not fit in `shared_buffers`
 
-**FORMAT JSON** produces machine-readable output suitable for tools like [explain.depesz.com](https://explain.depesz.com) or pgBadger.
+**FORMAT JSON** produces machine-readable output for tools such as [explain.dalibo.com](https://explain.dalibo.com) (accepts JSON or text) or your own scripts; [explain.depesz.com](https://explain.depesz.com) expects the text format.
 
 ---
 
@@ -144,7 +144,7 @@ graph TD
 
 ### Seq Scan
 
-Reads every page of the table sequentially. Fast for large result sets (more than ~5% of the table) because sequential I/O is efficient. The planner prefers it when:
+Reads every page of the table sequentially. Fast for large result sets (roughly a few percent of the table or more, depending on row order and storage) because sequential I/O is efficient. The planner prefers it when:
 
 - No suitable index exists
 - The filter is not selective (most rows match)
@@ -192,7 +192,7 @@ The planner calculates the cost of each access path and chooses the cheapest. It
 4. **Cost misconfiguration**: `random_page_cost` is set too high relative to `seq_page_cost` (default 4.0 vs 1.0). On SSDs, `random_page_cost = 1.1` is more accurate.
 
 ```sql
--- Check estimated vs actual correlation for a column
+-- How closely does the physical row order follow this column's order?
 SELECT attname, correlation
 FROM   pg_stats
 WHERE  tablename = 'payments'
@@ -257,7 +257,7 @@ WHERE  relname = 'payments';
 `autovacuum` runs `ANALYZE` automatically, but it can lag after:
 - Bulk inserts (millions of rows inserted in one statement)
 - Initial data loads
-- Partitioned tables where autovacuum processes partitions separately
+- Partitioned tables: autovacuum analyzes each partition, but never the partitioned parent itself — run `ANALYZE` on the parent manually (e.g. after loads) so queries over the whole table get good estimates
 
 Trigger a manual analyze after every bulk load in your ETL pipelines.
 
@@ -307,7 +307,8 @@ The `Sort Method: external merge Disk` line is the signal to increase `work_mem`
 ## 7. pg_stat_statements — Identifying Slow Queries
 
 ```sql
--- Enable the extension (requires superuser, once per database)
+-- Needs shared_preload_libraries = 'pg_stat_statements' (restart), then
+-- once per database (as a superuser or a role allowed to create it):
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
 -- Find the top 10 slowest queries by total execution time
@@ -322,8 +323,9 @@ FROM   pg_stat_statements
 ORDER  BY total_exec_time DESC
 LIMIT  10;
 
--- Find queries with the highest row estimates vs actuals divergence
--- (indicates stale statistics)
+-- Queries that are slow on average: candidates for EXPLAIN (ANALYZE)
+-- (pg_stat_statements has no plan estimates -- compare estimated vs
+--  actual rows in the plan itself, or log plans with auto_explain)
 SELECT
     left(query, 120) AS query_snippet,
     calls,
@@ -353,7 +355,10 @@ The `auto_explain` extension captures plans for slow queries without manual inst
 -- auto_explain.log_buffers = on
 -- auto_explain.log_format = json
 
--- Enable per-session for testing
+-- log_analyze adds timing overhead to EVERY query (not just logged ones);
+-- auto_explain.log_timing = off keeps row counts but removes most of it
+
+-- Enable per-session for testing (LOAD needs superuser)
 LOAD 'auto_explain';
 SET auto_explain.log_min_duration = 0;
 SET auto_explain.log_analyze = true;
@@ -375,13 +380,13 @@ LOG:  duration: 1832.491 ms  plan:
 
 ## 9. explain.depesz.com Format
 
-Pasting output into [explain.depesz.com](https://explain.depesz.com) or [explain.dalibo.com](https://explain.dalibo.com) produces an interactive visualisation with colour-coded nodes highlighting the most expensive operations. For CI pipelines, use the JSON format and pipe it through `pgbadger` or custom tooling.
+Pasting output into [explain.depesz.com](https://explain.depesz.com) or [explain.dalibo.com](https://explain.dalibo.com) produces an interactive visualisation with colour-coded nodes highlighting the most expensive operations. For CI pipelines, capture the JSON format and check it with your own tooling. (pgBadger is a different tool: it analyses PostgreSQL *log files*, including plans logged by auto_explain.)
 
 ```bash
 # Capture JSON plan to file
-psql -d fintech -c "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT ..." \
-  | python3 -c "import sys,json; print(json.dumps(json.loads(sys.stdin.read()[1:-2]), indent=2))" \
-  > plan.json
+# -X: ignore .psqlrc  -A: unaligned  -t: rows only  -q: quiet
+psql -XAtq -d fintech \
+  -c "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT ..." > plan.json
 ```
 
 ---
@@ -409,7 +414,7 @@ Limit  (cost=89421.50..89421.75 rows=100 width=60)
   ->  Sort  (cost=89421.50..89441.50 rows=8000 width=60)
             (actual time=14821.33..14821.38 rows=100 loops=1)
         Sort Key: p.created_at DESC
-        Sort Method: external merge  Disk: 1240kB
+        Sort Method: top-N heapsort  Memory: 52kB
         ->  Hash Join  (cost=1842.55..89101.33 rows=8000 width=60)
                        (actual time=38.21..14801.22 rows=8213 loops=1)
               ->  Seq Scan on payments p
@@ -419,18 +424,21 @@ Limit  (cost=89421.50..89421.75 rows=100 width=60)
               ->  Hash ... accounts a
 ```
 
-Execution time: **14.8 seconds**. The seq scan reads all 50 million rows.
+Execution time: **14.8 seconds** (illustrative numbers). The seq scan reads all 50 million rows to find 8,213.
 
 ### Create the right index
 
 ```sql
--- Composite index: filter on customer_id, range on created_at,
--- covering columns to avoid heap fetch (index-only scan)
+-- Composite index: equality on customer_id, range + ORDER BY on created_at.
+-- INCLUDE covers every other payments column the query reads (id, amount,
+-- status, source_account_id), so an index-only scan is possible.
 CREATE INDEX CONCURRENTLY idx_payments_customer_created
     ON payments (customer_id, created_at DESC)
-    INCLUDE (amount, status, source_account_id);
+    INCLUDE (id, amount, status, source_account_id);
 
-ANALYZE payments;
+-- VACUUM sets the visibility map, which index-only scans need to skip
+-- heap visits; ANALYZE refreshes statistics
+VACUUM (ANALYZE) payments;
 ```
 
 ### After: index scan
@@ -438,18 +446,20 @@ ANALYZE payments;
 ```
 EXPLAIN (ANALYZE, BUFFERS):
 
-Limit  (cost=0.56..412.21 rows=100 width=60)
+Limit  (cost=0.99..412.21 rows=100 width=60)
        (actual time=0.142..1.891 rows=100 loops=1)
-  ->  Index Scan using idx_payments_customer_created on payments p
-      (actual time=0.141..1.882 rows=100 loops=1)
-        Index Cond: ((customer_id = 42001)
-                     AND (created_at >= (now() - '90 days'::interval)))
-  ->  Nested Loop
-        (actual time=0.144..1.943 rows=100 loops=1)
-        ->  Index Scan on accounts a ...
+  ->  Nested Loop  (actual time=0.141..1.882 rows=100 loops=1)
+        ->  Index Only Scan using idx_payments_customer_created on payments p
+              (actual time=0.120..0.402 rows=100 loops=1)
+              Index Cond: ((customer_id = 42001)
+                           AND (created_at >= (now() - '90 days'::interval)))
+              Heap Fetches: 0
+        ->  Index Scan using accounts_pkey on accounts a
+              (actual time=0.012..0.012 rows=1 loops=100)
+              Index Cond: (id = p.source_account_id)
 ```
 
-Execution time: **1.9 ms**. A 7,800x improvement.
+Execution time: **1.9 ms**. A ~7,800x improvement: the index returns rows already in `created_at DESC` order, so the scan stops after 100 rows — no sort, no full scan.
 
 ---
 
@@ -468,14 +478,15 @@ INSERT INTO payments SELECT * FROM payments_staging;
 INSERT INTO payments SELECT * FROM payments_staging;
 ANALYZE payments;  -- Run immediately after the load
 
--- For very large loads, also check autovacuum thresholds
-SELECT relname,
-       n_live_tup,
-       autovacuum_analyze_threshold,
-       autovacuum_analyze_scale_factor
+-- For very large tables, check how far behind auto-analyze is.
+-- Auto-analyze runs after autovacuum_analyze_threshold +
+-- autovacuum_analyze_scale_factor * rows have changed (defaults: 50 + 10%)
+SELECT relname, n_live_tup, n_mod_since_analyze, last_analyze, last_autoanalyze
 FROM   pg_stat_user_tables
-JOIN   pg_class ON relname = relname
 WHERE  relname = 'payments';
+
+SHOW autovacuum_analyze_scale_factor;
+SELECT reloptions FROM pg_class WHERE relname = 'payments';  -- per-table overrides
 ```
 
 Practical rule: run `ANALYZE` explicitly in every ETL script that modifies more than 1% of a table's rows.
@@ -488,10 +499,13 @@ Month-end reconciliation reports scan millions of rows and sort them, but `work_
 -- BAD: global work_mem too low, disk sorts in reconciliation report
 -- postgresql.conf: work_mem = 4MB  (default)
 
--- Check if disk sorts are happening
-SELECT query, sort_spills
+-- Check if sorts/hashes are spilling: temp_blks_written counts temporary
+-- file blocks written by a statement (set log_temp_files = 0 to log each)
+SELECT left(query, 100) AS query, calls, temp_blks_written
 FROM   pg_stat_statements
-WHERE  sort_spills > 0;
+WHERE  temp_blks_written > 0
+ORDER  BY temp_blks_written DESC
+LIMIT  10;
 
 -- GOOD: set work_mem at the transaction level for heavy analytical queries
 BEGIN;
@@ -512,41 +526,41 @@ COMMIT;
 -- work_mem resets to global value after COMMIT/ROLLBACK
 ```
 
-### Pitfall 3 — Unused Index Due to Type Cast
+### Pitfall 3 — Unused Index Due to Type Mismatch
 
-A developer adds `payment_reference` as `VARCHAR` in the database but the application passes an integer literal in the query, causing an implicit cast that makes the index unusable.
+The column is `BIGINT`, but the application binds a `BigDecimal` (for example, a number parsed from JSON). PostgreSQL has no `bigint = numeric` operator that an index on the column can use, so it casts the **column** to `numeric` on every row — and the B-tree index on `customer_id` is useless.
 
 ```sql
 -- Table definition
 CREATE TABLE payments (
-    id               BIGSERIAL PRIMARY KEY,
-    payment_reference VARCHAR(64),
+    id           BIGSERIAL PRIMARY KEY,
+    customer_id  BIGINT NOT NULL,
     ...
 );
-CREATE INDEX idx_payments_ref ON payments (payment_reference);
+CREATE INDEX idx_payments_customer ON payments (customer_id);
 
--- BAD: type mismatch — passing integer, column is VARCHAR
--- PostgreSQL must cast every row: index cannot be used
-EXPLAIN SELECT * FROM payments WHERE payment_reference = 12345;
--- -> Seq Scan (Filter: ((payment_reference)::integer = 12345))
+-- BAD: numeric parameter -- the column is cast, index cannot be used
+EXPLAIN SELECT * FROM payments WHERE customer_id = 42001::numeric;
+-- -> Seq Scan  Filter: ((customer_id)::numeric = '42001'::numeric)
 
--- GOOD: pass the correct type — single quotes for string literals
-EXPLAIN SELECT * FROM payments WHERE payment_reference = '12345';
--- -> Index Scan using idx_payments_ref
+-- GOOD: same type as the column
+EXPLAIN SELECT * FROM payments WHERE customer_id = 42001;
+-- -> Index Scan using idx_payments_customer
 
--- In Java (Spring JDBC / JPA), always bind the right Java type:
-// BAD (binds as int)
+-- In Java (Spring JDBC / JPA), always bind the column's Java type:
+// BAD (binds as numeric)
 jdbcTemplate.queryForList(
-    "SELECT * FROM payments WHERE payment_reference = ?",
-    12345);         // passes Integer
+    "SELECT * FROM payments WHERE customer_id = ?",
+    new BigDecimal("42001"));
 
-// GOOD (binds as String)
+// GOOD (binds as bigint)
 jdbcTemplate.queryForList(
-    "SELECT * FROM payments WHERE payment_reference = ?",
-    "12345");       // passes String
+    "SELECT * FROM payments WHERE customer_id = ?",
+    42001L);
 ```
 
----
+(The reverse — comparing a `VARCHAR` column with an integer — does not silently degrade: PostgreSQL rejects it with `operator does not exist: character varying = integer`.) The same problem appears when a query wraps the column in a function, e.g. `WHERE date(created_at) = ...` or `lower(email) = ...`: either rewrite the condition as a range on the bare column, or create an expression index.
+
 
 ## 12. Query Plan Analysis Checklist
 
@@ -562,14 +576,14 @@ jdbcTemplate.queryForList(
 - [ ] Set `random_page_cost = 1.1` on SSD-backed instances
 - [ ] Use `CONCURRENTLY` when creating indexes on live tables
 - [ ] Verify index is being used after creation (`EXPLAIN` again)
-- [ ] For type-cast issues: ensure application binds the same type as the column
+- [ ] For type-cast issues: ensure the application binds the same type as the column, and avoid functions on indexed columns
 
 ---
 
 <!-- KNOWLEDGE-CHECK
-{"questions":[{"text":"In an EXPLAIN ANALYZE output, the node shows cost=100..5000 rows=200 and actual time=50..8000 actual rows=12000. What does this indicate?","options":["The query ran faster than estimated","Statistics are stale — the planner severely underestimated row count","The index is being used correctly","work_mem needs to be reduced"],"correct":1,"explanation":"When actual rows (12000) far exceed estimated rows (200), it means pg_stats are outdated. The planner made decisions based on wrong cardinality estimates. Run ANALYZE to refresh statistics."},{"text":"A Hash Join node shows Batches: 8. What is the most effective way to fix this?","options":["Add an index on the join column","Increase work_mem for this query session","Run VACUUM ANALYZE","Change the join to a Nested Loop"],"correct":1,"explanation":"Batches > 1 means the hash table spilled to disk because work_mem was insufficient. Increasing work_mem allows the hash table to stay in memory, eliminating disk I/O. SET LOCAL work_mem = '256MB' before the query."},{"text":"An index exists on payments(payment_reference VARCHAR) but EXPLAIN shows a Seq Scan with filter ((payment_reference)::integer = 42). What is the root cause?","options":["The index is corrupt and needs REINDEX","The table statistics are stale","The application is passing an integer literal instead of a string, causing a type cast that prevents index use","The index needs to be a GIN index instead of B-tree"],"correct":2,"explanation":"PostgreSQL cannot use the index when it must cast the column type to match the predicate type. The cast (payment_reference)::integer must be applied to every row, defeating the index. Fix by passing a string literal: WHERE payment_reference = '42'."}]}
+{"questions": [{"text": "In an EXPLAIN ANALYZE output, the node shows cost=100..5000 rows=200 and actual time=50..8000 actual rows=12000. What does this indicate?", "options": ["The query ran faster than estimated", "Statistics are stale — the planner severely underestimated row count", "The index is being used correctly", "work_mem needs to be reduced"], "correct": 1, "explanation": "When actual rows (12000) far exceed estimated rows (200), the planner worked with wrong cardinality estimates. The usual cause is stale statistics — run ANALYZE. If the estimate stays wrong after ANALYZE, look for correlated predicates (fix with CREATE STATISTICS) or a too-small statistics target."}, {"text": "A Hash Join node shows Batches: 8. What is the most effective way to fix this?", "options": ["Add an index on the join column", "Increase work_mem for this query session", "Run VACUUM ANALYZE", "Change the join to a Nested Loop"], "correct": 1, "explanation": "Batches > 1 means the hash table did not fit in memory (work_mem × hash_mem_multiplier) and was split into batches written to temporary files. Raising work_mem for this query (SET LOCAL work_mem = '256MB' inside the transaction) lets it stay in memory and removes that disk I/O."}, {"text": "An index exists on payments(customer_id BIGINT), but EXPLAIN shows a Seq Scan with Filter: ((customer_id)::numeric = '42'::numeric). What is the root cause?", "options": ["The index is corrupt and needs REINDEX", "The table statistics are stale", "The application binds a numeric value (e.g. a Java BigDecimal) instead of a long, so PostgreSQL casts the column to numeric on every row and cannot use the index", "The index needs to be a GIN index instead of B-tree"], "correct": 2, "explanation": "An index on customer_id can only be used when the condition compares the bare column with a value of a compatible type. With a numeric parameter, PostgreSQL casts the column, (customer_id)::numeric, for every row, which defeats the B-tree index. Fix it by binding the column's type (a Long / bigint): WHERE customer_id = 42."}]}
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{"title":"Diagnose and Fix a Slow Payment History Query","difficulty":"advanced","estimatedMinutes":60,"tasks":[{"id":"1","description":"Run EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) on the payment history query: SELECT p.id, p.amount, p.status, p.created_at FROM payments p WHERE p.customer_id = ? AND p.created_at >= NOW() - INTERVAL '90 days' ORDER BY p.created_at DESC LIMIT 100. Identify and document: the scan type, actual vs estimated rows, whether disk spill is occurring, and cache hit ratio."},{"id":"2","description":"Create a composite index on payments(customer_id, created_at DESC) INCLUDE (amount, status) using CONCURRENTLY. Run ANALYZE payments. Re-run the EXPLAIN and confirm the plan changes from Seq Scan to Index Scan. Record the execution time before and after."},{"id":"3","description":"Write a SQL query against pg_stat_statements to find the top 5 queries by mean execution time where mean_exec_time > 50ms. For each, identify whether the slowness is likely due to missing index, stale stats, or low work_mem based on the plan."},{"id":"4","description":"Simulate a stale-statistics pitfall: INSERT 500,000 rows into a test payments table in one statement without running ANALYZE. Run EXPLAIN ANALYZE on a selective query and observe the row count discrepancy. Then run ANALYZE and re-run the plan. Document the difference in estimated vs actual rows and the resulting change in execution plan."}]}
+{"title": "Diagnose and Fix a Slow Payment History Query", "difficulty": "advanced", "estimatedMinutes": 60, "tasks": [{"id": "1", "description": "Run EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) on the payment history query: SELECT p.id, p.amount, p.status, p.created_at FROM payments p WHERE p.customer_id = ? AND p.created_at >= NOW() - INTERVAL '90 days' ORDER BY p.created_at DESC LIMIT 100. Identify and document: the scan type, actual vs estimated rows, whether disk spill is occurring, and cache hit ratio."}, {"id": "2", "description": "Create a composite index on payments(customer_id, created_at DESC) INCLUDE (id, amount, status) using CONCURRENTLY. Run VACUUM (ANALYZE) payments. Re-run the EXPLAIN and confirm the plan changes from Seq Scan to an Index Only Scan with Heap Fetches close to 0. Record the execution time before and after."}, {"id": "3", "description": "Write a SQL query against pg_stat_statements to find the top 5 queries by mean execution time where mean_exec_time > 50ms. For each, identify whether the slowness is likely due to missing index, stale stats, or low work_mem based on the plan."}, {"id": "4", "description": "Simulate a stale-statistics pitfall: INSERT 500,000 rows into a test payments table in one statement without running ANALYZE. Run EXPLAIN ANALYZE on a selective query and observe the row count discrepancy. Then run ANALYZE and re-run the plan. Document the difference in estimated vs actual rows and the resulting change in execution plan."}]}
 -->

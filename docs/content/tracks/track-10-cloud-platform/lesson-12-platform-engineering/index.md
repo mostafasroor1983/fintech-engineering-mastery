@@ -71,10 +71,17 @@ backend:
 
 # Service catalog — where all services are registered
 catalog:
+  # Auto-discover services by scanning all GitHub repos (GitHub entity
+  # provider of the new backend system; replaces "github-discovery" locations)
+  providers:
+    github:
+      fintechOrg:
+        organization: fintech
+        catalogPath: /catalog-info.yaml
+        schedule:
+          frequency: { minutes: 30 }
+          timeout: { minutes: 3 }
   locations:
-    # Auto-discover services by scanning all GitHub repos
-    - type: github-discovery
-      target: https://github.com/fintech/*/blob/main/catalog-info.yaml
     # Explicitly register platform components
     - type: url
       target: https://github.com/fintech/platform/blob/main/catalog-info.yaml
@@ -83,7 +90,9 @@ catalog:
 integrations:
   github:
     - host: github.com
-      token: ${GITHUB_TOKEN}
+      # Prefer a GitHub App (short-lived, scoped tokens) over a personal token
+      apps:
+        - $include: github-app-credentials.yaml
 
 # TechDocs: render Markdown documentation in the portal
 techdocs:
@@ -232,6 +241,10 @@ spec:
           title: Estimated Requests Per Second (peak)
           type: integer
           default: 100
+        pciScope:
+          title: Handles cardholder data (PCI scope)?
+          type: boolean
+          default: false
 
   steps:
     # Step 1: Create GitHub repository
@@ -257,7 +270,6 @@ spec:
           database: ${{ parameters.database }}
           kafkaTopics: ${{ parameters.kafkaTopics }}
           estimatedRPS: ${{ parameters.estimatedRPS }}
-          year: ${{ '' | now | date('YYYY') }}
 
     # Step 3: Push scaffolded code to repo
     - id: publish
@@ -276,24 +288,32 @@ spec:
         repoContentsUrl: https://github.com/fintech/${{ parameters.name }}/blob/main
         catalogInfoPath: /catalog-info.yaml
 
-    # Step 5: Provision Kubernetes namespace via GitOps
-    - id: provision-namespace
-      name: Provision Kubernetes Namespace
-      action: github:file:create
+    # Step 5: Provision Kubernetes namespace via GitOps -- as a PULL REQUEST
+    # to the platform-config repo, so the change is reviewed (four eyes)
+    # before Argo CD applies it
+    - id: namespace-files
+      name: Render Namespace Manifest
+      action: fetch:template
       input:
-        repoUrl: github.com/fintech/platform-config
-        path: clusters/production/namespaces/${{ parameters.name }}.yaml
-        message: "feat: provision namespace for ${{ parameters.name }}"
-        content: |
-          apiVersion: v1
-          kind: Namespace
-          metadata:
-            name: ${{ parameters.name }}
-            labels:
-              team: ${{ parameters.owner }}
-              app.kubernetes.io/managed-by: backstage
-              fintech.io/service: ${{ parameters.name }}
-              fintech.io/pci-scope: "false"  # engineer updates if needed
+        url: ./namespace-template      # contains ${{ values.name }}.yaml
+        targetPath: ./platform-config
+        values:
+          name: ${{ parameters.name }}
+          # an owner like "group:default/payments" is not a valid label value
+          team: ${{ parameters.owner | parseEntityRef | pick('name') }}
+          pciScope: ${{ parameters.pciScope }}   # asked in the form; PCI-scope
+                                                 # namespaces get extra controls
+
+    - id: provision-namespace
+      name: Open Pull Request for Namespace
+      action: publish:github:pull-request
+      input:
+        repoUrl: github.com?owner=fintech&repo=platform-config
+        branchName: namespace-${{ parameters.name }}
+        title: "feat: provision namespace for ${{ parameters.name }}"
+        description: "Requested via Backstage golden-path template"
+        sourcePath: ./platform-config
+        targetPath: clusters/production/namespaces
 
   output:
     links:
@@ -337,11 +357,12 @@ resources:
     cpu: 1000m
     memory: 1Gi
 
-# Health checks — standardized across all services
+# Health checks — standardized across all services (a startupProbe covers
+# JVM start-up, so liveness needs no guessed initial delay)
 healthCheck:
   livenessPath: /actuator/health/liveness
   readinessPath: /actuator/health/readiness
-  initialDelaySeconds: 30
+  startupFailureThreshold: 30     # x 5s = up to 150s to start
   periodSeconds: 10
 
 # Security context — enforced for all services
@@ -404,12 +425,15 @@ metadata:
   name: {{ include "platform-service.fullname" . }}
   labels:
     {{- include "platform-service.labels" . | nindent 4 }}
-    # Mandatory compliance labels
-    fintech.io/pci-scope: {{ .Values.annotations.pciScope | default "false" | quote }}
-    fintech.io/data-classification: {{ .Values.annotations.dataClassification | default "internal" | quote }}
+    # Mandatory compliance labels (keys contain dots and slashes, so they
+    # must be read with "index" -- .Values.annotations.pciScope would not
+    # exist and silently fall back to the default)
+    fintech.io/pci-scope: {{ index .Values.annotations "fintech.io/pci-scope" | default "false" | quote }}
+    fintech.io/data-classification: {{ index .Values.annotations "fintech.io/data-classification" | default "internal" | quote }}
   annotations:
-    # Last deployed annotation for audit trail
-    fintech.io/last-deployed: {{ now | date "2006-01-02T15:04:05Z" | quote }}
+    # No "now" timestamp here: it would change on every render and keep
+    # Argo CD permanently OutOfSync. The Git commit and the Argo CD sync
+    # history are the deployment audit trail.
     fintech.io/deployed-by: {{ .Values.deployedBy | default "ci" | quote }}
 spec:
   {{- if not .Values.autoscaling.enabled }}
@@ -452,24 +476,28 @@ spec:
             - containerPort: {{ .Values.service.port }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.healthCheck.livenessPath }}
+              port: {{ .Values.service.port }}
+            periodSeconds: 5
+            failureThreshold: {{ .Values.healthCheck.startupFailureThreshold }}
           livenessProbe:
             httpGet:
               path: {{ .Values.healthCheck.livenessPath }}
               port: {{ .Values.service.port }}
-            initialDelaySeconds: {{ .Values.healthCheck.initialDelaySeconds }}
             periodSeconds: {{ .Values.healthCheck.periodSeconds }}
           readinessProbe:
             httpGet:
               path: {{ .Values.healthCheck.readinessPath }}
               port: {{ .Values.service.port }}
-            initialDelaySeconds: 5
             periodSeconds: 5
 
           # Graceful shutdown: drain in-flight requests
           lifecycle:
             preStop:
-              exec:
-                command: ["/bin/sh", "-c", "sleep 5"]
+              sleep:              # native sleep action (Kubernetes 1.30+)
+                seconds: 5
       terminationGracePeriodSeconds: 30
 ```
 
@@ -480,6 +508,8 @@ spec:
 Engineers should be able to request databases, queues, and secrets without opening tickets to the platform team.
 
 ### Crossplane: Self-Service Database Provisioning
+
+The example uses the Upbound AWS provider and a Composition in *pipeline* mode (with the patch-and-transform function) — the form current Crossplane versions expect. Crossplane v2 additionally makes composite resources namespaced and drops claims; the idea stays the same.
 
 ```yaml
 # Crossplane Composite Resource Definition (XRD)
@@ -528,44 +558,70 @@ spec:
   compositeTypeRef:
     apiVersion: fintech.io/v1alpha1
     kind: XPaymentDatabase
-  resources:
-    - name: rds-instance
-      base:
-        apiVersion: rds.aws.crossplane.io/v1alpha1
-        kind: DBInstance
-        spec:
-          forProvider:
-            region: us-east-1
-            engine: postgres
-            engineVersion: "15.4"
-            multiAZ: true          # always HA for financial data
-            storageEncrypted: true
-            kmsKeyID: arn:aws:kms:us-east-1:123456789:key/rds-key
-            enableIAMDatabaseAuthentication: true
-            backupRetentionPeriod: 7
-            deletionProtection: true  # prevent accidental deletion
-            tags:
-              - key: ManagedBy
-                value: crossplane
-              - key: DataClassification
-                value: pii-financial
-      patches:
-        - fromFieldPath: spec.size
-          toFieldPath: spec.forProvider.dbInstanceClass
-          transforms:
-            - type: map
-              map:
-                small: db.t3.medium
-                medium: db.r6g.large
-                large: db.r6g.xlarge
-                xlarge: db.r6g.2xlarge
-        - fromFieldPath: spec.team
-          toFieldPath: spec.forProvider.tags[0].value
-          transforms:
-            - type: string
-              string:
-                type: Format
-                fmt: "team-%s"
+  mode: Pipeline
+  pipeline:
+    - step: patch-and-transform
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
+          - name: rds-instance
+            base:
+              apiVersion: rds.aws.upbound.io/v1beta1
+              kind: Instance
+              spec:
+                forProvider:
+                  region: us-east-1
+                  engine: postgres
+                  engineVersion: "16"
+                  multiAz: true             # always HA for financial data
+                  storageEncrypted: true    # fixed here -- not exposed in
+                  kmsKeyIdSelector:         # the XRD, so users can't change it
+                    matchLabels:
+                      purpose: rds
+                  iamDatabaseAuthenticationEnabled: true
+                  backupRetentionPeriod: 7
+                  deletionProtection: true  # prevent accidental deletion
+                  publiclyAccessible: false
+                  autoGeneratePassword: true
+                  username: dbadmin
+                  passwordSecretRef:
+                    namespace: crossplane-system
+                    name: rds-master-password   # generated, never typed
+                    key: password
+                  tags:
+                    ManagedBy: crossplane
+                    DataClassification: pii-financial
+                writeConnectionSecretToRef:
+                  namespace: crossplane-system
+            connectionDetails:
+              - name: endpoint
+                fromConnectionSecretKey: endpoint
+              - name: port
+                fromConnectionSecretKey: port
+            patches:
+              - fromFieldPath: spec.size
+                toFieldPath: spec.forProvider.instanceClass
+                transforms:
+                  - type: map
+                    map:
+                      small: db.t3.medium
+                      medium: db.r6g.large
+                      large: db.r6g.xlarge
+                      xlarge: db.r6g.2xlarge
+              # Team tag as its own key -- patching a list index such as
+              # tags[0] would overwrite whichever tag happens to be first
+              - fromFieldPath: spec.team
+                toFieldPath: spec.forProvider.tags.Team
+              - fromFieldPath: metadata.uid
+                toFieldPath: spec.writeConnectionSecretToRef.name
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "%s-rds"
 ---
 # How an engineer provisions a database (no Terraform, no ticket):
 # kubectl apply -f payment-webhooks-db.yaml
@@ -578,6 +634,9 @@ spec:
   size: small
   team: payments-platform
   serviceNamespace: payment-webhooks
+  # where the connection details (endpoint, port) are written
+  writeConnectionSecretToRef:
+    name: payment-webhooks-db-connection
 # After ~10 minutes:
 # kubectl get secret payment-webhooks-db-connection -n payment-webhooks
 ```
@@ -591,20 +650,22 @@ Security and compliance controls should be defaults in the platform, not checkli
 ### OPA Gatekeeper: Mandatory Policy Enforcement
 
 ```yaml
-# OPA Gatekeeper constraint: all deployments must have resource limits
+# OPA Gatekeeper constraint: all pods must have resource limits
+# (constraint kinds come from installed ConstraintTemplates -- these three
+#  are from the Gatekeeper policy library. Matching Pods catches pods from
+#  every controller: Deployments, StatefulSets, Jobs...)
 apiVersion: constraints.gatekeeper.sh/v1beta1
-kind: K8sRequiredResourceLimits
+kind: K8sRequiredResources
 metadata:
   name: require-resource-limits
 spec:
   match:
     kinds:
-      - apiGroups: [apps]
-        kinds: [Deployment, StatefulSet]
+      - apiGroups: [""]
+        kinds: [Pod]
     namespaces: [payments, fraud, compliance, risk]
   parameters:
-    cpu: "true"
-    memory: "true"
+    limits: ["cpu", "memory"]
 ---
 # Constraint: all pods must run as non-root
 apiVersion: constraints.gatekeeper.sh/v1beta1
@@ -646,7 +707,10 @@ spec:
 The platform team should measure the developer experience they provide using DORA metrics.
 
 ```
-DORA Four Key Metrics:
+DORA Four Key Metrics (thresholds from the DORA research; the
+categories and cut-offs shift between yearly reports -- e.g. "elite"
+lead time was < 1 hour in 2021 and < 1 day in 2023; MTTR is now called
+"failed deployment recovery time"):
 
   1. Deployment Frequency
      What: How often does a team deploy to production?
@@ -690,13 +754,15 @@ gh run list \
   --json createdAt \
   | jq 'length'
 
-# Lead time: average time from PR merge to production deployment
+# Lead time: needs BOTH timestamps -- first commit (or merge) of a change
+# and the production deployment that shipped it. Collect the merge times
+# here and join them with deployment times (e.g. from Argo CD history)
 gh pr list \
   --repo fintech/payment-api \
   --state merged \
   --limit 50 \
-  --json mergedAt,headRefName \
-  | jq '.[] | .mergedAt'
+  --json number,mergedAt,mergeCommit \
+  | jq '.[] | {number, mergedAt, sha: .mergeCommit.oid}'
 ```
 
 ---
@@ -754,21 +820,36 @@ Platform team operating model:
   "questions": [
     {
       "text": "A Backstage Scaffolder template creates a new payment microservice. After a developer fills in the template form, what artifacts should the template automatically create without any further human intervention?",
-      "options": ["Only the GitHub repository with a README and the service's tech stack configured", "The GitHub repository with application scaffolding, a Kubernetes namespace with RBAC, a Backstage catalog-info.yaml entry, a Datadog dashboard, and a PagerDuty service — so the new service is production-ready from day one", "A Jira ticket requesting the platform team to provision the required infrastructure", "The GitHub repository and a Terraform workspace that the developer must manually apply"],
+      "options": [
+        "Only the GitHub repository with a README and the service's tech stack configured",
+        "The GitHub repository with application scaffolding, a Kubernetes namespace with RBAC, a Backstage catalog-info.yaml entry, a Datadog dashboard, and a PagerDuty service — so the new service is production-ready from day one",
+        "A Jira ticket requesting the platform team to provision the required infrastructure",
+        "The GitHub repository and a Terraform workspace that the developer must manually apply"
+      ],
       "correct": 1,
       "explanation": "The golden path template's value is eliminating the multi-day provisioning process by automating everything a new service needs: source control (GitHub repo), infrastructure (Kubernetes namespace, RBAC, network policies), observability (Datadog dashboard, PagerDuty service, Grafana dashboard), CI/CD (GitHub Actions workflow), and service registration (Backstage catalog entry). If the developer must still manually provision any of these, the template has not fully delivered on the golden path promise."
     },
     {
       "text": "A Crossplane Composition creates an RDS PostgreSQL instance when a developer applies a PostgreSQLInstance custom resource. The composition enforces: encryption at rest, automated backups, and a specific VPC subnet group. A developer applies the custom resource without specifying encryption settings. What happens?",
-      "options": ["The PostgreSQLInstance is created without encryption because the developer did not specify it", "The Crossplane Composition's default values and patches apply the platform's encryption standard automatically, regardless of what the developer specified — the platform enforces the standard, not the user", "Crossplane rejects the resource and returns a validation error asking the developer to specify encryption settings", "The PostgreSQLInstance is created but Crossplane posts a warning that encryption is recommended"],
+      "options": [
+        "The PostgreSQLInstance is created without encryption because the developer did not specify it",
+        "The Crossplane Composition's default values and patches apply the platform's encryption standard automatically, regardless of what the developer specified — the platform enforces the standard, not the user",
+        "Crossplane rejects the resource and returns a validation error asking the developer to specify encryption settings",
+        "The PostgreSQLInstance is created but Crossplane posts a warning that encryption is recommended"
+      ],
       "correct": 1,
-      "explanation": "Crossplane Compositions are the platform team's mechanism for encoding infrastructure standards. The Composition defines patches that override or default security-critical settings — if the platform requires encryption at rest, the Composition patches storage.encrypted = true regardless of the input. Developers cannot accidentally create non-compliant infrastructure because the Composition enforces compliance at the infrastructure API layer, not through documentation or checklist review."
+      "explanation": "Crossplane Compositions are the platform team's mechanism for encoding infrastructure standards. Security-critical settings such as storage encryption are set in the Composition's base resource and are simply not part of the XRD schema the developer fills in — so there is no field to leave out or override. Only the exposed parameters (size, team, ...) are patched in. Developers cannot accidentally create non-compliant infrastructure because the Composition enforces compliance at the infrastructure API layer, not through documentation or checklist review."
     },
     {
       "text": "A platform team measures their effectiveness using DORA metrics. They find: Deployment Frequency = 2 per month, Lead Time for Changes = 8 days. What is the DORA performance category and what platform investment most directly improves lead time?",
-      "options": ["High performer; no improvement needed", "Low performer; the most direct improvement is reducing manual approval gates in the deployment pipeline by automating quality verification (automated testing, canary analysis) so human approval is only required for production promotion, not for each environment promotion", "Medium performer; improving lead time requires hiring more engineers rather than platform changes", "Elite performer; a lead time of 8 days is acceptable for financial services"],
+      "options": [
+        "High performer; no improvement needed",
+        "Medium performer; the most direct improvement is reducing manual approval gates in the deployment pipeline by automating quality verification (automated testing, canary analysis) so human approval is only required for production promotion, not for each environment promotion",
+        "Low performer; improving lead time requires hiring more engineers rather than platform changes",
+        "Elite performer; a lead time of 8 days is acceptable for financial services"
+      ],
       "correct": 1,
-      "explanation": "DORA defines Elite performers as deploying multiple times per day with lead time under 1 hour; High performers deploy 1x/day-1x/week with lead time under 1 day; Medium performers deploy 1x/week-1x/month. 2 deployments per month with 8-day lead time is Low performer. The primary driver of long lead time in financial services is typically manual approval gates at each environment (dev→staging→UAT→production). Automating quality verification (automated tests, security scans, canary analysis with Prometheus gates) allows continuous promotion with human approval only at the final production step."
+      "explanation": "In recent DORA reports, deploying between once a week and once a month with a lead time between one week and one month is the Medium cluster; High performers deploy between daily and weekly with lead times of one day to one week, and Elite performers deploy on demand with lead times under a day. Two deployments a month with an 8-day lead time is therefore Medium. The primary driver of long lead times in financial services is typically manual approval gates at each environment (dev→staging→UAT→production). Automating quality verification (automated tests, security scans, canary analysis with Prometheus gates) allows continuous promotion with human approval only at the final production step."
     }
   ]
 }
@@ -786,11 +867,11 @@ Platform team operating model:
     },
     {
       "id": "2",
-      "description": "Design a Crossplane Composition for a PostgreSQLInstance XRD that provisions an RDS PostgreSQL 15 instance. The Composition must enforce regardless of user input: storage_encrypted = true, backup_retention_period >= 7, deletion_protection = true, publicly_accessible = false, and vpc_security_group_ids from the platform's pre-approved security group. Expose to developers only: instance_class, allocated_storage, and db_name. Write a test using crossplane-tools that verifies a user cannot override the encryption setting."
+      "description": "Design a Crossplane Composition for a PostgreSQLInstance XRD that provisions an RDS PostgreSQL instance. The Composition must enforce regardless of user input: storage encryption, backup retention >= 7 days, deletion protection, no public access, and the platform's pre-approved security group. Expose to developers only: instance class, allocated storage, and database name. Use crossplane render (and crossplane beta validate) in CI to verify the rendered resources keep encryption enabled whatever the claim contains."
     },
     {
       "id": "3",
-      "description": "Implement an OPA Gatekeeper ConstraintTemplate (FinancialServiceSecurityBaseline) that enforces on all Deployments in namespaces labelled tier=payment: (a) all containers must have readOnlyRootFilesystem: true, (b) runAsNonRoot: true, (c) no container may request privileged: true, (d) all containers must have CPU and memory limits set. Write test cases covering each constraint violation. Document how this policy maps to PCI-DSS Requirement 6.4 (protect public-facing web applications)."
+      "description": "Implement an OPA Gatekeeper ConstraintTemplate (FinancialServiceSecurityBaseline) that enforces on all Pods in namespaces labelled tier=payment: (a) all containers must have readOnlyRootFilesystem: true, (b) runAsNonRoot: true, (c) no container may request privileged: true, (d) all containers must have CPU and memory limits set. Write test cases covering each constraint violation. Document how this policy supports PCI-DSS Requirement 2.2 (system components are configured and managed securely)."
     },
     {
       "id": "4",

@@ -67,7 +67,7 @@ For payment services:
 ## async-profiler — The Go-To JVM Profiler
 
 async-profiler is the best tool for production JVM profiling:
-- Uses Linux perf_events (AsyncGetCallTrace API) — no safepoint bias
+- Samples with OS signals (perf_events or timers on Linux) and walks Java stacks with `AsyncGetCallTrace` — no safepoint bias
 - Works on running JVMs without code changes
 - Minimal overhead (~1-3% CPU)
 - Generates flame graphs directly
@@ -77,7 +77,7 @@ async-profiler is the best tool for production JVM profiling:
 ```bash
 # Download async-profiler
 wget https://github.com/async-profiler/async-profiler/releases/download/v3.0/async-profiler-3.0-linux-x64.tar.gz
-tar xf async-profiler-3.0-linux-x64.tar.gz
+tar xf async-profiler-3.0-linux-x64.tar.gz -C /opt
 export ASPROF=/opt/async-profiler-3.0-linux-x64/bin/asprof
 ```
 
@@ -88,13 +88,13 @@ export ASPROF=/opt/async-profiler-3.0-linux-x64/bin/asprof
 # Replace <pid> with payment service PID
 $ASPROF -d 30 -f /tmp/payment-cpu-flame.html <pid>
 
-# Profile with higher sampling interval (less overhead)
-$ASPROF -d 30 -i 10ms -f /tmp/payment-cpu-flame.html <pid>
+# Longer sampling interval = fewer samples, less overhead (default: 10ms)
+$ASPROF -d 30 -i 20ms -f /tmp/payment-cpu-flame.html <pid>
 
 # Profile CPU with thread separation (see per-thread breakdown)
 $ASPROF -d 30 --threads -f /tmp/payment-cpu-flame-threads.html <pid>
 
-# Profile with Java frame context (shows JIT-compiled code properly)
+# Only user-mode samples (leave out kernel frames)
 $ASPROF -d 30 -e cpu --all-user -f /tmp/payment-cpu.html <pid>
 
 # Interactive: start and stop manually
@@ -110,8 +110,9 @@ $ASPROF stop -f /tmp/payment-cpu.html <pid>
 # Tracks object allocations, not CPU time
 $ASPROF -d 30 -e alloc -f /tmp/payment-alloc-flame.html <pid>
 
-# Filter: only show allocations >= 512 bytes
-$ASPROF -d 30 -e alloc --alloc 512b -f /tmp/payment-alloc-large.html <pid>
+# Sample more often: one sample per 512 KB allocated is the default;
+# --alloc sets this sampling interval (smaller = more detail, more overhead)
+$ASPROF -d 30 -e alloc --alloc 128k -f /tmp/payment-alloc-detailed.html <pid>
 
 # Wall-clock mode: includes threads waiting on IO
 # Essential for latency investigation
@@ -123,7 +124,7 @@ $ASPROF -d 30 -e wall -t -f /tmp/payment-wall.html <pid>
 ## Reading a CPU Flame Graph — Payment Service Example
 
 ```
-Common flame graph patterns in payment services:
+Common flame graph patterns in payment services (illustrative):
 
 PATTERN 1: JSON serialization hotspot
 ─────────────────────────────────────
@@ -144,7 +145,8 @@ FraudRuleEngine.evaluate [██████████████████
       Pattern.<init> [████████]
 
 FINDING: Pattern.compile called on every fraud evaluation (10,000+/sec).
-         Each Pattern.compile call takes ~200µs.
+         Each Pattern.compile call can cost tens to hundreds of µs.
+         (String.matches / replaceAll / split with a regex compile too.)
 ACTION: Cache Pattern instances at class initialization.
         @PostConstruct: patterns = rules.stream()
             .map(r -> Pattern.compile(r.getRegex()))
@@ -153,13 +155,13 @@ ACTION: Cache Pattern instances at class initialization.
 PATTERN 3: JDBC result set mapping
 ────────────────────────────────────
 AccountRepository.findById [████████████████████████████████]
-  ResultSet.getString [████████████████████]
-    AbstractResultSet.getString [██████████]
-      StringFactory.newString [████████]  ← many String allocations
+  PgResultSet.getString [████████████████████]
+    String.<init> / decoding [██████████]  ← many String allocations
 
 FINDING: ResultSet mapping allocates thousands of String objects per query.
-ACTION: Use primitive types where possible. Consider ResultSet.getBytes()
-        for binary data. Batch queries to reduce result set processing overhead.
+ACTION: SELECT only the columns you need, read numbers with getLong /
+        getBigDecimal instead of parsing strings, and avoid loading rows
+        you then filter in Java.
 ```
 
 ---
@@ -172,43 +174,40 @@ ACTION: Use primitive types where possible. Consider ResultSet.getBytes()
  * Useful for capturing profiles around specific operations.
  */
 @Service
+@Slf4j
 public class FlameGraphCapture {
 
     private final AsyncProfiler profiler = AsyncProfiler.getInstance();
-    private volatile boolean profiling = false;
+    private final AtomicBoolean profiling = new AtomicBoolean(false);
 
     /**
      * Start profiling around a specific endpoint under load.
-     * Call startProfiling() before load test, stopAndSave() after.
+     * Call startCpuProfiling() before the load test, stopAndSaveFlameGraph() after.
      */
-    public void startCpuProfiling(String outputPath) throws IOException {
-        if (profiling) return;
-        profiling = true;
-        profiler.start(Events.CPU, 10_000_000);  // 10ms interval
-        log.info("CPU profiling started, output: {}", outputPath);
+    public void startCpuProfiling() throws IOException {
+        if (!profiling.compareAndSet(false, true)) return;   // already running
+        profiler.execute("start,event=cpu,interval=10ms");
+        log.info("CPU profiling started");
     }
 
     public void stopAndSaveFlameGraph(String outputPath) throws IOException {
-        if (!profiling) return;
-        profiling = false;
-        profiler.stop();
-
-        // Write flame graph HTML
-        profiler.dumpFlame(outputPath, "");
+        if (!profiling.compareAndSet(true, false)) return;
+        // "stop,file=x.html" stops and writes an HTML flame graph
+        // (the format follows the file extension)
+        profiler.execute("stop,file=" + outputPath);
         log.info("Flame graph saved to {}", outputPath);
     }
 
     /**
-     * Profile a specific code block and generate flame graph.
-     * Usage: wrapWithProfiling(() -> runLoadTest(), "/tmp/profile.html")
+     * Profile a specific code block and generate a flame graph.
+     * Usage: profileBlock(() -> runLoadTest(), "/tmp/profile.html")
      */
     public <T> T profileBlock(Callable<T> block, String outputPath) throws Exception {
-        profiler.start(Events.CPU, 10_000_000);
+        startCpuProfiling();
         try {
             return block.call();
         } finally {
-            profiler.stop();
-            profiler.dumpFlame(outputPath, "");
+            stopAndSaveFlameGraph(outputPath);
         }
     }
 }
@@ -221,17 +220,16 @@ public class FlameGraphCapture {
 Differential flame graphs compare two profiles to highlight what changed between versions. This is essential for performance regression analysis.
 
 ```bash
-# Step 1: Profile production (or baseline)
-$ASPROF -d 60 -f /tmp/baseline.jfr -o jfr <baseline-pid>
+# Step 1: Profile the baseline as collapsed stacks (one line per stack)
+$ASPROF -d 60 -o collapsed -f /tmp/baseline.txt <baseline-pid>
 
-# Step 2: Deploy new version, profile again
-$ASPROF -d 60 -f /tmp/new-version.jfr -o jfr <new-pid>
+# Step 2: Deploy new version, profile again UNDER THE SAME LOAD
+$ASPROF -d 60 -o collapsed -f /tmp/new.txt <new-pid>
 
-# Step 3: Convert to collapsed stacks for diff
-$ASPROF convert --jfr2collapsed /tmp/baseline.jfr > /tmp/baseline.txt
-$ASPROF convert --jfr2collapsed /tmp/new-version.jfr > /tmp/new.txt
+# (A recording saved as .jfr can be converted later with the jfrconv
+#  tool that ships with async-profiler.)
 
-# Step 4: Generate differential flame graph
+# Step 3: Generate differential flame graph
 # Using Brendan Gregg's diff tools:
 ./flamegraph/difffolded.pl /tmp/baseline.txt /tmp/new.txt > /tmp/diff.txt
 ./flamegraph/flamegraph.pl /tmp/diff.txt > /tmp/diff-flame.svg
@@ -240,23 +238,26 @@ $ASPROF convert --jfr2collapsed /tmp/new-version.jfr > /tmp/new.txt
 # Blue frames: LESS time in new version (improvement)
 ```
 
-Interpreting a differential flame graph from a payment service regression:
+Interpreting a differential **wall-clock** flame graph from a payment service regression (a CPU profile would barely show this change, because a thread waiting on HTTP uses no CPU):
 
 ```
 Differential Flame Graph: v2.1.0 vs v2.2.0
 
-RED (regression, 40% more CPU):
+RED (regression, much more wall-clock time):
   PaymentValidator.validate [████████████████████]  ← NEW: validation added
     AccountValidator.checkKycStatus [████████████]  ← added in v2.2.0
       KycService.fetchStatus [████████]              ← synchronous HTTP call
         HttpClient.send [████████]                   ← blocks on IO
 
 FINDING: v2.2.0 added synchronous KYC validation that calls external HTTP service.
-         This adds 40ms CPU-equivalent wait time to every authorization.
-ACTION: 
-  1. Make KYC check asynchronous — cache KYC status per account
-  2. Or prefetch KYC status on account login, cache for session duration
-  3. Or move KYC check to async post-authorization audit
+         This adds ~40ms of waiting to every authorization.
+ACTION:
+  1. Cache KYC status per account WITH event-driven invalidation (status
+     changes are rare but must take effect immediately — e.g. a newly
+     restricted customer)
+  2. Or have the KYC service push status changes to this service
+  3. Moving the check after authorisation is only acceptable if policy
+     and regulation allow it — KYC is usually a gate, not an audit
 ```
 
 ---
@@ -268,27 +269,39 @@ Java Flight Recorder (JFR) is built into the JDK and captures events with minima
 ```java
 /**
  * Enable JFR for payment service with performance-focused settings.
- * JFR can run continuously in production with ~1% overhead.
+ * JFR can run continuously in production with ~1% overhead
+ * (using the "default" settings).
+ * Equivalent to: java -XX:StartFlightRecording=name=payment-service,
+ *                     settings=default,maxage=6h,maxsize=1g
  */
 @Component
-public class JfrConfiguration {
+public class JfrConfiguration implements DisposableBean {
+
+    private Recording recording;
 
     @PostConstruct
-    public void configureJfr() throws ParseException {
-        // Configure JFR recording for production
-        // Equivalent to: java -XX:StartFlightRecording=...
-        Map<String, String> settings = new HashMap<>();
-        settings.put("jdk.CPUSample#enabled", "true");
-        settings.put("jdk.CPUSample#period", "10ms");
-        settings.put("jdk.GCHeapSummary#enabled", "true");
-        settings.put("jdk.JavaMonitorWait#enabled", "true");
-        settings.put("jdk.JavaMonitorEnter#enabled", "true");
-        settings.put("jdk.ThreadPark#enabled", "true");
-        settings.put("jdk.ObjectAllocationInNewTLAB#enabled", "true");
-        settings.put("jdk.ObjectAllocationOutsideTLAB#enabled", "true");
+    public void configureJfr() throws IOException, ParseException {
+        recording = new Recording(Configuration.getConfiguration("default"));
+        recording.setName("payment-service");
+        recording.setMaxAge(Duration.ofHours(6));     // keep the last 6 hours
+        recording.setMaxSize(1024L * 1024 * 1024);    // ...or at most 1 GB
+        recording.setToDisk(true);
 
-        // Start continuous recording — rotates every hour, keeps last 6 hours
+        // CPU samples (the event is called jdk.ExecutionSample)
+        recording.enable("jdk.ExecutionSample").withPeriod(Duration.ofMillis(20));
+        recording.enable("jdk.JavaMonitorEnter").withThreshold(Duration.ofMillis(10));
+        recording.enable("jdk.ThreadPark").withThreshold(Duration.ofMillis(10));
+        // Allocation: the throttled sampler, NOT ObjectAllocationInNewTLAB,
+        // which fires far too often for continuous production use
+        recording.enable("jdk.ObjectAllocationSample");
+
+        recording.start();
         // Dump on demand: jcmd <pid> JFR.dump name=payment-service filename=/tmp/dump.jfr
+    }
+
+    @Override
+    public void destroy() {
+        if (recording != null) recording.close();
     }
 }
 ```
@@ -308,7 +321,7 @@ jcmd <pid> JFR.stop name=payment-profile
 
 # Open in JDK Mission Control (JMC)
 jmc /tmp/payment-profile.jfr
-# Navigate to: Code → Hot Methods → "Flame Graph" view
+# JMC 8+: open the "Flame Graph" view (Window → Show View → Flame Graph)
 ```
 
 ---
@@ -324,7 +337,8 @@ jmc /tmp/payment-profile.jfr
 public class BadPaymentController {
     @PostMapping("/payments")
     public String authorize(@RequestBody String body) throws Exception {
-        ObjectMapper mapper = new ObjectMapper();  // BAD: 2-5ms to create
+        ObjectMapper mapper = new ObjectMapper();  // BAD: costly to create, and
+                                                   // its serializer caches start empty
         Payment payment = mapper.readValue(body, Payment.class);
         // ...
     }
@@ -345,15 +359,16 @@ public class GoodPaymentController {
 }
 
 // Flame graph signature of the BAD pattern:
-// ObjectMapper.<init> [████████████]  ← wide plateau at top level
-//   Jackson2ObjectMapperBuilder.build [████████]
-//     DeserializationContext.<init> [████]
+// ObjectMapper.<init> [████████████]  ← wide frame under every request
+// plus BeanDeserializerFactory / introspection frames that never go away,
+// because every new mapper must rebuild its (de)serializers
 ```
 
 ```java
 /**
  * Pattern 2: String concatenation in loops
- * BAD: creates O(n) String objects
+ * BAD: creates a new, ever longer String on every iteration --
+ * O(n) objects and O(n²) bytes copied
  */
 public String buildAuditLog(List<Transaction> transactions) {
     String log = "";
@@ -375,9 +390,9 @@ public String buildAuditLog(List<Transaction> transactions) {
 }
 
 // Allocation flame graph signature of the BAD pattern:
-// StringBuilder.append [████████████████]  ← many String.concat calls
-//   AbstractStringBuilder.ensureCapacityInternal [████████]
-//     Arrays.copyOf [████████]  ← array resizing on every iteration
+// buildAuditLog [████████████████]
+//   string concatenation helpers (StringConcatHelper on Java 9+) [████████]
+//     byte[] allocations  ← a larger copy on every iteration
 ```
 
 ```java
@@ -392,7 +407,10 @@ public void processPayment(Payment p) {
 }
 
 /**
- * GOOD: lazy evaluation with lambda
+ * GOOD: parameterised logging -- the message is only formatted if DEBUG is
+ * enabled (the argument expressions themselves still run). For expensive
+ * arguments, use the SLF4J 2 fluent API with a Supplier, or check
+ * log.isDebugEnabled() first.
  */
 public void processPayment(Payment p) {
     log.debug("Processing payment: {} amount={} account={}",
@@ -419,7 +437,8 @@ When GC pressure is high (>5% time in GC):
   1. Generate allocation flame graph: asprof -d 30 -e alloc -f alloc.html <pid>
   2. Look for wide allocation sites — these create garbage
   3. Check for: temporary objects in hot loops, String concatenation, boxing
-  4. Use @Contended, object pooling, or primitive types to reduce allocation
+  4. Use primitives (avoid boxing), pre-size collections, and reuse objects
+     only where measured -- object pooling rarely pays off on modern GCs
 
 When latency is high but CPU is low (<20%):
   1. Generate wall-clock flame graph: asprof -d 30 -e wall -t -f wall.html <pid>

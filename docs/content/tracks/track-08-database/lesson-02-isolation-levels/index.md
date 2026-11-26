@@ -59,7 +59,7 @@ COMMIT;
 
 **Financial impact:** A fraud-scoring service reads an uncommitted debit and flags the account as low-balance. Session A rolls back. The account was flagged unnecessarily. Worse: a payment gateway approves a transfer based on a balance that was never committed.
 
-PostgreSQL does not implement dirty reads even at READ UNCOMMITTED — it simply behaves like READ COMMITTED at that level. However, MySQL, SQL Server, and Oracle support true READ UNCOMMITTED. Never rely on database-specific behaviour for correctness guarantees.
+PostgreSQL does not implement dirty reads even at READ UNCOMMITTED — it simply behaves like READ COMMITTED at that level. However, MySQL and SQL Server support true READ UNCOMMITTED (Oracle does not offer it at all). Never rely on database-specific behaviour for correctness guarantees.
 
 ### 2.2 Non-Repeatable Read
 
@@ -151,7 +151,7 @@ COMMIT;
 - Loosely consistent reporting where slight staleness is tolerable
 
 **When READ COMMITTED is NOT acceptable:**
-- Balance checks followed by debits in the same transaction
+- Balance checks followed by debits in the same transaction (without row locks)
 - Multi-statement reconciliation
 - Calculations that aggregate data and then act on the aggregate
 
@@ -159,7 +159,7 @@ COMMIT;
 
 Each transaction sees a consistent snapshot taken at the start of the transaction. Rows read at the beginning remain unchanged from the transaction's perspective, even if they are modified and committed by other sessions.
 
-In PostgreSQL, REPEATABLE READ is implemented via MVCC (covered in Lesson 03) and prevents both dirty reads and non-repeatable reads. PostgreSQL's REPEATABLE READ also prevents most phantom reads in practice, though the SQL standard does not require this.
+In PostgreSQL, REPEATABLE READ is implemented via MVCC (covered in Lesson 03) as snapshot isolation: it prevents dirty reads, non-repeatable reads **and** phantom reads (the SQL standard only requires the first two).
 
 ```sql
 BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
@@ -175,8 +175,9 @@ SELECT balance FROM accounts WHERE account_id = 'ACC-1001';
 -- Still returns 1000.00 — repeatable!
 
 -- However: if we try to UPDATE the same row that another session
--- already updated and committed, PostgreSQL will raise an error
--- forcing the transaction to retry
+-- updated and committed after our snapshot, PostgreSQL raises
+-- ERROR 40001: could not serialize access due to concurrent update
+-- and the transaction must be retried
 COMMIT;
 ```
 
@@ -262,7 +263,7 @@ public void enforceAndRecordDailyLimit(String accountId,
 }
 ```
 
-Without SERIALIZABLE isolation, two concurrent calls could both read `todaySpend` as 2400, both pass a 400-transaction check against a 3000 limit, and both commit — resulting in 2800 of spend that should have been rejected.
+Without SERIALIZABLE isolation, two concurrent calls could both read `todaySpend` as 2400, both pass a 400-transaction check against a 3000 limit, and both commit — resulting in 3200 of spend, 200 over the limit.
 
 ### 4.3 Idempotency Token Checks
 
@@ -288,6 +289,10 @@ public PaymentResult processWithIdempotency(String idempotencyKey,
 ```
 
 Without SERIALIZABLE, two concurrent requests with the same idempotency key could both find no existing record and both insert — creating duplicate charges.
+
+Two cautions:
+- **Simpler and stronger:** a `UNIQUE` constraint on `idempotency_key` (with `INSERT ... ON CONFLICT DO NOTHING`, or catching the duplicate-key error) prevents duplicates at any isolation level.
+- **Never call external systems inside a transaction that may be retried.** If `processPayment` charges a card through a gateway and the transaction is then retried after a serialization failure, the card is charged again. Claim the key and commit first; call the gateway outside the retried transaction, with the same idempotency key.
 
 ---
 
@@ -346,13 +351,20 @@ SERIALIZABLE transactions must be retried on serialization failure. Spring Retry
 ```java
 import org.springframework.retry.annotation.Backoff;
 import org.springframework.retry.annotation.Retryable;
-import org.springframework.dao.CannotSerializeTransactionException;
+import org.springframework.dao.ConcurrencyFailureException;
 
 @Service
 public class TransferService {
 
+    // SQLSTATE 40001 / 40P01 reach the application as different Spring
+    // exceptions depending on the stack (JDBC vs Hibernate): e.g.
+    // CannotSerializeTransactionException or CannotAcquireLockException.
+    // Their common parent ConcurrencyFailureException covers both (and
+    // deadlocks, which are retryable too).
+    // @Retryable runs OUTSIDE @Transactional here (Spring Retry's advice has
+    // higher precedence), so every attempt is a fresh transaction.
     @Retryable(
-        retryFor = CannotSerializeTransactionException.class,
+        retryFor = ConcurrencyFailureException.class,
         maxAttempts = 3,
         backoff = @Backoff(delay = 50, multiplier = 2, random = true)
     )
@@ -363,7 +375,7 @@ public class TransferService {
 
     @Recover
     public TransferResult transferFailed(
-            CannotSerializeTransactionException ex,
+            ConcurrencyFailureException ex,
             TransferRequest request) {
         log.error("Transfer failed after retries: {}", request.getTransferId());
         throw new TransferFailedException("Concurrent modification conflict", ex);
@@ -419,7 +431,7 @@ Understanding the performance cost of each isolation level helps you make inform
 ### 6.1 READ COMMITTED Performance Characteristics
 
 - Each statement acquires a fresh snapshot — low overhead
-- Short-lived row locks released immediately after each statement
+- Row locks taken by writes are held until the transaction ends; plain reads take no row locks and never block
 - Highest concurrency, lowest contention
 - Appropriate for: read-heavy services, reporting, analytics on non-critical data
 
@@ -427,35 +439,33 @@ Understanding the performance cost of each isolation level helps you make inform
 
 - Snapshot taken at transaction start — held for the transaction's duration
 - Longer-lived transaction means more MVCC overhead (more dead tuple versions)
-- Write conflicts detected at commit time (transaction may need to retry or fail)
-- Approximately 10–30% more overhead than READ COMMITTED for update-heavy workloads
+- Write conflicts are detected when the transaction tries to update a row that another transaction changed after the snapshot — it fails with 40001 and must be retried
+- The extra cost depends on the workload (retries, longer-held snapshots); measure it
 
 ### 6.3 SERIALIZABLE Performance Characteristics
 
-PostgreSQL's SSI implementation tracks three types of dependency conflicts:
-- **rw-anti-dependency:** T1 reads a row that T2 later writes
-- **wr-dependency:** T1 writes a row that T2 reads
-- **ww-dependency:** T1 and T2 both write the same row
+PostgreSQL's SSI implementation records what each serializable transaction has read (as non-blocking **SIRead** "predicate locks") and watches for **rw-antidependencies**: T1 reads data that a concurrent T2 then writes. When it finds a "dangerous structure" — two such conflicts in a row between concurrent transactions — it aborts one transaction with 40001. (Write-write conflicts on the same row are handled by normal row locking.)
 
 ```sql
--- Check SSI overhead in production
-SELECT pid, query, wait_event_type, wait_event, state
-FROM pg_stat_activity
-WHERE wait_event = 'relation'
-  AND state = 'active';
+-- SSI bookkeeping in production: predicate locks held right now
+SELECT count(*) AS siread_locks
+FROM pg_locks
+WHERE mode = 'SIReadLock';
+-- Many locks get combined into coarser ones (page/relation) when
+-- max_pred_locks_per_transaction is reached -> more false-positive aborts
 
--- Monitor serialization failures via rollback stats
-SELECT pg_stat_get_db_conflicts(oid) AS conflicts,
-       pg_stat_get_db_xact_rollback(oid) AS rollbacks
-FROM pg_database
+-- Rollbacks per database (serialization failures are part of this count;
+-- PostgreSQL has no separate counter -- count 40001 errors in the app)
+SELECT xact_commit, xact_rollback
+FROM pg_stat_database
 WHERE datname = current_database();
 ```
 
 Performance impact of SERIALIZABLE:
-- 10–40% throughput reduction under high concurrency
+- Throughput cost depends on the workload — measure it under realistic concurrency
 - Memory overhead for tracking predicate locks
-- Abort rate increases with contention (plan for retries)
-- For most fintech critical paths: acceptable overhead given correctness guarantee
+- Abort rate increases with contention (plan for retries; keep transactions short)
+- For most fintech critical paths: acceptable overhead given the correctness guarantee
 
 ### 6.4 Isolation Level by Use Case
 
@@ -466,7 +476,7 @@ Performance impact of SERIALIZABLE:
 | Multi-step reconciliation | REPEATABLE READ | Consistent view needed; no write skew risk |
 | Transfer with balance check | SERIALIZABLE or SELECT FOR UPDATE | Write decision based on aggregate read |
 | Daily limit enforcement | SERIALIZABLE | Phantom risk on aggregate read |
-| Idempotency check + insert | SERIALIZABLE | Phantom risk on existence check |
+| Idempotency check + insert | UNIQUE constraint (+ ON CONFLICT) | The database rejects the duplicate at any isolation level |
 | Batch report generation | REPEATABLE READ | Consistent snapshot for the report |
 | Fraud score lookup | READ COMMITTED | Non-critical, latency sensitive |
 
@@ -629,7 +639,9 @@ This is intentional PostgreSQL behaviour. If you need a fixed row set, use REPEA
 ### 9.1 Transaction Conflict Metrics
 
 ```sql
--- PostgreSQL conflict statistics by database
+-- NOTE: pg_stat_database_conflicts counts queries cancelled on a STANDBY
+-- because of recovery conflicts (useful for read replicas) -- it does NOT
+-- count serialization failures on the primary
 SELECT confl_tablespace,
        confl_lock,
        confl_snapshot,
@@ -638,7 +650,8 @@ SELECT confl_tablespace,
 FROM pg_stat_database_conflicts
 WHERE datname = current_database();
 
--- Active transactions by isolation level
+-- Transactions holding a transaction id, oldest first
+-- (long-running ones keep old row versions alive)
 SELECT pid,
        backend_xid,
        backend_xmin,
@@ -656,27 +669,25 @@ ORDER BY query_start;
 @Component
 public class TransactionIsolationMetrics {
 
-    private final Counter serializationFailures;
-    private final Counter retrySuccesses;
+    private final MeterRegistry registry;
 
     public TransactionIsolationMetrics(MeterRegistry registry) {
-        this.serializationFailures = Counter.builder("db.serialization.failures")
-            .description("Serialization failures requiring retry")
-            .register(registry);
-        this.retrySuccesses = Counter.builder("db.serialization.retries.success")
-            .description("Successful retries after serialization failure")
-            .register(registry);
+        this.registry = registry;
     }
 
+    // Counter.increment() takes an amount, not tags: tagged counters are
+    // looked up (and cached by Micrometer) per tag combination
     public void recordSerializationFailure(String operationName) {
-        serializationFailures.increment(
-            Tags.of("operation", operationName));
+        registry.counter("db.serialization.failures",
+                "operation", operationName)
+            .increment();
     }
 
     public void recordRetrySuccess(String operationName, int attemptNumber) {
-        retrySuccesses.increment(
-            Tags.of("operation", operationName,
-                    "attempt", String.valueOf(attemptNumber)));
+        registry.counter("db.serialization.retries.success",
+                "operation", operationName,
+                "attempt", String.valueOf(attemptNumber))
+            .increment();
     }
 }
 ```
@@ -700,7 +711,7 @@ public class TransactionIsolationMetrics {
 
 - `@Transactional` with no `isolation` specified on a method that reads then writes
 - Multi-statement transactions under READ COMMITTED with aggregate reads
-- Idempotency checks without locking or SERIALIZABLE
+- Idempotency checks without a UNIQUE constraint, locking or SERIALIZABLE
 - Balance validation separated from the debit by any amount of non-trivial code
 
 ---
@@ -711,10 +722,10 @@ The four SQL isolation levels represent a spectrum between concurrency and corre
 
 - **Dirty read:** reading uncommitted data — prevented at READ COMMITTED and above
 - **Non-repeatable read:** same row returns different values in one transaction — prevented at REPEATABLE READ and above
-- **Phantom read:** same range query returns different rows — prevented at SERIALIZABLE (and largely in PostgreSQL's REPEATABLE READ)
+- **Phantom read:** same range query returns different rows — prevented at SERIALIZABLE (and also by PostgreSQL's REPEATABLE READ)
 - **Write skew:** two transactions make individually-valid decisions that are collectively invalid — only prevented by SERIALIZABLE
 
-Use `@Transactional(isolation = Isolation.SERIALIZABLE)` for balance checks, limit enforcement, and idempotency patterns. Always implement retry logic for serialization failures. When pessimistic locking is simpler, `SELECT FOR UPDATE` under READ COMMITTED is a valid alternative for single-row cases.
+Use `@Transactional(isolation = Isolation.SERIALIZABLE)` for aggregate checks such as limit enforcement, and UNIQUE constraints for idempotency. Always implement retry logic for serialization failures — and keep external calls out of retried transactions. When pessimistic locking is simpler, `SELECT FOR UPDATE` under READ COMMITTED is a valid alternative for single-row cases.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -750,7 +761,7 @@ Use `@Transactional(isolation = Isolation.SERIALIZABLE)` for balance checks, lim
         "Increase max_connections in PostgreSQL to reduce contention"
       ],
       "correct": 1,
-      "explanation": "ERROR 40001 is a serialization failure — PostgreSQL detected that allowing the transaction to commit would violate serializability. The correct response is to retry the entire transaction from scratch (re-read all data, re-apply business logic, re-attempt commit). Spring Retry with @Retryable(CannotSerializeTransactionException.class) is the standard pattern. Downgrading isolation would defeat the purpose and could introduce the very anomaly you were preventing."
+      "explanation": "ERROR 40001 is a serialization failure — PostgreSQL detected that allowing the transaction to commit would violate serializability. The correct response is to retry the entire transaction from scratch (re-read all data, re-apply business logic, re-attempt commit), a bounded number of times with backoff. With Spring Retry, retry on ConcurrencyFailureException (which covers CannotSerializeTransactionException and CannotAcquireLockException). Downgrading isolation would defeat the purpose and could introduce the very anomaly you were preventing."
     }
   ]
 }
@@ -762,10 +773,22 @@ Use `@Transactional(isolation = Isolation.SERIALIZABLE)` for balance checks, lim
   "difficulty": "advanced",
   "estimatedMinutes": 50,
   "tasks": [
-    {"id": "1", "description": "Audit an existing Spring service that processes payments using default @Transactional (READ COMMITTED). Identify all read-modify-write patterns and classify each as: safe (single-row with FOR UPDATE), at-risk (aggregate reads), or dangerous (read then write without locking). Document the specific anomaly that could occur for each at-risk pattern."},
-    {"id": "2", "description": "Implement a daily spending limit check that is correct under concurrent load. The check must read the sum of today's transactions for an account and reject the new transaction if the sum would exceed the limit. Write the implementation using SERIALIZABLE isolation with Spring Retry, and explain why SELECT FOR UPDATE alone would not work for this aggregate check."},
-    {"id": "3", "description": "Write a multi-threaded JUnit test using 20 concurrent threads that each submit a £400 payment for the same account with a £3,000 daily limit. Without SERIALIZABLE isolation, demonstrate that more than 7 payments succeed (proving the race condition). With SERIALIZABLE isolation, verify that exactly 7 payments succeed and the rest are rejected or retried correctly."},
-    {"id": "4", "description": "Add Micrometer metrics to track serialization failure rate and retry success rate per operation type. Define alert thresholds: what serialization failure rate would indicate a design problem requiring architectural review rather than just more retries?"}
+    {
+      "id": "1",
+      "description": "Audit an existing Spring service that processes payments using default @Transactional (READ COMMITTED). Identify all read-modify-write patterns and classify each as: safe (single-row with FOR UPDATE), at-risk (aggregate reads), or dangerous (read then write without locking). Document the specific anomaly that could occur for each at-risk pattern."
+    },
+    {
+      "id": "2",
+      "description": "Implement a daily spending limit check that is correct under concurrent load. The check must read the sum of today's transactions for an account and reject the new transaction if the sum would exceed the limit. Write the implementation using SERIALIZABLE isolation with Spring Retry, then a second version that locks a guard row (the account row) with SELECT ... FOR UPDATE, and explain why locking only the existing transaction rows would not work (new rows are not locked)."
+    },
+    {
+      "id": "3",
+      "description": "Write a multi-threaded JUnit test using 20 concurrent threads that each submit a £400 payment for the same account with a £3,000 daily limit. Without SERIALIZABLE isolation, demonstrate that more than 7 payments succeed (proving the race condition). With SERIALIZABLE isolation, verify that exactly 7 payments succeed and the rest are rejected or retried correctly."
+    },
+    {
+      "id": "4",
+      "description": "Add Micrometer metrics to track serialization failure rate and retry success rate per operation type. Define alert thresholds: what serialization failure rate would indicate a design problem requiring architectural review rather than just more retries?"
+    }
   ]
 }
 -->

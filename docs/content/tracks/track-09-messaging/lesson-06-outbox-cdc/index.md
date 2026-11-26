@@ -80,7 +80,7 @@ CREATE TABLE outbox_events (
     event_type      VARCHAR(100) NOT NULL,   -- e.g., 'PaymentCreated'
     payload         JSONB NOT NULL,          -- event payload
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    processed       BOOLEAN NOT NULL DEFAULT FALSE  -- for polling relay (optional)
+    processed       BOOLEAN NOT NULL DEFAULT FALSE  -- polling relay only (CDC never sets it)
 );
 
 -- Index for CDC monitoring and polling relay
@@ -189,19 +189,25 @@ Polling Relay:
   Scheduled job: SELECT * FROM outbox_events WHERE processed = FALSE ORDER BY created_at
   Publishes each row to Kafka, then marks processed = TRUE
   
-  Pros: Simple, works with any database
+  Pros: Simple, works with any database, no special DB privileges
   Cons: Latency (poll interval: 100ms–1s), extra DB load from SELECT queries,
-        at-least-once (need idempotent consumer), risk of polling gap under load
+        at-least-once (need idempotent consumer); several relay instances
+        need SELECT ... FOR UPDATE SKIP LOCKED; and never page by
+        "created_at > last seen" -- transactions commit out of order, so
+        a row with an older timestamp can appear later and be skipped
 
 CDC (Debezium):
   Reads PostgreSQL WAL (Write-Ahead Log) — not SELECT queries
   Triggers on each INSERT/UPDATE/DELETE to the outbox table
   
-  Pros: Sub-100ms latency, zero DB query overhead, never misses events
-  Cons: Requires WAL access (wal_level=logical), connector management overhead
+  Pros: Typically sub-second latency, no polling queries, every committed
+        insert is captured in commit order
+  Cons: Requires logical replication (wal_level=logical, privileges), a
+        replication slot that retains WAL while the connector is down,
+        connector operations; still at-least-once
 ```
 
-**Recommendation for production financial systems:** Use CDC. The polling relay adds ~200ms latency and significant query load on the database under high throughput. CDC reads the WAL which PostgreSQL writes anyway.
+**Recommendation for production financial systems:** prefer CDC when you can operate it (and monitor the replication slot). A polling relay adds latency and query load under high throughput, while CDC reads the WAL that PostgreSQL writes anyway. A well-built polling relay is still a perfectly valid choice for moderate volumes or where logical replication is not available.
 
 ---
 
@@ -217,10 +223,11 @@ CDC (Debezium):
     "database.user": "debezium",
     "database.password": "${file:/secrets/debezium-creds:password}",
     "database.dbname": "payments",
-    "database.server.name": "payments-db",
+    "topic.prefix": "payments-db",
 
     "plugin.name": "pgoutput",
-    "publication.autocreate.mode": "filtered",
+    "publication.name": "dbz_outbox_publication",
+    "publication.autocreate.mode": "disabled",
 
     "table.include.list": "public.outbox_events",
     "tombstones.on.delete": "false",
@@ -233,15 +240,16 @@ CDC (Debezium):
     "transforms.outbox.table.field.event.type": "event_type",
     "transforms.outbox.route.by.field": "aggregate_type",
     "transforms.outbox.route.topic.replacement": "payments.${routedByValue}.events",
+    "transforms.outbox.table.expand.json.payload": "true",
 
     "transforms.outbox.table.fields.additional.placement":
         "aggregate_type:header:aggregate_type,event_type:header:event_type",
 
     "key.converter": "org.apache.kafka.connect.storage.StringConverter",
-    "value.converter": "io.confluent.connect.avro.AvroConverter",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
 
-    "snapshot.mode": "never",
+    "snapshot.mode": "no_data",
     "max.batch.size": "500",
     "max.queue.size": "8192",
     "poll.interval.ms": "100",
@@ -251,6 +259,8 @@ CDC (Debezium):
   }
 }
 ```
+
+Notes: `topic.prefix` replaced `database.server.name` in Debezium 2.x. `snapshot.mode=no_data` (older name `never`) skips the initial snapshot — so create the replication slot (start the connector) **before** the application writes its first outbox rows, or unpublished rows written earlier are never sent. The EventRouter puts the outbox row id into a Kafka header named `id` — consumers de-duplicate on it.
 
 **PostgreSQL prerequisites:**
 
@@ -262,8 +272,12 @@ CDC (Debezium):
 -- max_wal_senders = 10
 
 -- Create a dedicated replication user
-CREATE ROLE debezium REPLICATION LOGIN PASSWORD 'secret';
+CREATE ROLE debezium REPLICATION LOGIN PASSWORD 'from-your-secret-store';
 GRANT SELECT ON TABLE outbox_events TO debezium;
+
+-- Create the publication as the table owner (Debezium would need owner or
+-- superuser rights to create it itself -- hence autocreate.mode=disabled)
+CREATE PUBLICATION dbz_outbox_publication FOR TABLE outbox_events;
 ```
 
 ---
@@ -283,7 +297,7 @@ EventRouter SMT transforms this to:
   Kafka topic: payments.Payment.events
   Kafka key:   "pay-123"            ← from aggregate_id
   Kafka value: { "paymentId": "pay-123", ... }  ← from payload
-  Headers:     aggregate_type=Payment, event_type=PaymentCreated
+  Headers:     id=<outbox row id>, aggregate_type=Payment, event_type=PaymentCreated
 ```
 
 ---
@@ -297,7 +311,7 @@ Debezium guarantees **at-least-once delivery** — in failure scenarios (connect
 @Slf4j
 public class PaymentEventConsumer {
 
-    @Autowired private ProcessedEventRepository processedEvents;
+    @Autowired private JdbcTemplate jdbcTemplate;
     @Autowired private SettlementService settlementService;
 
     @KafkaListener(topics = "payments.Payment.events", groupId = "settlement-consumer")
@@ -305,12 +319,19 @@ public class PaymentEventConsumer {
     public void handlePaymentEvent(
             ConsumerRecord<String, String> record,
             @Header("event_type") String eventType,
-            @Header(KafkaHeaders.RECEIVED_MESSAGE_KEY) String aggregateId) {
+            @Header(KafkaHeaders.RECEIVED_KEY) String aggregateId) {   // RECEIVED_MESSAGE_KEY before Spring Kafka 3.0
 
         String eventId = extractEventId(record);
 
-        // Idempotency check — in same DB transaction as business logic
-        if (processedEvents.existsByEventId(eventId)) {
+        // Idempotency: claim the event id first (primary key) -- in the same
+        // DB transaction as the business logic. A separate "exists?" check
+        // would race with a concurrent duplicate delivery.
+        int claimed = jdbcTemplate.update("""
+            INSERT INTO processed_events (event_id, aggregate_id, processed_at)
+            VALUES (?, ?, now())
+            ON CONFLICT (event_id) DO NOTHING
+            """, eventId, aggregateId);
+        if (claimed == 0) {
             log.debug("Duplicate event {} — skipping", eventId);
             return;
         }
@@ -326,15 +347,17 @@ public class PaymentEventConsumer {
             }
             default -> log.warn("Unknown event type: {}", eventType);
         }
-
-        processedEvents.save(new ProcessedEvent(eventId, aggregateId, Instant.now()));
     }
 
     private String extractEventId(ConsumerRecord<String, String> record) {
-        // Debezium sets the outbox event UUID as the message key or in headers
-        return Optional.ofNullable(record.headers().lastHeader("event_id"))
-                .map(h -> new String(h.value(), StandardCharsets.UTF_8))
-                .orElse(record.key() + "-" + record.offset());
+        // The EventRouter puts the outbox row id into the "id" header.
+        // No fallback such as key+offset: a re-published duplicate has a
+        // DIFFERENT offset, so that fallback would not detect it.
+        Header idHeader = record.headers().lastHeader("id");
+        if (idHeader == null) {
+            throw new IllegalStateException("Outbox event without id header");
+        }
+        return new String(idHeader.value(), StandardCharsets.UTF_8);
     }
 }
 ```
@@ -345,18 +368,24 @@ public class PaymentEventConsumer {
 
 Without cleanup, the outbox table grows indefinitely. Two strategies:
 
-**Strategy 1: Delete after CDC confirmation (Kafka Connect + Kafka Streams tombstone)**
+**Strategy 1: Delete in the same transaction (CDC only)**
 ```sql
--- Debezium publishes tombstone after delete if tombstones.on.delete=true
--- Application deletes processed rows via scheduled job:
-DELETE FROM outbox_events
-WHERE processed = TRUE
-  AND created_at < NOW() - INTERVAL '1 day';
+-- Debezium reads the INSERT from the WAL, so the row may be deleted right
+-- away, in the same transaction: the table stays tiny, the event is still
+-- published. (The EventRouter ignores the DELETE; tombstones.on.delete=false
+-- prevents tombstone records.)
+BEGIN;
+INSERT INTO payments (...) VALUES (...);
+INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload)
+VALUES ('6f1c...', 'Payment', 'pay-123', 'PaymentCreated', '{...}');
+DELETE FROM outbox_events WHERE id = '6f1c...';
+COMMIT;
+-- (For a polling relay: delete rows with processed = TRUE in a job instead)
 ```
 
 **Strategy 2: Time-based cleanup (simpler, most common)**
 ```java
-@Scheduled(cron = "0 2 * * * *")  // Run at 2 AM every day
+@Scheduled(cron = "0 0 2 * * *", zone = "UTC")  // sec min hour ... -> 02:00 daily
 @Transactional
 public void cleanupOutbox() {
     Instant cutoff = Instant.now().minus(Duration.ofDays(7));
@@ -369,16 +398,20 @@ public void cleanupOutbox() {
 
 ## Monitoring Outbox Lag
 
+For a **polling relay**, the age of the oldest unprocessed row is the key metric. (With **CDC** the `processed` flag is never set, so this gauge would grow forever — monitor the connector instead: Debezium's `MilliSecondsBehindSource` streaming metric and the replication slot's lag in `pg_replication_slots`, see Track 08 Lesson 11.)
+
 ```java
 @Component
-public class OutboxLagMonitor {
+public class OutboxLagMonitor {   // polling relay
 
     @Autowired private OutboxEventRepository outboxRepository;
     @Autowired private MeterRegistry meterRegistry;
 
     @PostConstruct
     public void registerMetrics() {
-        // Gauge: age of oldest unprocessed outbox event
+        // Gauge: age of oldest unprocessed outbox event.
+        // Each scrape runs a query -- keep it cheap (the partial index on
+        // processed = FALSE serves it)
         Gauge.builder("outbox.lag.seconds",
                 outboxRepository,
                 repo -> {
@@ -426,15 +459,15 @@ groups:
 
 ### Pitfall 1: Forgetting `wal_level=logical` on Managed Databases
 
-**Problem:** Many managed PostgreSQL services (AWS RDS pre-12, some GCP Cloud SQL configs) default to `wal_level=replica`. Debezium requires `wal_level=logical` for logical replication slots. The connector starts successfully but fails to capture changes.
+**Problem:** Managed PostgreSQL services such as Amazon RDS and Google Cloud SQL run with `wal_level=replica` by default. Debezium needs `wal_level=logical` for logical replication slots; without it the connector fails at startup and no events flow.
 
-**Fix:** Confirm `SHOW wal_level;` returns `logical` before deploying. For AWS RDS, set `rds.logical_replication=1` in the parameter group. Verify with the Debezium health endpoint that the slot is active.
+**Fix:** Confirm `SHOW wal_level;` returns `logical` before deploying. On Amazon RDS / Aurora set `rds.logical_replication=1` in the parameter group (restart required); on Cloud SQL set the `cloudsql.logical_decoding` flag. Verify with the Kafka Connect status API and `pg_replication_slots` that the slot is active.
 
 ### Pitfall 2: Replication Slot Lag Causing WAL Disk Exhaustion
 
 **Problem:** PostgreSQL retains WAL files until the replication slot consumer (Debezium) confirms it has read them. If the Debezium connector goes offline for hours or days (e.g., Kafka Connect cluster restart), the replication slot does not advance. PostgreSQL accumulates WAL indefinitely, potentially filling the disk and crashing the database.
 
-**Fix:** Set `max.replication.slots.per.checkpoint` and configure a WAL retention limit. Monitor `pg_replication_slots.lag` and alert if `confirmed_flush_lsn` does not advance. Drop stale replication slots with `SELECT pg_drop_replication_slot('debezium_outbox_slot');` if the connector will be offline for a long period.
+**Fix:** Set `max_slot_wal_keep_size` (PostgreSQL 13+) as a safety cap so a stuck slot is invalidated instead of filling the disk. Monitor the retained WAL — `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)` from `pg_replication_slots` — and alert if `confirmed_flush_lsn` does not advance. Dropping the slot (`SELECT pg_drop_replication_slot('debezium_outbox_slot');`) frees the WAL but loses every outbox row written while the connector was down — they must then be re-published (e.g. a one-off snapshot of `outbox_events`), so treat it as a deliberate recovery step.
 
 ### Pitfall 3: Writing Large Payloads to the Outbox Table
 
@@ -473,7 +506,7 @@ groups:
         "KafkaTemplate.send() is always asynchronous, so it completes after the transaction commits"
       ],
       "correct": 1,
-      "explanation": "Database transactions and Kafka produce operations are managed by completely different systems. Even if Spring's KafkaTransactionManager is configured, a database rollback does not unsend a Kafka message. If the application crashes after the Kafka send but before the database commit, the event was published for a non-existent entity. The outbox pattern eliminates this by making Kafka publication a consequence of a database change, not a parallel operation."
+      "explanation": "Database transactions and Kafka produce operations are managed by different systems. Even with Spring's transaction synchronisation (committing one after the other, best-effort), there is a window between the two commits: a crash there leaves one committed and the other not — an event for a payment that does not exist, or a payment whose event is never sent. The outbox pattern removes this window by making Kafka publication a consequence of the database commit, not a parallel operation."
     },
     {
       "text": "What is the role of the Debezium Outbox Event Router SMT in the outbox pattern?",
@@ -521,7 +554,7 @@ groups:
     },
     {
       "id": "4",
-      "description": "Build an idempotent consumer that processes events from payments.Payment.events, extracts the event_id from headers, checks a processed_events table before applying business logic, and marks the event as processed within the same database transaction as the business operation. Test by replaying the same event twice and verifying the business logic runs only once."
+      "description": "Build an idempotent consumer that processes events from payments.Payment.events, reads the event id from the 'id' header set by the EventRouter, claims it in a processed_events table (INSERT ... ON CONFLICT DO NOTHING) and applies the business logic within the same database transaction. Test by replaying the same event twice and verifying the business logic runs only once."
     }
   ]
 }

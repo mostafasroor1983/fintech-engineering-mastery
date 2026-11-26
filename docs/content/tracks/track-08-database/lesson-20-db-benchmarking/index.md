@@ -94,10 +94,19 @@ This models a debit/credit transaction with:
 
 The TPC-B default doesn't match a real payment workload. Write custom scripts.
 
+pgbench's `random()` produces **integers**, but our `accounts.id` is a UUID — an integer cannot simply be cast to `uuid`. The scripts below therefore assume the benchmark data was seeded with deterministic ids, so that any number 1..N maps to an existing account:
+
+```sql
+-- Seed 10M accounts whose id is derived from the number n
+INSERT INTO accounts (id, balance, currency, status, version)
+SELECT md5(n::text)::uuid, 1000000, 'USD', 'ACTIVE', 0
+FROM generate_series(1, 10000000) AS n;
+```
+
 ### Script 1: Balance Lookup (Read-Heavy)
 
 ```bash
-# File: balance_lookup.sql
+-- File: balance_lookup.sql
 \set account_id random(1, 10000000)
 
 SELECT
@@ -107,7 +116,7 @@ SELECT
     status,
     version
 FROM accounts
-WHERE id = :account_id::uuid;
+WHERE id = md5(:account_id::text)::uuid;
 ```
 
 ```bash
@@ -125,17 +134,16 @@ pgbench \
 ### Script 2: Transaction Debit (Write-Heavy)
 
 ```bash
-# File: debit_transaction.sql
+-- File: debit_transaction.sql
 \set account_id random(1, 10000000)
 \set amount random(100, 10000)
-\set idempotency_key random(1, 1000000000)
 
 BEGIN;
 
 -- Check balance and version
 SELECT balance, version
 FROM accounts
-WHERE id = :account_id::uuid
+WHERE id = md5(:account_id::text)::uuid
 FOR UPDATE;
 
 -- Record transaction
@@ -148,7 +156,7 @@ INSERT INTO transactions (
     idempotency_key,
     created_at
 ) VALUES (
-    :account_id::uuid,
+    md5(:account_id::text)::uuid,
     (:amount / 100.0)::numeric,
     'USD',
     'PENDING',
@@ -163,7 +171,7 @@ SET
     balance = balance - (:amount / 100.0),
     version = version + 1,
     updated_at = NOW()
-WHERE id = :account_id::uuid;
+WHERE id = md5(:account_id::text)::uuid;
 
 COMMIT;
 ```
@@ -171,32 +179,33 @@ COMMIT;
 ### Script 3: Concurrent Transfer (Highest Contention)
 
 ```bash
-# File: transfer.sql
+-- File: transfer.sql
 \set source_account random(1, 10000000)
 \set target_account random(1, 10000000)
 \set amount random(100, 5000)
 
 BEGIN;
 
--- Lock both accounts in consistent order to avoid deadlock
--- Always lock lower ID first
-\set min_account :source_account < :target_account ? :source_account : :target_account
-\set max_account :source_account < :target_account ? :target_account : :source_account
+-- Lock both accounts in consistent order to avoid deadlock:
+-- always lock the lower NUMBER first (pgbench expressions have least() /
+-- greatest(); there is no ?: operator)
+\set min_account least(:source_account, :target_account)
+\set max_account greatest(:source_account, :target_account)
 
-SELECT id, balance FROM accounts WHERE id = :min_account::uuid FOR UPDATE;
-SELECT id, balance FROM accounts WHERE id = :max_account::uuid FOR UPDATE;
+SELECT id, balance FROM accounts WHERE id = md5(:min_account::text)::uuid FOR UPDATE;
+SELECT id, balance FROM accounts WHERE id = md5(:max_account::text)::uuid FOR UPDATE;
 
 UPDATE accounts SET balance = balance - (:amount / 100.0)
-WHERE id = :source_account::uuid;
+WHERE id = md5(:source_account::text)::uuid;
 
 UPDATE accounts SET balance = balance + (:amount / 100.0)
-WHERE id = :target_account::uuid;
+WHERE id = md5(:target_account::text)::uuid;
 
 INSERT INTO transactions (account_id, amount, currency, status, type, created_at)
-VALUES (:source_account::uuid, -(:amount / 100.0), 'USD', 'COMPLETED', 'TRANSFER', NOW());
+VALUES (md5(:source_account::text)::uuid, -(:amount / 100.0), 'USD', 'COMPLETED', 'TRANSFER', NOW());
 
 INSERT INTO transactions (account_id, amount, currency, status, type, created_at)
-VALUES (:target_account::uuid, (:amount / 100.0), 'USD', 'COMPLETED', 'TRANSFER', NOW());
+VALUES (md5(:target_account::text)::uuid, (:amount / 100.0), 'USD', 'COMPLETED', 'TRANSFER', NOW());
 
 COMMIT;
 ```
@@ -204,7 +213,7 @@ COMMIT;
 ### Script 4: Mixed Workload (Realistic)
 
 ```bash
-# pgbench supports weighted script selection with --file and multiple -c args
+# pgbench picks one script per transaction, weighted: --file=script@weight
 # Compose: 70% balance reads, 20% debits, 10% transfers
 
 pgbench \
@@ -226,25 +235,30 @@ pgbench \
 | `-j` / `--jobs` | pgbench worker threads | Match CPU cores on the benchmark client machine |
 | `-T` / `--time` | Duration in seconds | At least 5x the warmup period (usually 300s+) |
 | `-n` / `--no-vacuum` | Skip VACUUM before test | Use for steady-state benchmarks |
-| `-M` / `--protocol` | Query protocol | `prepared` for connection pool simulation |
-| `--log` | Log each transaction | Enable for latency distribution analysis |
-| `--aggregate-interval` | Log summary every N seconds | 10-30 seconds |
+| `-M` / `--protocol` | Query protocol | `prepared` to mimic apps using server-side prepared statements |
+| `--log` | Log each transaction | Enable for latency distribution analysis (with `--sampling-rate` at high TPS) |
+| `--aggregate-interval` | With `--log`: write one summary line per N seconds instead of one line per transaction | 10-30 seconds (use a separate run for per-transaction percentiles) |
 
 ```bash
 # Production-like benchmark parameters
+#   500 concurrent sessions, 8 worker threads on the benchmark machine,
+#   10 minutes (long enough to include checkpoints), progress every 60 s,
+#   prepared statements (like production), no VACUUM (already done),
+#   per-transaction log for 10% of transactions (for percentiles)
 pgbench \
-  --client=500 \           # 500 concurrent sessions
-  --jobs=8 \               # 8 worker threads on benchmark machine
-  --time=600 \             # 10 minutes (long enough to stabilize)
-  --progress=60 \          # print progress every 60s
-  --protocol=prepared \    # use prepared statements (like production)
-  --no-vacuum \            # already vacuumed; don't waste time
-  --log \                  # log all transactions for percentile analysis
-  --aggregate-interval=10 \ # log TPS every 10 seconds
+  --client=500 \
+  --jobs=8 \
+  --time=600 \
+  --progress=60 \
+  --protocol=prepared \
+  --no-vacuum \
+  --log \
+  --sampling-rate=0.1 \
   --file=payment_workload.sql \
   payments_benchmark
 
 # Post-process the transaction log for percentiles
+# (column 3 = transaction latency in microseconds)
 awk '{print $3}' pgbench_log.* | sort -n | \
   awk 'BEGIN{count=0} {data[count++]=$1} END {
     p50=data[int(count*0.50)]; p95=data[int(count*0.95)]; p99=data[int(count*0.99)];
@@ -269,7 +283,7 @@ Interpreting:
 High stddev relative to mean (31/48 = 64%) indicates:
   - Lock contention (some transactions wait for locks)
   - Variable I/O (some queries hit disk, most hit cache)
-  - GC or connection pool pressure during spikes
+  - Checkpoint or autovacuum I/O spikes
 
 For payment processing, care about:
   - p99 latency (what's the worst case a customer experiences?)
@@ -278,7 +292,8 @@ For payment processing, care about:
 
 ```bash
 # Compute percentiles from pgbench log
-# pgbench log format: client_id | transaction_no | time_us | ...
+# per-transaction log format:
+#   client_id transaction_no time_us script_no time_epoch time_us_part
 sort -k3 -n pgbench_log.* > sorted_latencies.txt
 
 TOTAL=$(wc -l < sorted_latencies.txt)
@@ -334,9 +349,12 @@ WHERE state != 'idle'
 GROUP BY wait_event_type, wait_event
 ORDER BY occurrences DESC;
 
--- If 'Lock' wait events are high: contention is the bottleneck
--- If 'IO' wait events are high: I/O is the bottleneck (check indexes/shared_buffers)
--- If 'CPU' utilization is saturated: compute is the bottleneck
+-- Sample this every few seconds during the run (one snapshot proves little)
+-- If 'Lock' wait events dominate: row/table lock contention is the bottleneck
+-- If 'LWLock' (e.g. WALWrite, BufferMapping) dominates: internal contention
+-- If 'IO' wait events dominate: I/O is the bottleneck (check indexes/shared_buffers)
+-- Active sessions with wait_event IS NULL are running on CPU -- many of
+-- them plus a saturated CPU means compute is the bottleneck
 ```
 
 ## 6. HammerDB for Mixed OLTP/OLAP
@@ -355,13 +373,15 @@ diset connection pg_sslmode prefer
 
 # Configure workload
 diset tpcc pg_count_ware 100   # warehouses (scale factor)
-diset tpcc pg_num_vu 50        # virtual users
+diset tpcc pg_num_vu 8         # virtual users used to BUILD the schema
+diset tpcc pg_driver timed     # timed test with rampup + duration
 diset tpcc pg_rampup 2         # 2 minutes warmup
 diset tpcc pg_duration 10      # 10 minutes test
 
-# Run
+# Build, then run with 50 virtual users
 buildschema
 loadscript
+vuset vu 50
 vuset logtotemp 1
 tcstart
 vucreate
@@ -370,7 +390,7 @@ vudestroy
 tcstop
 ```
 
-TPC-C simulates a wholesale supplier with 5 transaction types: New Order, Payment, Order Status, Delivery, and Stock Level. It is significantly more realistic than TPC-B for payment workloads.
+TPC-C simulates a wholesale supplier with 5 transaction types: New Order, Payment, Order Status, Delivery, and Stock Level. Its mix is richer than TPC-B, which makes it useful for comparing hardware and configurations — but it is still not your workload, so custom scripts that mirror your real queries matter most.
 
 ## 7. Baseline Benchmarks Before Optimization
 
@@ -388,14 +408,13 @@ pgbench \
   --jobs=4 \
   --time=300 \
   --file=payment_workload.sql \
-  --log \
-  --aggregate-interval=10 \
   payments_benchmark 2>&1 | tee "benchmarks/pgbench_${TIMESTAMP}.log"
 
 # Parse results
 TPS=$(grep "^tps" "benchmarks/pgbench_${TIMESTAMP}.log" | awk '{print $3}')
-AVG_LAT=$(grep "latency average" "benchmarks/pgbench_${TIMESTAMP}.log" | awk '{print $3}')
-STDDEV_LAT=$(grep "latency stddev" "benchmarks/pgbench_${TIMESTAMP}.log" | awk '{print $3}')
+# "latency average = 48.234 ms" -> the number is field 4
+AVG_LAT=$(grep "latency average" "benchmarks/pgbench_${TIMESTAMP}.log" | awk '{print $4}')
+STDDEV_LAT=$(grep "latency stddev" "benchmarks/pgbench_${TIMESTAMP}.log" | awk '{print $4}')
 
 # Save structured results
 cat > "${RESULTS_FILE}" << EOF
@@ -406,6 +425,7 @@ cat > "${RESULTS_FILE}" << EOF
   "avg_latency_ms": ${AVG_LAT},
   "stddev_latency_ms": ${STDDEV_LAT},
   "environment": {
+    "_comment": "record the REAL values of the system under test",
     "db_instance": "db.r6g.2xlarge",
     "storage": "io1 20000 IOPS",
     "shared_buffers_gb": 8,
@@ -423,7 +443,11 @@ echo "Baseline recorded: ${RESULTS_FILE}"
 # Scenario 1: Balance check under high read concurrency
 # Models: 1000 customers checking balance simultaneously
 pgbench -c 1000 -j 8 -T 120 -f balance_lookup.sql payments_benchmark
-# Expected: > 50,000 TPS (index-only scan on accounts table)
+# Example target: > 50,000 TPS (primary-key lookups, mostly cached)
+# (1000 direct connections need max_connections >= 1000 -- or put
+#  PgBouncer in front, as production would)
+# All "expected" numbers here are example targets: they depend entirely
+# on hardware, data size and configuration
 
 # Scenario 2: Payment authorization (debit + write)
 # Models: 200 concurrent payment authorizations
@@ -436,7 +460,8 @@ pgbench -c 50 -j 2 -T 300 -f transfer.sql payments_benchmark
 # Expected: > 500 TPS (limited by lock contention)
 
 # Scenario 4: Settlement aggregation (analytical)
-# Models: 10 concurrent settlement queries
+# Models: 10 concurrent settlement queries (settlement_query.sql = your
+# own reporting query)
 pgbench -c 10 -j 2 -T 60 -f settlement_query.sql payments_benchmark
 # Expected: > 10 queries/second (each query < 1 second with partitioning)
 ```
@@ -446,6 +471,7 @@ pgbench -c 10 -j 2 -T 60 -f settlement_query.sql payments_benchmark
 ```java
 @SpringBootTest
 @Tag("performance-benchmark")
+@Slf4j
 class DatabaseBenchmarkTest {
 
     @Autowired
@@ -457,52 +483,55 @@ class DatabaseBenchmarkTest {
     private static final int WARMUP_ITERATIONS = 1000;
     private static final int BENCHMARK_ITERATIONS = 10_000;
 
-    @Test
-    void balanceLookupShouldMeetThroughputSla() throws Exception {
-        // Warmup
-        warmup();
+    private List<UUID> sampleIds;
 
-        // Benchmark
-        List<Long> latencies = new ArrayList<>();
+    @BeforeEach
+    void loadSampleIds() {
+        // Pick test ids ONCE, outside the measurement. (A per-iteration
+        // "ORDER BY random() LIMIT 1" sorts the whole table every time and
+        // would dominate the numbers.)
+        sampleIds = jdbcTemplate.queryForList(
+            "SELECT id FROM accounts TABLESAMPLE SYSTEM (1) LIMIT 5000", UUID.class);
+        assertThat(sampleIds).isNotEmpty();
+    }
+
+    @Test
+    void balanceLookupShouldMeetLatencySla() {
+        ThreadLocalRandom rnd = ThreadLocalRandom.current();
+
+        // Warmup
+        for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+            accountRepository.findBalanceById(sampleIds.get(rnd.nextInt(sampleIds.size())));
+        }
+
+        // Benchmark (single thread: this measures LATENCY; throughput under
+        // concurrency belongs in pgbench / Gatling, not in a unit test)
+        long[] latencies = new long[BENCHMARK_ITERATIONS];
         long startTime = System.nanoTime();
 
         for (int i = 0; i < BENCHMARK_ITERATIONS; i++) {
-            UUID accountId = getRandomAccountId();
+            UUID accountId = sampleIds.get(rnd.nextInt(sampleIds.size()));
             long queryStart = System.nanoTime();
-
             accountRepository.findBalanceById(accountId);
-
-            latencies.add(System.nanoTime() - queryStart);
+            latencies[i] = System.nanoTime() - queryStart;
         }
 
-        long totalTimeMs = (System.nanoTime() - startTime) / 1_000_000;
-        double tps = BENCHMARK_ITERATIONS * 1000.0 / totalTimeMs;
+        double totalSeconds = (System.nanoTime() - startTime) / 1e9;
+        double callsPerSecond = BENCHMARK_ITERATIONS / totalSeconds;
 
         // Compute percentiles
-        Collections.sort(latencies);
-        double p50 = latencies.get(BENCHMARK_ITERATIONS / 2) / 1_000_000.0;
-        double p95 = latencies.get((int)(BENCHMARK_ITERATIONS * 0.95)) / 1_000_000.0;
-        double p99 = latencies.get((int)(BENCHMARK_ITERATIONS * 0.99)) / 1_000_000.0;
+        Arrays.sort(latencies);
+        double p50 = latencies[BENCHMARK_ITERATIONS / 2] / 1e6;
+        double p95 = latencies[(int) (BENCHMARK_ITERATIONS * 0.95)] / 1e6;
+        double p99 = latencies[(int) (BENCHMARK_ITERATIONS * 0.99)] / 1e6;
 
-        log.info("Balance lookup benchmark: TPS={:.0f} p50={:.2f}ms p95={:.2f}ms p99={:.2f}ms",
-            tps, p50, p95, p99);
+        log.info("Balance lookup: {} calls/s (1 thread) p50={}ms p95={}ms p99={}ms",
+            Math.round(callsPerSecond),
+            String.format("%.2f", p50), String.format("%.2f", p95), String.format("%.2f", p99));
 
-        // Assertions: enforce performance SLA
-        assertThat(tps).as("Balance lookup TPS must exceed 5000").isGreaterThan(5000.0);
+        // Assertions: enforce the latency SLA (CI hardware varies -- keep
+        // the bound generous and compare against a stored baseline)
         assertThat(p99).as("p99 latency must be < 20ms").isLessThan(20.0);
-    }
-
-    private void warmup() {
-        for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-            accountRepository.findBalanceById(getRandomAccountId());
-        }
-    }
-
-    private UUID getRandomAccountId() {
-        return jdbcTemplate.queryForObject(
-            "SELECT id FROM accounts ORDER BY RANDOM() LIMIT 1",
-            UUID.class
-        );
     }
 }
 ```
@@ -517,7 +546,8 @@ class DatabaseBenchmarkTest {
    (pgbench -s 100 for 10M accounts, not -s 1 for 100K)
 
 3. Warmup period: allow 2-5 minutes for caches to warm before measuring
-   (pgbench --rampup-time 120 or discard first N seconds of data)
+   (pgbench has no ramp-up option: run a separate warm-up first, or
+   discard the first N seconds using --progress output / log timestamps)
 
 4. Duration: run for at least 5 minutes (300 seconds)
    (longer tests expose steady-state behavior including WAL checkpoint impact)
@@ -535,8 +565,8 @@ class DatabaseBenchmarkTest {
    (measure TPS at 100, 200, 500, 1000 concurrent clients)
 
 9. Run under realistic I/O conditions
-   (prime the buffer cache with ANALYZE / sequential scan before benchmarking,
-   or test with cold cache to simulate restart behavior)
+   (prime the buffer cache with the pg_prewarm extension before benchmarking,
+   or test with a cold cache to simulate restart behavior)
 ```
 
 > [!WARNING]
@@ -547,19 +577,34 @@ class DatabaseBenchmarkTest {
   "questions": [
     {
       "text": "A pgbench run reports: tps = 4,823 (without initial connection establishment). A second run with -c 200 -j 8 reports: tps = 3,102. What does the decrease in TPS indicate?",
-      "options": ["The database is misconfigured and needs max_connections increased", "The system has reached a saturation point where adding concurrency beyond the hardware's parallelism capacity increases contention and reduces throughput", "pgbench is reporting incorrect results because -j 8 is too low for -c 200", "The benchmark needs to run longer with -T 300 to stabilise the TPS measurement"],
+      "options": [
+        "The database is misconfigured and needs max_connections increased",
+        "The system has reached a saturation point where adding concurrency beyond the hardware's parallelism capacity increases contention and reduces throughput",
+        "pgbench is reporting incorrect results because -j 8 is too low for -c 200",
+        "The benchmark needs to run longer with -T 300 to stabilise the TPS measurement"
+      ],
       "correct": 1,
       "explanation": "When TPS decreases as concurrency increases, the system has passed its saturation point on the Universal Scalability Law curve. Beyond the optimal concurrency level, additional clients add more lock contention, context-switching overhead, and connection management cost than they add throughput. The fix is not to increase max_connections but to understand the bottleneck: use pg_stat_statements to identify the most contended queries and pg_locks to find lock wait chains."
     },
     {
-      "text": "pg_stat_statements shows that SELECT * FROM payments WHERE merchant_id = $1 AND status = 'pending' has mean_exec_time = 0.3ms but total_exec_time = 847,000ms. What does this combination of metrics indicate and what is the appropriate action?",
-      "options": ["The query is slow and needs an index on merchant_id", "The query is individually fast but called extremely frequently (approximately 2.8 million times); optimise by adding a covering index with INCLUDE(id, amount_cents, created_at) to avoid heap fetches, reducing the per-call cost even further", "The query has high variance; the mean is misleading and p99 latency should be investigated instead", "The total_exec_time is a cumulative lifetime metric; reset pg_stat_statements and re-measure over a 1-hour window"],
+      "text": "pg_stat_statements shows that SELECT id, amount_minor, created_at FROM payments WHERE merchant_id = $1 AND status = 'pending' has mean_exec_time = 0.3ms but total_exec_time = 847,000ms. What does this combination of metrics indicate and what is the appropriate action?",
+      "options": [
+        "The query is slow and needs an index on merchant_id",
+        "The query is individually fast but called extremely often (about 2.8 million times); reduce its total cost — first ask whether it needs to run that often (caching, batching), then make each call cheaper, e.g. an index on (merchant_id, status) INCLUDE (id, amount_minor, created_at) for index-only scans",
+        "The query has high variance; the mean is misleading and p99 latency should be investigated instead",
+        "The total_exec_time is a cumulative lifetime metric; reset pg_stat_statements and re-measure over a 1-hour window"
+      ],
       "correct": 1,
-      "explanation": "total_exec_time / mean_exec_time ≈ 2.8 million calls. The query is fast individually but its aggregate impact is very high. At this call frequency even a 0.1ms improvement in mean latency saves 280 seconds of total CPU time per benchmark window. A covering index (INCLUDE columns that appear in SELECT) eliminates heap tuple fetches entirely, often halving or better the execution time for index-covered queries."
+      "explanation": "total_exec_time / mean_exec_time ≈ 2.8 million calls. Each call is fast, but the aggregate cost is very high. At this frequency even a 0.1ms improvement saves about 280 seconds of database time per measurement window — and avoiding unnecessary calls (caching, batching) saves even more. A covering index (all selected columns in the key or INCLUDE) allows index-only scans that skip heap fetches, which often halves the per-call time for such lookups."
     },
     {
       "text": "A custom pgbench script simulates payment processing. The benchmark runs for 300 seconds with -c 100 -j 4. The results show latency average = 48ms but latency stddev = 312ms. What does the high standard deviation indicate?",
-      "options": ["The benchmark script has a bug causing some transactions to be counted multiple times", "There is bimodal latency: most transactions complete quickly but a subset experiences dramatically higher latency due to lock waits, autovacuum interference, or checkpoint I/O spikes", "pgbench stddev includes connection establishment time which inflates the variance", "The -j 4 thread count is insufficient for -c 100 clients causing queuing at the client level"],
+      "options": [
+        "The benchmark script has a bug causing some transactions to be counted multiple times",
+        "There is bimodal latency: most transactions complete quickly but a subset experiences dramatically higher latency due to lock waits, autovacuum interference, or checkpoint I/O spikes",
+        "pgbench stddev includes connection establishment time which inflates the variance",
+        "The -j 4 thread count is insufficient for -c 100 clients causing queuing at the client level"
+      ],
       "correct": 1,
       "explanation": "A standard deviation of 312ms with a mean of 48ms (coefficient of variation > 6) indicates highly bimodal or heavy-tailed latency distribution. In PostgreSQL this typically means: some transactions hit lock contention and wait (producing outliers of hundreds or thousands of ms) while most complete in under 20ms. The correct diagnostic step is to capture latency percentiles (p50, p95, p99, p99.9) using --sampling-rate and analyse the tail — the p99 is what customers experience during peak load."
     }
@@ -587,7 +632,7 @@ class DatabaseBenchmarkTest {
     },
     {
       "id": "4",
-      "description": "Implement a Java BenchmarkReportParser that reads a pgbench log file (--log output) and computes: p50, p95, p99, p99.9 latency in milliseconds, TPS over each 10-second window, and the timestamp of the worst 1-second spike. The parser must handle the pgbench log format: 'client_id transaction_number duration script_number time'. Write a unit test using a synthetic 10,000-line log file verifying the percentile calculation is accurate to within 1ms."
+      "description": "Implement a Java BenchmarkReportParser that reads a pgbench log file (--log output) and computes: p50, p95, p99, p99.9 latency in milliseconds, TPS over each 10-second window, and the timestamp of the worst 1-second spike. The parser must handle the pgbench log format: 'client_id transaction_no time_us script_no time_epoch time_us_part' (latency in microseconds in column 3). Write a unit test using a synthetic 10,000-line log file verifying the percentile calculation is accurate to within 1ms."
     }
   ]
 }

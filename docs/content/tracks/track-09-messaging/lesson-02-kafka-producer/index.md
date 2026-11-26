@@ -30,7 +30,7 @@ This lesson walks through every critical producer configuration from first princ
 Before tuning configuration, understand the lifecycle of a single `ProducerRecord`:
 
 1. **Serialization** — Key and value are serialized using configured serializers.
-2. **Partitioning** — A partitioner assigns the record to a partition (default: hash of key, or round-robin if no key).
+2. **Partitioning** — A partitioner assigns the record to a partition (default: murmur2 hash of the key; without a key, the "sticky" behaviour fills a batch for one partition before moving on).
 3. **Record Accumulator** — Records are buffered in a per-partition `Deque<ProducerBatch>`. Batches accumulate until `batch.size` is reached or `linger.ms` expires.
 4. **Sender Thread** — A background `Sender` thread drains the accumulator and groups batches by broker (leader for each partition).
 5. **In-Flight Requests** — Batches are sent as `ProduceRequest` messages. Up to `max.in.flight.requests.per.connection` requests can be outstanding per broker connection.
@@ -100,10 +100,9 @@ When idempotence is enabled:
 - Each record batch carries a **sequence number** per partition.
 - The broker deduplicates retries using `(PID, partition, sequence_number)`.
 
-Idempotence also automatically sets:
-- `acks=all`
-- `retries=Integer.MAX_VALUE`
-- `max.in.flight.requests.per.connection=5`
+Idempotence requires `acks=all`, `retries > 0` and `max.in.flight.requests.per.connection <= 5` — the defaults (`acks=all`, `retries=Integer.MAX_VALUE`, 5 in flight). Since Kafka 3.0 idempotence is **enabled by default** when nothing conflicts with it.
+
+Limit: deduplication works per producer session. If the producer *application* restarts and resends a record, it gets a new PID and the broker cannot recognise the duplicate — that needs transactions (`transactional.id`) or idempotent consumers.
 
 ```java
 // Idempotent producer configuration
@@ -120,7 +119,7 @@ producerProps.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120_000); // 2 minu
 ```
 
 > [!WARNING]
-> `max.in.flight.requests.per.connection` must be <= 5 when idempotence is enabled. Setting it higher disables the deduplication guarantee and will throw a `ConfigException` at startup.
+> `max.in.flight.requests.per.connection` must be <= 5 for idempotence. If you set `enable.idempotence=true` explicitly together with a higher value (or `acks` other than `all`), the producer fails at startup with a `ConfigException`. If you did NOT set idempotence explicitly, a conflicting setting silently turns the default idempotence off — so always set `enable.idempotence=true` explicitly in financial producers.
 
 ---
 
@@ -146,7 +145,7 @@ The maximum time the producer will wait before sending an incomplete batch. This
 props.put(ProducerConfig.LINGER_MS_CONFIG, 5); // Wait up to 5ms to fill a batch
 ```
 
-Default is 0 (send immediately). For payment processing where you have high message rates but can tolerate 5–20ms of additional latency, `linger.ms=5` can double throughput by dramatically improving batch fill rates.
+Default is 0 (send immediately) — Kafka 4.0 changed the default to 5 ms. For payment processing where you have high message rates but can tolerate 5–20ms of additional latency, `linger.ms=5` can double throughput by dramatically improving batch fill rates.
 
 ### buffer.memory
 
@@ -206,9 +205,12 @@ Kafka guarantees ordering **within a partition, not across partitions**. The par
 
 ### Why Keys Matter for Financial Systems
 
-Consider a payment transfer between two accounts. The sequence `DEBIT account A → CREDIT account B` must be processed in order. If these two events land in different partitions, consumers in different threads can process them out of order.
+Ordering only exists per key, so choose the key by asking *which events must stay in order relative to each other*:
 
-The solution is to use a consistent key that maps semantically related events to the same partition:
+- All events of one **account** (balance changes) must be ordered → key = account id.
+- All events of one **payment** (`INITIATED → AUTHORISED → SETTLED`) must be ordered → key = payment id.
+
+A transfer touches two accounts. Keyed by account, its debit event for A and its credit event for B land in different partitions and can be processed in any order relative to each other. If that matters, publish one `TransferCompleted` event keyed by the transfer id and let each consumer derive both legs, or design consumers so the two legs do not depend on each other's order.
 
 ```java
 // Always use account_id or payment_id as the partition key
@@ -236,40 +238,35 @@ ProducerRecord<String, PaymentEvent> record = new ProducerRecord<>(
     paymentEvent
 );
 
-// Better: composite key balances load while maintaining ordering per entity
-String compositeKey = payment.getAccountId() + ":" + payment.getRegion();
-ProducerRecord<String, PaymentEvent> record = new ProducerRecord<>(
+// Better: key by the high-cardinality entity whose events must stay in order
+ProducerRecord<String, PaymentEvent> keyed = new ProducerRecord<>(
     "payment-events",
-    compositeKey,
+    payment.getAccountId(),   // millions of accounts -> even spread
     paymentEvent
 );
+// (A few huge accounts can still create hot partitions -- watch
+//  per-partition throughput)
 ```
 
 ---
 
 ## 7. Partition Assignment Strategies
 
-### Default Partitioner
+### Default Partitioning
 
-The `DefaultPartitioner` uses a murmur2 hash of the key's bytes modulo the number of partitions. This provides good distribution for high-cardinality keys.
+With no `partitioner.class` set, the producer uses a murmur2 hash of the key's bytes modulo the number of partitions. This provides good distribution for high-cardinality keys. (The old `DefaultPartitioner` class is deprecated since Kafka 3.3 — just leave `partitioner.class` unset.)
 
-```java
-// Default behavior — explicit for clarity
-props.put(ProducerConfig.PARTITIONER_CLASS_CONFIG, DefaultPartitioner.class);
-```
+### Sticky Behaviour for Records Without Keys
 
-### Sticky Partitioner (Kafka 2.4+)
-
-For records **without keys**, the `UniformStickyPartitioner` batches records to the same partition until the batch is sent, then moves to the next partition. This dramatically improves batching efficiency compared to the old round-robin behavior.
+For records **without keys**, the producer fills a batch for one partition, then moves to another (sticky partitioning, Kafka 2.4+; improved in 3.3 to favour faster brokers). This greatly improves batching compared to the old round-robin behaviour. The separate `UniformStickyPartitioner` class is deprecated; to ignore keys entirely, use:
 
 ```java
-props.put(ProducerConfig.PARTITIONER_CLASS_CONFIG,
-    "org.apache.kafka.clients.producer.UniformStickyPartitioner");
+props.put(ProducerConfig.PARTITIONER_IGNORE_KEYS_CONFIG, true);  // keys no longer pick the partition
 ```
 
-### Custom Partitioner for Data Residency
+### Custom Partitioner for Isolating Regions or Tenants
 
-For regulatory compliance (data residency), you may need to route events to specific partitions based on jurisdiction:
+A custom partitioner can reserve partition ranges for regions or tenants (for example to isolate a noisy tenant or to let a regional consumer group read only its range). **It does not provide data residency:** all partitions of a topic live on the same cluster's brokers, wherever they run. Residency requires separate clusters (or topics on clusters) per jurisdiction.
 
 ```java
 public class RegionalPartitioner implements Partitioner {
@@ -280,20 +277,29 @@ public class RegionalPartitioner implements Partitioner {
         "APAC", 8    // APAC events go to partitions 8-11
     );
     private static final int RANGE_SIZE = 4;
+    private static final int REQUIRED_PARTITIONS = 12;
 
     @Override
     public int partition(String topic, Object key, byte[] keyBytes,
                          Object value, byte[] valueBytes, Cluster cluster) {
-        List<PartitionInfo> partitions = cluster.partitionsForTopic(topic);
+        int numPartitions = cluster.partitionsForTopic(topic).size();
+        if (numPartitions < REQUIRED_PARTITIONS) {
+            throw new IllegalStateException(topic + " needs at least "
+                + REQUIRED_PARTITIONS + " partitions, has " + numPartitions);
+        }
+        // murmur2 like the default; toPositive avoids the
+        // Math.abs(Integer.MIN_VALUE) < 0 trap
+        int keyHash = keyBytes != null ? Utils.toPositive(Utils.murmur2(keyBytes)) : 0;
 
         if (value instanceof PaymentEvent event) {
-            String region = event.getRegion();
-            int basePartition = REGION_PARTITION_BASE.getOrDefault(region, 0);
-            int keyHash = keyBytes != null ? Math.abs(Arrays.hashCode(keyBytes)) : 0;
-            return basePartition + (keyHash % RANGE_SIZE);
+            Integer base = REGION_PARTITION_BASE.get(event.getRegion());
+            if (base == null) {
+                throw new IllegalArgumentException("Unknown region: " + event.getRegion());
+            }
+            return base + (keyHash % RANGE_SIZE);
         }
 
-        return Math.abs(Arrays.hashCode(keyBytes)) % partitions.size();
+        return keyHash % numPartitions;
     }
 
     @Override
@@ -417,11 +423,12 @@ For exactly-once semantics, use the transactional producer API. This is covered 
 public ProducerFactory<String, PaymentEvent> transactionalProducerFactory() {
     Map<String, Object> props = new HashMap<>();
     // ... base props ...
-    // Transactional ID must be unique and stable per producer instance
-    props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "payment-producer-" + instanceId);
+    // Do NOT set transactional.id yourself: the factory generates one per
+    // producer from this prefix. The prefix must be unique per application
+    // instance (e.g. include the pod name) to avoid fencing each other.
     DefaultKafkaProducerFactory<String, PaymentEvent> factory =
         new DefaultKafkaProducerFactory<>(props);
-    factory.setTransactionIdPrefix("payment-tx-");
+    factory.setTransactionIdPrefix("payment-tx-" + instanceId + "-");
     return factory;
 }
 
@@ -469,14 +476,16 @@ The Kafka producer exposes JMX metrics that are critical for production operatio
 ### Micrometer Integration
 
 ```java
-@Configuration
-public class KafkaMetricsConfig {
-
-    @Bean
-    public MicrometerProducerListener<String, PaymentEvent> producerListener(
-            MeterRegistry registry) {
-        return new MicrometerProducerListener<>(registry);
-    }
+// Spring Boot registers this automatically for the producer factory it
+// creates. For a factory you build yourself, add the listener explicitly:
+@Bean
+public ProducerFactory<String, PaymentEvent> producerFactory(MeterRegistry registry) {
+    DefaultKafkaProducerFactory<String, PaymentEvent> factory =
+        new DefaultKafkaProducerFactory<>(producerProps());
+    // Binds the native client metrics (record-send-rate, request-latency-avg,
+    // ...) to Micrometer, tagged per producer
+    factory.addListener(new MicrometerProducerListener<>(registry));
+    return factory;
 }
 ```
 
@@ -535,23 +544,25 @@ props.put(ProducerConfig.INTERCEPTOR_CLASSES_CONFIG,
 
 ```yaml
 # application.yml
+# Only some producer settings have dedicated Spring Boot keys; the rest go
+# under "properties" with their native Kafka names
 spring:
   kafka:
     bootstrap-servers: kafka-broker-1:9092,kafka-broker-2:9092,kafka-broker-3:9092
     producer:
       acks: all
       retries: 2147483647
-      enable-idempotence: true
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
       compression-type: lz4
-      batch-size: 65536
-      linger-ms: 5
-      buffer-memory: 67108864
-      max-in-flight-requests-per-connection: 5
-      delivery-timeout-ms: 120000
-      request-timeout-ms: 30000
+      batch-size: 64KB
+      buffer-memory: 64MB
       properties:
+        enable.idempotence: true
+        linger.ms: 5
+        max.in.flight.requests.per.connection: 5
+        delivery.timeout.ms: 120000
+        request.timeout.ms: 30000
         max.block.ms: 60000
         metadata.max.age.ms: 300000
 ```
@@ -564,10 +575,11 @@ spring:
     producer:
       acks: all
       retries: 2147483647
-      enable-idempotence: true
       compression-type: zstd
-      linger-ms: 0            # No batching delay for audit events
-      batch-size: 16384       # Default batch size
+      batch-size: 16KB        # Default batch size
+      properties:
+        enable.idempotence: true
+        linger.ms: 0          # No batching delay for audit events
 ```
 
 ---
@@ -577,23 +589,27 @@ spring:
 ### Pitfall 1: Sharing KafkaTemplate Across Transactions
 
 ```java
-// WRONG: Sharing a transactional producer across threads causes transaction corruption
-@Autowired
-private KafkaTemplate<String, PaymentEvent> template;
-
-// ThreadA and ThreadB both call template.send() inside @Transactional methods
-// They share the underlying producer, causing transaction interleaving
+// WRONG: one raw transactional KafkaProducer shared by several threads
+KafkaProducer<String, PaymentEvent> shared = new KafkaProducer<>(txProps);
+shared.initTransactions();
+// ThreadA: shared.beginTransaction(); ... send ...
+// ThreadB: shared.beginTransaction();  -> IllegalStateException, or ThreadB's
+// sends end up inside ThreadA's transaction. A KafkaProducer can only run
+// ONE transaction at a time.
 ```
 
 ```java
-// CORRECT: DefaultKafkaProducerFactory manages a thread-local pool
+// CORRECT: let Spring manage transactional producers
 @Bean
 public ProducerFactory<String, PaymentEvent> producerFactory() {
     DefaultKafkaProducerFactory<String, PaymentEvent> factory =
         new DefaultKafkaProducerFactory<>(props);
     factory.setTransactionIdPrefix("payment-tx-");
     return factory;
-    // One producer instance per thread — no interleaving
+    // The factory caches transactional producers; each Kafka transaction
+    // (executeInTransaction, or a KafkaTransactionManager-driven
+    // @Transactional method) gets its OWN producer for its duration --
+    // no interleaving between threads
 }
 ```
 
@@ -604,31 +620,40 @@ public ProducerFactory<String, PaymentEvent> producerFactory() {
 SendResult<String, PaymentEvent> result = kafkaTemplate.send(record).get();
 // If broker is slow, your payment API latency spikes
 
-// BETTER: Non-blocking with explicit timeout
+// BETTER: Non-blocking with explicit timeout, and react to the outcome
 CompletableFuture<SendResult<String, PaymentEvent>> future = kafkaTemplate.send(record);
 future.orTimeout(5, TimeUnit.SECONDS)
-      .exceptionally(ex -> {
-          // Handle timeout — circuit breaker, fallback to outbox
-          throw new PaymentPublishTimeoutException(ex);
+      .whenComplete((result, ex) -> {
+          if (ex != null) {
+              // alert / metric; the event must not be lost -- which is why
+              // payment events are better written via the transactional
+              // outbox (Lesson 06) than sent directly from the API path
+              publishFailures.increment();
+          }
       });
 ```
 
 ### Pitfall 3: Not Handling Buffer Exhaustion
 
 ```java
-// WRONG: No handling when producer buffer is full
-kafkaTemplate.send(topic, key, event); // Silently fails if max.block.ms exceeded
+// WRONG: fire and forget -- nobody looks at the outcome
+kafkaTemplate.send(topic, key, event);
+// When the buffer is full, send() BLOCKS the calling thread for up to
+// max.block.ms and then fails (BufferExhaustedException / TimeoutException,
+// thrown directly or via the returned future). Ignored, the event is lost.
 
-// CORRECT: Handle MaxBlockMsExceededException with outbox fallback
+// CORRECT: handle both the synchronous failure and the future's failure
 try {
-    kafkaTemplate.send(topic, key, event).get(30, TimeUnit.SECONDS);
-} catch (ExecutionException e) {
-    if (e.getCause() instanceof BufferExhaustedException) {
-        // Producer buffer full — broker unreachable or producing too fast
-        outboxRepository.save(toOutboxEntry(event));
-        log.warn("Kafka buffer exhausted, wrote to outbox: {}", event.getEventId());
-    }
+    kafkaTemplate.send(topic, key, event)
+        .whenComplete((r, ex) -> { if (ex != null) handlePublishFailure(event, ex); });
+} catch (KafkaException | org.apache.kafka.common.errors.TimeoutException e) {
+    handlePublishFailure(event, e);   // buffer full / metadata unavailable
 }
+// handlePublishFailure: metric + alert + retry from a durable store.
+// For payment events, the robust design is to write the event to an
+// OUTBOX table in the same DB transaction as the business change, and
+// publish from there (Lesson 06) -- a fallback written only after Kafka
+// failed is no longer atomic with the business transaction.
 ```
 
 ### Pitfall 4: Inconsistent Partition Keys for the Same Entity
@@ -657,6 +682,7 @@ public class KafkaKeyNormalizer {
 @EmbeddedKafka(
     partitions = 12,
     topics = {"payment-events"},
+    bootstrapServersProperty = "spring.kafka.bootstrap-servers",
     brokerProperties = {
         "transaction.state.log.replication.factor=1",
         "transaction.state.log.min.isr=1"
@@ -674,19 +700,27 @@ class PaymentEventPublisherTest {
 
     @BeforeEach
     void setup() {
+        // Unique group per test: the broker is shared across tests, and an
+        // "earliest" consumer in a reused group would see older test data
         Map<String, Object> consumerProps = KafkaTestUtils.consumerProps(
-            "test-consumer", "true", embeddedKafka);
+            "test-consumer-" + UUID.randomUUID(), "true", embeddedKafka);
         consumerProps.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         testConsumer = new KafkaConsumer<>(consumerProps,
             new StringDeserializer(), new StringDeserializer());
         testConsumer.subscribe(List.of("payment-events"));
     }
 
+    @AfterEach
+    void tearDown() {
+        testConsumer.close();
+    }
+
     @Test
     void shouldPublishPaymentEventToCorrectPartition() throws Exception {
+        String accountId = "ACC-" + UUID.randomUUID();   // unique per test run
         PaymentEvent event = PaymentEvent.builder()
             .eventId(UUID.randomUUID().toString())
-            .accountId("ACC-001")
+            .accountId(accountId)
             .amount(new BigDecimal("500.00"))
             .eventType(PaymentEventType.PAYMENT_INITIATED)
             .correlationId(UUID.randomUUID().toString())
@@ -694,17 +728,16 @@ class PaymentEventPublisherTest {
 
         publisher.publishPaymentEvent(event).get(10, TimeUnit.SECONDS);
 
-        ConsumerRecords<String, String> records =
-            KafkaTestUtils.getRecords(testConsumer, Duration.ofSeconds(5));
-
-        assertThat(records.count()).isEqualTo(1);
-        ConsumerRecord<String, String> received = records.iterator().next();
-        assertThat(received.key()).isEqualTo("ACC-001");
+        ConsumerRecord<String, String> received = StreamSupport.stream(
+                KafkaTestUtils.getRecords(testConsumer, Duration.ofSeconds(5)).spliterator(), false)
+            .filter(r -> accountId.equals(r.key()))
+            .findFirst().orElseThrow();
+        assertThat(received.key()).isEqualTo(accountId);
     }
 
     @Test
     void shouldMaintainOrderingForSameAccount() throws Exception {
-        String accountId = "ACC-002";
+        String accountId = "ACC-" + UUID.randomUUID();
         List<PaymentEvent> events = IntStream.range(0, 10)
             .mapToObj(i -> PaymentEvent.builder()
                 .eventId("EVT-" + i)
@@ -718,14 +751,19 @@ class PaymentEventPublisherTest {
             publisher.publishPaymentEvent(event).get(10, TimeUnit.SECONDS);
         }
 
-        ConsumerRecords<String, String> records =
-            KafkaTestUtils.getRecords(testConsumer, Duration.ofSeconds(10));
+        // wait until at least 10 records arrived (a single poll may return fewer)
+        List<ConsumerRecord<String, String>> mine = StreamSupport.stream(
+                KafkaTestUtils.getRecords(testConsumer, Duration.ofSeconds(10), 10).spliterator(), false)
+            .filter(r -> accountId.equals(r.key()))
+            .toList();
 
-        // All events for the same account must be in the same partition
-        Set<Integer> partitions = new HashSet<>();
-        records.forEach(r -> partitions.add(r.partition()));
-        assertThat(partitions).hasSize(1); // All in same partition
-        assertThat(records.count()).isEqualTo(10);
+        // All events for the same account must be in the same partition...
+        assertThat(mine).extracting(ConsumerRecord::partition).containsOnly(mine.get(0).partition());
+        assertThat(mine).hasSize(10);
+        // ...and arrive in the order they were sent
+        for (int i = 0; i < mine.size(); i++) {
+            assertThat(mine.get(i).value()).contains("\"EVT-" + i + "\"");
+        }
     }
 }
 ```
@@ -738,7 +776,7 @@ class PaymentEventPublisherTest {
 |-----------------------------------|-----------------------------------------------------|
 | `acks=all`                        | No data loss if any single broker fails             |
 | `enable.idempotence=true`         | No duplicate events from retries                    |
-| `linger.ms=5`                     | 2-5x throughput improvement at cost of 5ms latency  |
+| `linger.ms=5`                     | Fuller batches → often much higher throughput, for ≤5ms latency |
 | `batch.size=65536`                | Efficient batching for high-volume payment events   |
 | `compression.type=lz4`            | 50-80% bandwidth reduction with minimal CPU cost    |
 | Account ID as key                 | Ordering guarantee for all events within an account |
@@ -793,10 +831,10 @@ The Kafka producer is a sophisticated pipeline. In financial systems, treat it l
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    "Configure a KafkaProducer with acks=all, enable.idempotence=true, max.in.flight.requests.per.connection=5, min.insync.replicas=2, and lz4 compression. Write a unit test that verifies the producer configuration values are set correctly before the producer is constructed.",
-    "Implement a PaymentEventPublisher that uses accountId as the partition key and attaches a UUID message key header for idempotency tracking. Add structured logging of the partition and offset returned in the RecordMetadata callback.",
-    "Simulate a retriable error (LEADER_NOT_AVAILABLE) and a non-retriable error (INVALID_TOPIC_EXCEPTION) in a test using MockProducer. Verify that the retriable error is retried up to retries=3 and the non-retriable error is surfaced immediately without retry.",
-    "Build a producer monitoring component that exposes record-send-rate, record-error-rate, and request-latency-avg as Prometheus gauges using Micrometer. Write an integration test that publishes 1000 messages and asserts that error-rate remains zero and p99 latency stays below 100 ms."
+    "Configure a KafkaProducer with acks=all, enable.idempotence=true (set explicitly), max.in.flight.requests.per.connection=5 and lz4 compression, and create the topic with min.insync.replicas=2 (a topic/broker setting, not a producer setting). Write a unit test that verifies the producer configuration values before the producer is constructed.",
+    "Implement a PaymentEventPublisher that uses accountId as the partition key and attaches a UUID event-id header for idempotency tracking on the consumer side. Add structured logging of the partition and offset returned in the RecordMetadata callback.",
+    "Using MockProducer (errorNext), verify that the publisher records an error metric and surfaces a non-retriable error (e.g. InvalidTopicException) to the caller. Then explain, with the real client, which errors it retries internally (e.g. NotLeaderOrFollowerException) and how delivery.timeout.ms bounds those retries.",
+    "Build a producer monitoring component that exposes record-send-rate, record-error-rate, and request-latency-avg through Micrometer (MicrometerProducerListener). Write an integration test that publishes 1000 messages and asserts that the error rate remains zero and p99 send latency stays below 100 ms."
   ]
 }
 -->

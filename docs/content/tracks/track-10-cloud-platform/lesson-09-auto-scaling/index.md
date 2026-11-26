@@ -30,7 +30,10 @@ Three complementary auto-scalers:
   VPA (Vertical Pod Autoscaler):
     What: Adjusts pod RESOURCE REQUESTS (CPU/memory) per pod
     When: You don't know the right resource requests (right-sizing)
-    Modes: Off (recommendation only), Initial (set at startup), Auto (live resize)
+    Modes: Off (recommendation only), Initial (set at pod creation),
+           Recreate/Auto (evicts pods to apply new values),
+           InPlaceOrRecreate (newer: resizes running pods in place
+           where the cluster supports it)
 
   KEDA (Kubernetes Event-Driven Autoscaler):
     What: Scales pod count based on EXTERNAL event sources
@@ -73,13 +76,16 @@ spec:
           type: Utilization
           averageUtilization: 60
 
-    # Also scale on memory (payment API has variable memory per connection)
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 70
+    # Memory as a scaling signal is risky for JVM services: the heap grows
+    # and is rarely returned to the OS, so memory utilisation stays high
+    # and the HPA scales up but never back down. Use it only for services
+    # whose memory really follows load.
+    # - type: Resource
+    #   resource:
+    #     name: memory
+    #     target:
+    #       type: Utilization
+    #       averageUtilization: 70
 
   behavior:
     # Scale UP fast — payment spikes are sudden
@@ -152,8 +158,8 @@ spec:
           # Graceful shutdown — drain in-flight payments before stopping
           lifecycle:
             preStop:
-              exec:
-                command: ["/bin/sh", "-c", "sleep 10"]
+              sleep:              # native sleep action (Kubernetes 1.30+)
+                seconds: 10
 
           # Readiness: pod must be ready to receive traffic before HPA counts it
           readinessProbe:
@@ -213,7 +219,8 @@ data:
           sum(rate(http_requests_total{<<.LabelMatchers>>}[2m]))
           by (<<.GroupBy>>)
 
-      # Payment processing queue depth
+      # Payment processing queue depth (namespace-level metric: use it in the
+      # HPA as an Object/External metric, not as a per-pod "Pods" metric)
       - seriesQuery: 'payment_queue_depth{namespace="payments"}'
         resources:
           overrides:
@@ -364,7 +371,8 @@ Important constraint:
   VPA and HPA cannot both manage the same resource on the same deployment.
   - If HPA manages CPU: VPA must use controlledResources: [memory]
   - If HPA manages memory: VPA must use controlledResources: [cpu]
-  - If KEDA (HPA-equivalent) manages replicas: VPA can manage both CPU and memory
+  - KEDA creates an HPA too: if its triggers are event-based (Kafka lag,
+    queue length) and not cpu/memory, VPA can manage both CPU and memory
 
   Recommended pattern for payment services:
     HPA: manages pod count (scaling out)
@@ -394,8 +402,13 @@ helm install keda kedacore/keda \
 
 ```yaml
 # Scale payment processors based on Kafka consumer lag
-# When lag = 0: scale to 0 pods (save cost)
+# When lag = 0: scale to 0 pods (save cost -- but the first payment after an
+#   idle period waits for a cold start; keep minReplicaCount >= 1 where
+#   latency matters)
 # When lag grows: scale up to handle the backlog
+# Ceiling: one consumer per PARTITION. KEDA by default does not scale
+# beyond the topic's partition count (extra consumers would sit idle), so
+# maxReplicaCount 50 only helps with >= 50 partitions.
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -439,10 +452,30 @@ spec:
         # 10,000 messages → 10 pods
         lagThreshold: "1000"
         offsetResetPolicy: latest
-        # For SASL authentication
-        sasl: plaintext
-        username: payment-processor
-        password: ref+k8s://payments/kafka-credentials#password
+      # Credentials come from a TriggerAuthentication (Secret reference),
+      # never inline in the ScaledObject
+      authenticationRef:
+        name: kafka-scaler-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: kafka-scaler-auth
+  namespace: payments
+spec:
+  secretTargetRef:
+    - parameter: sasl
+      name: kafka-credentials
+      key: sasl            # e.g. "scram_sha512"
+    - parameter: username
+      name: kafka-credentials
+      key: username
+    - parameter: password
+      name: kafka-credentials
+      key: password
+    - parameter: tls
+      name: kafka-credentials
+      key: tls             # "enable"
 ```
 
 ### KEDA ScaledObject: SQS Queue Depth
@@ -536,11 +569,13 @@ spec:
 
 ## PodDisruptionBudget During Scale-Down
 
-Scaling down must not cause payment service unavailability. PodDisruptionBudget (PDB) prevents Kubernetes from removing too many pods at once.
+Scaling down must not cause payment service unavailability. A PodDisruptionBudget (PDB) limits how many pods *evictions* may remove at once — node drains and the node consolidation that follows a scale-in. The number of replicas the HPA keeps is controlled by `minReplicas`, not by the PDB.
 
 ```yaml
-# PDB: ensure at least 2 payment-api pods are always available
-# This prevents HPA/KEDA from inadvertently taking the service down during scale-in
+# PDB: ensure at least 2 payment-api pods stay available during VOLUNTARY
+# disruptions -- node drains, Cluster Autoscaler / Karpenter node removal,
+# upgrades. (HPA/KEDA scale-in does NOT go through the Eviction API, so a
+# PDB does not limit it -- minReplicas does.)
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -592,38 +627,37 @@ When HPA/KEDA scale pods beyond existing node capacity, Cluster Autoscaler provi
 
 autoDiscovery:
   clusterName: payment-cluster
+  # node groups (ASGs) carrying these tags are managed
   tags:
-    - k8s.io/cluster-autoscaler/enabled: "true"
-    - k8s.io/cluster-autoscaler/payment-cluster: "owned"
+    - k8s.io/cluster-autoscaler/enabled
+    - k8s.io/cluster-autoscaler/payment-cluster
 
 awsRegion: us-east-1
 
 # Scale-down settings — conservative for financial workloads
 extraArgs:
-  # Wait 10 minutes of underutilization before scaling down a node
+  # Wait 10 minutes after a scale-up, and 10 minutes of underutilisation,
+  # before removing a node
   scale-down-delay-after-add: 10m
   scale-down-unneeded-time: 10m
-  # Don't remove nodes that have pods with no PDB or local storage
+  # Don't remove nodes running pods with local storage (emptyDir/hostPath)
+  # or kube-system pods
   skip-nodes-with-local-storage: true
   skip-nodes-with-system-pods: true
   # Balance nodes across AZs
   balance-similar-node-groups: true
   # Expander strategy: least-waste (minimize wasted resources)
   expander: least-waste
-
-# Separate node groups for payment workloads
-nodeGroupAutoDiscovery:
-  tags:
-    - key: k8s.io/cluster-autoscaler/node-template/resources/ephemeral-storage
-      value: 100Gi
+# Use separate node groups (ASGs) for payment workloads, each tagged for
+# auto-discovery, with taints/labels matching the payment pods
 ```
 
 ### Karpenter as Cluster Autoscaler Alternative
 
 ```yaml
 # Karpenter: faster node provisioning, more flexible than Cluster Autoscaler
-# NodePool for payment workloads
-apiVersion: karpenter.sh/v1beta1
+# NodePool for payment workloads (Karpenter v1 API; older guides show v1beta1)
+apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
   name: payment-workers
@@ -649,7 +683,7 @@ spec:
           operator: In
           values: [on-demand]
       nodeClassRef:
-        apiVersion: karpenter.k8s.aws/v1beta1
+        group: karpenter.k8s.aws
         kind: EC2NodeClass
         name: payment-node-class
 
@@ -658,8 +692,12 @@ spec:
     memory: 2000Gi
 
   disruption:
-    consolidationPolicy: WhenUnderutilized
+    consolidationPolicy: WhenEmptyOrUnderutilized
     consolidateAfter: 10m  # wait 10 minutes before consolidating
+    budgets:
+      - nodes: "10%"       # never disrupt more than 10% of nodes at once
+# Consolidation evicts pods (PDBs are respected); pods that must not be
+# moved can carry the annotation karpenter.sh/do-not-disrupt: "true"
 ```
 
 ---
@@ -690,12 +728,14 @@ spec:
       metadata:
         value: "60"
 
-    # Pre-scale for Black Friday: 2024-11-29 00:00 UTC → 20 pods minimum
+    # Pre-scale for Black Friday 2026 (Nov 27) → 20 pods minimum.
+    # A cron date repeats EVERY year on that day, while Black Friday moves:
+    # update the date each year (e.g. from a GitOps change ticket)
     - type: cron
       metadata:
         timezone: UTC
-        start: "0 0 29 11 *"   # Nov 29 00:00 UTC
-        end:   "0 0 30 11 *"   # Nov 30 00:00 UTC
+        start: "0 0 27 11 *"   # Nov 27 00:00 UTC
+        end:   "0 0 28 11 *"   # Nov 28 00:00 UTC
         desiredReplicas: "20"
 
     # Pre-scale for payroll Friday (last Friday of month) morning rush
@@ -763,11 +803,11 @@ groups:
 
 1. **HPA scale-up must be faster than scale-down** — payment spikes are sudden. Configure `stabilizationWindowSeconds: 15-30` for scale-up and `300-600` for scale-down. Conservative scale-down prevents thrashing during volatile traffic.
 
-2. **KEDA is the right tool for Kafka consumers** — HPA on CPU does not correlate with Kafka consumer lag. A consumer that is waiting for messages has 0% CPU but needs pods ready to handle the surge. KEDA's lag-based scaling solves this correctly.
+2. **KEDA is the right tool for Kafka consumers** — CPU does not track Kafka consumer lag well: a consumer blocked on a slow downstream call shows low CPU while the backlog grows. KEDA's lag-based scaling reacts to the backlog itself — up to one consumer per partition.
 
 3. **Scale-to-zero is free money for batch workloads** — settlement processors, DLQ processors, and batch enrichment jobs have no work for most of the day. KEDA scale-to-zero eliminates cost during idle periods entirely.
 
-4. **PodDisruptionBudget is not optional** — without PDB, cluster maintenance, node drains, and aggressive scale-in can remove all pods of a service simultaneously. Set `minAvailable: 2` for any customer-facing payment service.
+4. **PodDisruptionBudget is not optional** — without a PDB, cluster maintenance, node drains and node consolidation can evict all pods of a service at the same time. Set `minAvailable: 2` (or `maxUnavailable: 1`) for any customer-facing payment service. HPA scale-in is limited by `minReplicas`, not by the PDB.
 
 5. **VPA in Off mode first** — never apply VPA Auto mode to production payment databases or stateful services without first running in Off mode for at least one week to understand the recommendation range. Live CPU/memory changes to PostgreSQL can cause restart.
 
@@ -796,7 +836,7 @@ groups:
         "ceil(8500 / 1000) = 9 replicas, but KEDA waits for the full stabilisation window before scaling"
       ],
       "correct": 1,
-      "explanation": "KEDA calculates desired replicas as ceil(currentLag / lagThreshold): ceil(8500 / 1000) = ceil(8.5) = 9. This is within the maxReplicaCount=10 ceiling, so 9 replicas are targeted. KEDA passes this calculation to the underlying HPA, which applies its own stabilisation windows (scaleUp and scaleDown). The 9 replicas each process approximately 944 messages from the lag, bringing it toward zero. If lag were 10,500, the calculated result would be 11, capped at maxReplicaCount=10."
+      "explanation": "KEDA's Kafka scaler targets ceil(totalLag / lagThreshold) replicas: ceil(8500 / 1000) = ceil(8.5) = 9. This is within the maxReplicaCount=10 ceiling — and, by default, KEDA also caps the result at the topic's partition count, so this assumes at least 9 partitions. KEDA hands the metric to the HPA it manages, which applies its stabilisation windows and scaling policies. If lag were 10,500, the result would be 11, capped at maxReplicaCount=10."
     },
     {
       "text": "A payment-api Deployment has a PodDisruptionBudget with minAvailable: 2 and currently runs 3 replicas. A node drain operation is initiated. What is the behaviour?",
@@ -807,7 +847,7 @@ groups:
         "PDB blocks the drain indefinitely until an operator manually approves each eviction"
       ],
       "correct": 1,
-      "explanation": "PodDisruptionBudget with minAvailable: 2 means the drain (kubectl drain uses the Eviction API) can only evict pods when at least 2 replicas are running. With 3 replicas, 1 can be evicted (3 - 1 = 2 remaining, which meets minAvailable). The drain evicts the pod, waits for a replacement to be scheduled and become Ready, then evicts the next. If the replacement is not scheduled (e.g., resource constraints), the drain waits indefinitely. This is the correct behaviour — PDB protects against simultaneous pod removal during maintenance events."
+      "explanation": "PodDisruptionBudget with minAvailable: 2 means an eviction (kubectl drain uses the Eviction API) is only allowed if at least 2 replicas stay available afterwards. With 3 ready replicas, 1 can be evicted. The drain then retries the next eviction until the replacement pod is scheduled and Ready, so at least 2 remain available throughout. If the replacement cannot be scheduled (e.g., no capacity), the drain keeps waiting. Note that PDBs govern evictions — drains, autoscaler node removal — not HPA scale-in."
     }
   ]
 }
@@ -820,9 +860,9 @@ groups:
   "estimatedMinutes": 55,
   "tasks": [
     "Configure HPA v2 for payment-api with: scale-up behaviour (100% increase per 30s, stabilisationWindow=0), scale-down behaviour (10% decrease per 60s, stabilisationWindow=300s), minReplicas=3, maxReplicas=20, and two metrics: CPU targetUtilization=60% and a custom Prometheus metric http_requests_per_second with target averageValue=1000. Test by generating load with k6 and verifying scale-up triggers within 60 seconds of threshold breach.",
-    "Deploy KEDA with a ScaledObject for a payment-processor consuming from a Kafka topic. Configure the Kafka trigger with lagThreshold=500, minReplicaCount=0 (scale-to-zero when no lag), maxReplicaCount=15, and pollingInterval=10s. Publish a burst of 10,000 messages to the topic and monitor the scaling behaviour: verify the processor scales from 0 to the calculated replica count within the pollingInterval, processes all messages, and scales back to 0.",
-    "Create a PodDisruptionBudget for payment-api with minAvailable: 2. Simulate a node drain (kubectl drain --ignore-daemonsets) and observe the drain rate. Verify that at no point during the drain do fewer than 2 payment-api pods have Ready status. Add a readinessGate to the pod to introduce a 30-second readiness delay and repeat the drain — verify KEDA respects the PDB by waiting for readiness before evicting the next pod.",
-    "Implement a KEDA CronTrigger pre-scaling schedule: scale payment-api to 15 replicas at 09:55 (5 minutes before London market open at 10:00) and return to normal scaling at 10:30. Combine this with a Kafka lag trigger using KEDA's multiple-trigger mode. Document the reasoning: at market open, reactive HPA scaling (2-3 min pod startup + JVM warmup) would cause SLA breaches — pre-scaling ensures capacity is ready before the spike arrives."
+    "Deploy KEDA with a ScaledObject for a payment-processor consuming from a Kafka topic with 12 partitions. Configure the Kafka trigger with lagThreshold=500, minReplicaCount=0 (scale-to-zero when no lag), maxReplicaCount=15, pollingInterval=10s, and credentials via a TriggerAuthentication. Publish a burst of 10,000 messages and monitor the scaling: verify the processor scales from 0 up to the partition count (12, not 15), processes all messages, and scales back to 0.",
+    "Create a PodDisruptionBudget for payment-api with minAvailable: 2. Simulate a node drain (kubectl drain --ignore-daemonsets) and observe the drain rate. Verify that at no point during the drain do fewer than 2 payment-api pods have Ready status. Give the pods a slow start (e.g. a 30-second startup delay before readiness) and repeat the drain — verify the drain waits for each replacement to become Ready before evicting the next pod.",
+    "Implement a KEDA cron pre-scaling schedule with timezone Europe/London: scale payment-api to 15 replicas at 07:55 (5 minutes before the London Stock Exchange opens at 08:00) and return to normal scaling at 08:30. Combine this with a Kafka lag trigger using KEDA's multiple triggers. Document the reasoning: at market open, reactive HPA scaling (2-3 min pod startup + JVM warmup) would cause SLA breaches — pre-scaling ensures capacity is ready before the spike arrives."
   ]
 }
 -->

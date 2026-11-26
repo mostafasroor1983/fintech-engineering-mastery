@@ -105,37 +105,40 @@ class PaymentAuthorisationSimulation extends Simulation {
       http("POST /v1/payments/authorise")
         .post("/v1/payments/authorise")
         .body(StringBody(
-          """{"payment_id":"${payment_id}",
-             "amount":${amount},
-             "currency":"${currency}",
-             "merchant_id":"${merchant_id}",
-             "card_id":"${card_id}"}"""
+          // A FRESH payment ID per request (Gatling EL: #{...}; the old ${...}
+          // syntax is deprecated). Re-using CSV IDs would turn requests into
+          // idempotency-key replays and measure the cache, not the payment path.
+          """{"payment_id":"#{randomUuid()}",
+             "amount":#{amount},
+             "currency":"#{currency}",
+             "merchant_id":"#{merchant_id}",
+             "card_id":"#{card_id}"}"""
         ))
         .asJson
-        // SLO assertions — test fails if violated
         .check(status.in(200, 201))
-        .check(responseTimeInMillis.lte(500))  // p99 SLO: 500ms
         .check(jsonPath("$.status").in("APPROVED", "DECLINED", "PENDING"))
+        // No per-request responseTimeInMillis check: it would mark every
+        // request slower than 500ms as FAILED, turning the p99 SLO into a
+        // p99.9 one. Latency SLOs are asserted on percentiles below.
     )
 
   val getPaymentStatus = scenario("Get Payment Status")
     .feed(paymentFeeder)
     .exec(
       http("GET /v1/payments/:id")
-        .get("/v1/payments/${payment_id}")
+        .get("/v1/payments/#{payment_id}")    // existing payments from the CSV
         .check(status.is(200))
-        .check(responseTimeInMillis.lte(100))  // SLO: 100ms for reads
     )
 
-  // Load profile: ramp to peak over 5 minutes, sustain 20 minutes
+  // Load profile (open model: each new "user" sends ONE request, so users/sec
+  // = requests/sec): ramp to 500 TPS over 5 minutes, sustain 20 minutes.
+  // (Arrival rate and the throughput assertion must agree — 100 users/sec
+  //  could never reach 450 RPS.)
   setUp(
     authorisePayment.inject(
-      rampUsersPerSec(1).to(100).during(5.minutes),
-      constantUsersPerSec(100).during(20.minutes),
-      rampUsersPerSec(100).to(1).during(5.minutes)
-    ).throttle(
-      reachRps(500).in(5.minutes),  // cap at 500 TPS
-      holdFor(20.minutes)
+      rampUsersPerSec(1).to(500).during(5.minutes),
+      constantUsersPerSec(500).during(20.minutes),
+      rampUsersPerSec(500).to(1).during(5.minutes)
     ),
     getPaymentStatus.inject(
       constantUsersPerSec(50).during(30.minutes)
@@ -176,15 +179,14 @@ class PaymentSoakSimulation extends Simulation {
       http("Authorise Payment")
         .post("/v1/payments/authorise")
         .body(StringBody(
-          """{"payment_id":"${payment_id}",
-             "amount":${amount},
-             "currency":"${currency}",
-             "merchant_id":"${merchant_id}",
-             "card_id":"${card_id}"}"""
+          """{"payment_id":"#{payment_id}",
+             "amount":#{amount},
+             "currency":"#{currency}",
+             "merchant_id":"#{merchant_id}",
+             "card_id":"#{card_id}"}"""
         ))
         .asJson
         .check(status.in(200, 201))
-        .check(responseTimeInMillis.lte(1000))  // relaxed for soak
     )
 
   setUp(
@@ -195,8 +197,9 @@ class PaymentSoakSimulation extends Simulation {
     )
   ).protocols(httpProtocol)
    .assertions(
-     // Response time should not degrade over the soak period
-     // Compare first vs last 10 minutes
+     // Response time should not degrade over the soak period: compare the
+     // first and last hour in the metrics afterwards (section 8) — Gatling's
+     // global assertions only see the whole run
      global.responseTime.percentile(99).lte(1000),
      global.successfulRequests.percent.gte(99.5)
    )
@@ -209,45 +212,42 @@ class PaymentSoakSimulation extends Simulation {
 @Component
 public class SoakTestMemoryMonitor {
 
-    private final MeterRegistry meterRegistry;
     private static final Logger log = LoggerFactory.getLogger(SoakTestMemoryMonitor.class);
+    private final MeterRegistry meterRegistry;
 
-    // During soak tests: monitor for memory growth
+    public SoakTestMemoryMonitor(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+    }
+
+    // Micrometer already publishes what a soak test needs — do not register
+    // your own "jvm.memory.used" (it clashes with the built-in meter):
+    //   jvm_memory_used_bytes{area="heap"}   heap in use (saw-tooth with GC)
+    //   jvm_gc_live_data_size_bytes          heap LEFT after a full GC ← the leak signal
+    //   hikaricp_connections_active / _idle / _pending
+    // "Used heap" right now includes garbage that is about to be collected,
+    // so it is noisy; the live-data size after GC rising hour after hour is
+    // what reveals a leak.
+
     @Scheduled(fixedRate = 60_000)
-    public void recordMemoryMetrics() {
-        Runtime runtime = Runtime.getRuntime();
-        long usedMemory = runtime.totalMemory() - runtime.freeMemory();
-        long maxMemory  = runtime.maxMemory();
-        double utilisation = (double) usedMemory / maxMemory;
-
-        meterRegistry.gauge("jvm.memory.used",    usedMemory);
-        meterRegistry.gauge("jvm.memory.max",     maxMemory);
-        meterRegistry.gauge("jvm.memory.utilisation", utilisation);
-
-        // During soak test: alert if memory grows continuously
-        // (indicates leak — GC should stabilise usage over time)
-        if (utilisation > 0.85) {
-            log.warn("High memory utilisation during soak test: {:.1f}%",
-                    utilisation * 100);
+    public void logLiveData() {
+        Gauge liveData = meterRegistry.find("jvm.gc.live.data.size").gauge();
+        Gauge maxData  = meterRegistry.find("jvm.gc.max.data.size").gauge();
+        if (liveData != null && maxData != null && maxData.value() > 0) {
+            double utilisation = liveData.value() / maxData.value();
+            if (utilisation > 0.85) {
+                log.warn("Live heap after GC at {}% of the old generation during soak test",
+                        String.format("%.1f", utilisation * 100));
+            }
         }
     }
 
-    // Check for connection pool growth (should be constant in steady state)
-    public void checkConnectionPoolLeak(DataSource ds) {
-        if (ds instanceof HikariDataSource hikariDs) {
-            int active = hikariDs.getHikariPoolMXBean().getActiveConnections();
-            int idle   = hikariDs.getHikariPoolMXBean().getIdleConnections();
-            int total  = active + idle;
-
-            meterRegistry.gauge("hikari.connections.active", active);
-            meterRegistry.gauge("hikari.connections.idle",   idle);
-            meterRegistry.gauge("hikari.connections.total",  total);
-
-            // If total connections grow continuously: connection leak
-            if (total >= hikariDs.getMaximumPoolSize()) {
-                log.error("Connection pool exhausted during soak test: active={} idle={}",
-                        active, idle);
-            }
+    // Connection pool: in steady state "active" should hover, not climb
+    public void checkConnectionPoolLeak(HikariDataSource hikariDs) {
+        int active = hikariDs.getHikariPoolMXBean().getActiveConnections();
+        int idle   = hikariDs.getHikariPoolMXBean().getIdleConnections();
+        if (active >= hikariDs.getMaximumPoolSize()) {
+            log.error("Connection pool exhausted during soak test: active={} idle={}",
+                    active, idle);
         }
     }
 }
@@ -274,11 +274,11 @@ class PaymentSpikeSimulation extends Simulation {
       http("Authorise Payment")
         .post("/v1/payments/authorise")
         .body(StringBody(
-          """{"payment_id":"${payment_id}",
-             "amount":${amount},
-             "currency":"${currency}",
-             "merchant_id":"${merchant_id}",
-             "card_id":"${card_id}"}"""
+          """{"payment_id":"#{payment_id}",
+             "amount":#{amount},
+             "currency":"#{currency}",
+             "merchant_id":"#{merchant_id}",
+             "card_id":"#{card_id}"}"""
         ))
         .asJson
         .check(status.in(200, 201, 429))  // 429 (rate limited) is acceptable
@@ -349,8 +349,6 @@ export default function () {
     ip_address: `192.168.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`,
   });
 
-  const startTime = Date.now();
-
   const res = http.post(
     'https://api.payments.internal/v1/fraud/score',
     payload,
@@ -363,18 +361,22 @@ export default function () {
     }
   );
 
-  const latency = Date.now() - startTime;
+  // k6's own measurement of the request (excludes script overhead)
+  const latency = res.timings.duration;
   fraudScoreLatency.add(latency);
+
+  // Parse once, and never on an error body (JSON.parse would throw)
+  let body = null;
+  if (res.status === 200) {
+    try { body = res.json(); } catch (e) { body = null; }
+  }
 
   const success = check(res, {
     'status is 200':          (r) => r.status === 200,
-    'has fraud_score field':   (r) => JSON.parse(r.body).fraud_score !== undefined,
-    'fraud_score in [0,1]':   (r) => {
-      const score = JSON.parse(r.body).fraud_score;
-      return score >= 0 && score <= 1;
-    },
-    'latency < 50ms':          () => latency < 50,
+    'has fraud_score field':  () => body !== null && body.fraud_score !== undefined,
+    'fraud_score in [0,1]':   () => body !== null && body.fraud_score >= 0 && body.fraud_score <= 1,
   });
+  // (latency is judged by the p(99) threshold, not per request)
 
   errorRate.add(!success);
   sleep(0.1);  // 10 TPS per VU
@@ -409,8 +411,8 @@ performance-test:
         --success-rate-threshold 99.9
         --throughput-threshold 450
   artifacts:
-    reports:
-      junit: results/gatling/*/simulation.log
+    # simulation.log is Gatling's own format, NOT a JUnit report — keep the
+    # HTML report and stats as plain artifacts
     paths:
       - results/gatling/
     expire_in: 30 days
@@ -418,34 +420,51 @@ performance-test:
 
 ```python
 # ci/assert_gatling_results.py
-import json, sys, argparse
+import argparse, glob, json, os, sys
+
+def latest_stats(results_dir):
+    # Gatling writes one timestamped folder per run: <dir>/<run>/js/stats.json
+    runs = sorted(glob.glob(os.path.join(results_dir, "*", "js", "stats.json")),
+                  key=os.path.getmtime)
+    if not runs:
+        sys.exit(f"No Gatling stats.json found under {results_dir}")
+    return runs[-1]
 
 def assert_results(results_dir, p99_ms, success_rate, throughput):
-    with open(f"{results_dir}/stats.json") as f:
-        stats = json.load(f)
+    with open(latest_stats(results_dir)) as f:
+        stats = json.load(f)["stats"]
 
-    global_stats = stats["stats"]["global"]
-
-    actual_p99         = global_stats["percentiles4"]["value"]   # p99
-    actual_success     = global_stats["successfulRequests"]["percent"]
-    actual_throughput  = global_stats["meanNumberOfRequestsPerSecond"]["value"]
+    # percentiles4 is p99 with Gatling's default percentile settings
+    actual_p99        = stats["percentiles4"]["total"]
+    requests          = stats["numberOfRequests"]
+    actual_success    = 100.0 * requests["ok"] / requests["total"]
+    actual_throughput = stats["meanNumberOfRequestsPerSecond"]["total"]
 
     failures = []
     if actual_p99 > p99_ms:
         failures.append(f"p99 {actual_p99}ms > threshold {p99_ms}ms")
     if actual_success < success_rate:
-        failures.append(f"Success rate {actual_success}% < threshold {success_rate}%")
+        failures.append(f"Success rate {actual_success:.2f}% < threshold {success_rate}%")
     if actual_throughput < throughput:
-        failures.append(f"Throughput {actual_throughput} RPS < threshold {throughput} RPS")
+        failures.append(f"Throughput {actual_throughput:.1f} RPS < threshold {throughput} RPS")
 
     if failures:
         print("PERFORMANCE TEST FAILED:")
-        for f in failures:
-            print(f"  - {f}")
+        for failure in failures:
+            print(f"  - {failure}")
         sys.exit(1)
-    else:
-        print(f"Performance test PASSED: p99={actual_p99}ms, "
-              f"success={actual_success}%, throughput={actual_throughput}RPS")
+    print(f"Performance test PASSED: p99={actual_p99}ms, "
+          f"success={actual_success:.2f}%, throughput={actual_throughput:.1f}RPS")
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results-dir", required=True)
+    ap.add_argument("--p99-threshold", type=float, required=True)
+    ap.add_argument("--success-rate-threshold", type=float, required=True)
+    ap.add_argument("--throughput-threshold", type=float, required=True)
+    a = ap.parse_args()
+    assert_results(a.results_dir, a.p99_threshold,
+                   a.success_rate_threshold, a.throughput_threshold)
 ```
 
 ---
@@ -517,7 +536,9 @@ public class PerformanceTestSLOValidator {
 @Component
 public class SoakTestResultAnalyser {
 
-    // Detect linear memory growth (indicates leak) vs stable oscillation (normal GC)
+    // Detect linear memory growth (indicates leak) vs stable oscillation (normal GC).
+    // Feed it the heap remaining AFTER GC (jvm_gc_live_data_size_bytes), not
+    // instantaneous used heap — the latter mixes in garbage and saw-tooths.
     public MemoryAnalysisResult analyseMemoryProfile(
             List<TimestampedMetric> memoryMetrics) {
 
@@ -591,10 +612,22 @@ Reliability testing is not optional for fintech systems. Load tests validate SLO
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Write a Gatling load simulation for the payment authorisation API: ramp from 1 to 100 TPS over 5 minutes, sustain for 20 minutes, then ramp down. Assert that p99 <= 500ms, p95 <= 200ms, success rate >= 99.9%, and throughput >= 450 RPS. Fail the build if any assertion fails."},
-    {"id": "2", "description": "Write a Gatling soak simulation: run at 50 TPS for 8 hours using circular feeder. Implement a SoakTestMemoryMonitor that detects linear heap growth by computing linear regression slope, flags growth > 1%/hour as a likely leak, and publishes JVM heap utilisation to Prometheus."},
-    {"id": "3", "description": "Write a Gatling spike simulation: baseline 50 TPS for 2 minutes, spike to 500 TPS (10x) for 5 minutes, then recover. Assert that the global success rate is >= 95% (429s are acceptable), and that p99 during the spike does not exceed 5000ms. Document what circuit breaker behavior you expect to see."},
-    {"id": "4", "description": "Create a CI pipeline step that: runs the smoke test on every merge to main, runs the full load test on release branches, parses Gatling stats.json to extract p99/success-rate/throughput, and exits with code 1 if any SLO threshold is violated. Include a Python assertion script."}
+    {
+      "id": "1",
+      "description": "Write a Gatling load simulation for the payment authorisation API using an open injection model (one request per virtual user): ramp from 1 to 500 users/sec over 5 minutes, sustain for 20 minutes, then ramp down, with a fresh payment ID per request. Assert that p99 <= 500ms, p95 <= 200ms, success rate >= 99.9%, and throughput >= 450 RPS. Fail the build if any assertion fails."
+    },
+    {
+      "id": "2",
+      "description": "Write a Gatling soak simulation: run at 50 TPS for 8 hours using a circular feeder. Implement a soak analysis that uses Micrometer's jvm_gc_live_data_size_bytes (heap after GC), computes a linear regression slope, and flags growth > 1%/hour as a likely leak."
+    },
+    {
+      "id": "3",
+      "description": "Write a Gatling spike simulation: baseline 50 TPS for 2 minutes, spike to 500 TPS (10x) for 5 minutes, then recover. Assert that the global success rate is >= 95% (429s are acceptable), and that p99 during the spike does not exceed 5000ms. Document what circuit breaker behavior you expect to see."
+    },
+    {
+      "id": "4",
+      "description": "Create a CI pipeline step that: runs the smoke test on every merge to main, runs the full load test on release branches, parses Gatling stats.json to extract p99/success-rate/throughput, and exits with code 1 if any SLO threshold is violated. Include a Python assertion script."
+    }
   ]
 }
 -->

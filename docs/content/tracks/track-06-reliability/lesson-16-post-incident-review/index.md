@@ -71,7 +71,7 @@ Learnings shared in monthly reliability review
 - **Customer impact:** ~8,500 customers unable to process payments
 - **Failed transactions:** 23,400
 - **Estimated financial impact:** $340,000 in failed transaction value
-- **Regulatory notification:** Yes — EBA notified at 00:30 UTC (within 4h SLA)
+- **Regulatory notification:** Yes — classified as major at 22:50; competent authority notified under DORA at 00:30 UTC (within 4 hours of classification)
 - **SLO breach:** Payment success rate dropped to 61% (SLO: 99.9%)
 
 ---
@@ -142,7 +142,7 @@ the incident worse or harder to resolve)
 1. On-call engineer acknowledged within 5 minutes (SLA: 15 min)
 2. Root cause identified within 17 minutes of alert
 3. Rollback decision made quickly without committee approval
-4. Regulatory notification sent within 4-hour EBA deadline
+4. Regulatory notification sent within the DORA 4-hour deadline
 5. Customer communication sent within 1 hour of resolution
 
 ---
@@ -151,12 +151,14 @@ the incident worse or harder to resolve)
 
 | # | Action | Owner | Priority | Due Date |
 |---|---|---|---|---|
-| 1 | Add EXPLAIN ANALYZE check to CI/CD — fail build on full table scan | Platform Team | P1 | 2026-11-14 |
-| 2 | Increase connection pool to 50 with slow query timeout of 3s | Payments Team | P1 | 2026-11-14 |
-| 3 | Lower alert threshold to 99% success rate (not 95%) | Observability Team | P2 | 2026-11-21 |
-| 4 | Add index on payments.merchant_category | Payments Team | P1 | 2026-11-10 |
-| 5 | Add canary deployment with query performance gate | Platform Team | P2 | 2026-12-05 |
-| 6 | Document rollback procedure for schema-coupled deployments | Payments Team | P3 | 2026-11-28 |
+| 1 | Add an EXPLAIN check (against a production-sized dataset) to CI/CD — fail the build on a sequential scan of a large table | [Name], Platform | P1 | 2026-11-14 |
+| 2 | Set statement_timeout = 3s for payment-service queries (a bigger pool would only let more slow queries pile onto the database) | [Name], Payments | P1 | 2026-11-14 |
+| 3 | Lower alert threshold to 99% success rate (not 95%) | [Name], Observability | P2 | 2026-11-21 |
+| 4 | Add index on payments.merchant_category | [Name], Payments | P1 | 2026-11-10 |
+| 5 | Add canary deployment with query performance gate | [Name], Platform | P2 | 2026-12-05 |
+| 6 | Document rollback procedure for schema-coupled deployments | [Name], Payments | P3 | 2026-11-28 |
+
+(Every action item has ONE named owner — the team is shown for context only.)
 ```
 
 ---
@@ -207,8 +209,8 @@ public class ActionItemValidator {
     public List<String> validate(ActionItem item) {
         List<String> issues = new ArrayList<>();
 
-        // Specific: what exactly will be done?
-        if (item.getDescription().split(" ").length < 5) {
+        // Specific: what exactly will be done? (a rough proxy: at least 10 words)
+        if (item.getDescription().trim().split("\\s+").length < 10) {
             issues.add("Description too vague — specify exactly what will be done");
         }
 
@@ -271,13 +273,11 @@ public class PIRActionItem {
     @Column(name = "acceptance_criteria") private String acceptanceCriteria;
     @Column(name = "completed_at")  private LocalDate completedAt;
     @Column(name = "jira_ticket")   private String jiraTicket;
-    @Column(name = "is_overdue")    private boolean isOverdue;
-
-    @PreUpdate
-    public void checkOverdue() {
-        this.isOverdue = status != ActionItemStatus.COMPLETED
-                && dueDate != null
-                && LocalDate.now().isAfter(dueDate);
+    // No stored "is_overdue" flag: a flag computed in @PreUpdate is only
+    // refreshed when the row is updated — an item nobody touches would never
+    // become overdue. Overdue is a QUERY: status != COMPLETED AND due_date < today.
+    public boolean isOverdue(LocalDate today) {
+        return status != ActionItemStatus.COMPLETED && dueDate != null && today.isAfter(dueDate);
     }
 }
 
@@ -287,10 +287,11 @@ public class ActionItemTracker {
     private final PIRActionItemRepository actionItemRepo;
     private final AlertService alertService;
 
-    @Scheduled(cron = "0 9 * * MON")  // Monday mornings
+    // Spring cron has SIX fields (seconds first): 09:00 every Monday
+    @Scheduled(cron = "0 0 9 * * MON", zone = "Europe/London")
     public void reportOverdueItems() {
         List<PIRActionItem> overdue = actionItemRepo
-                .findByIsOverdueTrueAndStatusNot(ActionItemStatus.COMPLETED);
+                .findByStatusNotAndDueDateBefore(ActionItemStatus.COMPLETED, LocalDate.now());
 
         if (overdue.isEmpty()) return;
 
@@ -398,13 +399,14 @@ public class ActionItemTracker {
 /*
  * Financial institution PIR requirements by regulatory body:
  *
- * EBA Guidelines on ICT Risk Management (EBA/GL/2019/04):
- * - Major ICT-related incidents: post-incident analysis required
- * - Root cause and impact must be documented
- * - Lessons learned must feed back into risk assessment
- * - Report available to supervisor on request
+ * EU — DORA (applies since January 2025; Article 13 "learning and evolving"):
+ * - Post-incident reviews after significant ICT-related disruptions
+ * - Root causes identified, and lessons fed back into the ICT risk framework
+ * - Results available to the competent authority on request
+ * (The earlier EBA Guidelines on ICT risk, EBA/GL/2019/04, had similar
+ *  requirements; for firms in DORA's scope, DORA now applies.)
  *
- * UK FCA: Operational Resilience (PS21/3):
+ * UK FCA/PRA: Operational Resilience (FCA PS21/3, PRA SS1/21):
  * - Lessons learned from incidents affecting important business services
  * - Must feed into annual operational resilience assessment
  *
@@ -437,15 +439,16 @@ public class PIREffectivenessMetrics {
         List<Incident> qualifyingIncidents = incidentRepo
                 .findQualifyingForPIR(period);
         List<PIR> completedPIRs = pirRepo.findByPeriod(period);
-        double completionRate = (double) completedPIRs.size()
-                / qualifyingIncidents.size();
+        double completionRate = qualifyingIncidents.isEmpty() ? 1.0
+                : (double) completedPIRs.size() / qualifyingIncidents.size();
 
         // Action item completion rate
         List<PIRActionItem> actionItems = actionItemRepo.findByPeriod(period);
         long completed = actionItems.stream()
                 .filter(i -> i.getStatus() == ActionItemStatus.COMPLETED)
                 .count();
-        double actionCompletionRate = (double) completed / actionItems.size();
+        double actionCompletionRate = actionItems.isEmpty() ? 1.0
+                : (double) completed / actionItems.size();
 
         // Recurrence rate: same root cause in multiple incidents
         Map<String, Long> rootCauseCounts = completedPIRs.stream()
@@ -476,21 +479,36 @@ Blameless PIRs produce better outcomes than blame-based reviews because engineer
   "questions": [
     {
       "text": "Why is 'human error' an anti-pattern answer in the Five Whys technique?",
-      "options": ["Humans never make errors in well-designed systems", "It stops the analysis prematurely and prevents identifying the systemic conditions that allowed the error to cause an incident", "Regulatory bodies do not accept human error as a root cause", "It violates blameless PIR principles by naming individuals"],
+      "options": [
+        "Humans never make errors in well-designed systems",
+        "It stops the analysis prematurely and prevents identifying the systemic conditions that allowed the error to cause an incident",
+        "Regulatory bodies do not accept human error as a root cause",
+        "It violates blameless PIR principles by naming individuals"
+      ],
       "correct": 1,
       "explanation": "Stopping at 'human error' as a root cause means the system remains unchanged — humans will make the same type of error again. The correct response is to continue asking why the system allowed the human error to reach production or to cause customer impact. The goal is systemic changes (automated checks, better tooling, clearer processes) not behavioral changes in individuals."
     },
     {
       "text": "An action item from a PIR reads 'Improve monitoring.' What is wrong with this action item?",
-      "options": ["It is too technical for a PIR document", "It lacks specificity, a named single owner, a measurable acceptance criterion, and a due date — it fails all SMART criteria", "It should be assigned to the team, not an individual", "Monitoring improvements should not come from PIRs"],
+      "options": [
+        "It is too technical for a PIR document",
+        "It lacks specificity, a named single owner, a measurable acceptance criterion, and a due date — it fails all SMART criteria",
+        "It should be assigned to the team, not an individual",
+        "Monitoring improvements should not come from PIRs"
+      ],
       "correct": 1,
       "explanation": "SMART action items require: Specific (what exactly), Measurable (acceptance criteria), Assignable (single named owner), Realistic, and Time-bound (specific due date). 'Improve monitoring' is vague about what to improve, has no way to know when done, has no owner, and has no date. A proper action item would be: 'Add Grafana alert for database query duration p99 > 5s — owner: Alice — due: 2026-11-21 — acceptance: fires in staging with synthetic slow query.'"
     },
     {
       "text": "Why are PIR documents particularly important from a regulatory compliance perspective in financial services?",
-      "options": ["They are required to be published publicly under GDPR", "They are discoverable in regulatory examinations and examiners verify that identified corrective actions were actually completed", "They must be approved by the board before publication", "They replace the need for incident notification to regulators"],
+      "options": [
+        "They are required to be published publicly under GDPR",
+        "They are discoverable in regulatory examinations and examiners verify that identified corrective actions were actually completed",
+        "They must be approved by the board before publication",
+        "They replace the need for incident notification to regulators"
+      ],
       "correct": 1,
-      "explanation": "Financial regulators (EBA, FCA, OCC) can request PIR documents during examinations and audits. They verify not just that PIRs were written, but that the action items identified were completed within the stated timelines. An incomplete PIR action item is itself a regulatory finding. This makes PIR action item tracking and completion a compliance obligation, not just an engineering best practice."
+      "explanation": "Financial supervisors (EU competent authorities under DORA, the FCA/PRA, the OCC) can request PIR documents during examinations and audits. They verify not just that PIRs were written, but that the action items identified were completed within the stated timelines. An incomplete PIR action item can itself become a supervisory finding. This makes PIR action item tracking and completion a compliance obligation, not just an engineering best practice."
     }
   ]
 }
@@ -502,10 +520,22 @@ Blameless PIRs produce better outcomes than blame-based reviews because engineer
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Design a PIR document structure for a database connection pool exhaustion incident: write a complete five-whys analysis (minimum 5 levels deep), identify at least 4 contributing factors beyond the root cause, and ensure no why-answer stops at 'human error'."},
-    {"id": "2", "description": "Implement an ActionItemValidator that enforces SMART criteria: description must be at least 10 words specific, acceptance criteria is required, owner must be a single named person (not a team), due date is required and within 3 months, and returns a list of validation failures."},
-    {"id": "3", "description": "Build a PIRActionItem JPA entity with isOverdue computed field and an ActionItemTracker @Scheduled(cron Monday mornings) that queries overdue items, generates a weekly report showing item description, owner, due date, and days overdue, and sends critical alerts for P1 items that are overdue."},
-    {"id": "4", "description": "Create a PIREffectivenessMetrics service that generates a monthly report with: PIR completion rate (qualifying incidents with PIR / total qualifying), action item completion rate, and recurrent root cause detection (same category appearing in multiple PIRs). Publish these as Prometheus gauges for trending."}
+    {
+      "id": "1",
+      "description": "Design a PIR document structure for a database connection pool exhaustion incident: write a complete five-whys analysis (minimum 5 levels deep), identify at least 4 contributing factors beyond the root cause, and ensure no why-answer stops at 'human error'."
+    },
+    {
+      "id": "2",
+      "description": "Implement an ActionItemValidator that enforces SMART criteria: description must be at least 10 words specific, acceptance criteria is required, owner must be a single named person (not a team), due date is required and within 3 months, and returns a list of validation failures."
+    },
+    {
+      "id": "3",
+      "description": "Build a PIRActionItem JPA entity and an ActionItemTracker @Scheduled(cron = \"0 0 9 * * MON\") that queries overdue items (status not COMPLETED and due date before today — computed by the query, not a stored flag), generates a weekly report showing item description, owner, due date, and days overdue, and sends critical alerts for P1 items that are overdue."
+    },
+    {
+      "id": "4",
+      "description": "Create a PIREffectivenessMetrics service that generates a monthly report with: PIR completion rate (qualifying incidents with PIR / total qualifying), action item completion rate, and recurrent root cause detection (same category appearing in multiple PIRs). Publish these as Prometheus gauges for trending."
+    }
   ]
 }
 -->

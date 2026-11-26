@@ -15,7 +15,7 @@ prerequisites: [track-06-lesson-02]
 # Kafka High Availability — Replication and Partition Leadership
 
 > [!NOTE]
-> Kafka's durability guarantees are only as strong as your configuration. The defaults (replication.factor=1, acks=1) mean you can lose messages on a single broker failure. For payment event processing, losing a "PAYMENT_DEBITED" event means the debit is unrecorded and the customer's balance is wrong. The correct configuration for fintech — replication.factor=3, min.insync.replicas=2, acks=all — provides durability guarantees equivalent to a synchronous database write.
+> Kafka's durability guarantees are only as strong as your configuration. Since Kafka 3.0 the *producer* defaults are safe (`acks=all`, idempotence on), but the *broker* defaults (`default.replication.factor=1`, `min.insync.replicas=1`) still mean you can lose messages on a single broker failure. For payment event processing, losing a "PAYMENT_DEBITED" event means the debit is unrecorded and the customer's balance is wrong. The correct configuration for fintech — replication.factor=3, min.insync.replicas=2, acks=all — gives durability comparable to a synchronously replicated database write. (Kafka acknowledges once the in-sync replicas have the record in memory/page cache; its durability comes from replication across machines, not from an fsync per message.)
 
 ## Kafka HA Architecture for Fintech
 
@@ -146,7 +146,14 @@ public class PaymentEventProducer {
     private final MeterRegistry meterRegistry;
     private static final Logger log = LoggerFactory.getLogger(PaymentEventProducer.class);
 
-    public void publishPaymentEvent(PaymentEvent event) {
+    /**
+     * Returns the send future so the CALLER can react to a failure.
+     * Throwing inside whenComplete() would be lost: that callback runs later,
+     * on the producer's I/O thread, after this method has already returned.
+     * (For events that must never be lost, write them to an outbox in the
+     *  same DB transaction as the payment and let a relay publish them.)
+     */
+    public CompletableFuture<SendResult<String, Object>> publishPaymentEvent(PaymentEvent event) {
         // Key by payment ID: ensures ordering within a payment's lifecycle
         String key = event.getPaymentId();
 
@@ -160,7 +167,7 @@ public class PaymentEventProducer {
               .add("event-type", event.getEventType().name()
                       .getBytes(StandardCharsets.UTF_8));
 
-        kafkaTemplate.send(record)
+        return kafkaTemplate.send(record)
                 .whenComplete((result, ex) -> {
                     if (ex != null) {
                         // acks=all failure: message was NOT durably stored
@@ -168,10 +175,6 @@ public class PaymentEventProducer {
                                 "topic", "payment-events").increment();
                         log.error("Failed to publish payment event: id={} type={}",
                                 event.getPaymentId(), event.getEventType(), ex);
-                        // Re-throw or handle: payment must not proceed
-                        // without durable event record
-                        throw new PaymentEventPublishException(
-                                "Failed to publish payment event", ex);
                     } else {
                         meterRegistry.counter("kafka.publish.success",
                                 "topic", "payment-events").increment();
@@ -181,6 +184,15 @@ public class PaymentEventProducer {
                                 result.getRecordMetadata().offset());
                     }
                 });
+    }
+
+    /** Caller that must not proceed without a durable event: wait, bounded. */
+    public void publishOrFail(PaymentEvent event) {
+        try {
+            publishPaymentEvent(event).get(10, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            throw new PaymentEventPublishException("Failed to publish payment event", e);
+        }
     }
 }
 ```
@@ -267,10 +279,11 @@ public class PaymentEventConsumer {
                     event.getPaymentId(), record.offset());
 
         } catch (RetryableException e) {
-            // Don't acknowledge — will be retried after rebalance
+            // Don't acknowledge: rethrow, and the container's error handler
+            // (DefaultErrorHandler) seeks back to this record and retries it
+            // with backoff — processing must be idempotent
             log.warn("Retryable error processing payment event: id={}",
                     event.getPaymentId(), e);
-            // Let the container handle retry via backoff
             throw e;
 
         } catch (NonRetryableException e) {
@@ -288,7 +301,7 @@ public class PaymentEventConsumer {
 
 ## 4. KRaft Mode (No ZooKeeper)
 
-Kafka 3.x introduces KRaft mode, eliminating the ZooKeeper dependency. KRaft is production-ready as of Kafka 3.3+ and is the recommended mode for new clusters.
+Kafka 3.x introduced KRaft mode, eliminating the ZooKeeper dependency. KRaft has been production-ready since Kafka 3.3, and Kafka 4.0 (2025) removed ZooKeeper support entirely — so every current cluster runs KRaft. The combined broker+controller node below is fine for small clusters and tests; larger production clusters usually run dedicated controller nodes.
 
 ```properties
 # KRaft configuration (no ZooKeeper)
@@ -327,15 +340,22 @@ broker.rack=us-east-1c    # broker 2
 ```java
 // Verify rack-awareness is configured correctly
 @Component
+@Slf4j
 public class KafkaRackAwarenessValidator {
+
+    private final Map<String, Object> adminProps;
+
+    public KafkaRackAwarenessValidator(KafkaAdmin kafkaAdmin) {
+        this.adminProps = kafkaAdmin.getConfigurationProperties();
+    }
 
     @PostConstruct
     public void validate() {
-        AdminClient admin = AdminClient.create(adminProps);
-        try {
+        // try-with-resources: an AdminClient holds threads and connections
+        try (AdminClient admin = AdminClient.create(adminProps)) {
             // List brokers and their rack assignments
             DescribeClusterResult cluster = admin.describeCluster();
-            Collection<Node> nodes = cluster.nodes().get();
+            Collection<Node> nodes = cluster.nodes().get(10, TimeUnit.SECONDS);
 
             long brokersWithRack = nodes.stream()
                     .filter(n -> n.rack() != null && !n.rack().isEmpty())
@@ -380,6 +400,10 @@ public class ISRShrinkageMonitor {
     private final AlertService alertService;
     private static final Logger log = LoggerFactory.getLogger(ISRShrinkageMonitor.class);
 
+    // One holder per topic-partition, registered as a gauge ONCE
+    // (re-registering a primitive every run leaves the gauge frozen or NaN)
+    private final Map<String, AtomicInteger> isrSizes = new ConcurrentHashMap<>();
+
     @Scheduled(fixedRate = 30_000)
     public void monitorISR() {
         try {
@@ -393,10 +417,12 @@ public class ISRShrinkageMonitor {
                     int isrSize          = partition.isr().size();
 
                     // Track ISR size per partition
-                    meterRegistry.gauge("kafka.isr.size",
+                    isrSizes.computeIfAbsent(topic + "-" + partition.partition(), k ->
+                        meterRegistry.gauge("kafka.isr.size",
                             Tags.of("topic", topic,
                                     "partition", String.valueOf(partition.partition())),
-                            isrSize);
+                            new AtomicInteger()))
+                        .set(isrSize);
 
                     // Alert if ISR has shrunk
                     if (isrSize < replicationFactor) {
@@ -437,7 +463,7 @@ public class ISRShrinkageMonitor {
 Scenario: Broker 1 fails (leader for 4 out of 12 partitions)
 
 Immediate impact:
-- Kafka detects broker failure via ZooKeeper/KRaft session timeout (~10s)
+- Kafka detects broker failure via the KRaft broker session timeout (~9s default)
 - Controller triggers leader election for affected partitions (~1-2s per partition)
 - Producers get NOT_LEADER_OR_FOLLOWER error during election (~2-5s per partition)
 - KafkaTemplate.send() with retries: queues messages, retries automatically
@@ -451,8 +477,10 @@ Configuration mitigation:
 Recovery:
 1. Bring broker back online
 2. Kafka syncs broker from ISR (may take minutes for large lag)
-3. Preferred leader election: kafka-preferred-replica-election.sh
-   Or use auto.leader.rebalance.enable=true (default)
+3. Preferred leader election:
+   kafka-leader-election.sh --election-type PREFERRED --all-topic-partitions ...
+   (the old kafka-preferred-replica-election.sh was removed in Kafka 3.0)
+   Or rely on auto.leader.rebalance.enable=true (default)
 ```
 
 ---
@@ -460,7 +488,11 @@ Recovery:
 ## 8. Payment Event Durability Guarantees
 
 ```java
-// Exactly-once semantics for payment events using Kafka transactions
+// Exactly-once semantics for payment events using Kafka transactions.
+// Requirements: a transactional producer (spring.kafka.producer.transaction-id-prefix)
+// AND consumers with isolation.level=read_committed — otherwise consumers also
+// read records from ABORTED transactions. The transaction covers Kafka writes
+// only; a database write in the same method is NOT part of it (use an outbox).
 @Service
 public class TransactionalPaymentEventService {
 
@@ -509,7 +541,7 @@ public class TransactionalPaymentEventService {
 
 ## 10. Summary
 
-Kafka HA for fintech requires three configuration layers: topic configuration (RF=3, min.insync.replicas=2, unclean leader election disabled), producer configuration (acks=all, idempotent), and consumer configuration (manual offset commit, appropriate session timeouts). KRaft mode eliminates ZooKeeper as a single point of failure. Rack-awareness ensures replicas span availability zones. ISR monitoring is the critical operational metric — when ISR drops below min.insync.replicas, the payment processing pipeline will block until a replica catches up. This is by design: durability over availability for financial messages.
+Kafka HA for fintech requires three configuration layers: topic configuration (RF=3, min.insync.replicas=2, unclean leader election disabled), producer configuration (acks=all, idempotent), and consumer configuration (manual offset commit, appropriate session timeouts). KRaft mode removes ZooKeeper as a separate system to run and secure. Rack-awareness ensures replicas span availability zones. ISR monitoring is the critical operational metric — when ISR drops below min.insync.replicas, the payment processing pipeline will block until a replica catches up. This is by design: durability over availability for financial messages.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -542,10 +574,22 @@ Kafka HA for fintech requires three configuration layers: topic configuration (R
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Create Kafka topic definitions for payment-events (12 partitions, RF=3, min.insync.replicas=2, unclean.leader.election=false, 7-day retention) and fraud-alerts (6 partitions, same durability settings, 30-day retention) using Spring Kafka's TopicBuilder."},
-    {"id": "2", "description": "Configure an idempotent producer (enable.idempotence=true, acks=all, retries=MAX_VALUE, delivery.timeout=120s) and implement a PaymentEventProducer that publishes with payment ID as the key, adds correlation-id and event-type headers, and throws PaymentEventPublishException on send failure."},
-    {"id": "3", "description": "Build an ISRShrinkageMonitor @Scheduled(fixedRate=30000) that queries AdminClient for all payment topic partitions, tracks ISR size per partition as a Prometheus gauge, sends warning when ISR < replication factor, and sends critical alert when ISR == 1."},
-    {"id": "4", "description": "Implement a transactional payment event service using @Transactional(kafkaTransactionManager) that atomically publishes to payment-events, fraud-scoring-requests, and audit-events in a single Kafka transaction. Write an integration test that verifies all three topics receive the event or none do when a mid-publish exception occurs."}
+    {
+      "id": "1",
+      "description": "Create Kafka topic definitions for payment-events (12 partitions, RF=3, min.insync.replicas=2, unclean.leader.election=false, 7-day retention) and fraud-alerts (6 partitions, same durability settings, 30-day retention) using Spring Kafka's TopicBuilder."
+    },
+    {
+      "id": "2",
+      "description": "Configure an idempotent producer (enable.idempotence=true, acks=all, retries=MAX_VALUE, delivery.timeout=120s) and implement a PaymentEventProducer that publishes with payment ID as the key, adds correlation-id and event-type headers, and surfaces send failures to the caller (by returning the send future, plus a publishOrFail() that waits with a bounded timeout and throws PaymentEventPublishException) — explaining why throwing inside whenComplete() does not work."
+    },
+    {
+      "id": "3",
+      "description": "Build an ISRShrinkageMonitor @Scheduled(fixedRate=30000) that queries AdminClient for all payment topic partitions, tracks ISR size per partition as a Prometheus gauge, sends warning when ISR < replication factor, and sends critical alert when ISR == 1."
+    },
+    {
+      "id": "4",
+      "description": "Implement a transactional payment event service using @Transactional(kafkaTransactionManager) that atomically publishes to payment-events, fraud-scoring-requests, and audit-events in a single Kafka transaction. Write an integration test with a read_committed consumer that verifies all three topics receive the event or none do when a mid-publish exception occurs."
+    }
   ]
 }
 -->

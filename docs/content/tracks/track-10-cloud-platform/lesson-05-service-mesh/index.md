@@ -19,7 +19,9 @@ tags:
 
 # Service Mesh — Istio Traffic Management and Observability
 
-A service mesh adds a dedicated infrastructure layer for service-to-service communication, handling encryption, retries, circuit breaking, and distributed tracing transparently — without changing application code. For fintech platforms where every inter-service call carries financial data, Istio's mutual TLS enforcement and fine-grained authorization policies provide security controls that satisfy PCI-DSS Requirement 4 (encryption in transit) and Requirement 7 (access control).
+A service mesh adds a dedicated infrastructure layer for service-to-service communication, handling encryption, retries, circuit breaking, and distributed tracing transparently — without changing application code. For fintech platforms where every inter-service call carries financial data, Istio's mutual TLS enforcement and fine-grained authorization policies provide security controls that support PCI-DSS requirements on encryption in transit (Requirement 4) and access control (Requirement 7) — as evidence alongside your other controls, not as a complete answer on their own.
+
+(The examples use the `v1` Istio APIs, available since Istio 1.22; older guides show `v1alpha3`/`v1beta1`.)
 
 ---
 
@@ -47,11 +49,14 @@ graph LR
     ENV_B -->|plain localhost| APP_B
 ```
 
-The iptables rules injected by the `istio-init` init container redirect all inbound and outbound traffic through the Envoy proxy on port 15001 (outbound) and 15006 (inbound). The application never sees this — it still connects to `fraud-service:8081` as normal.
+The iptables rules injected by the `istio-init` init container (or the Istio CNI plugin) redirect all inbound and outbound traffic through the Envoy proxy on port 15001 (outbound) and 15006 (inbound). The application never sees this — it still connects to `fraud-service:8081` as normal.
+
+> [!NOTE]
+> Istio also offers **ambient mode** (GA since Istio 1.24): no sidecar per pod; a per-node `ztunnel` provides mTLS and L4 policy, and optional per-namespace *waypoint* proxies add L7 features. It cuts the per-pod resource cost and the start-up ordering problems described below. This lesson uses the sidecar model, which is still the most widely deployed.
 
 ### 1.2 Istio Control Plane (istiod)
 
-`istiod` consolidates three functions:
+`istiod` consolidates three functions that were separate components before Istio 1.5 (the old names are still used in docs and talks):
 
 | Component | Function |
 |-----------|----------|
@@ -72,14 +77,14 @@ graph TD
 
 ## 2. Automatic mTLS Between Services
 
-Istio's most valuable security feature is automatic mutual TLS (mTLS) between all services in the mesh. No application code changes are required — Envoy sidecars negotiate TLS transparently using SPIFFE/SPIRE certificates issued by istiod's built-in CA.
+Istio's most valuable security feature is automatic mutual TLS (mTLS) between all services in the mesh. No application code changes are required — Envoy sidecars negotiate TLS transparently using SPIFFE-format X.509 certificates issued by istiod's built-in CA (an external CA, or SPIRE, can be plugged in instead), rotated automatically every 24 hours by default.
 
 ### 2.1 PeerAuthentication — Enforce STRICT mTLS
 
 ```yaml
 # Enforce mTLS in the entire payments namespace
 # Any service calling payment-service without a valid cert is rejected
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: PeerAuthentication
 metadata:
   name: payments-mtls-strict
@@ -89,18 +94,23 @@ spec:
     mode: STRICT
 ```
 
-With `STRICT` mode, any plaintext connection to a service in the `payments` namespace is rejected — even from other pods in the same cluster that are not part of the mesh. This satisfies PCI-DSS Requirement 4.2 (never transmit cardholder data over unencrypted protocols).
+With `STRICT` mode, any plaintext connection to a service in the `payments` namespace is rejected — even from other pods in the same cluster that are not part of the mesh. Encrypting all internal traffic is strong evidence for PCI-DSS encryption-in-transit and segmentation controls. Roll it out by starting in `PERMISSIVE` mode, checking (e.g. in Kiali) that all clients already use mTLS, then switching to `STRICT`.
 
 ### 2.2 Verifying mTLS
 
 ```bash
-# Check the mTLS status between two services
+# Check sidecar injection and the effective mTLS / policy setup of a pod
 istioctl x check-inject -n payments
-istioctl authn tls-check payment-service.payments.svc.cluster.local
+istioctl x describe pod payment-service-7d9f8-abcde -n payments
 
-# Expected output:
-# HOST:PORT                                     STATUS     SERVER     CLIENT
-# payment-service.payments.svc.cluster.local:8080  OK    STRICT     mTLS
+# Expected (excerpt):
+# Pod: payment-service-7d9f8-abcde
+#    Pod Ports: 8080 (payment-service), 15090 (istio-proxy)
+# Service: payment-service
+#    Port: http 8080/HTTP targets pod port 8080
+# Effective PeerAuthentication:
+#    Workload mTLS mode: STRICT
+# (The old "istioctl authn tls-check" command was removed in Istio 1.5+)
 ```
 
 ---
@@ -113,7 +123,7 @@ Istio's traffic management uses two CRDs working together: `VirtualService` (rou
 
 ```yaml
 # Route 90% to stable v1, 10% to canary v2
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: payment-service-vs
@@ -143,15 +153,20 @@ spec:
           weight: 10
       timeout: 5s
       retries:
-        attempts: 3
+        # POST /payments is NOT idempotent by itself: retry only failures
+        # where the request certainly did not reach the app -- or rely on
+        # an idempotency key. (Istio retries by default -- 2 attempts on
+        # connect-failure, refused-stream, unavailable... -- so set this
+        # explicitly for payment routes.)
+        attempts: 2
         perTryTimeout: 2s
-        retryOn: "5xx,reset,connect-failure,retriable-4xx"
+        retryOn: "connect-failure,refused-stream"
 ```
 
 ### 3.2 DestinationRule — Subsets and Load Balancing
 
 ```yaml
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: payment-service-dr
@@ -170,8 +185,8 @@ spec:
     loadBalancer:
       simple: LEAST_CONN     # least connections for payment processing
     outlierDetection:
-      # Circuit breaking: eject pods with 5 consecutive errors for 30s
-      consecutiveGatewayErrors: 5
+      # Circuit breaking: eject pods with 5 consecutive 5xx errors for 30s
+      consecutive5xxErrors: 5
       interval: 10s
       baseEjectionTime: 30s
       maxEjectionPercent: 50
@@ -196,12 +211,12 @@ spec:
 
 ## 4. Circuit Breaking with OutlierDetection
 
-Istio's circuit breaking is configured in `DestinationRule.outlierDetection`. When a pod returns `consecutiveGatewayErrors` 5xx responses within the `interval`, it is ejected from the load-balancing pool for `baseEjectionTime`.
+Istio's circuit breaking is configured in `DestinationRule.outlierDetection`. When a pod returns `consecutive5xxErrors` 5xx responses in a row (or `consecutiveGatewayErrors` — only 502/503/504), it is ejected from the load-balancing pool for `baseEjectionTime` (multiplied by the number of times it has been ejected). The analysis runs every `interval`. The diagram below maps this onto the classic circuit-breaker states — strictly, an ejected host simply returns to the pool after the ejection time and is ejected again if it keeps failing.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Closed: service healthy
-    Closed --> Open: 5 consecutive 5xx errors in 10s
+    Closed --> Open: 5 consecutive 5xx errors
     Open --> HalfOpen: after 30s ejection time
     HalfOpen --> Closed: next request succeeds
     HalfOpen --> Open: next request fails
@@ -209,7 +224,7 @@ stateDiagram-v2
 
 ```yaml
 # Dedicated circuit breaker for external payment gateway
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: visa-gateway-cb
@@ -234,7 +249,7 @@ spec:
 Combining retries with timeouts prevents cascading failures in payment processing chains.
 
 ```yaml
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: fraud-service-vs
@@ -250,9 +265,10 @@ spec:
       retries:
         attempts: 2
         perTryTimeout: 1s
-        retryOn: "gateway-error,connect-failure,retriable-4xx"
-        # Do NOT retry on 5xx if the request is not idempotent
-        # For POST /payments, use idempotency keys instead
+        retryOn: "gateway-error,connect-failure,refused-stream"
+        # gateway-error (502/503/504) is acceptable here because a fraud
+        # SCORE request has no side effects. Do NOT retry on 5xx for
+        # requests that change state unless they carry an idempotency key
 ```
 
 **Rule for fintech**: Never retry non-idempotent payment mutations without idempotency keys. Retry only on connection failures (`connect-failure`, `reset`) or idempotent reads.
@@ -261,11 +277,13 @@ spec:
 
 ## 6. Distributed Tracing with Jaeger
 
-Istio automatically injects trace context into every HTTP request. Jaeger collects and visualizes these traces.
+The sidecars create spans for every request and add trace headers if none are present. Jaeger (or any OpenTelemetry-compatible backend) collects and visualizes these traces.
 
-### 6.1 B3 Trace Propagation Headers
+### 6.1 Trace Context Propagation
 
-Istio uses B3 propagation (Zipkin-compatible). The sidecar creates spans automatically, but applications must propagate the headers when making outbound calls.
+Depending on the tracer configuration, Envoy uses B3 (Zipkin-style) or W3C `traceparent` headers. The sidecar creates spans automatically, but it cannot know which outgoing call belongs to which incoming request — the **application** must copy the trace headers (and `x-request-id`) from the incoming request to its outbound calls.
+
+In Spring Boot 3, Micrometer Tracing (or the OpenTelemetry Java agent) does this automatically for `RestTemplate`, `RestClient`, `WebClient` and Kafka — configure the propagation type to match the mesh (`management.tracing.propagation.type=b3,w3c`). The manual version below shows what happens underneath:
 
 ```java
 // TraceContextPropagationFilter.java
@@ -297,14 +315,18 @@ public class TraceContextPropagationFilter implements Filter {
             }
         }
         TraceContext.set(traceHeaders);
-        chain.doFilter(req, res);
+        try {
+            chain.doFilter(req, res);
+        } finally {
+            TraceContext.clear();   // thread-pool threads are reused
+        }
     }
 }
 ```
 
 ```java
 // PaymentClient.java — propagate trace headers on outbound calls
-public PaymentResponse callFraudService(FraudRequest request) throws Exception {
+public FraudResponse callFraudService(FraudRequest request) throws Exception {
     Map<String, String> traceHeaders = TraceContext.get();
 
     HttpRequest.Builder builder = HttpRequest.newBuilder()
@@ -323,7 +345,7 @@ public PaymentResponse callFraudService(FraudRequest request) throws Exception {
 ### 6.2 Telemetry Resource for Sampling
 
 ```yaml
-apiVersion: telemetry.istio.io/v1alpha1
+apiVersion: telemetry.istio.io/v1
 kind: Telemetry
 metadata:
   name: payment-tracing
@@ -331,11 +353,12 @@ metadata:
 spec:
   tracing:
     - providers:
-        - name: jaeger
-      randomSamplingPercentage: 100.0  # 100% sampling for payments (PCI audit)
+        - name: otel-tracing     # extension provider defined in MeshConfig
+                                 # (OpenTelemetry collector -> Jaeger)
+      randomSamplingPercentage: 10.0
 ```
 
-For high-volume services, reduce to 10% sampling and use `x-b3-sampled: 1` header to force sampling for suspicious transactions.
+Traces are a debugging tool, not an audit record: the audit trail of payments lives in the application's audit logs and database. 100% sampling at payment volumes is expensive; sample a percentage and force sampling for specific requests (e.g. `x-b3-sampled: 1`, or tail-based sampling in the OpenTelemetry collector that keeps all traces with errors). Never put card data in span attributes.
 
 ---
 
@@ -372,7 +395,7 @@ AuthorizationPolicy enforces which services can call which other services, based
 ```yaml
 # Only api-gateway can call payment-service
 # All other callers receive HTTP 403 RBAC denied
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: payment-service-authz
@@ -394,7 +417,7 @@ spec:
             paths: ["/api/v1/payments/*", "/api/v1/payments"]
 ---
 # payment-service can call fraud-service, but only the /score endpoint
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: fraud-service-authz
@@ -414,14 +437,15 @@ spec:
             methods: ["POST"]
             paths: ["/api/v1/fraud/score"]
 ---
-# Default deny all — must be last policy
-apiVersion: security.istio.io/v1beta1
+# Default deny all -- policy order does not matter: a request is allowed
+# only if some ALLOW policy matches it (and no DENY policy does)
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: default-deny
   namespace: payments
 spec:
-  {}  # empty spec with no rules = deny all
+  {}  # empty spec: ALLOW action with no rules -> matches nothing -> deny all
 ```
 
 ---
@@ -430,7 +454,7 @@ spec:
 
 ### Pitfall 1: mTLS STRICT Mode Breaking Kubernetes Health Checks
 
-**Problem**: When `PeerAuthentication` is set to `STRICT`, Kubernetes liveness and readiness probes (sent from kubelet, which is not part of the mesh) are rejected because they are plaintext connections. Services fail health checks and are restarted in a loop.
+**Problem**: When `PeerAuthentication` is set to `STRICT`, Kubernetes liveness and readiness probes (sent from kubelet, which is not part of the mesh) are rejected because they are plaintext connections. Services fail health checks and are restarted in a loop. Since Istio 1.10 the sidecar injector **rewrites HTTP probes by default** (fix option 2), so today this shows up mainly when probe rewriting was disabled or with TCP/gRPC probes and custom setups.
 
 **Diagnosis**:
 ```bash
@@ -448,7 +472,7 @@ annotations:
   # probe on 8081 bypasses Envoy; application logic on 8080 uses mTLS
 ```
 
-**Fix Option 2**: Rewrite probes to use Istio's built-in probe rewrite (enabled by default in Istio 1.9+):
+**Fix Option 2**: Rewrite probes to use Istio's built-in probe rewrite (enabled by default since Istio 1.10):
 
 ```yaml
 # Istio automatically rewrites HTTP probes using the sidecar agent port
@@ -474,7 +498,7 @@ livenessProbe:
 
 ### Pitfall 2: VirtualService Not Matching Because Service Port Name Does Not Match Protocol
 
-**Problem**: Istio routes HTTP vs TCP traffic differently. If a Service port is named `http` or `grpc`, Istio applies L7 routing rules. If it is named `tcp` or any unlisted name, Istio treats it as TCP and VirtualService HTTP rules have no effect — canary weights are silently ignored.
+**Problem**: Istio routes HTTP vs TCP traffic differently. The protocol comes from the Service port's `appProtocol` field or its name prefix (`http`, `http2`, `grpc`, `tcp`, `tls`, ...). A port declared as TCP (e.g. named `tcp-api`) gets no L7 processing: VirtualService HTTP rules have no effect — canary weights are silently ignored. For ports with no recognised protocol, Istio falls back to automatic protocol *sniffing*, which detects HTTP/1.1 and HTTP/2 but treats anything it cannot detect as plain TCP. Declare the protocol explicitly for every port.
 
 **Broken Service definition**:
 ```yaml
@@ -485,7 +509,7 @@ metadata:
   namespace: payments
 spec:
   ports:
-    - name: api          # generic name — Istio treats as TCP
+    - name: tcp-api      # declared as TCP — no HTTP routing
       port: 8080
       targetPort: 8080
 ```
@@ -499,10 +523,12 @@ metadata:
   namespace: payments
 spec:
   ports:
-    - name: http         # must start with 'http' for Istio L7 routing
+    - name: http         # name prefix 'http' ...
+      appProtocol: http  # ... or appProtocol (preferred, explicit)
       port: 8080
       targetPort: 8080
-    - name: grpc-internal  # must start with 'grpc' for gRPC
+    - name: grpc-internal
+      appProtocol: grpc
       port: 9090
       targetPort: 9090
 ```
@@ -547,30 +573,19 @@ annotations:
     holdApplicationUntilProxyStarts: true
 ```
 
-**Alternative**: Add a `postStart` lifecycle hook with a short sleep if `holdApplicationUntilProxyStarts` cannot be set globally:
+This works by placing the istio-proxy container first and blocking in its `postStart` hook until Envoy is ready — the kubelet starts the next container only after that. (A `postStart` hook on the *application* container would not help: the application process is already running while its own hook executes.)
 
-```yaml
-lifecycle:
-  postStart:
-    exec:
-      command:
-        - /bin/sh
-        - -c
-        - |
-          until curl -sf http://localhost:15021/healthz/ready; do
-            sleep 1
-          done
-```
+**Alternative**: On Kubernetes 1.29+ Istio can inject the proxy as a **native sidecar** (an init container with `restartPolicy: Always`, enabled by default in recent Istio releases). Native sidecars start before and stop after the application containers, which solves both the start-up and the shutdown ordering.
 
 ---
 
 ## Checklist
 
 ### Istio Installation and Namespace Configuration
-- [ ] Istio installed with production profile (`istioctl install --set profile=production`)
+- [ ] Istio installed with the `default` profile plus production overrides (istiod HA, PodDisruptionBudgets, resource requests) — there is no "production" profile
 - [ ] Namespace injection label applied: `kubectl label namespace payments istio-injection=enabled`
 - [ ] `holdApplicationUntilProxyStarts: true` set in MeshConfig
-- [ ] All Service port names start with `http`, `grpc`, or `tls` (not generic names)
+- [ ] Every Service port declares its protocol (`appProtocol` or a name prefix such as `http`, `grpc`, `tls`)
 - [ ] istiod deployed with at least 2 replicas for HA
 
 ### mTLS and Security
@@ -578,10 +593,10 @@ lifecycle:
 - [ ] Kubernetes health check probes compatible with mTLS (probe rewrite enabled or exec probes used)
 - [ ] `AuthorizationPolicy` default-deny applied to all production namespaces
 - [ ] Explicit `AuthorizationPolicy` ALLOW rules for each service-to-service call path
-- [ ] SPIFFE identities verified with `istioctl authn tls-check`
+- [ ] mTLS and SPIFFE identities verified with `istioctl x describe pod` / Kiali
 
 ### Traffic Management
-- [ ] `VirtualService` retries configured for connection failures only (not 5xx on non-idempotent POSTs)
+- [ ] `VirtualService` retries set explicitly — connection failures only for non-idempotent POSTs (Istio retries by default)
 - [ ] Timeouts set at VirtualService level (not only at application level)
 - [ ] `DestinationRule` `outlierDetection` configured for all external dependencies
 - [ ] Canary weights validated in staging before production deployment
@@ -589,22 +604,22 @@ lifecycle:
 
 ### Observability
 - [ ] Jaeger or Zipkin tracing backend deployed and connected to Istio
-- [ ] Application propagates B3 trace headers on all outbound calls
-- [ ] `Telemetry` resource configured with appropriate sampling rate (100% for payments)
+- [ ] Application propagates trace headers (B3 or W3C, plus `x-request-id`) on all outbound calls
+- [ ] `Telemetry` resource configured with an affordable sampling rate plus forced/tail sampling for errors
 - [ ] Kiali deployed and service graph reviewed weekly
 - [ ] Envoy access logs shipping to centralized log aggregator (Fluentd/Loki)
 
 ### Compliance
-- [ ] mTLS STRICT mode documented as PCI-DSS Requirement 4.2.1 control
-- [ ] `AuthorizationPolicy` rules documented as PCI-DSS Requirement 7.2.1 control
-- [ ] Distributed traces retained for 90+ days for PCI-DSS audit evidence
+- [ ] mTLS STRICT mode documented as an encryption-in-transit / segmentation control
+- [ ] `AuthorizationPolicy` rules documented as least-privilege access control (PCI-DSS Requirement 7)
+- [ ] Access logs retained per PCI-DSS 10.5.1 (12 months, last 3 months immediately available); traces contain no cardholder data
 
 ---
 
 <!-- KNOWLEDGE-CHECK
-{"questions":[{"text":"Why does setting PeerAuthentication to STRICT mode sometimes cause Kubernetes liveness probe failures?","options":["a) STRICT mode disables all TCP connections including health check probes","b) Kubernetes kubelet health check probes are plaintext HTTP and are rejected by Envoy because kubelet does not have a mesh certificate","c) STRICT mode requires the application to implement mTLS in its own code","d) Liveness probes are blocked by the default-deny AuthorizationPolicy"],"correct":1,"explanation":"Kubernetes kubelet sends liveness and readiness probes directly to the pod IP as plaintext HTTP. With mTLS STRICT mode, Envoy rejects these unauthenticated connections. The fix is to enable Istio's probe rewrite feature (holdApplicationUntilProxyStarts or rewriteAppHTTPProbe) or switch to exec probes that run inside the container."},{"text":"A VirtualService with 90/10 canary weight routing is deployed but all traffic continues going to v1. What is the most likely cause?","options":["a) The DestinationRule subsets are missing OutlierDetection configuration","b) The Kubernetes Service port is named 'api' instead of starting with 'http' or 'grpc', causing Istio to treat it as TCP and ignore L7 routing rules","c) The canary deployment has fewer pods than the stable deployment","d) The PeerAuthentication mode is PERMISSIVE instead of STRICT"],"correct":1,"explanation":"Istio determines the traffic protocol from the Service port name. Port names must start with 'http', 'grpc', or 'tls' for Istio to apply L7 routing rules. A generic name like 'api' causes Istio to treat the traffic as TCP, and VirtualService HTTP routing rules including canary weights are silently bypassed."},{"text":"What must Java Spring Boot services do to ensure distributed traces appear as a single trace across multiple services in Jaeger?","options":["a) Register each service with the Jaeger agent using a unique service name","b) Call istioctl proxy-config to export the trace context","c) Extract incoming B3 headers (x-b3-traceid, x-b3-spanid, etc.) and forward them on all outbound HTTP calls","d) Enable Istio's telemetry API with 100% sampling — no code changes are needed"],"correct":2,"explanation":"Istio's Envoy sidecars create spans automatically, but they cannot propagate trace context between application-level calls. The application must extract B3 headers from incoming requests and forward them on outbound calls. Without this, Jaeger shows disconnected single-service traces rather than end-to-end payment flow traces."}]}
+{"questions": [{"text": "Why does setting PeerAuthentication to STRICT mode sometimes cause Kubernetes liveness probe failures?", "options": ["a) STRICT mode disables all TCP connections including health check probes", "b) Kubernetes kubelet health check probes are plaintext HTTP and are rejected by Envoy because kubelet does not have a mesh certificate", "c) STRICT mode requires the application to implement mTLS in its own code", "d) Liveness probes are blocked by the default-deny AuthorizationPolicy"], "correct": 1, "explanation": "Kubernetes kubelet sends liveness and readiness probes directly to the pod IP as plaintext HTTP. With mTLS STRICT mode, Envoy rejects these unauthenticated connections. The fix is Istio's probe rewrite (rewriteAppHTTPProbe — on by default since Istio 1.10), which redirects probes through the sidecar agent, or exec probes that run inside the container, or excluding a dedicated health port from interception. (holdApplicationUntilProxyStarts is unrelated: it controls container start-up order.)"}, {"text": "A VirtualService with 90/10 canary weight routing is deployed but all traffic continues going to v1. What is the most likely cause?", "options": ["a) The DestinationRule subsets are missing OutlierDetection configuration", "b) The Kubernetes Service port is declared as TCP (e.g. named 'tcp-api', or a protocol Istio cannot detect), so Istio treats the traffic as TCP and ignores L7 routing rules", "c) The canary deployment has fewer pods than the stable deployment", "d) The PeerAuthentication mode is PERMISSIVE instead of STRICT"], "correct": 1, "explanation": "Istio determines the traffic protocol from the Service port's appProtocol field or name prefix ('http', 'grpc', 'tcp', 'tls', ...), and falls back to protocol sniffing for undeclared ports. If the port is declared as TCP — or sniffing cannot detect HTTP — Istio treats the traffic as TCP, and VirtualService HTTP routing rules, including canary weights, are silently bypassed. Declare the protocol explicitly on every port."}, {"text": "What must Java Spring Boot services do to ensure distributed traces appear as a single trace across multiple services in Jaeger?", "options": ["a) Register each service with the Jaeger agent using a unique service name", "b) Call istioctl proxy-config to export the trace context", "c) Copy the incoming trace headers (B3 or W3C traceparent, plus x-request-id) onto all outbound calls — done automatically by Micrometer Tracing or the OpenTelemetry agent, or manually", "d) Enable Istio's telemetry API with 100% sampling — no code changes are needed"], "correct": 2, "explanation": "Istio's Envoy sidecars create spans automatically, but they cannot link an application's outgoing call to the incoming request that caused it. The application must carry the trace headers from incoming requests to outbound calls. In Spring Boot 3, Micrometer Tracing or the OpenTelemetry Java agent does this for instrumented clients; otherwise it must be coded by hand. Without it, Jaeger shows disconnected single-hop traces rather than end-to-end payment flow traces."}]}
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{"title":"Deploy Istio Service Mesh for Fintech Payment Platform","difficulty":"advanced","estimatedMinutes":100,"tasks":[{"id":"1","description":"Install Istio with the production profile on a local cluster (kind or minikube). Enable sidecar injection for a 'payments' namespace. Apply PeerAuthentication STRICT mode and verify that a curl from a non-mesh pod receives a connection error while a mesh pod succeeds. Confirm mTLS status with istioctl authn tls-check."},{"id":"2","description":"Deploy payment-service with two versions (v1 and v2). Create a DestinationRule with subsets for each version. Create a VirtualService routing 90% traffic to v1 and 10% to v2. Send 1000 requests using hey or wrk and verify approximately 100 (10%) reach v2 by checking Kiali or Envoy access logs."},{"id":"3","description":"Add OutlierDetection to the DestinationRule: eject a pod after 3 consecutive 5xx errors, with a 30-second ejection window. Inject failures into v2 (use Istio fault injection or a /fail endpoint). Observe in Kiali that v2 is ejected from the pool. Verify traffic automatically shifts to v1 during ejection."},{"id":"4","description":"Implement B3 header propagation in a Spring Boot payment service. Deploy payment-service and fraud-service with Jaeger tracing. Make a payment call that triggers a fraud check. In Jaeger UI, verify the full trace shows both payment-service and fraud-service spans in a single trace. Document the trace propagation code pattern used."}]}
+{"title": "Deploy Istio Service Mesh for Fintech Payment Platform", "difficulty": "advanced", "estimatedMinutes": 100, "tasks": [{"id": "1", "description": "Install Istio with the default profile on a local cluster (kind or minikube). Enable sidecar injection for a 'payments' namespace. Apply PeerAuthentication STRICT mode and verify that a curl from a non-mesh pod receives a connection error while a mesh pod succeeds. Confirm the effective mTLS mode with istioctl x describe pod."}, {"id": "2", "description": "Deploy payment-service with two versions (v1 and v2). Create a DestinationRule with subsets for each version. Create a VirtualService routing 90% traffic to v1 and 10% to v2. Send 1000 requests using hey or wrk and verify approximately 100 (10%) reach v2 by checking Kiali or Envoy access logs."}, {"id": "3", "description": "Add OutlierDetection to the DestinationRule: eject a pod after 3 consecutive 5xx errors (consecutive5xxErrors), with a 30-second base ejection time. Inject failures into v2 (use Istio fault injection or a /fail endpoint). Observe in Kiali that v2 is ejected from the pool. Verify traffic automatically shifts to v1 during ejection."}, {"id": "4", "description": "Set up trace context propagation in a Spring Boot payment service (Micrometer Tracing with the propagation type matching the mesh, or a manual header filter). Deploy payment-service and fraud-service with Jaeger tracing. Make a payment call that triggers a fraud check. In Jaeger UI, verify the full trace shows both payment-service and fraud-service spans in a single trace. Document the propagation pattern used."}]}
 -->

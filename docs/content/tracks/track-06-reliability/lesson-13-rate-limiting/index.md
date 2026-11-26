@@ -55,6 +55,8 @@ references:
   - "Kong Rate Limiting Algorithm Comparison"
 ---
 
+## Overview
+
 Security teams implement rate limiting to prevent credential stuffing and API abuse. Reliability engineers implement rate limiting for a different reason: to protect downstream services from being overwhelmed by legitimate traffic. A payment processing service that sends 10,000 transaction queries per second to a fraud-scoring API is not attacking it — but the effect is indistinguishable. Rate limiting as a reliability tool is about defining sustainable load, enforcing it at the boundary, and degrading gracefully when limits are reached.
 
 This lesson focuses exclusively on rate limiting as a reliability mechanism. We cover three algorithms, distributed enforcement with Redis, per-tier limits for a payment API, and the operational concern of monitoring limit hits before they become incidents.
@@ -145,22 +147,20 @@ ASCII:
 Records the timestamp of each request. When a new request arrives, count the number of requests in the last N seconds. If count >= limit, reject.
 
 ```
-Limit: 5 requests per 10 seconds
+Limit: 5 requests per 10 seconds (window = the last 10 seconds)
+Only ACCEPTED requests are logged.
 
-T=0s:  request (log: [0])              count=1  -> ACCEPT
-T=2s:  request (log: [0,2])            count=2  -> ACCEPT
-T=4s:  request (log: [0,2,4])          count=3  -> ACCEPT
-T=6s:  request (log: [0,2,4,6])        count=4  -> ACCEPT
-T=8s:  request (log: [0,2,4,6,8])      count=5  -> ACCEPT
-T=9s:  request (log: [0,2,4,6,8,9])    count=6  -> REJECT (6 > 5)
-T=11s: request (log: [2,4,6,8,9,11])   -- T=0 expires
-       (log: [2,4,6,8,9,11])          count=6  -> REJECT
-T=12s: request                         -- T=2 expires
-       (log: [4,6,8,9,11,12])         count=6  -> REJECT
-T=13s: request                         -- T=4 expires, count drops to 5
-       (log: [6,8,9,11,12,13])        count=6  -> REJECT
-T=14s: request                         -- T=6 expires
-       (log: [8,9,11,12,13,14])       count=5+1=6 -> boundary case
+T=0s:  log [0]                 count=1 -> ACCEPT
+T=2s:  log [0,2]               count=2 -> ACCEPT
+T=4s:  log [0,2,4]             count=3 -> ACCEPT
+T=6s:  log [0,2,4,6]           count=4 -> ACCEPT
+T=8s:  log [0,2,4,6,8]         count=5 -> ACCEPT
+T=9s:  window (-1,9]: 5 logged -> REJECT (limit reached; not logged)
+T=11s: T=0 has left the window (1,11]: [2,4,6,8] = 4
+                               -> ACCEPT, log [2,4,6,8,11]
+T=12s: T=2 leaves: [4,6,8,11] = 4
+                               -> ACCEPT, log [4,6,8,11,12]
+T=13s: [4,6,8,11,12] = 5       -> REJECT
 
 Properties:
   - No boundary burst problem (window slides continuously)
@@ -184,10 +184,11 @@ Weighted estimate = (80 * 0.5) + 20 = 60
 
 60 < 100 -> ACCEPT (increment current_minute_count)
 
-This approximation has ~0.003% error rate — acceptable for most rate limiting.
+Cloudflare, which popularised this method, measured only about 0.003% of
+requests wrongly allowed or limited — acceptable for most rate limiting.
 ```
 
-This is what Redis implements in its built-in rate limiter modules and what Bucket4j's sliding window uses.
+Redis has no built-in rate limiter: with Redis you implement this (or a token bucket) yourself, usually as a small Lua script so the read-and-update is atomic. Bucket4j, used below, implements the token bucket.
 
 ### Algorithm Comparison Table
 
@@ -196,7 +197,7 @@ This is what Redis implements in its built-in rate limiter modules and what Buck
 | Fixed Window | Poor (boundary burst) | O(1) | Low | Very Low | Internal batch |
 | Token Bucket | Excellent | O(1) per key | High | Low | Public APIs, payments |
 | Sliding Window Log | None (exact) | O(requests) | Exact | Medium | High-precision limits |
-| Sliding Window Counter | Good | O(1) per key | Very high (~99.997%) | Low | Most production cases |
+| Sliding Window Counter | Good | O(1) per key | Very high (approximation) | Low | Most production cases |
 
 ## Bucket4j with Redis — Distributed Rate Limiting
 
@@ -205,6 +206,9 @@ For a payment API running multiple instances, in-memory rate limiters (like Resi
 ### Maven Dependencies
 
 ```xml
+<!-- Maven groupId is com.bucket4j, but the Java PACKAGE is io.github.bucket4j.
+     Later releases split the Redis module per client (e.g. bucket4j_jdk17-lettuce):
+     check the artifact name for the version you use. -->
 <dependency>
     <groupId>com.bucket4j</groupId>
     <artifactId>bucket4j-redis</artifactId>
@@ -225,8 +229,8 @@ For a payment API running multiple instances, in-memory rate limiters (like Resi
 ```java
 package com.fintech.ratelimit.config;
 
-import com.bucket4j.distributed.ExpirationAfterWriteStrategy;
-import com.bucket4j.redis.lettuce.cas.LettuceBasedProxyManager;
+import io.github.bucket4j.distributed.ExpirationAfterWriteStrategy;
+import io.github.bucket4j.redis.lettuce.cas.LettuceBasedProxyManager;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.codec.ByteArrayCodec;
@@ -274,8 +278,8 @@ public class RateLimitConfig {
 ```java
 package com.fintech.ratelimit.config;
 
-import com.bucket4j.Bandwidth;
-import com.bucket4j.BucketConfiguration;
+import io.github.bucket4j.Bandwidth;
+import io.github.bucket4j.BucketConfiguration;
 
 import java.time.Duration;
 
@@ -317,7 +321,11 @@ public class PaymentRateLimitConfig {
     /**
      * Global limit: 10,000 payments/minute across ALL merchants combined.
      * This protects fraud API (SLA: 10,000 req/min) and core banking connector.
-     * Uses sliding window approximation via two overlapping token buckets.
+     * Two token buckets on one key: a per-minute budget with a 500 burst, and
+     * a per-second smoothing limit.
+     * Note: every payment hits this ONE Redis key, and Bucket4j's CAS updates
+     * retry under contention. At high volume, measure it — or split the global
+     * budget into N sub-buckets and pick one per request.
      */
     public static BucketConfiguration globalLimit() {
         return BucketConfiguration.builder()
@@ -354,13 +362,14 @@ public class PaymentRateLimitConfig {
 ```java
 package com.fintech.ratelimit.service;
 
-import com.bucket4j.Bucket;
-import com.bucket4j.BucketConfiguration;
-import com.bucket4j.ConsumptionProbe;
-import com.bucket4j.distributed.proxy.ProxyManager;
+import io.github.bucket4j.Bucket;
+import io.github.bucket4j.BucketConfiguration;
+import io.github.bucket4j.ConsumptionProbe;
+import io.github.bucket4j.distributed.proxy.ProxyManager;
 import com.fintech.ratelimit.config.PaymentRateLimitConfig;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.function.Supplier;
@@ -392,7 +401,9 @@ public class DistributedRateLimitService {
             return merchantResult;
         }
 
-        // Check global limit (protects downstream services)
+        // Check global limit (protects downstream services).
+        // (If the global check rejects, the merchant token is already spent —
+        //  acceptable here; refund it with addTokens(1) if that matters to you.)
         return checkGlobalLimit();
     }
 
@@ -402,7 +413,7 @@ public class DistributedRateLimitService {
             ? PaymentRateLimitConfig.premiumMerchantLimit()
             : PaymentRateLimitConfig.merchantLimit();
 
-        byte[] bucketKey = ("merchant:" + merchantId + ":payment").getBytes();
+        byte[] bucketKey = ("merchant:" + merchantId + ":payment").getBytes(StandardCharsets.UTF_8);
 
         Supplier<BucketConfiguration> configSupplier = () -> config;
         Bucket bucket = proxyManager.builder().build(bucketKey, configSupplier);
@@ -417,8 +428,9 @@ public class DistributedRateLimitService {
             );
         }
 
-        // Not consumed: calculate retry-after in seconds
-        long retryAfterSeconds = probe.getNanosToWaitForRefill() / 1_000_000_000L;
+        // Not consumed: retry-after in WHOLE seconds, rounded UP (integer
+        // division would turn 0.4s into "Retry-After: 0")
+        long retryAfterSeconds = ceilSeconds(probe.getNanosToWaitForRefill());
         return RateLimitResult.denied(
             getLimitForTier(tier),
             0,
@@ -427,8 +439,9 @@ public class DistributedRateLimitService {
         );
     }
 
-    private RateLimitResult checkGlobalLimit() {
-        byte[] bucketKey = GLOBAL_BUCKET_KEY.getBytes();
+    // public: internal callers skip the merchant limit but NOT this one
+    public RateLimitResult checkGlobalLimit() {
+        byte[] bucketKey = GLOBAL_BUCKET_KEY.getBytes(StandardCharsets.UTF_8);
         Bucket bucket = proxyManager.builder().build(
             bucketKey, PaymentRateLimitConfig::globalLimit);
 
@@ -439,9 +452,13 @@ public class DistributedRateLimitService {
                 Instant.now().plusSeconds(60).getEpochSecond());
         }
 
-        long retryAfterSeconds = probe.getNanosToWaitForRefill() / 1_000_000_000L;
+        long retryAfterSeconds = ceilSeconds(probe.getNanosToWaitForRefill());
         return RateLimitResult.denied(10_000, 0,
             Instant.now().plusSeconds(60).getEpochSecond(), retryAfterSeconds);
+    }
+
+    private static long ceilSeconds(long nanos) {
+        return Math.max(1, (nanos + 999_999_999L) / 1_000_000_000L);
     }
 
     private int getLimitForTier(MerchantTier tier) {
@@ -470,7 +487,7 @@ public class DistributedRateLimitService {
 
 ## Rate Limit Response Headers
 
-RFC 6585 introduced HTTP status 429 (Too Many Requests). The de facto standard headers (not yet formally standardised, but universally adopted by Stripe, GitHub, Twilio):
+RFC 6585 introduced HTTP status 429 (Too Many Requests). The `X-RateLimit-*` headers below are a widely used convention (GitHub, for example), not a standard; the IETF is standardising `RateLimit` / `RateLimit-Policy` header fields as a replacement. `Retry-After` itself is standard HTTP (RFC 9110):
 
 ```
 X-RateLimit-Limit: 100
@@ -538,7 +555,13 @@ public class PaymentRateLimitFilter extends OncePerRequestFilter {
         // Internal services (fraud engine calling back, reconciliation jobs)
         // bypass per-merchant rate limits but NOT the global limit
         if (isInternalService(request)) {
-            filterChain.doFilter(request, response);
+            RateLimitResult global = rateLimitService.checkGlobalLimit();
+            if (global.allowed()) {
+                filterChain.doFilter(request, response);
+            } else {
+                setRateLimitHeaders(response, global);
+                response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
+            }
             return;
         }
 
@@ -609,7 +632,10 @@ public class PaymentRateLimitFilter extends OncePerRequestFilter {
     }
 
     private String apiKeyToMerchantId(String apiKey) {
-        // In production: Redis lookup with API key -> merchant ID cache
+        // In production: look the key up (hashed) in the API-key store and use
+        // the merchant it belongs to. NEVER trust a merchant ID parsed from the
+        // key itself — anyone could send "mk_<someone-else>_x" and spend (or
+        // escape) another merchant's limit. The parsing below is a sketch only.
         // For brevity, extract prefix from key format "mk_{merchantId}_{hash}"
         if (apiKey.startsWith("mk_")) {
             String[] parts = apiKey.split("_");
@@ -626,7 +652,7 @@ While Bucket4j+Redis is best for inbound API rate limiting, Resilience4j's `Rate
 
 ```yaml
 resilience4j:
-  rate-limiter:
+  ratelimiter:                    # NOT "rate-limiter" — that key does not bind
     instances:
       fraud-api-outbound:
         # Limit outbound calls to fraud API to 500/second
@@ -741,7 +767,9 @@ public class PaymentSubmissionService {
         MerchantTier tier = getTier(merchantId);
 
         if (tier == MerchantTier.PREMIUM) {
-            // Queue for async processing — 202 Accepted with polling URL
+            // Queue for async processing — 202 Accepted with polling URL.
+            // The queue (durable!) only SMOOTHS load: its consumer must still
+            // drain it at a rate the global limit and the downstreams allow.
             String queueId = paymentQueue.enqueue(merchantId, request);
             return ResponseEntity
                 .status(HttpStatus.ACCEPTED)
@@ -783,14 +811,16 @@ import org.springframework.stereotype.Component;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.Set;
 
 /**
  * Validates HMAC-signed internal service tokens.
- * Token format: base64(serviceName + ":" + timestamp + ":" + hmac(secret, serviceName+timestamp))
- * Tokens are time-bounded: valid for 5 minutes to prevent replay attacks.
+ * Token format: base64(serviceName + ":" + timestamp + ":" + hmac(secret, serviceName + ":" + timestamp))
+ * Tokens are time-bounded: valid for 5 minutes, which LIMITS replay (a token
+ * can still be replayed inside that window).
  *
  * This is NOT a substitute for mTLS between services.
  * Use mTLS as the primary auth mechanism; this token is an additional rate-limit bypass signal.
@@ -827,9 +857,12 @@ public class InternalServiceTokenValidator {
             // Check service allowlist
             if (!ALLOWED_SERVICES.contains(serviceName)) return false;
 
-            // Verify HMAC
-            String expectedMac = computeHmac(serviceName + timestamp);
-            return expectedMac.equals(receivedMac);
+            // Verify HMAC — with a delimiter in the signed data, and a
+            // CONSTANT-TIME comparison (String.equals leaks timing information)
+            String expectedMac = computeHmac(serviceName + ":" + timestamp);
+            return MessageDigest.isEqual(
+                expectedMac.getBytes(StandardCharsets.UTF_8),
+                receivedMac.getBytes(StandardCharsets.UTF_8));
 
         } catch (Exception e) {
             return false;
@@ -903,6 +936,8 @@ public class RateLimitMetrics {
 
     private double getGlobalRemainingTokens() {
         // Inject and query the global bucket in production
+        // (bucket.getAvailableTokens()). Until then this placeholder returns 0,
+        // which would make the "near capacity" alert fire permanently.
         return 0.0;
     }
 
@@ -934,8 +969,10 @@ groups:
             Review merchant's integration or consider a temporary limit increase.
 
       - alert: GlobalRateLimitNearCapacity
+        # The global bucket holds at most 500 tokens (its burst capacity):
+        # alert when less than 10% is left
         expr: |
-          rate_limit_global_remaining_tokens < 500
+          rate_limit_global_remaining_tokens < 50
         for: 1m
         labels:
           severity: critical
@@ -943,7 +980,7 @@ groups:
         annotations:
           summary: "Global payment rate limit near capacity"
           description: >
-            Global remaining tokens below 500. Downstream services (fraud API,
+            Global remaining tokens below 50 (10% of the burst capacity). Downstream services (fraud API,
             core banking) may be approaching their capacity. Investigate traffic
             sources and consider emergency capacity increase.
 
@@ -988,8 +1025,8 @@ Resilience4j's default `RateLimiter` stores state in JVM memory. With 10 instanc
 ```java
 // WRONG: in-memory RateLimiter with multiple instances
 // application.yml:
-//   resilience4j.rate-limiter.instances.payment-inbound.limit-for-period: 100
-//   resilience4j.rate-limiter.instances.payment-inbound.limit-refresh-period: 1m
+//   resilience4j.ratelimiter.instances.payment-inbound.limit-for-period: 100
+//   resilience4j.ratelimiter.instances.payment-inbound.limit-refresh-period: 1m
 //
 // With 10 pods: effective limit = 100 x 10 = 1000/min per merchant
 // A merchant sending 500 req/min appears limited per-pod but is not globally limited.
@@ -1109,5 +1146,5 @@ private BucketConfiguration getConfigForEndpoint(String path) {
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{"title":"Build a Distributed Rate Limiting System for a Multi-Merchant Payment API","difficulty":"advanced","estimatedMinutes":70,"tasks":[{"id":"1","description":"Implement a distributed rate limiting service using Bucket4j and Redis (or Jedis). Configure three tiers: (a) standard merchants: 100 payments/min with burst 20, (b) premium merchants: 1000 payments/min with burst 100, (c) global limit: 10000 payments/min with a secondary smoothing limit of 200/second to prevent bursts. Write a MerchantTierRepository that returns the tier for a merchant ID. Test that two merchant IDs on the same Redis instance are rate limited independently."},{"id":"2","description":"Implement a PaymentRateLimitFilter as a Spring OncePerRequestFilter. It should: (a) skip rate limiting for /actuator/* paths, (b) validate internal service tokens using HMAC-SHA256 and bypass per-merchant limits for valid tokens, (c) extract merchant ID from an X-Api-Key header, (d) set X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset headers on EVERY response from /api/v1/payments, (e) return 429 with Retry-After and a JSON error body when rate limited. Write an integration test that verifies the headers appear on both 200 and 429 responses."},{"id":"3","description":"Add Resilience4j RateLimiter for outbound calls to a fraud API. Configure: 500 permits/second, 100ms timeout. The fraud API limit should be per-pod (not global) because each pod independently throttles its own outbound traffic. Implement a fallback that approves payments under 200 currency units when the outbound rate limit is exceeded and declines payments above 500 currency units. Write a test using WireMock that (a) stubs the fraud API to respond normally, (b) fires 600 requests/second and verifies requests above 500/sec trigger the fallback, (c) verifies the fallback applies the correct threshold logic."},{"id":"4","description":"Implement monitoring for the rate limiting system. Create a RateLimitMetrics component that publishes: (a) a counter per merchant for rejections with merchant_id tag (use only the first 8 characters to control cardinality), (b) a gauge for global remaining tokens, (c) a counter for global rejections. Write a Prometheus alerting rule that fires when any single merchant's rejection rate exceeds 5 per second for 2 minutes. Demonstrate the alert fires in a test by simulating a merchant that continuously exceeds its limit and verify the counter increments correctly."}]}
+{"title":"Build a Distributed Rate Limiting System for a Multi-Merchant Payment API","difficulty":"advanced","estimatedMinutes":70,"tasks":[{"id":"1","description":"Implement a distributed rate limiting service using Bucket4j and Redis (or Jedis). Configure three tiers: (a) standard merchants: 100 payments/min with burst 20, (b) premium merchants: 1000 payments/min with burst 100, (c) global limit: 10000 payments/min with a secondary smoothing limit of 200/second to prevent bursts. Write a MerchantTierRepository that returns the tier for a merchant ID. Test that two merchant IDs on the same Redis instance are rate limited independently."},{"id":"2","description":"Implement a PaymentRateLimitFilter as a Spring OncePerRequestFilter. It should: (a) skip rate limiting for /actuator/* paths, (b) validate internal service tokens using HMAC-SHA256 and bypass per-merchant limits for valid tokens (while still applying the global limit), (c) resolve the merchant ID by looking up the X-Api-Key header in the API-key store, (d) set X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset headers on EVERY response from /api/v1/payments, (e) return 429 with Retry-After and a JSON error body when rate limited. Write an integration test that verifies the headers appear on both 200 and 429 responses."},{"id":"3","description":"Add Resilience4j RateLimiter for outbound calls to a fraud API. Configure: 500 permits/second, 100ms timeout. The fraud API limit should be per-pod (not global) because each pod independently throttles its own outbound traffic. Implement a fallback that approves payments under 200 currency units when the outbound rate limit is exceeded and declines payments above 500 currency units. Write a test using WireMock that (a) stubs the fraud API to respond normally, (b) fires 600 requests/second and verifies requests above 500/sec trigger the fallback, (c) verifies the fallback applies the correct threshold logic."},{"id":"4","description":"Implement monitoring for the rate limiting system. Create a RateLimitMetrics component that publishes: (a) a counter per merchant for rejections with merchant_id tag (use only the first 8 characters to control cardinality), (b) a gauge for global remaining tokens, (c) a counter for global rejections. Write a Prometheus alerting rule that fires when any single merchant's rejection rate exceeds 5 per second for 2 minutes. Demonstrate the alert fires in a test by simulating a merchant that continuously exceeds its limit and verify the counter increments correctly."}]}
 -->

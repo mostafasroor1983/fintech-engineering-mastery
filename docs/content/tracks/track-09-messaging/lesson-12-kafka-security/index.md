@@ -48,21 +48,26 @@ TLS encrypts traffic between clients and brokers, and between brokers in a clust
 In production, use your organisation's PKI or a managed CA (AWS ACM, Vault PKI). For reference, the manual process:
 
 ```bash
-# 1. Create a CA (do this once per environment)
-keytool -genkeypair -keyalg RSA -keysize 2048 \
+# 1. Create a CA (do this once per environment) -- bc:c marks it as a CA
+keytool -genkeypair -keyalg RSA -keysize 3072 \
     -alias ca -keystore ca.jks \
     -dname "CN=Kafka-CA, OU=Fintech, O=Payments Ltd, C=GB" \
-    -validity 3650
+    -ext bc:c -validity 3650
+
+# Export the CA certificate (used by every truststore)
+keytool -exportcert -alias ca -keystore ca.jks -rfc -file ca.crt
 
 # 2. Create broker keystore
 keytool -genkeypair -keyalg RSA -keysize 2048 \
     -alias broker1 -keystore broker1.jks \
     -dname "CN=broker1.kafka.internal, OU=Kafka, O=Payments Ltd, C=GB"
 
-# 3. Sign broker cert with CA
+# 3. Sign broker cert with CA -- include the hostnames clients use as SAN
+#    (hostname verification checks the SAN, not only the CN)
 keytool -certreq -alias broker1 -keystore broker1.jks -file broker1.csr
 keytool -gencert -alias ca -keystore ca.jks \
-    -infile broker1.csr -outfile broker1.crt -validity 365
+    -infile broker1.csr -outfile broker1.crt -validity 365 \
+    -ext SAN=dns:broker1.kafka.internal,dns:broker1
 
 # 4. Import CA cert and signed cert into broker keystore
 keytool -importcert -alias ca -keystore broker1.jks -file ca.crt
@@ -75,22 +80,27 @@ keytool -importcert -alias ca -keystore client.truststore.jks -file ca.crt
 ### Broker TLS Configuration
 
 ```properties
-# server.properties
-listeners=PLAINTEXT://localhost:9092,SSL://localhost:9093
-advertised.listeners=PLAINTEXT://broker1:9092,SSL://broker1:9093
+# server.properties -- TLS only: no PLAINTEXT listener in production
+listeners=SSL://0.0.0.0:9093
+advertised.listeners=SSL://broker1.kafka.internal:9093
+inter.broker.listener.name=SSL
 
 ssl.keystore.location=/etc/kafka/ssl/broker1.jks
-ssl.keystore.password=keystore-secret
-ssl.key.password=key-secret
+# Passwords: inject via a config provider or a secret mount, not plain text
+ssl.keystore.password=${file:/etc/kafka/secrets/ssl.properties:keystore.password}
+ssl.key.password=${file:/etc/kafka/secrets/ssl.properties:key.password}
 ssl.truststore.location=/etc/kafka/ssl/ca.truststore.jks
-ssl.truststore.password=truststore-secret
+ssl.truststore.password=${file:/etc/kafka/secrets/ssl.properties:truststore.password}
+config.providers=file
+config.providers.file.class=org.apache.kafka.common.config.provider.FileConfigProvider
 
 # Require TLS 1.2 minimum
 ssl.enabled.protocols=TLSv1.2,TLSv1.3
 ssl.protocol=TLSv1.3
 
-# Cipher suites — restrict to strong ciphers
-ssl.cipher.suites=TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256
+# Cipher suites — strong AEAD suites only. If TLS 1.2 stays enabled, the
+# list must also contain TLS 1.2 suites, or TLS 1.2 clients cannot connect
+ssl.cipher.suites=TLS_AES_256_GCM_SHA384,TLS_AES_128_GCM_SHA256,TLS_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
 ```
 
 ### Client TLS Configuration (Java)
@@ -118,7 +128,9 @@ public class SecureProducerConfig {
         props.put(SslConfigs.SSL_KEY_PASSWORD_CONFIG, "key-secret");
 
         props.put(SslConfigs.SSL_ENDPOINT_IDENTIFICATION_ALGORITHM_CONFIG, "https");
-        // Verifies that broker hostname matches cert CN/SAN — prevents MITM attacks
+        // Verifies that the broker hostname matches the cert SAN — prevents
+        // MITM attacks. "https" is the default since Kafka 2.0: never set it
+        // to "" (empty) to work around certificate problems
 
         return props;
     }
@@ -147,7 +159,11 @@ spring.kafka.ssl.key-store-password=${KAFKA_KEYSTORE_PASSWORD}
 spring.kafka.ssl.key-password=${KAFKA_KEY_PASSWORD}
 ```
 
-**mTLS identity:** The broker extracts the client identity from the certificate CN. For example, a certificate with `CN=payment-service` authenticates as `User:CN=payment-service,OU=Services,O=Payments Ltd,C=GB`. This identity is used in ACL rules.
+**mTLS identity:** By default the broker uses the certificate's full distinguished name as the principal: a certificate with `CN=payment-service` authenticates as `User:CN=payment-service,OU=Services,O=Payments Ltd,C=GB`. To use short names such as `User:payment-service` in ACL rules (as below), map them on the broker:
+
+```properties
+ssl.principal.mapping.rules=RULE:^CN=([a-zA-Z0-9.-]+),.*$/$1/,DEFAULT
+```
 
 ---
 
@@ -155,7 +171,9 @@ spring.kafka.ssl.key-password=${KAFKA_KEY_PASSWORD}
 
 SASL (Simple Authentication and Security Layer) provides username/password and token-based authentication. Use different mechanisms for different client types.
 
-### SASL/PLAIN (Internal Services — Simple)
+### SASL/PLAIN (Development Only)
+
+Passwords are listed in clear text in the broker configuration and sent (inside TLS) on every connection; changing one needs a broker restart. Fine for local development — avoid it in production.
 
 ```properties
 # Broker: SASL_SSL listener (SASL + TLS)
@@ -185,15 +203,18 @@ props.put("sasl.jaas.config",
 
 ### SASL/SCRAM-SHA-512 (Microservices — Recommended)
 
-SCRAM provides a challenge-response protocol — credentials are never sent in plaintext, even with TLS.
+SCRAM provides a challenge-response protocol — the password itself is never sent, only a salted proof; the broker stores salted hashes, and credentials can be added or rotated at runtime with `kafka-configs.sh` (no restart). Still use it over TLS (`SASL_SSL`).
 
 ```bash
-# Create SCRAM credentials in ZooKeeper / KRaft
-kafka-configs.sh --bootstrap-server broker1:9092 \
+# Create SCRAM credentials (stored in the KRaft metadata log).
+# admin.properties holds the admin client's SASL_SSL settings.
+# (The very first admin credential is created when formatting the
+#  storage: kafka-storage.sh format ... --add-scram)
+kafka-configs.sh --bootstrap-server broker1:9094 --command-config admin.properties \
     --alter --add-config "SCRAM-SHA-512=[password=payment-secret]" \
     --entity-type users --entity-name payment-service
 
-kafka-configs.sh --bootstrap-server broker1:9092 \
+kafka-configs.sh --bootstrap-server broker1:9094 --command-config admin.properties \
     --alter --add-config "SCRAM-SHA-512=[password=settlement-secret]" \
     --entity-type users --entity-name settlement-service
 ```
@@ -210,19 +231,23 @@ props.put("sasl.jaas.config",
 
 ### SASL/OAUTHBEARER (Kubernetes — Modern)
 
-OAuth Bearer tokens integrate with Kubernetes service accounts and identity providers (Keycloak, AWS IAM, Azure AD):
+OAuth bearer tokens come from an identity provider (Keycloak, Entra ID, Okta, ...) — in Kubernetes typically with per-workload client credentials. Kafka 3.1+ ships an OIDC client-credentials implementation (KIP-768):
 
 ```java
-// Spring Boot OAUTHBEARER configuration
+// OAUTHBEARER with Kafka's built-in OIDC support (client credentials flow)
 props.put("security.protocol", "SASL_SSL");
 props.put("sasl.mechanism", "OAUTHBEARER");
+props.put("sasl.oauthbearer.token.endpoint.url",
+    "https://keycloak.internal/realms/fintech/protocol/openid-connect/token");
 props.put("sasl.login.callback.handler.class",
     "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginCallbackHandler");
 props.put("sasl.jaas.config",
     "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required " +
-    "oauth.token.endpoint.uri=\"https://keycloak:8080/realms/fintech/protocol/openid-connect/token\" " +
-    "oauth.client.id=\"kafka-payment-service\" " +
-    "oauth.client.secret=\"${OAUTH_CLIENT_SECRET}\";");
+    "clientId=\"kafka-payment-service\" " +
+    // a "${...}" inside a Java string is NOT substituted -- read the secret
+    "clientSecret=\"" + System.getenv("OAUTH_CLIENT_SECRET") + "\";");
+// Brokers validate the JWTs against the IdP's JWKS endpoint
+// (sasl.oauthbearer.jwks.endpoint.url on the broker listener)
 ```
 
 ---
@@ -248,32 +273,32 @@ Access Control Lists (ACLs) grant/deny specific operations to specific identitie
 
 ```bash
 # payment-service: can WRITE to payments.events (producer)
-kafka-acls.sh --bootstrap-server broker1:9092 \
+kafka-acls.sh --bootstrap-server broker1:9094 --command-config admin.properties \
     --add --allow-principal User:payment-service \
     --operation WRITE --operation DESCRIBE \
     --topic payments.events
 
 # settlement-service: can READ from payments.events (consumer)
-kafka-acls.sh --bootstrap-server broker1:9092 \
+kafka-acls.sh --bootstrap-server broker1:9094 --command-config admin.properties \
     --add --allow-principal User:settlement-service \
     --operation READ --operation DESCRIBE \
     --topic payments.events \
     --group settlement-service-group
 
 # notification-service: can READ from payments.events
-kafka-acls.sh --bootstrap-server broker1:9092 \
+kafka-acls.sh --bootstrap-server broker1:9094 --command-config admin.properties \
     --add --allow-principal User:notification-service \
     --operation READ --operation DESCRIBE \
     --topic payments.events \
     --group notification-service-group
 
 # schema-registry: needs WRITE on _schemas topic
-kafka-acls.sh --bootstrap-server broker1:9092 \
+kafka-acls.sh --bootstrap-server broker1:9094 --command-config admin.properties \
     --add --allow-principal User:schema-registry \
     --operation ALL --topic _schemas
 
 # admin user: can describe all topics (monitoring)
-kafka-acls.sh --bootstrap-server broker1:9092 \
+kafka-acls.sh --bootstrap-server broker1:9094 --command-config admin.properties \
     --add --allow-principal User:monitoring-service \
     --operation DESCRIBE --topic '*'
 ```
@@ -408,14 +433,15 @@ public void checkCertificateExpiry() {
 For payment card industry compliance:
 
 ```
-PCI DSS Requirement 2 (Default Credentials):
+PCI DSS Requirement 2 (Secure Configuration / Default Credentials):
   ✓ No default Kafka admin credentials in production
-  ✓ SCRAM-SHA-512 or mTLS — no SASL/PLAIN in production
+  ✓ SCRAM-SHA-512, OAUTHBEARER or mTLS — avoid SASL/PLAIN with static
+    passwords in production (an internal policy choice that supports Req. 8)
 
 PCI DSS Requirement 4 (Data in Transit):
   ✓ TLS 1.2+ for all Kafka traffic
   ✓ No PLAINTEXT listener exposed
-  ✓ Strong cipher suites only (AES-256)
+  ✓ Strong cipher suites only (AES-GCM / ChaCha20-Poly1305)
 
 PCI DSS Requirement 7 (Access Control):
   ✓ ACLs per service — least privilege
@@ -435,12 +461,14 @@ PCI DSS Requirement 12 (Security Policies):
 ### Enable Audit Logging
 
 ```properties
-# Broker: log all authorisation decisions
-authorizer.class.name=kafka.security.authorizer.AclAuthorizer
-# or for KRaft:
+# Broker authorizer -- KRaft (the only mode since Kafka 4.0):
 authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+# (older ZooKeeper-based clusters used kafka.security.authorizer.AclAuthorizer)
 
-# Log to separate audit log file
+# Log to separate audit log file. The authorizer logger writes DENIED
+# requests at INFO and ALLOWED ones at DEBUG (very verbose).
+# Kafka 4.0 uses Log4j 2 -- express the same settings in log4j2.yaml;
+# shown here in the older log4j 1 properties style
 log4j.logger.kafka.authorizer.logger=INFO, authorizerAppender
 log4j.additivity.kafka.authorizer.logger=false
 log4j.appender.authorizerAppender=org.apache.log4j.DailyRollingFileAppender
@@ -540,10 +568,10 @@ public class KafkaSecurityConfig {
         "SCRAM is faster than PLAIN due to fewer round trips",
         "SCRAM provides a challenge-response protocol where credentials are never sent in plaintext, even with TLS",
         "SCRAM does not require TLS while PLAIN does",
-        "SCRAM allows password rotation without broker restart"
+        "SCRAM removes the need for ACLs because each user is already authenticated"
       ],
       "correct": 1,
-      "explanation": "SASL/PLAIN sends credentials in plaintext (relying on TLS for protection). SASL/SCRAM uses a challenge-response mechanism where the actual password is never transmitted — only a salted hash proof. This provides defense-in-depth even if TLS is somehow compromised."
+      "explanation": "SASL/PLAIN sends the password itself (relying on TLS for protection). SASL/SCRAM uses a challenge-response mechanism where the password is never transmitted — only a salted proof — and the broker stores only salted hashes. This gives defence in depth even if TLS were compromised. (SCRAM credentials can also be rotated at runtime. Authentication never replaces ACLs: those decide what an authenticated user may do.)"
     },
     {
       "text": "What is the correct procedure for rolling certificate rotation on a Kafka cluster without downtime?",
@@ -566,10 +594,22 @@ public class KafkaSecurityConfig {
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
-    {"id": "1", "description": "Configure Kafka brokers with SASL_SSL listener (port 9094) using SASL/SCRAM-SHA-512. Create SCRAM credentials for payment-service, settlement-service, and notification-service using kafka-configs.sh. Configure Spring Boot services with SASL_SSL security protocol and SCRAM-SHA-512 mechanism reading passwords from environment variables."},
-    {"id": "2", "description": "Set up ACLs implementing least privilege: payment-service gets WRITE+DESCRIBE on 'payments.events', settlement-service gets READ+DESCRIBE on 'payments.events' and READ on its consumer group, notification-service gets READ+DESCRIBE on 'payments.events'. Verify no service has wildcard WRITE access."},
-    {"id": "3", "description": "Enable Kafka authorisation logging by configuring AclAuthorizer and routing authorisation decisions to a dedicated kafka-authorizer.log file. Implement a certificate expiry monitor that checks keystores daily and sends HIGH severity alerts when any certificate expires within 30 days."},
-    {"id": "4", "description": "Document and implement the four-phase rolling certificate rotation procedure: (1) add new CA to all truststores, (2) rolling broker keystore replacement, (3) rolling client keystore replacement, (4) remove old CA. Test the procedure in a staging environment and verify zero consumer group disconnections during rotation."}
+    {
+      "id": "1",
+      "description": "Configure Kafka brokers with SASL_SSL listener (port 9094) using SASL/SCRAM-SHA-512. Create SCRAM credentials for payment-service, settlement-service, and notification-service using kafka-configs.sh. Configure Spring Boot services with SASL_SSL security protocol and SCRAM-SHA-512 mechanism reading passwords from environment variables."
+    },
+    {
+      "id": "2",
+      "description": "Set up ACLs implementing least privilege: payment-service gets WRITE+DESCRIBE on 'payments.events', settlement-service gets READ+DESCRIBE on 'payments.events' and READ on its consumer group, notification-service gets READ+DESCRIBE on 'payments.events'. Verify no service has wildcard WRITE access."
+    },
+    {
+      "id": "3",
+      "description": "Enable Kafka authorisation logging with the KRaft StandardAuthorizer and route authorisation decisions to a dedicated kafka-authorizer.log file. Implement a certificate expiry monitor that checks keystores daily and sends HIGH severity alerts when any certificate expires within 30 days."
+    },
+    {
+      "id": "4",
+      "description": "Document and implement the four-phase rolling certificate rotation procedure: (1) add new CA to all truststores, (2) rolling broker keystore replacement, (3) rolling client keystore replacement, (4) remove old CA. Test the procedure in a staging environment and verify zero consumer group disconnections during rotation."
+    }
   ]
 }
 -->

@@ -37,10 +37,10 @@ Every write goes to both the cache and the database synchronously.
 
 ```
 Write -> DB (synchronous) + Cache (synchronous) -> return success
-Read  -> Cache -> always HIT (data was written there)
+Read  -> Cache -> usually HIT (unless the entry was evicted or expired)
 ```
 
-**Pros**: Cache always consistent with DB; no cold-start misses for recently written data.
+**Pros**: Cache usually in step with the DB; no cold-start misses for recently written data. (It is still two separate writes: if one fails, or two writers race, cache and DB can disagree — keep a TTL as a safety net.)
 **Cons**: Write latency increases (two writes per mutation); cache fills with data that may never be read.
 
 ### Write-Behind (Write-Back)
@@ -95,15 +95,21 @@ Spring's cache abstraction provides a unified API over any cache implementation.
 @EnableCaching
 public class CacheConfig {
 
-    // L1: Caffeine (in-process, nanosecond access)
+    // L1: Caffeine (in-process, sub-microsecond access).
+    // With TWO cache managers, mark one @Primary and name the other in
+    // @Cacheable(cacheManager = "redisCacheManager", ...)
     @Bean
-    public CaffeineSpec caffeineSpec() {
-        return CaffeineSpec.parse(
-            "maximumSize=10000,expireAfterWrite=60s,recordStats"
-        );
+    @Primary
+    public CaffeineCacheManager caffeineCacheManager() {
+        CaffeineCacheManager manager = new CaffeineCacheManager();
+        manager.setCaffeine(Caffeine.newBuilder()
+            .maximumSize(10_000)
+            .expireAfterWrite(Duration.ofSeconds(60))
+            .recordStats());
+        return manager;
     }
 
-    // L2: Redis (distributed, millisecond access, survives restarts)
+    // L2: Redis (distributed, ~millisecond access, survives restarts)
     @Bean
     public RedisCacheManager redisCacheManager(RedisConnectionFactory factory) {
         RedisCacheConfiguration defaultConfig = RedisCacheConfiguration.defaultCacheConfig()
@@ -121,6 +127,7 @@ public class CacheConfig {
         return RedisCacheManager.builder(factory)
             .cacheDefaults(defaultConfig.entryTtl(Duration.ofSeconds(60)))
             .withInitialCacheConfigurations(cacheConfigs)
+            .transactionAware()   // puts/evicts inside a transaction run AFTER commit
             .build();
     }
 }
@@ -137,12 +144,13 @@ public class ExchangeRateService {
 
     /**
      * Exchange rates: cached 60 seconds.
-     * Business justification: rates change at most once per minute from provider.
+     * Business justification: our provider publishes at most once per minute.
      * Worst-case staleness: 60 seconds.
      * Acceptable for FX display, NOT for trade execution.
      */
     @Cacheable(
         cacheNames = "exchange-rates",
+        cacheManager = "redisCacheManager",
         key = "#baseCurrency + ':' + #quoteCurrency",
         unless = "#result == null"
     )
@@ -153,11 +161,15 @@ public class ExchangeRateService {
     }
 
     /**
-     * @CachePut: update both cache and DB atomically.
-     * Used when rate provider pushes a new rate — cache is updated immediately.
+     * @CachePut: write the new value to the cache as well as the DB.
+     * This is NOT atomic. Without a transaction-aware cache, the put can happen
+     * before the DB commit -- if the commit then fails, the cache holds a rate
+     * that was never stored. The transactionAware() Redis manager above defers
+     * the put until after commit.
      */
     @CachePut(
         cacheNames = "exchange-rates",
+        cacheManager = "redisCacheManager",
         key = "#rate.baseCurrency + ':' + #rate.quoteCurrency"
     )
     @Transactional
@@ -173,6 +185,7 @@ public class ExchangeRateService {
      */
     @CacheEvict(
         cacheNames = "exchange-rates",
+        cacheManager = "redisCacheManager",
         key = "#baseCurrency + ':' + #quoteCurrency"
     )
     public void deactivatePair(String baseCurrency, String quoteCurrency) {
@@ -182,7 +195,7 @@ public class ExchangeRateService {
     /**
      * Evict all exchange rates (e.g., after bulk rate update from provider).
      */
-    @CacheEvict(cacheNames = "exchange-rates", allEntries = true)
+    @CacheEvict(cacheNames = "exchange-rates", cacheManager = "redisCacheManager", allEntries = true)
     public void invalidateAllRates() {
         log.info("Invalidating all cached exchange rates");
     }
@@ -200,14 +213,15 @@ public class AccountMetadataService {
      * Includes: account_number, customer_id, currency, account_type.
      * Does NOT include balance (live data — never cache).
      *
-     * condition: only cache ACTIVE accounts (closed accounts won't be queried again)
-     * unless: don't cache null results (account not found)
+     * condition: skip the cache entirely for a null id
+     * unless: don't cache null results (account not found) or CLOSED accounts
+     *         (status is an enum, so compare its name)
      */
     @Cacheable(
         cacheNames = "account-metadata",
         key = "#accountId",
         condition = "#accountId != null",
-        unless = "#result == null || #result.status == 'CLOSED'"
+        unless = "#result == null || #result.status.name() == 'CLOSED'"
     )
     public AccountMetadata getMetadata(UUID accountId) {
         return accountRepository.findMetadataById(accountId)
@@ -216,7 +230,10 @@ public class AccountMetadataService {
 
     /**
      * When an account's metadata changes (e.g., currency change, type upgrade),
-     * evict immediately to prevent stale reads.
+     * evict to prevent stale reads. Careful: without a transaction-aware cache
+     * the evict can run BEFORE the commit, and a concurrent read can reload
+     * the OLD row and cache it for 300 s. Prefer evicting after commit
+     * (transactionAware() or the event listener in section 7).
      */
     @CacheEvict(cacheNames = "account-metadata", key = "#accountId")
     @Transactional
@@ -232,13 +249,13 @@ TTL choices must be driven by the acceptable staleness window for each data type
 
 | Data Type | TTL | Rationale | Risk of Staleness |
 |---|---|---|---|
-| Exchange rates (display) | 60 s | Rates change at most per minute | FX display shows outdated rate |
+| Exchange rates (display) | 60 s | Provider publishes at most once per minute | FX display shows outdated rate |
 | Exchange rates (execution) | 0 s | No caching — always live for trades | Incorrect trade pricing |
 | Account metadata | 300 s | Changes are rare (account upgrades) | Wrong currency displayed |
 | Fee schedules | 3600 s | Updated by admin, not automated | Wrong fee shown |
 | Country/currency lists | 86400 s | Static reference data | Missing new currency |
 | Account balance | 0 s | Never cache — always from DB | Overdraft, fraud |
-| Transaction status | 0 s | Never cache — compliance requirement | Wrong status shown |
+| Transaction status | 0 s | Never cache — customers and operations act on it | Wrong status shown, duplicate retries |
 | Compliance flags | 0 s | Never cache — real-time requirement | Blocked transaction processed |
 
 ```java
@@ -273,7 +290,7 @@ T=0+100ms: DB overloads, payment processing slows
 
 ### Solution 1: Probabilistic Early Expiry (PER)
 
-Randomly extend TTL for a small fraction of requests as expiry approaches, so the cache is refreshed proactively before it expires for all requests.
+As expiry approaches, a small, random fraction of requests refresh the entry early, so the cache is reloaded by one caller before it expires for everyone. (This is the "XFetch" algorithm.)
 
 ```java
 @Service
@@ -281,7 +298,6 @@ public class ProbabilisticCacheService {
 
     private final RedisTemplate<String, String> redis;
     private final ObjectMapper objectMapper;
-    private final Random random = new Random();
 
     /**
      * Probabilistic Early Expiry (PER) algorithm.
@@ -303,7 +319,7 @@ public class ProbabilisticCacheService {
             double ttlRemaining = expiryEpoch - Instant.now().getEpochSecond();
 
             // Should we refresh early?
-            double jitter = -beta * deltaSeconds * Math.log(random.nextDouble());
+            double jitter = -beta * deltaSeconds * Math.log(ThreadLocalRandom.current().nextDouble());
             if (ttlRemaining > jitter) {
                 return entry.getValue(); // return cached value
             }
@@ -327,9 +343,13 @@ Ensure only one thread executes the DB query for a given cache key — all other
 @Component
 public class SingleFlightCache {
 
-    private final ConcurrentHashMap<String, CompletableFuture<?>> inFlight =
+    private final ConcurrentHashMap<String, CompletableFuture<Object>> inFlight =
         new ConcurrentHashMap<>();
     private final Cache l2Cache;
+
+    public SingleFlightCache(Cache l2Cache) {
+        this.l2Cache = l2Cache;
+    }
 
     @SuppressWarnings("unchecked")
     public <T> CompletableFuture<T> get(String key,
@@ -340,19 +360,29 @@ public class SingleFlightCache {
             return CompletableFuture.completedFuture((T) cached.get());
         }
 
-        // If a load is in progress for this key, return the same future
-        return (CompletableFuture<T>) inFlight.computeIfAbsent(key, k -> {
-            CompletableFuture<T> future = loader.get();
-            future.whenComplete((value, ex) -> {
-                inFlight.remove(key);
-                if (value != null) {
-                    l2Cache.put(key, value);
-                }
-            });
-            return future;
+        // Only ONE caller installs a placeholder future for this key
+        CompletableFuture<Object> mine = new CompletableFuture<>();
+        CompletableFuture<Object> existing = inFlight.putIfAbsent(key, mine);
+        if (existing != null) {
+            return (CompletableFuture<T>) existing;      // join the load in progress
+        }
+
+        // We are the loader. Start it OUTSIDE the map operation: a loader that
+        // completes immediately would otherwise modify the map from inside
+        // computeIfAbsent, which ConcurrentHashMap forbids.
+        loader.get().whenComplete((value, ex) -> {
+            if (ex == null && value != null) {
+                l2Cache.put(key, value);
+            }
+            inFlight.remove(key, mine);                  // only remove OUR entry
+            if (ex != null) mine.completeExceptionally(ex); else mine.complete(value);
         });
+        return (CompletableFuture<T>) mine;
     }
 }
+// Note: this coalesces loads within ONE JVM. Across many instances, each
+// instance may still load once -- usually acceptable; otherwise use a
+// short-lived distributed lock or early refresh.
 ```
 
 ### Solution 3: Background Refresh with Caffeine
@@ -381,7 +411,9 @@ public LoadingCache<String, ExchangeRate> exchangeRateCache(
 
 ## 5. Multi-Level Caching (L1 Caffeine + L2 Redis)
 
-L1 (in-process) provides nanosecond access. L2 (Redis) provides distributed consistency.
+L1 (in-process) provides sub-microsecond access. L2 (Redis) is shared by all instances.
+
+**The catch**: each instance has its own L1. When one instance evicts or updates a key, the other instances' L1 copies stay stale until their L1 TTL expires. Keep L1 TTLs short, and/or broadcast invalidations (for example over Redis pub/sub) so every instance drops its L1 entry.
 
 ```java
 @Configuration
@@ -397,7 +429,7 @@ public class MultiLevelCacheConfig {
      */
     @Bean
     public CacheManager cacheManager(RedisConnectionFactory factory) {
-        return new TwoLevelCacheManager(factory);
+        return new TwoLevelCacheManager(factory);   // creates TwoLevelCache per name (not shown)
     }
 }
 
@@ -435,8 +467,8 @@ public class TwoLevelCache implements Cache {
 
     @Override
     public void evict(Object key) {
-        l1.invalidate(key);
-        l2.evict(key);
+        l1.invalidate(key);      // only THIS instance's L1 --
+        l2.evict(key);           // publish an invalidation message for the others
     }
 
     @Override
@@ -492,9 +524,12 @@ public class BalanceService {
      * 4. Fraud: fraudsters exploit balance cache windows to double-spend
      *
      * If balance reads are a bottleneck, the solution is:
-     * - Read replicas (track-08-lesson-08)
+     * - Make the authorisation check an atomic conditional update on the
+     *   primary (UPDATE ... SET balance = balance - ? WHERE balance >= ?)
      * - Optimistic locking to reduce contention
-     * - Balance ledger optimization (track-05)
+     * - Balance ledger optimisation (track 05)
+     * - Read replicas ONLY for display/history: replica lag is staleness too,
+     *   so never authorise against a replica
      * NOT caching.
      */
     // No @Cacheable annotation — this is intentional
@@ -609,26 +644,16 @@ public class CacheWarmingService implements ApplicationRunner {
 public class CacheMetricsCollector {
 
     private final CacheManager cacheManager;
-    private final MeterRegistry metrics;
 
-    @Scheduled(fixedRate = 30_000)
-    public void collectCacheMetrics() {
-        cacheManager.getCacheNames().forEach(cacheName -> {
-            Cache cache = cacheManager.getCache(cacheName);
-            if (cache instanceof CaffeineCache caffeineCache) {
-                CacheStats stats = caffeineCache.getNativeCache().stats();
+    // Metrics: Spring Boot Actuator already binds Caffeine statistics
+    // (cache.gets{result=hit|miss}, cache.evictions, cache.load.duration ...)
+    // for caches that exist at startup and were built with recordStats().
+    // Compute hit rates in Prometheus/Grafana from those counters.
+    // (Do NOT call metrics.gauge(name, tags, doubleValue) on a schedule: it
+    // registers a boxed number once and never updates it.)
 
-                metrics.gauge("cache.hit_rate",
-                    Tags.of("cache", cacheName), stats.hitRate());
-                metrics.gauge("cache.miss_rate",
-                    Tags.of("cache", cacheName), stats.missRate());
-                metrics.gauge("cache.load_average_ms",
-                    Tags.of("cache", cacheName),
-                    stats.averageLoadPenalty() / 1_000_000.0);
-                metrics.gauge("cache.eviction_count",
-                    Tags.of("cache", cacheName), stats.evictionCount());
-            }
-        });
+    public CacheMetricsCollector(CacheManager cacheManager) {
+        this.cacheManager = cacheManager;
     }
 
     @Scheduled(fixedRate = 60_000)
@@ -642,6 +667,8 @@ public class CacheMetricsCollector {
         thresholds.forEach((cacheName, threshold) -> {
             Cache cache = cacheManager.getCache(cacheName);
             if (cache instanceof CaffeineCache cc) {
+                // Note: stats() is cumulative since start -- a recent drop
+                // shows up slowly. Prefer a rate-based alert in Prometheus.
                 double hitRate = cc.getNativeCache().stats().hitRate();
                 if (hitRate < threshold) {
                     log.warn("Cache hit rate alert: {} hit_rate={} threshold={}",
@@ -667,8 +694,14 @@ class ExchangeRateCacheTest {
     @Autowired
     private ExchangeRateService exchangeRateService;
 
-    @MockBean
+    @MockBean   // @MockitoBean on Spring Boot 3.4+
     private ExchangeRateRepository rateRepository;
+
+    @MockBean
+    private AccountRepository accountRepository;
+
+    @Autowired
+    private BalanceService balanceService;
 
     @Autowired
     private CacheManager cacheManager;
@@ -704,7 +737,7 @@ class ExchangeRateCacheTest {
         // Warm the cache
         exchangeRateService.getRate("USD", "EUR");
 
-        // Update (should evict cache)
+        // Update (@CachePut replaces the cached value)
         exchangeRateService.updateRate(updatedRate);
 
         // Next call should return updated value
@@ -766,7 +799,7 @@ Before caching any data in a financial system, answer these five questions:
         "Regulatory rules prohibit caching of financial data in all jurisdictions"
       ],
       "correct": 1,
-      "explanation": "If a stale cached balance shows sufficient funds when the real balance is insufficient, a payment authorization could succeed incorrectly, causing an overdraft or fraud loss. Even a 1-second TTL is dangerous under concurrent transfers. Balance reads must always go to the primary database with SELECT FOR UPDATE to get a consistent, locked value."
+      "explanation": "If a stale cached balance shows sufficient funds when the real balance is insufficient, a payment authorisation could succeed incorrectly, causing an overdraft or fraud loss. Even a 1-second TTL is dangerous under concurrent transfers. Authorisation decisions must read the primary database under a lock (SELECT ... FOR UPDATE) or use an atomic conditional update (UPDATE ... WHERE balance >= amount) — never a cache or a lagging read replica."
     },
     {
       "text": "What is cache stampede (thundering herd) and how does probabilistic early expiration prevent it?",
@@ -780,15 +813,15 @@ Before caching any data in a financial system, answer these five questions:
       "explanation": "When a popular cache entry expires, all concurrent requests that arrive in the window before the first refresh completes will miss and query the database simultaneously. Probabilistic early expiration (XFetch algorithm) makes some requests refresh the cache slightly before the TTL expires with probability proportional to how close to expiry the entry is, spreading the refresh load."
     },
     {
-      "text": "What is the correct caching strategy for exchange rates used in payment authorization?",
+      "text": "What is the correct caching strategy for indicative exchange rates shown in a customer's app (not the rate actually applied to the payment)?",
       "options": [
         "Never cache exchange rates; always fetch live rates for every transaction",
-        "Cache with a short TTL (60-300 seconds) and implement a background refresh to prevent stampede, since stale rates cause display inaccuracy but not financial loss on authorization",
+        "Cache with a short TTL (60-300 seconds) and a background refresh to prevent stampedes — stale indicative rates only make the display slightly out of date, while the rate actually applied comes from a live, locked quote",
         "Cache exchange rates indefinitely with @CacheEvict triggered only on rate provider updates",
         "Cache exchange rates in the application heap only (never Redis) to avoid network latency"
       ],
       "correct": 1,
-      "explanation": "Exchange rates change infrequently (seconds to minutes between updates) and slight staleness causes display inaccuracy rather than direct financial loss on authorization. A short TTL with background refresh is appropriate. Final settlement uses confirmed rates from the payment network, not the cached display rate, so this risk profile is acceptable."
+      "explanation": "Indicative rates shown on screen can tolerate seconds to minutes of staleness: the impact is a slightly outdated display. A short TTL with background refresh is appropriate. The rate used to convert and charge the payment is different: it must come from a live pricing service as a quote with an expiry that the customer accepts — never from this display cache."
     }
   ]
 }

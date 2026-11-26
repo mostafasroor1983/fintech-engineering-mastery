@@ -40,7 +40,9 @@ START: What problem are you solving?
 
 1. Do you need messages to survive consumption (replay)?
    NO  → Can use RabbitMQ or SQS/SNS
-   YES → Kafka or Pulsar
+   YES → Kafka or Pulsar (managed log services also allow
+         replay: Kinesis, Event Hubs, Pub/Sub with seek --
+         with limited retention)
 
 2. Do multiple independent services need the same messages?
    NO  → Task queue: RabbitMQ, SQS
@@ -52,8 +54,8 @@ START: What problem are you solving?
    >500k/s     → Kafka (definitely)
 
 4. What is your cloud strategy?
-   AWS-first   → MSK (managed Kafka) or SQS/SNS (serverless)
-   GCP-first   → Pub/Sub (serverless, Kafka if Kafka-specifically needed)
+   AWS-first   → MSK (managed Kafka, also serverless) or SQS/SNS
+   GCP-first   → Pub/Sub (serverless), or managed Kafka if Kafka is needed
    Azure-first → Event Hubs (Kafka-compatible) or Service Bus
    On-prem     → Kafka or RabbitMQ
 
@@ -70,18 +72,19 @@ START: What problem are you solving?
 
 ## Broker Comparison Matrix
 
+A qualitative comparison — limits and features of managed services change, so check current documentation before deciding:
+
 | Dimension | Kafka | RabbitMQ | AWS SQS/SNS | Azure Service Bus | Pulsar |
 |-----------|-------|---------|-------------|-------------------|--------|
-| Throughput | 1M+ msg/s | 50-100k/s | ~3k/s (std) | ~1M/s (premium) | 1M+ msg/s |
-| Retention | Days-forever | ACK = gone | 14 days max | 14 days max | Days-forever |
+| Throughput | Very high (scales with partitions) | Moderate per queue; scale with many queues / streams | Standard queues: very high; FIFO: limited per message group | Moderate; scales with premium messaging units (Event Hubs is Azure's high-throughput option) | Very high |
+| Retention | Time/size based, up to forever; compaction | Until ACK (streams: time/size based) | Up to 14 days, until deleted | Until consumed / TTL | Time/size based, tiered storage |
 | Replay | Yes | Streams only | No | No | Yes |
-| Ordering | Per-partition | Per-queue | Per MessageGroupId | Per session | Per-partition |
-| Exactly-once | Within Kafka | No | Deduplication | No native | Yes |
-| Schema evolution | Via Schema Registry | Manual | Manual | Manual | Schema Registry |
-| Managed option | MSK, Confluent Cloud | CloudAMQP | Native AWS | Native Azure | Pulsar Cloud |
-| Multi-tenancy | Manual | Via vhosts | Via SNS | Via namespaces | Native |
-| Geo-replication | MirrorMaker 2 | Federation | Native AWS | Native Azure | Native |
-| Cost at 1M msg/s | High (self-managed) | Very high | Very high | High | Comparable |
+| Ordering | Per partition | Per queue (single consumer) | FIFO: per MessageGroupId | Per session | Per partition / key |
+| Exactly-once | Within Kafka (transactions) | No — at-least-once + idempotency | FIFO: deduplication within a 5-minute window | Duplicate detection within a time window | Transactions |
+| Schema evolution | Schema Registry | Application level | Application level | Application level | Built-in schema registry |
+| Managed option | MSK, Confluent Cloud, others | Amazon MQ, CloudAMQP | Native AWS | Native Azure | StreamNative and others |
+| Multi-tenancy | ACLs, quotas, naming conventions | Via vhosts | Per account / queue | Via namespaces | Native (tenants, namespaces) |
+| Geo-replication | MirrorMaker 2, Cluster Linking | Federation / Shovel | Per region (build it yourself) | Geo-disaster recovery / geo-replication (premium) | Built-in |
 
 ---
 
@@ -92,9 +95,11 @@ CHECKLIST: Choosing your delivery guarantee
 
 [ ] What is the cost of a lost message?
     - Zero cost (telemetry) → at-most-once acceptable
-    - Low cost (notification) → at-least-once with idempotent consumer
-    - High cost (payment event) → at-least-once with idempotent consumer
-    - Catastrophic (settlement instruction) → exactly-once (Kafka EOS)
+    - Any real cost (notification, payment event, settlement
+      instruction) → at-least-once: acks=all, retries, commit
+      offsets only AFTER processing
+    (exactly-once does not lose fewer messages than at-least-once --
+     it removes DUPLICATES)
 
 [ ] What is the cost of a duplicate message?
     - Zero cost (analytics counter) → at-least-once
@@ -109,12 +114,16 @@ CHECKLIST: Choosing your delivery guarantee
 [ ] Is the pipeline purely within Kafka?
     YES → Kafka EOS (producer transactions + read_committed)
     NO  → Outbox pattern (DB) + idempotent consumer (downstream)
+    Kafka EOS never covers side effects OUTSIDE Kafka (a DB write,
+    a call to a bank) -- those need idempotency keys
 
 CONCLUSION:
-    Financial payment events: at-least-once + idempotent consumers (pragmatic)
-    Financial settlement instructions: exactly-once (Kafka EOS or outbox)
+    Financial payment events: at-least-once + idempotent consumers
+    Settlement instructions: at-least-once + idempotency key that the
+        receiving system (bank, ledger) deduplicates on -- plus Kafka EOS
+        where the step is Kafka-to-Kafka
     Non-financial high-volume: at-least-once
-    Low-volume critical: exactly-once or strong deduplication
+    Telemetry: at-most-once is acceptable
 ```
 
 ---
@@ -136,12 +145,18 @@ CONCLUSION:
            → Dedicated topic for high-volume entities
            → Accept cross-sub-partition ordering using sequence numbers
 
-[ ] Do you need ordering guarantees across a failure (rebalance, restart)?
-    NO → Partition key sufficient
-    YES → Application-level sequence numbers + gap detection + replay
+[ ] What happens after a failure (rebalance, restart)?
+    Per-partition order is kept, but records since the last commit are
+    delivered AGAIN → idempotent consumer, or sequence numbers to skip
+    already-applied events
+    Producer side: enable.idempotence=true (default since Kafka 3.0)
+    keeps order across retries
 
 [ ] Does ordering need to be preserved across regions (MirrorMaker 2)?
-    YES → Sequence numbers only (MirrorMaker 2 may change relative ordering)
+    MirrorMaker 2 keeps the order within each replicated partition, but
+    events for one entity written in TWO regions (active-active) have no
+    common order → one home region per entity, or sequence numbers /
+    versioned updates
 ```
 
 ---
@@ -158,8 +173,10 @@ CONCLUSION:
     NONE — only during initial development, never in production
     BACKWARD — new consumers can read old data (add optional fields with defaults)
     FORWARD — old consumers can read new data (consumers skip unknown fields)
-    FULL — both (recommended for financial systems — most restrictive, most safe)
-    FULL_TRANSITIVE — FULL against ALL previous versions (not just the last one)
+    FULL — both (recommended for financial systems — the safest single-step mode)
+    FULL_TRANSITIVE — FULL against ALL previous versions (not just the last
+        one) -- the most restrictive; needed when consumers may read very
+        old retained records
 
 [ ] How will schema changes be deployed?
     Manual check → error prone, do not use
@@ -171,7 +188,8 @@ CONCLUSION:
     2. Deploy all consumers to handle V2 (may receive null for new field)
     3. Deploy producers to populate new field
     4. After migration window, remove old field if needed (new major version)
-    Never: rename a field in Avro without the multi-step migration
+    Never: rename a field in Avro in one step -- use an alias (reader
+    schema) or add the new field, migrate, then remove the old one
 
 [ ] Do you publish events to external consumers (partners, regulators)?
     YES → Stability guarantee required: no breaking changes without 6-month notice
@@ -223,7 +241,7 @@ CONCLUSION:
 
 [ ] Broker health metrics (minimum set):
     - UnderReplicatedPartitions = 0 (alert if > 0)
-    - ActiveControllerCount = 1 (alert if != 1)
+    - ActiveControllerCount summed over the cluster = 1 (alert if != 1)
     - OfflinePartitions = 0 (alert immediately if > 0)
     - RequestHandlerAvgIdlePercent > 0.3 (alert if < 0.2)
 
@@ -259,19 +277,21 @@ Self-Managed Kafka (AWS EC2 or bare metal):
   When: Large teams (>5 engineers) with Kafka expertise, >10M msg/day
 
 MSK (AWS Managed Kafka):
-  Pros: Managed upgrades, integrated with AWS IAM, MSK Connect
+  Pros: Managed upgrades, integrated with AWS IAM, MSK Connect, a serverless option
   Cons: Higher cost than self-managed, some configuration limits
   When: AWS-native platform, want reduced operational overhead
 
 Confluent Cloud:
-  Pros: Full-featured (Schema Registry, Connect, ksqlDB), best support
-  Cons: Highest cost, vendor lock-in on advanced features
-  When: Need Confluent-specific features (Tableau connector, etc.)
+  Pros: Full-featured (Schema Registry, managed connectors, Flink stream
+        processing, Cluster Linking), strong vendor support
+  Cons: Usually the highest list price, lock-in on proprietary features
+  When: Need these managed features and want to run as little as possible
 
 AWS SQS + SNS:
   Pros: Fully serverless, pay-per-use, no operational overhead
-  Cons: No replay (SQS), 14-day retention, limited throughput
-  When: Small-scale (<50k msg/s), AWS-native, teams without Kafka expertise
+  Cons: No replay (SQS), max 14-day retention, FIFO throughput limits,
+        AWS lock-in
+  When: Task queues and fan-out on AWS, teams without Kafka expertise
 
 RabbitMQ (self-managed):
   Pros: Mature, strong routing, low-latency
@@ -306,7 +326,7 @@ Proposed | Accepted | Deprecated | Superseded by ADR-NNN
 ## Alternatives Considered
 | Alternative | Why rejected |
 |-------------|-------------|
-| Kafka EOS   | 5% overhead unacceptable for 1M msg/s telemetry |
+| Kafka EOS   | Transaction overhead not justified for telemetry (example) |
 | RabbitMQ    | No replay capability for compliance audit |
 
 ## Consequences
@@ -391,13 +411,13 @@ Disaster Recovery:
     {
       "text": "A new settlement instruction service needs to consume payment events. The same events must also be consumed by an existing compliance archival service. Settlement instructions require exactly-once semantics. Which broker and configuration is most appropriate?",
       "options": [
-        "AWS SQS — it supports exactly-once delivery natively via MessageDeduplicationId",
+        "AWS SQS FIFO — it deduplicates messages via MessageDeduplicationId",
         "Kafka — log-based model allows independent consumer groups for settlement and compliance; Kafka EOS (transactional producer + read_committed) provides exactly-once for settlement",
         "RabbitMQ with a fanout exchange — broadcasts to both queues simultaneously",
         "Azure Service Bus — sessions provide exactly-once ordering"
       ],
       "correct": 1,
-      "explanation": "Kafka's log-based model is the right choice when multiple independent services need the same messages (each with their own consumer group and offset). SQS is a task queue — once consumed, the message is gone. RabbitMQ fanout delivers a copy to both queues but requires separate queue management and lacks replay. Kafka EOS (transactional producer + isolation.level=read_committed consumer) provides the exactly-once guarantee required for settlement instructions. Azure Service Bus sessions provide ordering but not exactly-once across replicas."
+      "explanation": "Kafka's log-based model is the right choice when multiple independent services need the same messages (each with its own consumer group and offset). SQS is a queue — a consumed and deleted message is gone for other consumers, and FIFO deduplication only covers a 5-minute window. RabbitMQ fanout delivers a copy to both queues but requires separate queue management and lacks replay. Kafka EOS (transactional producer + isolation.level=read_committed consumer) gives exactly-once for Kafka-to-Kafka steps; when the settlement service then calls a bank or writes to a database, an idempotency key is still needed for that side effect. Azure Service Bus sessions provide ordering, not this multi-consumer log model."
     },
     {
       "text": "A schema change is needed for the payments.events topic: a new required field 'regulatory_code' must be added. The team is using Avro with FULL compatibility mode. What is the correct migration procedure?",
@@ -408,7 +428,7 @@ Disaster Recovery:
         "Change the compatibility mode to NONE for the duration of the migration, then switch back to FULL"
       ],
       "correct": 1,
-      "explanation": "FULL compatibility means new schemas are both backward compatible (new consumers can read old records) and forward compatible (old consumers can read new records). Adding a required field with no default violates backward compatibility — old consumers cannot read new records that have a field they don't understand without a default. The safe procedure is: add as optional with a default → deploy consumers → deploy producers → optionally migrate old records. Never use NONE in production or delete topics with retained financial events."
+      "explanation": "FULL compatibility means new schemas are both backward compatible (consumers on the new schema can read old records) and forward compatible (consumers on the old schema can read new records). A required field with no default breaks backward compatibility: a reader using the new schema cannot read old records, because there is no value to fill in for the missing field. The safe procedure is: add the field as optional with a default → deploy consumers → deploy producers to populate it → optionally backfill. 'Required' is then enforced by business validation, not the schema. Never use NONE in production or delete topics with retained financial events."
     },
     {
       "text": "A DLQ has been accumulating entries for 6 hours. The on-call engineer wants to replay all DLQ messages back to the original topic. What precondition must be verified before initiating automated replay?",
@@ -432,7 +452,7 @@ Disaster Recovery:
   "estimatedMinutes": 65,
   "tasks": [
     "Using the broker selection decision tree from this lesson, evaluate three options (Kafka on MSK, AWS SQS+SNS, RabbitMQ self-managed) for a new payment platform with requirements: 200k msg/s peak throughput, 7-day event replay for compliance, 4 independent consumer services, AWS-native deployment, team of 8 with moderate Kafka experience. Document your evaluation in an ADR using the template provided in the lesson.",
-    "Design the delivery guarantee matrix for the platform: map each topic (payments.events, fraud.checks, settlement.instructions, notifications.email) to its appropriate guarantee (at-most-once / at-least-once / exactly-once) based on the cost-of-loss and cost-of-duplicate analysis framework from the lesson. Document the reasoning for each topic.",
+    "Design the delivery guarantee matrix for the platform: map each topic (payments.events, fraud.checks, settlement.instructions, notifications.email) to its appropriate guarantee (at-most-once / at-least-once / exactly-once within Kafka) plus the idempotency mechanism for side effects outside Kafka, based on the cost-of-loss and cost-of-duplicate analysis framework from the lesson. Document the reasoning for each topic.",
     "Implement a DLQ management service that: (1) consumes from a DLQ topic, (2) categorises each entry as TRANSIENT / SCHEMA / BUSINESS / DESERIALIZATION based on the exception type stored in a header, (3) automatically replays TRANSIENT entries after a 60-second delay, (4) routes SCHEMA and BUSINESS entries to separate alerting queues, (5) logs all actions with operator-level audit metadata. Write unit tests for each categorisation path.",
     "Build a Schema Registry CI/CD check: a GitHub Actions workflow step that uses the Confluent Schema Registry REST API to verify that a proposed Avro schema change for payments.events is FULL compatible before merging the PR. If the check fails, the workflow must output the specific compatibility error and block the merge. Test the workflow with both a compatible change (add optional field) and an incompatible change (rename a field)."
   ]

@@ -81,21 +81,26 @@ Pool size = 5 means no queuing at steady state
 
 BUT: if DB slows to 50 ms per query during a slow disk flush:
   Connections needed = 200 TPS * 0.050 s = 10 connections
-  Pool size = 5 -> 50% of requests queue
-  Queue builds up -> timeouts -> cascading failure
+  Pool size = 5 -> the pool can serve only half the arriving work
+  The queue grows without limit -> timeouts -> cascading failure
 ```
 
 ### Too Many Connections
 
 ```
-Scenario: PostgreSQL server with 32 GB RAM, 1,000 connections open
+Scenario: PostgreSQL server with 16 CPU cores, 1,000 connections open
 
-Memory per connection: ~10 MB (working memory, sort buffers, etc.)
-Total connection overhead: 1,000 * 10 MB = 10 GB  <-- 31% of server RAM wasted on overhead
-Remaining for query caches, shared buffers: 22 GB
+Memory: each backend is a separate OS process. An idle one costs a few MB;
+  an active one can use work_mem (default 4 MB) PER sort/hash operation,
+  so 1,000 busy connections can run the server out of RAM.
+CPU: if 300 of them run queries at once on 16 cores, the OS keeps
+  switching between processes, and lock/latch contention rises.
+  Each query gets slower, so connections are held longer -> even more
+  concurrent work.
 
-Result: poor query plan caching, more I/O, slower queries for everyone
-PostgreSQL performs best with 50-200 active connections for most workloads.
+Rule of thumb: keep ACTIVE connections around a small multiple of the
+database's CPU cores; use a pooler (PgBouncer) when many app instances
+need many mostly-idle connections.
 ```
 
 ---
@@ -130,9 +135,10 @@ public class HikariCpConfiguration {
         config.setDriverClassName("org.postgresql.Driver");
 
         // ---- Pool sizing ----
-        // Formula: pool_size = (core_count * 2) + effective_spindle_count
-        // For payment service on 8-core server with SSD (spindle = 1):
-        //   pool_size = (8 * 2) + 1 = 17 -> round to 20
+        // Starting point: (DB core_count * 2) + effective_spindle_count
+        // For an 8-core DATABASE server with SSD (spindle = 1):
+        //   (8 * 2) + 1 = 17 -> 20 (then validate with load tests, and
+        //   divide among app instances -- see section 3)
         config.setMaximumPoolSize(20);
         config.setMinimumIdle(5);  // keep at least 5 warm connections
 
@@ -144,19 +150,24 @@ public class HikariCpConfiguration {
         // idleTimeout: how long an idle connection stays in the pool
         config.setIdleTimeout(600_000);     // 10 minutes
 
-        // maxLifetime: maximum lifetime of a connection (always set below DB-side timeout)
-        // PostgreSQL default is 1 hour; set maxLifetime to 30 minutes to rotate safely
+        // maxLifetime: maximum lifetime of a connection. Set it a little below any
+        // limit imposed by the infrastructure (firewalls, NAT, proxies, PgBouncer
+        // server_lifetime). PostgreSQL itself has no connection lifetime limit.
         config.setMaxLifetime(1_800_000);   // 30 minutes
 
         // keepaliveTime: send keepalive query to prevent firewall timeouts
         config.setKeepaliveTime(60_000);    // 1 minute
 
         // ---- Validation ----
-        config.setConnectionTestQuery("SELECT 1");  // fast health check
+        // Do NOT set connectionTestQuery with a JDBC4 driver such as pgjdbc:
+        // HikariCP then uses Connection.isValid(), which is faster.
         config.setValidationTimeout(2_000);         // must complete in 2 s
 
         // ---- Performance settings ----
-        config.setAutoCommit(false);  // payment services should manage transactions explicitly
+        // Every unit of work then MUST commit explicitly (Spring's
+        // @Transactional does). With JPA, also set
+        // hibernate.connection.provider_disables_autocommit=true
+        config.setAutoCommit(false);
 
         // ---- PostgreSQL-specific properties ----
         config.addDataSourceProperty("ApplicationName", "payment-auth-service");
@@ -208,14 +219,15 @@ spring:
 
 ## 3. Pool Sizing Formula
 
-The authoritative reference for pool sizing comes from HikariCP's own documentation, citing research by Oracle and PostgreSQL teams:
+The best-known starting point is the formula in the HikariCP wiki page "About Pool Sizing", which comes from the PostgreSQL community. Treat it as a first estimate of how many connections the **database** can keep busy efficiently, then confirm with load tests:
 
 ```
 Optimal pool size = (core_count * 2) + effective_spindle_count
 
 Where:
   core_count          = number of CPU cores on the DATABASE server
-  effective_spindle_count = number of disk spindles (1 for SSD, 1-4 for RAID HDDs)
+  effective_spindle_count = number of disk spindles (0 if the working set
+                            is fully cached; ~1 for SSD; 1-4 for RAID HDDs)
 
 Example: 16-core database server with NVMe SSD:
   pool_size = (16 * 2) + 1 = 33
@@ -224,7 +236,7 @@ Example: 8-core database server with 4-disk RAID HDD array:
   pool_size = (8 * 2) + 4 = 20
 ```
 
-**Important**: this is the pool size per application instance. If you run 10 payment service instances, the total connections to PostgreSQL is `10 * 33 = 330` — which may exceed PostgreSQL's limit.
+**Important**: the formula describes the database, not one client. If you run 10 payment service instances each with a pool of 33, the total is `10 * 33 = 330` connections — which may exceed PostgreSQL's `max_connections`, and is far more than 33 *active* queries the server handles well. The utility below keeps the total within `max_connections`; if many of those connections could be busy at the same moment, lower the per-instance pools further or put PgBouncer in front.
 
 ```java
 // ConnectionPoolSizer.java -- utility for calculating pool size
@@ -286,7 +298,7 @@ public class ConnectionPoolSizer {
 
 ## 4. PreparedStatement Caching
 
-A `PreparedStatement` is parsed and planned by the database on first use and cached thereafter. The JDBC driver can maintain its own client-side cache of prepared statements, avoiding the round-trip cost of re-preparing on every connection.
+With pgjdbc, a `PreparedStatement` is sent as an unnamed statement at first; after it has been executed `prepareThreshold` times (default 5) on the same connection, the driver switches to a **named server-side prepared statement**, so PostgreSQL stops re-parsing it. The driver keeps these per connection in its statement cache (`preparedStatementCacheQueries`, default 256), even after your code closes the `PreparedStatement` object. PostgreSQL may then also reuse a generic plan instead of planning every execution.
 
 ```java
 // PreparedStatementCachingExample.java
@@ -296,15 +308,15 @@ public class PaymentRepository {
 
     private final DataSource dataSource;
 
-    // The JDBC URL property preparedStatementCacheQueries=250 means the
-    // pgjdbc driver will cache the last 250 PreparedStatement objects per connection.
-    // This avoids the parse + plan cost on every execution.
+    // preparedStatementCacheQueries=250: pgjdbc keeps up to 250 server-side
+    // prepared statements per connection, so repeated SQL is not re-parsed.
 
     public PaymentRepository(DataSource dataSource) {
         this.dataSource = dataSource;
     }
 
-    // This query is prepared once per connection, cached, reused on subsequent calls
+    // FOR UPDATE only makes sense inside a transaction that goes on to update
+    // the row -- in real code this runs within @Transactional
     private static final String BALANCE_QUERY =
         "SELECT balance FROM accounts WHERE account_id = ? AND currency = ? FOR UPDATE";
 
@@ -312,8 +324,8 @@ public class PaymentRepository {
             throws SQLException {
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(BALANCE_QUERY)) {
-            // On first call with this connection: PostgreSQL parses + plans
-            // On subsequent calls with same connection: plan reused from cache
+            // First executions on a connection: parsed each time;
+            // from the 5th: a named server-side statement, no re-parse
             ps.setString(1, accountId);
             ps.setString(2, currency);
 
@@ -365,11 +377,11 @@ public BigDecimal getBalance_correct(String accountId) throws SQLException {
 Settlement processing often requires inserting thousands of ledger entries atomically. Individual inserts are catastrophically slow compared to batch inserts.
 
 ```
-Performance comparison (PostgreSQL, 10,000 inserts):
+Illustrative comparison (PostgreSQL, 10,000 inserts, ~1 ms network round trip):
   Individual inserts, autocommit=true:  ~45 seconds (network round-trip per insert)
   Individual inserts, one transaction:  ~8 seconds
   JDBC batch inserts:                   ~0.8 seconds
-  JDBC batch + reWriteBatchedInserts:   ~0.3 seconds  (10x improvement)
+  JDBC batch + reWriteBatchedInserts:   ~0.3 seconds
 ```
 
 ### 5.1 Basic JDBC Batch Insert
@@ -434,6 +446,8 @@ public class LedgerEntryRepository {
                 }
 
                 conn.commit();
+                // Note: with reWriteBatchedInserts=true the counts are
+                // Statement.SUCCESS_NO_INFO (-2), not 1 per row
                 return totalResults;
 
             } catch (SQLException e) {
@@ -448,35 +462,36 @@ public class LedgerEntryRepository {
 
 ### 5.2 reWriteBatchedInserts — PostgreSQL Driver Optimisation
 
-The pgjdbc driver's `reWriteBatchedInserts=true` property rewrites multiple `INSERT` statements into a single multi-row INSERT:
+The pgjdbc driver's `reWriteBatchedInserts=true` property rewrites a batch of single-row `INSERT`s into multi-row INSERTs (in chunks of up to 128 rows):
 
 ```sql
--- Without reWriteBatchedInserts (3 separate network round trips per batch boundary):
+-- Without reWriteBatchedInserts: N separate statements. pgjdbc already sends
+-- them pipelined, but the server executes them one by one:
 INSERT INTO ledger_entries VALUES (?, ?, ?, ...);
 INSERT INTO ledger_entries VALUES (?, ?, ?, ...);
 INSERT INTO ledger_entries VALUES (?, ?, ?, ...);
 
--- With reWriteBatchedInserts (1 round trip per batch):
+-- With reWriteBatchedInserts: one statement per chunk of rows:
 INSERT INTO ledger_entries VALUES (?, ?, ?, ...), (?, ?, ?, ...), (?, ?, ?, ...);
 ```
 
-This is a **free 2-5x speedup** for batch insert workloads. Enable it via the JDBC URL or DataSource properties.
+This often gives a **2-3x (sometimes larger) speedup** for batch insert workloads, at no code cost — measure it on yours. Enable it via the JDBC URL or DataSource properties. (For bulk loads of many thousands of rows, PostgreSQL's `COPY` — `CopyManager` in pgjdbc — is faster still.)
 
 ### 5.3 Spring Data JPA Batch Inserts
 
 JPA/Hibernate has its own batching mechanism that works alongside JDBC batching:
 
-```java
-// application.yml
+```yaml
+# application.yml
 spring:
   jpa:
     properties:
       hibernate:
         jdbc:
           batch_size: 250          # match your JDBC batch size
-          order_inserts: true      # group inserts by entity type
-          order_updates: true      # group updates by entity type
           batch_versioned_data: true
+        order_inserts: true        # hibernate.order_inserts: group inserts by entity type
+        order_updates: true        # hibernate.order_updates: group updates by entity type
 
 # Entity must NOT use GenerationType.IDENTITY for batching to work
 # IDENTITY requires a separate DB round-trip per insert to get the generated ID
@@ -495,7 +510,8 @@ public class LedgerEntry {
                     generator = "ledger_entry_seq")
     @SequenceGenerator(name = "ledger_entry_seq",
                        sequenceName = "ledger_entry_id_seq",
-                       allocationSize = 50)  // pre-allocate 50 IDs per round-trip
+                       allocationSize = 50)  // 50 IDs per round-trip -- the DB sequence
+                                             // must use INCREMENT BY 50 to match
     private Long id;
 
     @Column(name = "account_id", nullable = false)
@@ -506,14 +522,21 @@ public class LedgerEntry {
 
     // ... other fields
 
-    // IMPORTANT: equals/hashCode based on business key, not generated id
-    // Hibernate relies on these for first-level cache lookups during batch
+    // equals/hashCode on a business key, not the generated id: the id is null
+    // until the entity is persisted, so id-based equality breaks Sets and
+    // collections that hold new entities. (Hibernate's persistence context
+    // itself tracks entities by id, not by equals.)
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
         if (!(o instanceof LedgerEntry other)) return false;
         return transactionId != null && transactionId.equals(other.transactionId)
             && entrySequence == other.entrySequence;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(transactionId, entrySequence);
     }
 }
 ```
@@ -522,7 +545,7 @@ public class LedgerEntry {
 
 ## 6. Connection Pool Monitoring with Micrometer
 
-HikariCP emits Micrometer metrics automatically when a `MeterRegistry` is provided. The key metrics:
+HikariCP emits Micrometer metrics when a `MeterRegistry` is provided (Spring Boot wires this automatically for its auto-configured pool). The key metrics:
 
 ```java
 // ConnectionPoolMonitor.java
@@ -537,13 +560,14 @@ public class ConnectionPoolMonitor {
         this.meterRegistry = meterRegistry;
     }
 
-    // HikariCP auto-registers these metrics with the pool name prefix:
+    // HikariCP registers these metrics, tagged with pool=<poolName>:
     // hikaricp.connections.active      -- connections in use by application code
     // hikaricp.connections.idle        -- connections available in pool
     // hikaricp.connections.pending     -- threads waiting for a connection
     // hikaricp.connections.max         -- maximumPoolSize
     // hikaricp.connections.min         -- minimumIdle
-    // hikaricp.connections.timeout.total -- count of connection timeout events
+    // hikaricp.connections.timeout     -- counter of connection timeouts
+    //                                     (hikaricp_connections_timeout_total in Prometheus)
     // hikaricp.connections.acquire     -- time to acquire a connection (histogram)
     // hikaricp.connections.usage       -- time a connection is held by application
 
@@ -560,10 +584,10 @@ public class ConnectionPoolMonitor {
             double utilisation = activeConnections / maxConnections;
 
             if (utilisation > 0.9) {
-                log.warn("Connection pool critically saturated: {}/{} ({:.0f}%)",
+                log.warn("Connection pool critically saturated: {}/{} ({}%)",
                     activeConnections.intValue(),
                     maxConnections.intValue(),
-                    utilisation * 100
+                    Math.round(utilisation * 100)
                 );
             }
         }
@@ -601,37 +625,36 @@ public class ConnectionPoolMonitor {
 // PaymentTransactionService.java
 
 @Service
+@Slf4j
 public class PaymentTransactionService {
 
-    private final LedgerEntryRepository ledgerRepo;
-    private final MeterRegistry meterRegistry;
-
-    // Counter for connection pool exhaustion events
+    private final TransactionTemplate tx;
     private final Counter poolExhaustionCounter;
 
-    public PaymentTransactionService(LedgerEntryRepository ledgerRepo,
-                                      MeterRegistry meterRegistry) {
-        this.ledgerRepo = ledgerRepo;
-        this.meterRegistry = meterRegistry;
+    public PaymentTransactionService(PlatformTransactionManager txManager,
+                                     MeterRegistry meterRegistry) {
+        this.tx = new TransactionTemplate(txManager);
         this.poolExhaustionCounter = Counter.builder("db.pool.exhaustion")
             .description("Connection pool exhaustion events")
             .register(meterRegistry);
     }
 
-    @Transactional
+    // NOT annotated @Transactional: with @Transactional the connection is
+    // taken by the transaction interceptor BEFORE this method runs, so a
+    // try/catch inside the method would never see the pool timeout.
     public PaymentResult processPayment(PaymentRequest request) {
         try {
-            return doProcessPayment(request);
-        } catch (org.springframework.dao.DataAccessResourceFailureException e) {
-            // Spring wraps HikariCP's SQLTimeoutException
-            // This means the pool was exhausted and no connection was available
-
+            return tx.execute(status -> doProcessPayment(request));
+        } catch (CannotCreateTransactionException | CannotGetJdbcConnectionException e) {
+            // HikariCP throws SQLTransientConnectionException after
+            // connectionTimeout; Spring wraps it in one of these exceptions.
+            // The pool was exhausted -- no SQL was run, so failing is safe.
             poolExhaustionCounter.increment();
             log.error("DB connection pool exhausted processing payment {}",
                 request.getId(), e);
 
-            // For payment services: fail fast rather than retry
-            // Retrying when pool is exhausted makes the problem worse
+            // Fail fast (e.g. HTTP 503 + Retry-After) rather than retry here:
+            // retrying while the pool is exhausted makes the problem worse
             throw new PaymentServiceUnavailableException(
                 "Payment service temporarily unavailable -- please retry", e
             );
@@ -639,7 +662,7 @@ public class PaymentTransactionService {
     }
 
     private PaymentResult doProcessPayment(PaymentRequest request) {
-        // ... actual processing
+        // ... actual processing (runs inside the transaction)
         return null;
     }
 }
@@ -653,7 +676,7 @@ For every production database-connected service:
 
 - [ ] `maximumPoolSize` calculated using the pool sizing formula
 - [ ] `connectionTimeout` set to fail fast (2-5 seconds) not wait indefinitely
-- [ ] `maxLifetime` set below database-side `idle_in_transaction_session_timeout`
+- [ ] `maxLifetime` set a few seconds/minutes below any infrastructure connection-lifetime limit (firewall, NAT, proxy, PgBouncer)
 - [ ] `keepaliveTime` set to prevent firewall/load-balancer connection drops
 - [ ] `autoCommit=false` for payment services managing explicit transactions
 - [ ] `reWriteBatchedInserts=true` for pgjdbc with batch insert workloads
@@ -676,7 +699,7 @@ For every production database-connected service:
 
 4. A payment service has `connectionTimeout=30000` (30 seconds). During a database slow-down, threads queue waiting for connections. What problem does this cause and what value would you set instead?
 
-5. The `hikaricp.connections.pending` metric spikes to 50 during peak load. The pool size is 20 and query duration is stable at 15 ms average. Using the pool sizing formula, what pool size is needed to handle the load without queuing?
+5. The `hikaricp.connections.pending` metric spikes to 50 during peak load. The pool size is 20, the service runs 2,000 queries per second at peak, and each holds a connection for 15 ms on average. Using Little's law (connections in use = rate × hold time), how many connections are busy on average — and is a bigger pool the right fix, or is something else holding connections?
 
 ---
 
@@ -726,12 +749,12 @@ For every production database-connected service:
       "text": "What effect does reWriteBatchedInserts=true have in pgjdbc, and when does it apply?",
       "options": [
         "It rewrites UPDATE statements as INSERT ... ON CONFLICT for idempotency",
-        "It rewrites multiple single-row INSERT statements executed in a JDBC batch into a single multi-row INSERT VALUES (...), (...), (...), reducing network round-trips",
+        "It rewrites multiple single-row INSERT statements executed in a JDBC batch into multi-row INSERT VALUES (...), (...), (...) statements, reducing per-statement work on the server",
         "It enables server-side prepared statement caching for batch operations",
         "It automatically partitions large batches into smaller sub-batches to avoid lock timeouts"
       ],
       "correct": 1,
-      "explanation": "reWriteBatchedInserts=true causes pgjdbc to transform a JDBC executeBatch() of N single-row INSERTs into one multi-row INSERT VALUES(...), (...), ... statement. This reduces the number of network round-trips and statement parse/plan cycles, typically delivering a 2-5x throughput improvement for batch insert workloads."
+      "explanation": "reWriteBatchedInserts=true causes pgjdbc to transform a JDBC executeBatch() of N single-row INSERTs into multi-row INSERT VALUES(...), (...), ... statements (in chunks of up to 128 rows). pgjdbc already pipelines batched statements, so the gain comes from the server executing far fewer statements — often a 2-3x throughput improvement for batch insert workloads. It applies only to INSERT batches."
     }
   ]
 }

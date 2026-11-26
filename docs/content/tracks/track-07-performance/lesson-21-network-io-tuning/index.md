@@ -15,16 +15,19 @@ prerequisites: [track-07-lesson-20]
 # Network I/O Tuning — TCP, Keepalive, and Buffer Sizing
 
 > [!NOTE]
-> Payment systems make thousands of network calls per second — to databases, payment gateways, fraud services, and messaging systems. A misconfigured TCP socket can add 40ms to every payment that hits a card network. At 1,000 TPS that is 40,000ms of unnecessary latency per second, manifesting as p99 degradation that no amount of algorithmic optimization can fix.
+> Payment systems make thousands of network calls per second — to databases, payment gateways, fraud services, and messaging systems. A misconfigured TCP socket can add tens of milliseconds to every payment call, or make the first request after an idle period fail — p99 problems that no amount of algorithmic optimization can fix.
 
 ## 1. TCP_NODELAY — Disabling the Nagle Algorithm
 
 The Nagle algorithm was designed in 1984 for telnet sessions to reduce tiny packet floods on slow networks. It buffers small outgoing segments and coalesces them into one larger packet.
 
-**Problem**: For payment APIs, every millisecond counts. The Nagle algorithm can delay a small HTTP request (e.g., a 200-byte payment authorization) by up to 40ms while waiting to coalesce it with a second packet.
+**Problem**: For payment APIs, every millisecond counts. Combined with the receiver's *delayed ACK*, Nagle can hold back a small write (e.g., the last part of a 200-byte authorization request) for up to ~40ms on Linux (longer on some systems) while it waits for an acknowledgement.
+
+**Check before tuning:** most modern clients and servers already disable Nagle — Reactor Netty (WebFlux/WebClient), gRPC-Java, Lettuce and pgjdbc set `TCP_NODELAY` by default. Verify what your libraries do; plain `java.net.Socket` code is where Nagle usually remains on.
 
 ```java
-// Netty (used by WebFlux, WebClient, gRPC)
+// Netty (used by WebFlux, WebClient, gRPC) -- Reactor Netty already sets
+// TCP_NODELAY; shown here explicitly
 @Configuration
 public class NettyServerConfig {
 
@@ -33,9 +36,9 @@ public class NettyServerConfig {
         return server -> server
             .option(ChannelOption.SO_BACKLOG, 1024)
             .childOption(ChannelOption.TCP_NODELAY, true)   // disable Nagle
-            .childOption(ChannelOption.SO_KEEPALIVE, true)
-            .childOption(ChannelOption.SO_SNDBUF, 65536)    // 64KB send buffer
-            .childOption(ChannelOption.SO_RCVBUF, 65536);   // 64KB receive buffer
+            .childOption(ChannelOption.SO_KEEPALIVE, true);
+            // Do NOT fix SO_SNDBUF / SO_RCVBUF here: setting them explicitly
+            // turns off Linux buffer auto-tuning (see section 3)
     }
 }
 
@@ -48,20 +51,19 @@ public OkHttpClient paymentGatewayHttpClient() {
         .writeTimeout(Duration.ofMillis(2_000))
         .connectionPool(new ConnectionPool(
             50,              // max idle connections
-            300,             // keep alive duration
+            50,              // keep idle connections below the server/LB idle timeout
             TimeUnit.SECONDS
         ))
-        .socketFactory(new SocketFactory() {
+        // DelegatingSocketFactory: a small helper (not part of OkHttp's API)
+        // that wraps the default factory and calls configureSocket() on
+        // every socket it creates
+        .socketFactory(new DelegatingSocketFactory(SocketFactory.getDefault()) {
             @Override
-            public Socket createSocket() throws IOException {
-                Socket socket = new Socket();
+            protected Socket configureSocket(Socket socket) throws IOException {
                 socket.setTcpNoDelay(true);        // disable Nagle
-                socket.setKeepAlive(true);          // enable keepalive
-                socket.setSendBufferSize(65536);    // 64KB
-                socket.setReceiveBufferSize(65536); // 64KB
+                socket.setKeepAlive(true);         // enable TCP keepalive
                 return socket;
             }
-            // ... other required overrides
         })
         .build();
 }
@@ -70,11 +72,13 @@ public OkHttpClient paymentGatewayHttpClient() {
 ### Verification
 
 ```bash
-# Verify TCP_NODELAY is set on live connections
-ss -tni | grep -A1 "ESTAB" | grep -i "nodelay\|nonagle"
-
-# Or check via /proc for a specific socket
-cat /proc/net/tcp  # complex parsing, prefer ss
+# ss and /proc do NOT show whether TCP_NODELAY is set. Options:
+# 1) Trace the setsockopt calls when the service starts:
+strace -f -e trace=setsockopt -p <pid> 2>&1 | grep TCP_NODELAY
+# 2) Capture traffic and check that small writes go out immediately
+#    instead of waiting for an ACK:
+tcpdump -i any -nn 'tcp port 443' -c 200
+# 3) Check the library's documented defaults / configuration in code
 ```
 
 ## 2. TCP Keepalive — Detecting Dead Connections
@@ -84,7 +88,8 @@ Persistent connections to payment gateways and databases can go "stale" silently
 ### OS-Level Keepalive
 
 ```bash
-# /etc/sysctl.conf — apply to all sockets on the machine
+# /etc/sysctl.conf — defaults for every socket that ENABLES SO_KEEPALIVE
+# (keepalive is off unless the application turns it on)
 net.ipv4.tcp_keepalive_time    = 60   # start keepalive probes after 60s idle
 net.ipv4.tcp_keepalive_intvl   = 10   # send probe every 10s
 net.ipv4.tcp_keepalive_probes  = 3    # send 3 probes before giving up
@@ -137,7 +142,7 @@ public HikariConfig hikariConfig() {
     config.setIdleTimeout(600_000);           // remove idle after 10 min
     config.setKeepaliveTime(60_000);          // send keepalive every 60s
     config.setMaxLifetime(1_800_000);         // recycle connections every 30 min
-    config.setConnectionTestQuery("SELECT 1");
+    // (no connectionTestQuery: pgjdbc is JDBC4, HikariCP uses isValid())
     config.addDataSourceProperty("socketTimeout", "30");  // 30s socket timeout
     config.addDataSourceProperty("tcpKeepAlive", "true");
     return config;
@@ -146,7 +151,7 @@ public HikariConfig hikariConfig() {
 
 ## 3. Socket Buffer Sizing — SO_SNDBUF and SO_RCVBUF
 
-Socket buffers hold data in transit between the application and the network card. Undersized buffers cause backpressure and stall the TCP window.
+Socket buffers hold data in transit between the application and the network card. Undersized buffers limit throughput on links with a large bandwidth-delay product. Linux **auto-tunes** TCP buffers per connection, so for most services the best setting is to leave the defaults alone.
 
 ### Optimal Buffer Size Calculation
 
@@ -159,12 +164,16 @@ Example: 10 Gbps link, 1ms RTT to database:
 For a 1 Gbps link with 1ms RTT:
   Buffer = 1 * 10^9 * 0.001 = 1,000,000 bits = 125 KB
 
-Default Linux socket buffer: 8 KB (way too small for modern networks)
+Linux defaults: tcp_rmem = 4096 131072 6291456, tcp_wmem = 4096 16384 4194304
+(min / initial / max) -- and the kernel grows each connection's buffer
+automatically up to the max. Inside one data centre (RTT well under 1ms)
+the defaults are usually plenty; long, fast links (cross-region
+replication, bulk transfers) may need a higher max.
 ```
 
 ```bash
-# OS-level socket buffer configuration
-# /etc/sysctl.conf
+# OS-level socket buffer configuration -- only for high-BDP links,
+# and only after measuring. /etc/sysctl.conf
 
 # TCP socket buffers
 net.core.rmem_default = 262144    # 256KB default receive buffer
@@ -176,19 +185,20 @@ net.core.wmem_max     = 16777216  # 16MB max send buffer
 net.ipv4.tcp_rmem = 4096 262144 16777216   # min, default, max
 net.ipv4.tcp_wmem = 4096 262144 16777216
 
-# Enable TCP auto-tuning
+# Receive-buffer auto-tuning (already on by default -- keep it on)
 net.ipv4.tcp_moderate_rcvbuf = 1
 ```
 
 ```java
-// Application-level buffer sizing via Netty
+// Application-level buffer sizing via Netty -- usually NOT recommended:
+// setting SO_RCVBUF / SO_SNDBUF explicitly disables the kernel's
+// auto-tuning for those sockets (they stay at the fixed size).
+// Only do this with measurements that show the fixed size is better.
 @Bean
 public NettyServerCustomizer bufferSizing() {
     return server -> server
-        .childOption(ChannelOption.SO_RCVBUF, 262144)  // 256KB receive
-        .childOption(ChannelOption.SO_SNDBUF, 262144)  // 256KB send
-        .childOption(ChannelOption.RCVBUF_ALLOCATOR,
-            new FixedRecvByteBufAllocator(65536));      // 64KB initial allocation
+        .childOption(ChannelOption.SO_RCVBUF, 262144)  // 256KB receive (fixed!)
+        .childOption(ChannelOption.SO_SNDBUF, 262144); // 256KB send (fixed!)
 }
 ```
 
@@ -207,11 +217,15 @@ public class WebClientConfig {
         // Netty connection pool settings
         ConnectionProvider connectionProvider = ConnectionProvider.builder("payment-gateway")
             .maxConnections(100)              // max connections in pool
-            .maxIdleTime(Duration.ofSeconds(300))    // keep idle connections for 5 min
+            // Must be SHORTER than the idle timeout of the server and any load
+            // balancer in between (often 60s) -- otherwise the pool hands out
+            // connections the other side has already closed
+            .maxIdleTime(Duration.ofSeconds(45))
             .maxLifeTime(Duration.ofSeconds(3600))   // recycle connections after 1 hr
             .pendingAcquireMaxCount(200)      // queue up to 200 requests
             .pendingAcquireTimeout(Duration.ofMillis(500)) // timeout in queue
             .evictInBackground(Duration.ofSeconds(30))     // background eviction
+            .metrics(true)                                 // pool metrics in Micrometer
             .build();
 
         HttpClient httpClient = HttpClient.create(connectionProvider)
@@ -236,65 +250,72 @@ public class WebClientConfig {
 
 ```java
 @Bean
-public OkHttpClient stripeHttpClient() {
-    // Stripe API calls are typically 200–600ms
+public OkHttpClient gatewayHttpClient() {
+    // Gateway API calls typically take a few hundred ms
     // Keep 20 connections warm to avoid handshake overhead
     return new OkHttpClient.Builder()
         .connectionPool(new ConnectionPool(
-            20,                // max idle connections per host
-            300,               // keep alive 5 minutes
+            20,                // max idle connections
+            50,                // keep idle below the gateway's idle timeout
             TimeUnit.SECONDS
         ))
         .connectTimeout(500, TimeUnit.MILLISECONDS)
-        .readTimeout(10_000, TimeUnit.MILLISECONDS)   // Stripe can be slow
+        .readTimeout(10_000, TimeUnit.MILLISECONDS)
         .writeTimeout(5_000, TimeUnit.MILLISECONDS)
-        .retryOnConnectionFailure(true)                // retry on stale connection
-        .addInterceptor(new RetryInterceptor(3))
+        // (retryOnConnectionFailure is already true by default: OkHttp
+        //  silently retries some failures on a fresh connection)
+        .addInterceptor(new SafeRetryInterceptor(1))
         .build();
 }
 
-// Interceptor: retry once on connection reset (stale connection from pool)
-public class RetryInterceptor implements Interceptor {
+// Interceptor: retry once on a connection reset -- but ONLY when a retry
+// cannot create a second payment
+public class SafeRetryInterceptor implements Interceptor {
     private final int maxRetries;
+
+    public SafeRetryInterceptor(int maxRetries) {
+        this.maxRetries = maxRetries;
+    }
 
     @Override
     public Response intercept(Chain chain) throws IOException {
         Request request = chain.request();
-        IOException lastException = null;
+        // A reset can happen AFTER the gateway received the request. Retrying
+        // a POST without an idempotency key could charge the customer twice.
+        boolean safeToRetry = "GET".equals(request.method())
+            || request.header("Idempotency-Key") != null;
 
-        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+        for (int attempt = 0; ; attempt++) {
             try {
                 return chain.proceed(request);
             } catch (IOException e) {
-                lastException = e;
-                if (attempt < maxRetries && isRetriable(e)) {
-                    log.warn("Retrying request to {} (attempt {}/{})",
-                        request.url(), attempt + 1, maxRetries);
-                } else {
+                if (!safeToRetry || attempt >= maxRetries || !isRetriable(e)) {
                     throw e;
                 }
+                log.warn("Retrying request to {} (attempt {}/{})",
+                    request.url(), attempt + 1, maxRetries);
             }
         }
-        throw lastException;
     }
 
     private boolean isRetriable(IOException e) {
-        return e instanceof SocketException &&
-               e.getMessage().contains("Connection reset");
+        String msg = e.getMessage();                  // may be null
+        return e instanceof SocketException && msg != null && msg.contains("Connection reset");
     }
 }
 ```
 
 ## 5. TIME_WAIT Exhaustion
 
-When a TCP connection closes, the initiating side enters TIME_WAIT for 2*MSL (typically 60–120 seconds). This prevents port reuse. Under high throughput, source ports can be exhausted.
+When a TCP connection closes, the side that closes first enters TIME_WAIT (60 seconds on Linux). During that time the same 4-tuple (source IP:port → destination IP:port) cannot be reused. A client that opens and closes many connections to ONE destination can therefore run out of source ports for that destination.
 
 ```bash
 # Check current TIME_WAIT connections
 ss -s | grep -i "time-wait\|time_wait"
 
-# Count TIME_WAIT connections to payment gateway
-ss -tn state time-wait | grep "api.payment-gateway.com" | wc -l
+# Count TIME_WAIT connections to the payment gateway
+# (ss shows IP addresses, not host names -- filter on the gateway's IP)
+ss -tn state time-wait dst 203.0.113.10 | wc -l
 
 # If count > 10,000, you have an exhaustion risk
 ```
@@ -302,15 +323,19 @@ ss -tn state time-wait | grep "api.payment-gateway.com" | wc -l
 ### Solutions
 
 ```bash
-# Option 1: Increase ephemeral port range (more ports = more TIME_WAIT capacity)
-# /etc/sysctl.conf
-net.ipv4.ip_local_port_range = 1024 65535   # default is 32768 60999
+# Option 1: Widen the ephemeral port range (more ports = more TIME_WAIT capacity)
+# /etc/sysctl.conf -- keep it above the ports your services LISTEN on,
+# or reserve those with net.ipv4.ip_local_reserved_ports
+net.ipv4.ip_local_port_range = 10000 65535   # default is 32768 60999
 
-# Option 2: Enable TCP TIME_WAIT reuse (safe for client connections)
-net.ipv4.tcp_tw_reuse = 1   # allow reuse of TIME_WAIT sockets for new connections
+# Option 2: TIME_WAIT reuse for OUTGOING connections (needs TCP timestamps,
+# on by default). Linux default is 2 = loopback only; 1 = all.
+net.ipv4.tcp_tw_reuse = 1
 
-# Option 3: Reduce TIME_WAIT duration (controversial — reduces safety margin)
-# net.ipv4.tcp_fin_timeout = 30   # reduce from 60s to 30s
+# NOT an option: net.ipv4.tcp_fin_timeout -- despite the name it controls
+# FIN_WAIT_2, not TIME_WAIT (which is fixed at 60s in Linux).
+# And never look for tcp_tw_recycle: it broke clients behind NAT and was
+# removed in Linux 4.12.
 ```
 
 ```java
@@ -328,7 +353,7 @@ public class NetworkMonitor {
         int timeWaitCount = countTimeWaitConnections();
         if (timeWaitCount > 5_000) {
             log.warn("TIME_WAIT connection count is high: {}. " +
-                "Consider increasing connection pool size to reduce connection churn.",
+                "Connections are being closed too often -- check keep-alive and pool reuse.",
                 timeWaitCount);
         }
     }
@@ -341,36 +366,32 @@ DNS lookups for external payment gateways (Stripe, Braintree, etc.) add 10–100
 
 ```java
 // JVM DNS cache configuration
-// By default, JVM caches DNS forever (security.properties)
-// This is dangerous: if a payment gateway rotates IP addresses, your connections fail
+// Default: successful lookups are cached for 30 seconds (when no security
+// manager is installed; with one, they were cached forever), failures 10s.
+// The setting is a SECURITY property (java.security), not a system property:
+// System.setProperty("networkaddress.cache.ttl", ...) has NO effect.
 
-// Set in application startup
-static {
-    java.security.Security.setProperty(
-        "networkaddress.cache.ttl", "60"           // cache for 60 seconds
-    );
-    java.security.Security.setProperty(
-        "networkaddress.cache.negative.ttl", "10"  // cache failures for 10s
-    );
-}
-
-// Or via JVM flags:
-// -Dsun.net.inetaddr.ttl=60
-// -Dsun.net.inetaddr.negative.ttl=10
-
-// Spring Boot: configure in application startup
-@SpringBootApplication
 public class PaymentApplication {
     public static void main(String[] args) {
-        // Set DNS cache TTL before Spring context loads
-        System.setProperty("networkaddress.cache.ttl", "60");
+        // Set before the first lookup -- i.e. first thing in main()
+        java.security.Security.setProperty("networkaddress.cache.ttl", "60");
+        java.security.Security.setProperty("networkaddress.cache.negative.ttl", "10");
         SpringApplication.run(PaymentApplication.class, args);
     }
 }
+
+// Or via JVM flags (the system-property equivalents):
+// -Dsun.net.inetaddr.ttl=60
+// -Dsun.net.inetaddr.negative.ttl=10
+// Keep the TTL modest: gateways move IPs (CDNs, failover) and a JVM that
+// caches too long keeps calling the old address.
 ```
 
 ```java
 // Monitor DNS resolution time
+// Note: InetAddress.getByName hits the JVM cache most of the time, so this
+// mostly measures the cache; spikes show real lookups (cache expiry or a
+// slow resolver).
 @Component
 public class DnsMonitor {
 
@@ -412,7 +433,9 @@ public class ComprehensiveNettyConfig {
             // Server socket options
             .option(ChannelOption.SO_BACKLOG, 1024)
             // Backlog: max pending connections before the OS starts rejecting.
-            // Default 128 is too low for payment services receiving bursts.
+            // Netty's default comes from net.core.somaxconn (128 on older
+            // kernels, 4096 since Linux 5.4) -- the kernel also caps the value
+            // at somaxconn, so raise both together.
 
             .option(ChannelOption.SO_REUSEADDR, true)
             // Allow binding to a port in TIME_WAIT state (useful during restarts)
@@ -424,22 +447,19 @@ public class ComprehensiveNettyConfig {
             .childOption(ChannelOption.SO_KEEPALIVE, true)
             // Enable TCP keepalive at OS level
 
-            .childOption(ChannelOption.SO_SNDBUF, 262144)
-            // 256KB send buffer — appropriate for intra-datacenter
-
-            .childOption(ChannelOption.SO_RCVBUF, 262144)
-            // 256KB receive buffer
+            // (No SO_SNDBUF / SO_RCVBUF: leave kernel auto-tuning on)
 
             .childOption(ChannelOption.SO_LINGER, -1)
             // -1: standard graceful close (do not use 0 which resets connections)
 
-            .childOption(ChannelOption.CONNECT_TIMEOUT_MILLIS, 1000)
-            // Outbound connection timeout: fail fast if service unreachable
+            // (CONNECT_TIMEOUT_MILLIS belongs on CLIENT bootstraps such as
+            //  WebClient's HttpClient -- accepted server connections never connect)
 
             .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK,
                 new WriteBufferWaterMark(32 * 1024, 64 * 1024))
-            // Backpressure: pause writes when buffer reaches 64KB,
-            // resume at 32KB. Prevents OOM under slow consumers.
+            // Backpressure: the channel is marked "not writable" above 64KB of
+            // pending output and writable again below 32KB. Reactor Netty
+            // respects this; raw Netty code must check channel.isWritable().
 
             .childOption(ChannelOption.AUTO_READ, true)
             // Start reading immediately when connection is established
@@ -467,16 +487,23 @@ public class PaymentGatewayClient {
      * Timeout hierarchy for payment gateway calls:
      *
      * 1. Connect timeout (500ms): fail fast if gateway is unreachable
-     * 2. Request timeout (5s): total time for the request including processing
-     * 3. Read timeout (4s): time to receive first byte of response
-     * 4. Circuit breaker (after 5 consecutive timeouts): open circuit for 30s
+     * 2. Response timeout (5s): time from sending the request to the response
+     * 3. Read timeout (ReadTimeoutHandler): maximum gap between reads
+     * 4. Circuit breaker (after repeated timeouts): open circuit for a while
      *
-     * The outer timeout in your SLA must exceed the gateway's own timeout.
-     * Example: Stripe authorize SLA = 2s. Your timeout must be > 2s.
+     * Your timeout must exceed the time the gateway itself may take,
+     * or you will time out on requests that were going to succeed.
+     *
+     * A timeout does NOT mean the authorization failed: the gateway may have
+     * approved it. Retry only with the SAME idempotency key, and if the
+     * outcome stays unknown, mark the payment PENDING and query the gateway
+     * by that key.
      */
     public Mono<AuthorizationResponse> authorize(AuthorizationRequest request) {
         return webClient.post()
             .uri("/v1/charges/authorize")
+            // Same key on the retry -> the gateway returns the first result
+            .header("Idempotency-Key", request.idempotencyKey())
             .bodyValue(request)
             .retrieve()
             .onStatus(HttpStatusCode::is5xxServerError,
@@ -502,17 +529,8 @@ public class NetworkHealthMonitor {
 
     private final MeterRegistry metrics;
 
-    /**
-     * Monitor key network metrics via Micrometer.
-     * These metrics should feed into your payment SLA dashboard.
-     */
-    @EventListener(ApplicationReadyEvent.class)
-    public void registerNetworkMetrics() {
-        // JVM-level: bytes sent/received (requires JVM NIO metrics)
-        Metrics.addRegistry(metrics);
-
-        // Connection pool metrics via Actuator
-        // Available at: /actuator/metrics/http.client.requests
+    public NetworkHealthMonitor(MeterRegistry metrics) {
+        this.metrics = metrics;
     }
 
     /**
@@ -520,15 +538,15 @@ public class NetworkHealthMonitor {
      * - p99 connection acquisition time > 50ms: pool exhausted
      * - Connection error rate > 0.1%: network instability
      * - DNS resolution time > 10ms: DNS cache miss or DNS server overload
-     * - TIME_WAIT count > 10,000: connection churn (need larger pool)
+     * - TIME_WAIT count > 10,000: connection churn (connections not reused)
+     * (Best expressed as Prometheus alert rules; this check is a fallback.)
      */
     @Scheduled(fixedRate = 15_000)
     public void checkNetworkHealth() {
-        // Connection pool metrics from WebClient (via Actuator metrics)
-        Double pendingConnections = metrics.find("reactor.netty.connection.provider.pending.connections")
-            .gauge()
-            .map(Gauge::value)
-            .orElse(0.0);
+        // Reactor Netty pool metrics (ConnectionProvider built with .metrics(true))
+        Gauge pending = metrics.find("reactor.netty.connection.provider.pending.connections")
+            .gauge();                                   // may be null
+        double pendingConnections = pending != null ? pending.value() : 0.0;
 
         if (pendingConnections > 50) {
             log.warn("High pending WebClient connections: {}. " +
@@ -542,17 +560,18 @@ public class NetworkHealthMonitor {
 
 | Setting | Default | Recommended | Impact |
 |---|---|---|---|
-| TCP_NODELAY | Off (Nagle on) | On | Eliminate 40ms Nagle delay |
+| TCP_NODELAY | Off for plain sockets (most modern libraries turn it on) | On | Avoid Nagle/delayed-ACK stalls |
 | SO_KEEPALIVE | Off | On | Detect stale connections |
 | TCP keepalive_time | 7200s | 60s | Detect failures faster |
-| SO_SNDBUF / SO_RCVBUF | 8 KB | 256 KB | Prevent buffer stall |
-| Connection pool size | Varies | 20–100 | Avoid handshake per request |
-| DNS cache TTL | Indefinite | 60s | Support gateway IP rotation |
-| ip_local_port_range | 32768–60999 | 1024–65535 | Prevent port exhaustion |
-| tcp_tw_reuse | Off | On | Reduce TIME_WAIT impact |
+| SO_SNDBUF / SO_RCVBUF | Kernel auto-tuned | Leave auto-tuned; raise the max only for high-BDP links | Fixed values disable auto-tuning |
+| Pool idle time | Varies | Below the server/LB idle timeout | No stale pooled connections |
+| Connection pool size | Varies | Sized from load tests | Avoid handshake per request |
+| DNS cache TTL | 30s (no security manager) | 30–60s | Follow gateway IP changes |
+| ip_local_port_range | 32768–60999 | e.g. 10000–65535 (reserve listening ports) | Prevent port exhaustion |
+| tcp_tw_reuse | 2 (loopback only) | 1 for busy clients | Reduce TIME_WAIT impact |
 
 > [!WARNING]
-> Never tune `net.ipv4.tcp_fin_timeout` below 15 seconds and never disable `tcp_tw_reuse` without understanding the NAT/load-balancer behavior in your network. Aggressive TCP settings can cause intermittent connection failures that are extremely difficult to diagnose. Measure first with `ss -s` and `netstat -s` before modifying kernel parameters.
+> Change kernel TCP settings only with care: copy-pasted "tuning" (fixed buffer sizes, the removed `tcp_tw_recycle`, very low timeouts) causes intermittent connection failures that are extremely difficult to diagnose — especially behind NAT and load balancers. Measure first with `ss -s` and `nstat` / `netstat -s`, change one setting at a time, and fix connection reuse in the application before touching the kernel.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -566,18 +585,18 @@ public class NetworkHealthMonitor {
         "Nagle's algorithm causes connection reuse issues; TCP_NODELAY disables connection pooling requirements"
       ],
       "correct": 1,
-      "explanation": "Nagle's algorithm is designed to improve throughput for chatty protocols by coalescing small packets. However, for a payment authorization request that fits in a single TCP packet, Nagle can delay the packet up to 40ms (the delayed ACK timeout) waiting for more data to coalesce. Payment SLAs of <100ms cannot afford this delay. Set TCP_NODELAY=true on all payment service sockets."
+      "explanation": "Nagle's algorithm improves efficiency for chatty protocols by holding back small segments while earlier data is unacknowledged. Combined with the receiver's delayed ACK, a small request can wait up to ~40ms on Linux before it is sent. Payment SLAs of <100ms cannot afford this. Set TCP_NODELAY=true on payment service sockets — many modern libraries (Reactor Netty, gRPC, Lettuce, pgjdbc) already do."
     },
     {
       "text": "Why do TCP TIME_WAIT states cause port exhaustion in high-TPS payment services?",
       "options": [
         "TIME_WAIT states consume memory proportional to the payload size of the closed connection",
-        "Each closed TCP connection enters TIME_WAIT for 2×MSL (typically 60-120 seconds); at high TPS with many short-lived connections, the number of TIME_WAIT sockets can exhaust the available ephemeral port range, preventing new connections",
+        "The side that closes a TCP connection first keeps it in TIME_WAIT (60 seconds on Linux); at high TPS with many short-lived connections to the same destination, TIME_WAIT sockets can exhaust the available ephemeral port range, preventing new connections",
         "TIME_WAIT states block the GC thread from reclaiming socket objects",
         "TIME_WAIT is only an issue for UDP; TCP connections use a different closing mechanism"
       ],
       "correct": 1,
-      "explanation": "The default ephemeral port range is 32768-60999 (~28,000 ports). At 1000 short-lived connections/second, with 60s TIME_WAIT, you need 60,000 ports simultaneously — exceeding the default range. Fix: extend the port range (1024-65535), enable tcp_tw_reuse (allows reuse of TIME_WAIT sockets for new connections to the same destination), and use connection pooling to minimize connection creation rate."
+      "explanation": "The default ephemeral port range is 32768-60999 (~28,000 ports). At 1000 new short-lived connections per second to the SAME destination, with 60s of TIME_WAIT, you would need about 60,000 ports at once — more than the range holds. Fixes: reuse connections (keep-alive and pooling, the real cure), widen the port range (keeping listening ports reserved), and enable tcp_tw_reuse for outgoing connections."
     },
     {
       "text": "What is the purpose of SO_KEEPALIVE and why is it important for payment service connections to upstream gateways?",

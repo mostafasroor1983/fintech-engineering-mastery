@@ -30,7 +30,7 @@ prerequisites: [kafka-architecture, kafka-producer, kafka-consumer]
       batch.size=16384  │███
       linger.ms=5       │██
                         │
-      linger.ms=0       │█
+      linger.ms=0       │█        (illustrative shape, not measurements)
                         └──────────────────────► Latency
                         0ms    10ms    50ms   100ms
 ```
@@ -58,7 +58,8 @@ public class HighThroughputProducerConfig {
         props.put(ProducerConfig.BATCH_SIZE_CONFIG, 65536);  // 64KB
 
         // Linger: how long to wait for more records before sending
-        // Default: 0 (send immediately) — increase for throughput at cost of latency
+        // Default: 0 (send immediately; 5 ms since Kafka 4.0) — increase for
+        // throughput at cost of latency
         // For settlement topic: 5ms acceptable. For fraud checks: 0ms required.
         props.put(ProducerConfig.LINGER_MS_CONFIG, 5);       // 5ms
 
@@ -91,20 +92,23 @@ public class LowLatencyProducerConfig {
         Properties props = new Properties();
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
 
-        // Minimum batch size — send as soon as 1 record available
-        props.put(ProducerConfig.BATCH_SIZE_CONFIG, 1);
-
-        // No wait — send immediately
+        // No wait — send immediately (explicit: the default is 5 ms in Kafka 4.0)
         props.put(ProducerConfig.LINGER_MS_CONFIG, 0);
 
-        // No compression — avoids CPU serialisation latency
+        // Keep the default batch.size (16 KB). Do NOT set it to 1: that puts
+        // every record into its own request, so under load requests queue up
+        // and latency gets WORSE. With linger.ms=0, records are sent at once
+        // anyway; batching only happens naturally when records pile up.
+
+        // No compression — avoids compression CPU on the hot path
         props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "none");
 
-        // Single in-flight for ordering (payment events must be ordered)
-        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 1);
+        // Idempotence keeps per-partition ordering with up to 5 in-flight
+        // requests -- no need to drop to 1 (which would cost throughput)
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
 
-        // Acks=1 for lower latency (at cost of durability) — use for non-critical data
-        // Acks=all for financial data
+        // acks=all for financial data (acks=1 only for non-critical data)
         props.put(ProducerConfig.ACKS_CONFIG, "all");
 
         return props;
@@ -126,7 +130,9 @@ public class HighThroughputConsumerConfig {
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
 
         // Minimum bytes to fetch in one request — wait until this much is available
-        // Default: 1 (fetch immediately) — increase to reduce broker load
+        // Default: 1 (fetch immediately) — increase to reduce broker load.
+        // Cost: on a quiet topic each fetch waits up to fetch.max.wait.ms
+        // (500 ms below) -- not for latency-sensitive consumers
         props.put(ConsumerConfig.FETCH_MIN_BYTES_CONFIG, 50000);  // 50KB
 
         // Max wait time for fetch.min.bytes to be satisfied
@@ -152,7 +158,7 @@ public class HighThroughputConsumerConfig {
 }
 ```
 
-**Parallelism tuning:** Consumer throughput scales linearly with the number of partitions (up to the partition count). To double consumer throughput, double the partition count and the number of consumer instances.
+**Parallelism tuning:** Consumer throughput scales roughly with the number of consumer instances, up to the partition count — as long as the downstream (database, APIs) keeps up. To double consumer throughput you may need to double both the partition count and the number of consumer instances (and remember that adding partitions changes the key → partition mapping).
 
 ```
 Topic: payments.events (8 partitions)
@@ -181,7 +187,9 @@ Deployment C: 16 consumers × 1 partition each = same as B (extra consumers idle
 // Compression benchmark setup
 public class CompressionBenchmark {
 
-    // Sample payment event JSON (~200 bytes uncompressed)
+    // Sample payment event JSON (~200 bytes uncompressed). Kafka compresses
+    // whole BATCHES, so the ratio depends on batch size and data similarity;
+    // the numbers below are illustrative
     private static final String SAMPLE_PAYMENT = """
         {"paymentId":"a1b2c3d4-e5f6-7890-abcd-ef1234567890",
          "accountId":"acc-9876","amount":125.50,"currency":"GBP",
@@ -212,7 +220,8 @@ num.network.threads=8
 # Default: 8 — typically 2× num.network.threads
 num.io.threads=16
 
-# Request handler threads: execute produce/fetch/metadata requests
+# Replica fetcher threads: how many threads each broker uses to copy data
+# from partition leaders (helps followers keep up / stay in the ISR)
 num.replica.fetchers=4
 
 # Socket buffer sizes
@@ -220,9 +229,10 @@ socket.send.buffer.bytes=1048576     # 1MB (default: 100KB)
 socket.receive.buffer.bytes=1048576  # 1MB (default: 100KB)
 socket.request.max.bytes=104857600   # 100MB max request size
 
-# Log flush — do NOT flush after every message (OS page cache handles this)
-log.flush.interval.messages=100000
-log.flush.interval.ms=10000
+# Log flush — leave the defaults (no forced fsync): Kafka relies on
+# replication across brokers plus the OS page cache for durability.
+# Forcing periodic flushes (log.flush.interval.messages / .ms) mainly
+# costs throughput.
 
 # Log retention
 log.retention.hours=168   # 7 days
@@ -248,7 +258,9 @@ Kafka's performance is heavily dependent on the OS, particularly filesystem and 
 
 # Format disk with XFS
 mkfs.xfs -f /dev/nvme1n1
-mount -o noatime,nodiratime,nobarrier /dev/nvme1n1 /kafka/data
+mount -o noatime /dev/nvme1n1 /kafka/data
+# (no "nobarrier": it risks data loss on power failure and was removed from
+#  XFS in Linux 4.19; noatime already implies nodiratime)
 
 # /etc/fstab
 /dev/nvme1n1  /kafka/data  xfs  defaults,noatime,nodiratime  0 2
@@ -270,8 +282,11 @@ net.core.wmem_default=262144
 net.core.wmem_max=16777216
 net.core.netdev_max_backlog=2500
 
-# File descriptors — Kafka opens many files
+# File descriptors — Kafka opens many files (segments + sockets).
+# Also raise the per-process limit for the kafka user, e.g. LimitNOFILE=100000
+# in the systemd unit (fs.file-max alone is not enough)
 fs.file-max=1000000
+vm.max_map_count=262144       # memory-mapped index files: one pair per segment
 
 # Apply without reboot
 sysctl -p
@@ -306,10 +321,10 @@ Increasing partitions:
     + Higher throughput (more parallelism)
     + More consumer instances can run simultaneously
   COSTS:
-    - More leader election work during broker failures
-    - Higher end-to-end latency (leader election, ISR sync)
-    - More file handles on brokers
-    - Rebalance time increases proportionally
+    - More leader election work during broker failures (longer unavailability)
+    - More replication work, file handles and memory on brokers
+    - Rebalances and metadata get heavier
+    - Adding partitions later changes the key → partition mapping
 
 Rule of thumb:
   - Start with max(target MB/s ÷ 10, consumers × 2)
@@ -325,7 +340,7 @@ Increase conservatively.
 ## Benchmarking with `kafka-producer-perf-test.sh`
 
 ```bash
-# Throughput test: 1 million records, 100-byte payload
+# Throughput test: 1 million records, 200-byte payload
 kafka-producer-perf-test.sh \
     --topic payments.benchmark \
     --num-records 1000000 \
@@ -338,7 +353,7 @@ kafka-producer-perf-test.sh \
         linger.ms=5 \
         compression.type=lz4
 
-# Expected output:
+# Example output (illustrative -- depends entirely on hardware/network):
 # 1000000 records sent, 185432.21 records/sec (35.37 MB/sec),
 # 2.84 ms avg latency, 112.00 ms max latency,
 # 1 ms 50th, 5 ms 95th, 15 ms 99th, 112 ms 99.9th.
@@ -356,7 +371,7 @@ kafka-consumer-perf-test.sh \
 
 | Metric | Good | Needs Tuning |
 |--------|------|-------------|
-| Throughput (MB/s) | > 100 MB/s per partition | < 10 MB/s |
+| Throughput (MB/s) | Meets your target with headroom (often tens of MB/s per partition) | Below target, or far below the disk/network limit |
 | Avg latency | < 5ms | > 50ms |
 | 99th pct latency | < 50ms | > 500ms |
 | Max latency spike | < 500ms | > 5s |
@@ -380,12 +395,13 @@ public static Properties paymentEventProducer() {
     return p;
 }
 
-// Use Case 2: Fraud event publishing (low latency, acks=1 acceptable)
+// Use Case 2: Fraud signals for a real-time dashboard (low latency).
+// acks=1 is only acceptable if losing a signal on a leader failure is
+// tolerable -- fraud DECISIONS that block payments need acks=all
 public static Properties fraudEventProducer() {
     Properties p = new Properties();
     p.put(ProducerConfig.ACKS_CONFIG, "1");       // Leader ACK only
-    p.put(ProducerConfig.BATCH_SIZE_CONFIG, 1);   // No batching
-    p.put(ProducerConfig.LINGER_MS_CONFIG, 0);    // Send immediately
+    p.put(ProducerConfig.LINGER_MS_CONFIG, 0);    // Send immediately (default batch.size)
     p.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "none");
     return p;
 }
@@ -397,6 +413,9 @@ public static Properties analyticsEventProducer() {
     p.put(ProducerConfig.BATCH_SIZE_CONFIG, 262144);  // 256KB batches
     p.put(ProducerConfig.LINGER_MS_CONFIG, 100);       // 100ms linger
     p.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "zstd");  // Best ratio
+    // > 5 in flight requires idempotence OFF: retries may then reorder or
+    // duplicate records -- acceptable only for analytics-style data
+    p.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, false);
     p.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 10);
     return p;
 }
@@ -408,11 +427,11 @@ public static Properties analyticsEventProducer() {
 
 - Throughput and latency are fundamentally in tension — tune for your use case's SLA, not for maximum throughput.
 - **Producer throughput:** increase `batch.size` (64-256KB) and `linger.ms` (5-100ms); use `lz4` compression.
-- **Producer low latency:** `batch.size=1`, `linger.ms=0`, no compression.
+- **Producer low latency:** `linger.ms=0` with the default `batch.size`, no compression (a tiny `batch.size` makes latency worse under load).
 - **Consumer throughput:** increase `fetch.min.bytes`, `max.poll.records`; scale consumers to match partition count.
 - **Compression:** `lz4` for payment events (best throughput/CPU balance); `zstd` for archival (best ratio).
 - Partition count is the primary throughput lever — plan carefully as reductions require topic recreation.
-- OS tuning (XFS filesystem, `vm.swappiness=1`, network buffers) can double Kafka throughput on the same hardware.
+- OS tuning (XFS, `noatime`, `vm.swappiness=1`, file-descriptor limits, network buffers) removes avoidable bottlenecks — measure the gain on your hardware.
 - Use `kafka-producer-perf-test.sh` before capacity planning, not just to verify after problems.
 
 <!-- KNOWLEDGE-CHECK
@@ -422,12 +441,12 @@ public static Properties analyticsEventProducer() {
       "text": "Which producer configuration settings are correct for minimizing latency at the cost of throughput?",
       "options": [
         "batch.size=262144, linger.ms=100, compression.type=zstd",
-        "batch.size=1, linger.ms=0, compression.type=none",
+        "linger.ms=0 with the default batch.size, compression.type=none",
         "batch.size=65536, linger.ms=5, compression.type=lz4",
         "acks=1, batch.size=32768, linger.ms=10"
       ],
       "correct": 1,
-      "explanation": "Minimum latency requires sending immediately without batching: batch.size=1 (or very small) and linger.ms=0 forces the producer to send each record as soon as it arrives. Disabling compression removes CPU processing time. This sacrifices throughput for the lowest possible latency."
+      "explanation": "Minimum latency means sending immediately without waiting: linger.ms=0 sends each record as soon as the sender thread can, and disabling compression removes compression CPU time. Keep the default batch.size: making it tiny (e.g. 1) does not make sends faster — it forces one request per record, which queues up under load and increases latency."
     },
     {
       "text": "What is the recommended compression format for payment event archival where storage efficiency is the priority?",
@@ -461,10 +480,22 @@ public static Properties analyticsEventProducer() {
   "difficulty": "advanced",
   "estimatedMinutes": 50,
   "tasks": [
-    {"id": "1", "description": "Configure and benchmark three producer profiles: (a) payment events (acks=all, batch.size=32768, linger.ms=5, lz4 compression), (b) fraud detection events (acks=1, batch.size=1, linger.ms=0, no compression), (c) compliance archival (acks=1, batch.size=262144, linger.ms=100, zstd compression). Use kafka-producer-perf-test.sh to measure throughput and 99th percentile latency for each."},
-    {"id": "2", "description": "Tune consumer settings for high-throughput settlement processing: set fetch.min.bytes=50000, fetch.max.wait.ms=500, and max.poll.records=500. Measure the impact on settlement service throughput vs processing latency. Determine the optimal max.poll.records value given a 2-second processing time per batch."},
-    {"id": "3", "description": "Apply OS-level tuning to a Kafka broker: set vm.swappiness=1, vm.dirty_ratio=80, configure XFS filesystem with noatime mount option, and increase socket buffer sizes. Run before/after benchmarks to quantify the throughput improvement."},
-    {"id": "4", "description": "Analyze a hot partition scenario where a high-volume merchant account generates 60% of all payment events. Implement the sub-partitioning strategy using sequence number suffixes (accountId + '-' + (seqNum % 4)) and add application-level sequence number reordering in the consumer to restore per-account ordering."}
+    {
+      "id": "1",
+      "description": "Configure and benchmark three producer profiles: (a) payment events (acks=all, idempotence, batch.size=32768, linger.ms=5, lz4 compression), (b) real-time fraud signals (acks=1, linger.ms=0, default batch.size, no compression), (c) compliance archival (acks=1, batch.size=262144, linger.ms=100, zstd compression). Use kafka-producer-perf-test.sh to measure throughput and 99th percentile latency for each, and also try batch.size=1 for (b) to see why it hurts under load."
+    },
+    {
+      "id": "2",
+      "description": "Tune consumer settings for high-throughput settlement processing: set fetch.min.bytes=50000, fetch.max.wait.ms=500, and max.poll.records=500. Measure the impact on settlement service throughput vs processing latency. Determine the optimal max.poll.records value given a 2-second processing time per batch."
+    },
+    {
+      "id": "3",
+      "description": "Apply OS-level tuning to a Kafka broker: set vm.swappiness=1, vm.dirty_background_ratio=5, mount the XFS data volume with noatime, raise the kafka user's file-descriptor limit and increase socket buffer sizes. Run before/after benchmarks to quantify the throughput improvement."
+    },
+    {
+      "id": "4",
+      "description": "Analyze a hot partition scenario where a high-volume merchant account generates 60% of all payment events. Implement the sub-partitioning strategy using sequence number suffixes (accountId + '-' + (seqNum % 4)) and add application-level sequence number reordering in the consumer to restore per-account ordering."
+    }
   ]
 }
 -->

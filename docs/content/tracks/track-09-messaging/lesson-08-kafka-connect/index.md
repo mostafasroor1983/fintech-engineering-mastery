@@ -100,10 +100,11 @@ The JDBC Source Connector polls a database table or query on a schedule, publish
         "connector.class": "io.confluent.connect.jdbc.JdbcSourceConnector",
         "connection.url": "jdbc:postgresql://postgres:5432/payments_db",
         "connection.user": "kafka_connect_user",
-        "connection.password": "secret",
+        "connection.password": "${file:/secrets/jdbc.properties:password}",
 
         "mode": "timestamp+incrementing",
         "timestamp.column.name": "updated_at",
+        "timestamp.delay.interval.ms": "5000",
         "incrementing.column.name": "id",
         "table.whitelist": "payments",
 
@@ -129,7 +130,7 @@ The JDBC Source Connector polls a database table or query on a schedule, publish
 | `timestamp+incrementing` | Both — most robust | General purpose |
 | `bulk` | Full table on every poll | Small reference tables |
 
-**Limitation vs CDC:** JDBC polling misses deletes, has higher latency, and adds DB load. Use Debezium CDC (Lesson 06) when possible. Use JDBC when CDC is not available (e.g., managed databases without WAL access).
+**Limitation vs CDC:** JDBC polling misses deletes and any intermediate updates between two polls (it only sees the current row), has higher latency, and adds DB load. Timestamp modes can also miss rows from long transactions that commit with an older `updated_at` than the last poll — `timestamp.delay.interval.ms` (above) waits a little before reading recent rows to reduce that risk. Use Debezium CDC (Lesson 06) when possible; use JDBC when logical replication is not available or not allowed. Keep secrets out of connector JSON — use a config provider (`${file:...}`) as shown.
 
 ---
 
@@ -172,6 +173,8 @@ The S3 Sink Connector reads from Kafka topics and writes to Amazon S3, enabling 
 }
 ```
 
+Notes: the Parquet format needs records **with a schema** — use the Avro/Protobuf/JSON Schema converter for this connector, not the schemaless JSON converter of the worker defaults. And `rotate.schedule.interval.ms` (wall-clock rotation) gives up the connector's exactly-once file output; for deterministic files rely on `flush.size` and `rotate.interval.ms` only.
+
 This creates a partitioned Parquet data lake at:
 ```
 s3://fintech-payments-archive/
@@ -187,27 +190,23 @@ s3://fintech-payments-archive/
 
 SMTs are lightweight transformations applied to each message as it passes through a connector. They are chained and applied in order.
 
-### Field Masking (PCI DSS Compliance)
+### Field Masking (Defence in Depth)
 
-Mask sensitive fields before they reach certain sinks:
+Mask sensitive fields before they reach certain sinks. Important for PCI DSS: the **CVV must never be stored at all** after authorisation — it must never be written to Kafka in the first place — and full card numbers (PAN) should be tokenised **before** publishing, because every topic and broker holding a PAN is in PCI scope. Masking in a sink connector is only an extra safety net:
 
 ```json
 {
-    "transforms": "maskCardNumber,maskCvv",
+    "transforms": "maskCardNumber",
     "transforms.maskCardNumber.type":
         "org.apache.kafka.connect.transforms.MaskField$Value",
     "transforms.maskCardNumber.fields": "cardNumber",
-    "transforms.maskCardNumber.replacement": "****-****-****-####",
-    "transforms.maskCvv.type":
-        "org.apache.kafka.connect.transforms.MaskField$Value",
-    "transforms.maskCvv.fields": "cvv",
-    "transforms.maskCvv.replacement": "***"
+    "transforms.maskCardNumber.replacement": "MASKED"
 }
 ```
 
 ### Routing (Topic Selection)
 
-Route messages to different topics based on field value:
+Rename the destination topic using a regular expression on the **topic name** (RegexRouter cannot look at field values — routing by content needs a custom SMT or a stream processor):
 
 ```json
 {
@@ -220,6 +219,8 @@ Route messages to different topics based on field value:
 ```
 
 ### Filtering (Drop Unwanted Records)
+
+(`io.confluent.connect.transforms.Filter` is a Confluent-licensed SMT. Apache Kafka's built-in `Filter` works with *predicates* on topic names, headers or tombstones, not on field values.)
 
 ```json
 {
@@ -248,12 +249,17 @@ Route messages to different topics based on field value:
 ```java
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.transforms.Transformation;
+import java.util.HashMap;
 import java.util.Map;
 
 /**
  * Custom SMT that adds a data_classification field based on payment amount.
  * Used to route high-value payments to enhanced monitoring topics.
+ * This version handles SCHEMALESS values (Map, e.g. JsonConverter with
+ * schemas.enable=false); records with a schema arrive as Struct and need
+ * a schema-aware variant that builds a new Schema + Struct.
  */
 public class PaymentClassificationSMT<R extends ConnectRecord<R>>
         implements Transformation<R> {
@@ -262,27 +268,27 @@ public class PaymentClassificationSMT<R extends ConnectRecord<R>>
     private static final long HIGH_VALUE_THRESHOLD = 100_000_00L; // 100,000.00 in minor units
 
     @Override
+    @SuppressWarnings("unchecked")
     public R apply(R record) {
-        if (record.value() == null) return record;
+        if (record.value() == null) return record;   // tombstone
+        if (!(record.value() instanceof Map)) {
+            throw new DataException("PaymentClassificationSMT expects schemaless (Map) values");
+        }
 
         Map<String, Object> value = (Map<String, Object>) record.value();
-        Long amount = (Long) value.get(AMOUNT_FIELD);
-
-        if (amount == null) return record;
+        // JSON numbers may arrive as Integer or Long -- read as Number
+        Object rawAmount = value.get(AMOUNT_FIELD);
+        if (!(rawAmount instanceof Number amount)) return record;
 
         Map<String, Object> updatedValue = new HashMap<>(value);
-        if (amount >= HIGH_VALUE_THRESHOLD) {
-            updatedValue.put("data_classification", "HIGH_VALUE");
-            updatedValue.put("enhanced_monitoring", true);
-        } else {
-            updatedValue.put("data_classification", "STANDARD");
-            updatedValue.put("enhanced_monitoring", false);
-        }
+        boolean highValue = amount.longValue() >= HIGH_VALUE_THRESHOLD;
+        updatedValue.put("data_classification", highValue ? "HIGH_VALUE" : "STANDARD");
+        updatedValue.put("enhanced_monitoring", highValue);
 
         return record.newRecord(
                 record.topic(), record.kafkaPartition(),
                 record.keySchema(), record.key(),
-                record.valueSchema(), updatedValue,
+                null, updatedValue,                    // still schemaless
                 record.timestamp()
         );
     }
@@ -336,6 +342,9 @@ curl -X PUT http://connect:8083/connectors/payments-s3-sink/resume
 
 # Restart a failed task
 curl -X POST http://connect:8083/connectors/payments-s3-sink/tasks/1/restart
+
+# Restart the connector and only its FAILED tasks in one call (Kafka 3.0+)
+curl -X POST "http://connect:8083/connectors/payments-s3-sink/restart?includeTasks=true&onlyFailed=true"
 
 # Update connector configuration
 curl -X PUT http://connect:8083/connectors/payments-s3-sink/config \
@@ -413,7 +422,7 @@ For **sink connectors**, offsets are tracked via the standard Kafka consumer gro
 }
 ```
 
-When `errors.tolerance=all`, failed records are routed to the DLQ instead of stopping the connector. The DLQ message headers contain error details:
+When `errors.tolerance=all`, records that fail **conversion or transformation** are skipped (and, for **sink** connectors, written to the DLQ) instead of stopping the connector. Two limits: dead-letter topics exist only for sink connectors, and errors while writing to the external system itself are not covered by `errors.tolerance`. For payment data, "tolerate all" can silently drop records — alert on every message that lands in the DLQ. The DLQ message headers contain error details:
 
 ```
 Header: __connect.errors.topic = payments.events
@@ -429,7 +438,9 @@ Header: __connect.errors.exception.message = Failed to convert value...
 ## Connector Monitoring
 
 ```java
-// Spring Boot actuator endpoint for Connect health
+// Spring Boot actuator endpoint for Connect health. Use it for dashboards /
+// readiness of the dependent feature -- NOT as a Kubernetes liveness probe
+// (a broken connector is no reason to restart this application)
 @Component
 public class KafkaConnectHealthIndicator implements HealthIndicator {
 
@@ -535,10 +546,22 @@ public class KafkaConnectHealthIndicator implements HealthIndicator {
   "difficulty": "advanced",
   "estimatedMinutes": 55,
   "tasks": [
-    {"id": "1", "description": "Deploy a Kafka Connect cluster in distributed mode and configure the three internal coordination topics (connect-configs, connect-offsets, connect-status) with replication factor 3. Implement a KafkaConnectHealthIndicator Spring Boot health check that verifies all monitored connectors are RUNNING with zero failed tasks."},
-    {"id": "2", "description": "Create an S3 Sink Connector configuration that archives 'payments.events' to an S3 bucket in Parquet format, partitioned by year/month/day/hour using the event's createdAt field, with KMS server-side encryption and 50,000 message flush size."},
-    {"id": "3", "description": "Implement a custom SMT (PaymentClassificationSMT) that reads the amount field from each payment event and adds a 'data_classification' field ('HIGH_VALUE' for amounts >= 100,000 minor units, 'STANDARD' otherwise), plus an 'enhanced_monitoring' boolean flag."},
-    {"id": "4", "description": "Configure the connector with errors.tolerance=all and a dead letter topic 'payments.connect.dlq' with context headers enabled. Implement automated task restart logic that detects FAILED tasks every 5 minutes and triggers restart via the Connect REST API."}
+    {
+      "id": "1",
+      "description": "Deploy a Kafka Connect cluster in distributed mode and configure the three internal coordination topics (connect-configs, connect-offsets, connect-status) with replication factor 3. Implement a KafkaConnectHealthIndicator Spring Boot health check that verifies all monitored connectors are RUNNING with zero failed tasks."
+    },
+    {
+      "id": "2",
+      "description": "Create an S3 Sink Connector configuration that archives 'payments.events' to an S3 bucket in Parquet format (with a schema-aware converter such as Avro), partitioned by year/month/day/hour using the event's createdAt field, with KMS server-side encryption and 50,000 message flush size."
+    },
+    {
+      "id": "3",
+      "description": "Implement a custom SMT (PaymentClassificationSMT) that reads the amount field from each payment event and adds a 'data_classification' field ('HIGH_VALUE' for amounts >= 100,000 minor units, 'STANDARD' otherwise), plus an 'enhanced_monitoring' boolean flag."
+    },
+    {
+      "id": "4",
+      "description": "Configure the connector with errors.tolerance=all and a dead letter topic 'payments.connect.dlq' with context headers enabled. Implement automated task restart logic that detects FAILED tasks every 5 minutes and triggers restart via the Connect REST API."
+    }
   ]
 }
 -->

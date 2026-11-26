@@ -15,7 +15,7 @@ prerequisites: [track-07-lesson-01]
 # Kafka Producer Tuning — Throughput, Latency, and Financial Durability
 
 > [!NOTE]
-> Kafka producer configuration has a direct impact on throughput, end-to-end latency, and message durability. For financial systems, the default configuration is almost always wrong — it optimises for neither performance nor durability, sitting in an uncomfortable middle ground that serves neither goal well.
+> Kafka producer configuration has a direct impact on throughput, end-to-end latency, and message durability. Since Kafka 3.0 the producer defaults are durable (`acks=all`, `enable.idempotence=true`), but they are not tuned for throughput, and many systems still run older clients or override the defaults. For financial systems, set every durability-related value explicitly and tune batching for your workload.
 
 ## Learning Objectives
 
@@ -32,7 +32,7 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-In 2021 a European payment processor upgraded their Kafka cluster without reviewing producer configuration. The default `acks=1` setting meant the broker acknowledged messages after only the leader replica persisted them. When a broker failed mid-replication, 847 payment events were lost — the leader had acknowledged them but follower replicas had not yet received them. The lost events were payment confirmation callbacks that downstream settlement services never received. Reconciliation caught the discrepancy 18 hours later, resulting in a £2.3M accounting imbalance and a 48-hour incident. The fix was a one-line configuration change: `acks=all`. The lesson: Kafka's default configuration is not safe for financial data.
+*Composite example:* a payment processor's producers ran with `acks=1` — the default for Kafka clients before 3.0, and still a common "performance" override. The broker acknowledged messages after only the leader replica had written them. When a broker failed mid-replication, several hundred payment events were lost: the leader had acknowledged them, but the followers had not yet received them. The lost events were payment confirmation callbacks that downstream settlement services never received. Reconciliation caught the discrepancy many hours later, after a large accounting imbalance and a long incident. The fix was a configuration change: `acks=all` (with `min.insync.replicas=2`). The lesson: check what your producers actually run with — never assume the defaults.
 
 ---
 
@@ -59,7 +59,7 @@ sequenceDiagram
     Sender-->>App: Future<RecordMetadata> resolved
 ```
 
-**`linger.ms`** — How long the producer waits to accumulate records before sending a batch. Default is `0` (send immediately — maximum latency predictability, minimum throughput). Setting `linger.ms=5` tells the producer to wait up to 5ms for more records to arrive, filling the batch before transmission.
+**`linger.ms`** — How long the producer waits to accumulate records before sending a batch. The default was `0` (send immediately — maximum latency predictability, minimum throughput) and is `5` since Kafka 4.0 (KIP-1030). Setting `linger.ms=5` tells the producer to wait up to 5ms for more records to arrive, filling the batch before transmission.
 
 **`batch.size`** — Maximum byte size of a single batch per partition. Default is `16384` (16KB). The batch is sent as soon as it reaches this size, regardless of `linger.ms`. Increasing to `65536` (64KB) or `131072` (128KB) improves throughput for high-volume payment event streams.
 
@@ -100,10 +100,12 @@ For payment event streams where message bodies are JSON-encoded `PaymentEvent` o
 public class KafkaProducerConfig {
 
     @Bean
-    public ProducerFactory<String, PaymentEvent> paymentEventProducerFactory() {
+    public ProducerFactory<String, PaymentEvent> paymentEventProducerFactory(
+            @Value("${kafka.bootstrap-servers}") String bootstrapServers) {
         Map<String, Object> config = new HashMap<>();
 
-        config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "${kafka.bootstrap-servers}");
+        // "${...}" inside a Java string is NOT resolved -- inject the value
+        config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
 
@@ -147,31 +149,33 @@ config.put(ProducerConfig.ACKS_CONFIG, "1");  // DO NOT USE for financial data
 
 // CORRECT — acks=all waits for all ISR replicas
 config.put(ProducerConfig.ACKS_CONFIG, "all");
-// Also set min.insync.replicas=2 on the broker/topic:
-// kafka-configs.sh --alter --entity-type topics --entity-name payment-events
+// Also set min.insync.replicas=2 on the topic (with replication factor 3):
+// kafka-configs.sh --bootstrap-server broker:9092 --alter \
+//   --entity-type topics --entity-name payment-events \
 //   --add-config min.insync.replicas=2
 ```
 
 **`enable.idempotence=true`** — Without idempotence, a network timeout during a produce request can cause the producer to retry and the broker to write the message twice. For payment events this means duplicate processing. Idempotence assigns a producer ID and sequence number to each record, allowing the broker to detect and discard duplicates.
 
-**`max.in.flight.requests.per.connection`** — With idempotence enabled, this can be up to 5 (Kafka 1.1+). Without idempotence, setting it above 1 risks message reordering when retries occur. The combination of `enable.idempotence=true` and `max.in.flight.requests.per.connection=5` gives you exactly-once delivery semantics per partition with maximum pipeline efficiency.
+**`max.in.flight.requests.per.connection`** — With idempotence enabled, this can be up to 5 (Kafka 1.1+). Without idempotence, setting it above 1 risks message reordering when retries occur. The combination of `enable.idempotence=true` and `max.in.flight.requests.per.connection=5` means producer retries cause no duplicates and no reordering within a partition, while keeping the pipeline full. It is not end-to-end exactly-once: a restarted producer gets a new ID, and consumers can still process a record twice, so consumers must be idempotent too (or use Kafka transactions for read-process-write flows).
 
 ```java
 // The three-way configuration that provides financial-grade producer guarantees
 config.put(ProducerConfig.ACKS_CONFIG, "all");
 config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
 config.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
-// Together: at-least-once delivery + deduplication = effectively-once per partition
+// Together: no loss once acknowledged + no duplicates from retries, per partition
+// (Since Kafka 3.0 these are the defaults -- set them explicitly anyway)
 ```
 
 > [!WARNING]
-> `enable.idempotence=true` requires `acks=all`. If you set `enable.idempotence=true` with `acks=1` or `acks=0`, Kafka will throw a `ConfigException` on producer initialisation. These settings must be used together.
+> `enable.idempotence=true` requires `acks=all`. If you explicitly set `enable.idempotence=true` with `acks=1` or `acks=0`, the producer throws a `ConfigException` at start-up. (If you only set `acks=1` and leave idempotence at its default, Kafka 3.x silently turns idempotence off.) These settings must be used together.
 
 ---
 
 ## Buffer Memory and Backpressure
 
-`buffer.memory` controls the total bytes of memory the producer uses for buffering records waiting to be sent. When the buffer is full, `send()` blocks for up to `max.block.ms` before throwing a `BufferExhaustedException`.
+`buffer.memory` controls the total bytes of memory the producer uses for buffering records waiting to be sent. When the buffer is full, `send()` blocks the calling thread for up to `max.block.ms`; after that the send fails with a `BufferExhaustedException` (a `TimeoutException`), reported through the returned future and callback.
 
 ```java
 // Default buffer.memory is 32MB — often too small for high-volume payment processors
@@ -181,14 +185,18 @@ config.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
 config.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 134_217_728L); // 128MB
 config.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 30_000);        // 30 seconds
 
-// Handle BufferExhaustedException explicitly — do NOT silently drop payments
+// Handle send failures explicitly — do NOT silently drop payments.
+// (The most robust design is the transactional outbox from track 05: write the
+//  event in the SAME database transaction as the payment and relay it to Kafka
+//  afterwards, so no event depends on the producer buffer at all.)
 KafkaTemplate<String, PaymentEvent> kafkaTemplate = new KafkaTemplate<>(producerFactory);
 kafkaTemplate.setProducerListener(new ProducerListener<>() {
     @Override
     public void onError(ProducerRecord<String, PaymentEvent> record,
                         RecordMetadata metadata,
                         Exception exception) {
-        // CRITICAL: a payment event that couldn't be buffered must be persisted elsewhere
+        // Called for ANY send failure (buffer full, delivery timeout, ...).
+        // CRITICAL: a payment event that could not be sent must be persisted elsewhere
         // Options: write to outbox table, circuit break the payment, alert on-call
         log.error("Failed to buffer payment event: {}", record.value().getPaymentId(), exception);
         outboxService.persistForRetry(record.value());
@@ -235,7 +243,10 @@ public CompletableFuture<PaymentConfirmation> sendPaymentEvent(PaymentEvent even
         .exceptionally(ex -> {
             log.error("Payment event delivery failed after retries: paymentId={}",
                 event.getPaymentId(), ex);
-            // Terminal failure — escalate to outbox/DLT
+            // Terminal failure — escalate to outbox/DLT.
+            // Careful: a delivery timeout does NOT prove the broker never wrote
+            // the record. Re-sending from the outbox can create a duplicate,
+            // so consumers must de-duplicate (e.g. by paymentId).
             throw new PaymentEventDeliveryException(event.getPaymentId(), ex);
         });
 }
@@ -249,13 +260,18 @@ Producer tuning must be complemented by consumer tuning. A well-tuned producer t
 
 ```java
 @Bean
-public ConsumerFactory<String, PaymentEvent> paymentEventConsumerFactory() {
+public ConsumerFactory<String, PaymentEvent> paymentEventConsumerFactory(
+        @Value("${kafka.bootstrap-servers}") String bootstrapServers) {
     Map<String, Object> config = new HashMap<>();
 
-    config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "${kafka.bootstrap-servers}");
+    config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
     config.put(ConsumerConfig.GROUP_ID_CONFIG, "payment-processor-group");
     config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
     config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+    config.put(JsonDeserializer.TRUSTED_PACKAGES, "com.example.payments.events");
+
+    // If producers use Kafka transactions, read only committed records
+    config.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
 
     // Fetch tuning — wait until at least 1KB is available before returning
     // Reduces fetch request count under light load
@@ -277,13 +293,13 @@ public ConsumerFactory<String, PaymentEvent> paymentEventConsumerFactory() {
 ```
 
 > [!TIP]
-> For financial consumers, always use manual offset commit (`ENABLE_AUTO_COMMIT_CONFIG=false`) with `ackMode = MANUAL_IMMEDIATE` or `MANUAL`. Auto-commit acknowledges offsets on a timer, not on successful processing. A consumer crash between auto-commit and processing completion causes data loss. Manual commit ensures offsets advance only after your business logic completes successfully.
+> For financial consumers, disable Kafka's auto-commit (`ENABLE_AUTO_COMMIT_CONFIG=false`) and let the listener container commit — its default `AckMode.BATCH` commits after your listener returns, or use `MANUAL` / `MANUAL_IMMEDIATE` to commit yourself. Auto-commit commits on a timer, not on successful processing: if work is handed to other threads, offsets can be committed for records that were never processed, and a crash then loses them. Commit only after your business logic has completed — and make processing idempotent, because after a crash some records will be delivered again.
 
 ---
 
 ## Benchmarking Results — Default vs Tuned
 
-The following measurements were taken on a 3-broker Kafka 3.5 cluster, payment event messages averaging 480 bytes each, using a Gatling producer load test over 10 minutes.
+Illustrative results for a 3-broker cluster with payment event messages of about 480 bytes. Your numbers will differ — always measure on your own hardware and payloads.
 
 | Configuration | Throughput (msg/s) | P99 Produce Latency | P99.9 Produce Latency | Compression Ratio |
 |---|---|---|---|---|
@@ -292,7 +308,7 @@ The following measurements were taken on a 3-broker Kafka 3.5 cluster, payment e
 | `acks=all`, idempotent, `linger=5ms`, lz4 | 78,000 | 22ms | 55ms | 1.6x |
 | `acks=all`, idempotent, `linger=10ms`, zstd, 128KB batch | 124,000 | 28ms | 70ms | 2.9x |
 
-The tuned configuration delivers 3x higher throughput than default while maintaining durability guarantees. The 10ms additional latency from `linger.ms=5` is negligible for most financial event processing — only authorisation confirmations require sub-5ms Kafka produce latency.
+In this example the tuned configuration delivers about 3x the throughput of the old defaults while keeping the durability guarantees. The extra ~10ms of P99 latency from batching is negligible for most financial event processing — only a few paths, such as authorisation confirmations, need very low Kafka produce latency.
 
 ---
 
@@ -304,7 +320,7 @@ The tuned configuration delivers 3x higher throughput than default while maintai
 
 **Q2: You increase `batch.size` from 16KB to 128KB on a payment event producer. Throughput increases significantly but P99 latency increases from 15ms to 85ms. What is causing the latency increase and how do you fix it?**
 
-**A:** With `linger.ms=0` (default), the producer sends a batch immediately when a record arrives. At 128KB batch size and low message volume, the batch rarely fills, so each message still sends immediately. But at higher volumes, the producer is now flushing larger batches, and network serialisation takes longer. If P99 latency is 85ms, this suggests the producer is waiting for `linger.ms` to expire to flush partially-filled batches — meaning `linger.ms` has inadvertently been set above 0, or the batch is building up. Check `linger.ms` configuration. For payment events, keep `batch.size=64KB` and `linger.ms=5`, which balances batching efficiency with bounded latency.
+**A:** `batch.size` alone does not delay sending: with `linger.ms=0` a batch is sent as soon as the sender is free. The usual cause is a non-zero `linger.ms` (explicitly set, or the default of 5 ms since Kafka 4.0, or a larger value): with a bigger `batch.size` the batch is full less often, so more records wait for the whole linger time. Larger requests also take longer to send and replicate, and if `buffer.memory` fills up, `send()` itself starts blocking. Check `linger.ms`, the producer metrics `record-queue-time-avg/max` and `bufferpool-wait-time`, and keep `linger.ms` small (1–5 ms) relative to the SLO — for payment events, `batch.size=64KB` with `linger.ms=5` is a balanced starting point.
 
 ---
 
@@ -345,18 +361,18 @@ The tuned configuration delivers 3x higher throughput than default while maintai
         "128KB batches exceed Kafka's max.message.bytes default and are silently rejected and retried"
       ],
       "correct": 1,
-      "explanation": "batch.size alone does not add latency — the producer sends as soon as a batch is full. If latency increased significantly, linger.ms is configured above 0, causing the producer to wait for linger.ms even for small batches. With a larger batch.size, the batch fills less often, and linger.ms becomes the dominant latency factor. The fix is to keep linger.ms small (1-5ms) relative to the SLO."
+      "explanation": "batch.size alone does not add latency — the producer sends as soon as a batch is full or the sender is free. If latency increased significantly, linger.ms is above 0 (explicitly, or the 5 ms default since Kafka 4.0), so records wait for linger.ms. With a larger batch.size the batch fills less often, and linger.ms becomes the dominant latency factor. The fix is to keep linger.ms small (1-5ms) relative to the SLO."
     },
     {
       "text": "What is the purpose of enable.idempotence=true in a financial Kafka producer, and what configuration constraint does it impose?",
       "options": [
         "It prevents duplicate consumers by tracking consumer group offsets",
-        "It guarantees exactly-once delivery by assigning each producer a PID and sequence numbers, requiring acks=all and max.in.flight.requests.per.connection <= 5",
+        "It prevents duplicates and reordering caused by producer retries by giving each producer a PID and per-partition sequence numbers; it requires acks=all and max.in.flight.requests.per.connection <= 5",
         "It enables Kafka transactions for atomic multi-topic writes",
         "It is a no-op in Kafka 3.x where idempotence is always enabled by default"
       ],
       "correct": 1,
-      "explanation": "enable.idempotence=true assigns the producer a unique Producer ID (PID) and sequence numbers each record. The broker detects and discards duplicates from retries. This requires acks=all (to ensure all ISR brokers can detect duplicates) and max.in.flight.requests.per.connection <= 5 (to allow the broker to track sequence numbers reliably). It eliminates duplicate events from producer retries — critical for payment events."
+      "explanation": "enable.idempotence=true gives the producer a Producer ID (PID) and numbers each record per partition. The broker uses the sequence numbers to discard duplicates and reject out-of-order batches caused by retries. It requires acks=all (so an acknowledged write cannot be lost on a leader change, which would break the sequence) and max.in.flight.requests.per.connection <= 5 (the number of batches the broker tracks per producer). It has been the default since Kafka 3.0. It is not end-to-end exactly-once: consumers must still be idempotent, or use transactions."
     }
   ]
 }

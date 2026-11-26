@@ -120,8 +120,9 @@ public class AccountBalanceProjection {
                            event_offset = ?,
                            last_event_at = NOW()
                     WHERE  account_id = ?
+                      AND  event_offset < ?
                     """,
-                    record.offset(), accountId);
+                    record.offset(), accountId, record.offset());
             }
             default -> log.debug("Event type {} not handled by balance projection", eventType);
         }
@@ -129,7 +130,7 @@ public class AccountBalanceProjection {
 }
 ```
 
-The `event_offset < ?` guard in UPDATE prevents out-of-order replay from overwriting a newer state with an older one during projection rebuild.
+The `event_offset < ?` guard makes every UPDATE idempotent: a redelivered event has an offset the row has already passed, so it changes nothing (a deposit is never applied twice). It works because all events of one account are in the same partition, so their offsets only grow. If the events are ever copied to another topic or cluster, offsets change — the aggregate version carried in the event (Lesson 09) is the more robust guard.
 
 ---
 
@@ -203,51 +204,46 @@ Rebuilding a projection is necessary when:
 
 ```java
 @Service
+@Slf4j
 public class ProjectionRebuildService {
 
     private final AdminClient adminClient;
     private final JdbcTemplate jdbc;
-    private final ApplicationContext ctx;
+    private final TransactionTemplate tx;
 
     /**
-     * Rebuild a projection with zero-downtime using a shadow table approach.
-     * The live table remains readable during rebuild.
+     * Zero-downtime rebuild with a shadow table, in two steps.
+     *
+     * Step 1 (startShadowRebuild): create the shadow table and let a NEW
+     * consumer group (e.g. proj-account-balance-v2) fill it from the earliest
+     * offsets. The LIVE group keeps updating the live table meanwhile --
+     * do not reset the live group, or the live table stops being updated.
      */
-    public void rebuildWithShadow(String projectionName, String consumerGroupId,
-                                   String topic, int partitionCount) {
-        log.warn("Starting projection rebuild: {} consumer group: {}",
-                 projectionName, consumerGroupId);
-
-        // 1. Create shadow table (copy of the live table, empty)
+    public void startShadowRebuild() {
+        // LIKE ... INCLUDING ALL copies columns, defaults, constraints and
+        // indexes -- the primary key is needed for ON CONFLICT.
+        // (CREATE TABLE ... AS TABLE ... WITH NO DATA would copy NONE of them.)
         jdbc.execute("CREATE TABLE account_summary_shadow " +
-                     "AS TABLE account_summary WITH NO DATA");
+                     "(LIKE account_summary INCLUDING ALL)");
+        // Deploy the projection with target table = account_summary_shadow and
+        // groupId = proj-account-balance-v2, auto.offset.reset = earliest
+        log.warn("Shadow rebuild started -- deploy the v2 projection consumers");
+    }
 
-        // 2. Reset consumer group offsets to 0 (earliest) for all partitions
-        Map<TopicPartition, OffsetAndMetadata> resetOffsets = new HashMap<>();
-        for (int i = 0; i < partitionCount; i++) {
-            resetOffsets.put(new TopicPartition(topic, i),
-                             new OffsetAndMetadata(0));
-        }
-
-        // Consumer group must be stopped before resetting offsets
-        adminClient.alterConsumerGroupOffsets(consumerGroupId, resetOffsets)
-                   .all()
-                   .get(30, TimeUnit.SECONDS);
-
-        log.info("Consumer group offsets reset to 0 for group: {}", consumerGroupId);
-
-        // 3. Restart the consumer service — it will replay from offset 0
-        //    and populate the shadow table
-        //    (In practice: rolling restart of the projection microservice
-        //     with shadow table target configuration)
-
-        // 4. When replay is complete (consumer lag reaches 0), atomically swap:
-        jdbc.execute("BEGIN");
-        jdbc.execute("ALTER TABLE account_summary RENAME TO account_summary_old");
-        jdbc.execute("ALTER TABLE account_summary_shadow RENAME TO account_summary");
-        jdbc.execute("DROP TABLE account_summary_old");
-        jdbc.execute("COMMIT");
-
+    /**
+     * Step 2 (promoteShadow): when the v2 group's lag is ~0, swap the tables
+     * in ONE database transaction, then point the v2 consumers at the live
+     * table name and stop the old group.
+     */
+    public void promoteShadow() {
+        // JdbcTemplate.execute("BEGIN") / ("COMMIT") would NOT work: each call
+        // may run on a different pooled connection. Use a real transaction.
+        tx.executeWithoutResult(status -> {
+            jdbc.execute("SET LOCAL lock_timeout = '5s'");   // don't queue behind readers forever
+            jdbc.execute("ALTER TABLE account_summary RENAME TO account_summary_old");
+            jdbc.execute("ALTER TABLE account_summary_shadow RENAME TO account_summary");
+        });
+        // DROP TABLE account_summary_old after verification
         log.info("Projection rebuild complete — shadow table promoted to live");
     }
 
@@ -255,23 +251,29 @@ public class ProjectionRebuildService {
      * Simple rebuild for non-production or small tables.
      * Causes brief unavailability of the read model.
      */
-    public void rebuildSimple(String consumerGroupId, String topic,
-                               int partitionCount) {
-        // 1. Stop the consumer (outside this method — requires orchestration)
+    public void rebuildSimple(String consumerGroupId, String topic) throws Exception {
+        // 1. Stop the consumers (outside this method — requires orchestration);
+        //    offsets can only be changed while the group has no active members
         // 2. Truncate the read table
         jdbc.execute("TRUNCATE TABLE account_summary");
 
-        // 3. Reset offsets
+        // 3. Reset offsets to the EARLIEST available offsets (after retention
+        //    removed old segments, that is no longer 0)
+        Set<TopicPartition> partitions = adminClient.describeTopics(List.of(topic))
+            .allTopicNames().get().get(topic).partitions().stream()
+            .map(p -> new TopicPartition(topic, p.partition()))
+            .collect(Collectors.toSet());
         Map<TopicPartition, OffsetAndMetadata> resetOffsets = new HashMap<>();
-        for (int i = 0; i < partitionCount; i++) {
-            resetOffsets.put(new TopicPartition(topic, i),
-                             new OffsetAndMetadata(0));
-        }
+        adminClient.listOffsets(partitions.stream()
+                .collect(Collectors.toMap(tp -> tp, tp -> OffsetSpec.earliest())))
+            .all().get(30, TimeUnit.SECONDS)
+            .forEach((tp, info) -> resetOffsets.put(tp, new OffsetAndMetadata(info.offset())));
+
         adminClient.alterConsumerGroupOffsets(consumerGroupId, resetOffsets)
                    .all()
                    .get(30, TimeUnit.SECONDS);
 
-        // 4. Restart the consumer — replay from offset 0
+        // 4. Restart the consumers — replay from the earliest offsets
     }
 }
 ```
@@ -309,6 +311,8 @@ public class ProjectionLagMonitor {
 
     private final AdminClient adminClient;
     private final MeterRegistry meterRegistry;
+    // Gauge registered once per group; the job only updates the holder
+    private final Map<String, AtomicLong> lagByGroup = new ConcurrentHashMap<>();
 
     @Scheduled(fixedDelayString = "${projection.lag.check.interval:30000}")
     public void checkLag() throws Exception {
@@ -341,8 +345,12 @@ public class ProjectionLagMonitor {
                     - e.getValue().offset()))
                 .sum();
 
-            meterRegistry.gauge("kafka.projection.lag",
-                Tags.of("group", groupId), totalLag);
+            lagByGroup.computeIfAbsent(groupId, g -> {
+                AtomicLong holder = new AtomicLong();
+                Gauge.builder("kafka.projection.lag", holder, AtomicLong::get)
+                    .tag("group", g).register(meterRegistry);
+                return holder;
+            }).set(totalLag);
 
             if (totalLag > 50_000) {
                 log.error("Projection lag critical: group={} lag={}", groupId, totalLag);
@@ -358,7 +366,7 @@ public class ProjectionLagMonitor {
 
 | Query Type | Consistency Requirement | Strategy |
 |---|---|---|
-| Payment authorisation (can I debit?) | Strong — must be current | Query write-side aggregate via Kafka (synchronous replay) or use a strongly-consistent write-side cache |
+| Payment authorisation (can I debit?) | Strong — must be current | Decide on the write side, with concurrency control (the command handler that owns the account, an expected-version check, or a database row lock) — never from a projection |
 | Account balance for customer portal | Near-real-time (seconds) | Projection consumer with low lag target (< 5 seconds) |
 | Transaction history (past 90 days) | Eventually consistent | Standard projection consumer |
 | Fraud risk score | Eventually consistent (minutes) | Dedicated batch projection |
@@ -377,7 +385,10 @@ public ResponseEntity<AuthorisationResult> authorise(@RequestBody PaymentRequest
         return ResponseEntity.ok(AuthorisationResult.declined("Insufficient funds"));
     }
 
-    // ... proceed with the payment
+    // ... proceed with the payment: append the debit WITH an expected-version
+    // check (account.getVersion()). Without it, two concurrent requests can
+    // both see "sufficient funds" and both debit -- the check above alone is
+    // not enough.
 }
 
 // Balance for UI: use projection (eventual consistency is acceptable)
@@ -464,6 +475,8 @@ public class PaymentHistoryProjection {
             record.headers().lastHeader("eventType").value());
 
         UUID accountId = UUID.fromString(record.key());
+        // Kafka record timestamp as a simple default; prefer the event's own
+        // occurredAt field (business time) when the payload carries it
         Instant occurredAt = Instant.ofEpochMilli(record.timestamp());
 
         switch (eventType) {
@@ -549,19 +562,22 @@ adminClient.alterConsumerGroupOffsets(consumerGroupId, resetOffsets).all().get()
 // Duration of outage: depends on replay time (can be hours for large topics)
 
 // GOOD: shadow table approach — live table is never unavailable
-// 1. Consumer writes to account_summary_rebuild during replay
-// 2. When lag reaches 0, atomically rename tables in a single transaction
-jdbc.execute("BEGIN");
-jdbc.execute("ALTER TABLE account_summary RENAME TO account_summary_bak");
-jdbc.execute("ALTER TABLE account_summary_rebuild RENAME TO account_summary");
-jdbc.execute("COMMIT");
+// 1. A NEW consumer group writes to account_summary_rebuild during replay
+//    (the live group keeps the live table current meanwhile)
+// 2. When its lag reaches 0, rename the tables in ONE real transaction
+//    (TransactionTemplate -- not jdbc.execute("BEGIN"), which may run on a
+//     different pooled connection than the following statements)
+tx.executeWithoutResult(status -> {
+    jdbc.execute("ALTER TABLE account_summary RENAME TO account_summary_bak");
+    jdbc.execute("ALTER TABLE account_summary_rebuild RENAME TO account_summary");
+});
 // DROP account_summary_bak after verification
 // Zero downtime: the live table is accessible throughout
 ```
 
-### Pitfall 2 — Too Many Consumer Groups Causing Broker Pressure
+### Pitfall 2 — Too Many Consumer Groups Each Re-Reading the Topic
 
-A team creates a separate consumer group for every micro-feature (12 projections, each with 3 instances, all consuming the same 32-partition topic). The broker handles 36 × 32 = 1,152 open fetch sessions simultaneously, causing elevated CPU and memory on the broker.
+A team creates a separate consumer group for every micro-feature (12 projections, each with 3 instances, all consuming the same 32-partition topic). Every group reads the whole topic, so the brokers serve 12× the fetch traffic (often from page cache, but during replays from disk), and there are 12 sets of offsets, rebalances and lag alerts to operate. Kafka handles many groups well — the cost is real but usually moderate; the point is to consolidate projections that share the same lifecycle.
 
 ```java
 // BAD: 12 separate consumer groups, each with 3 replicas, for a single topic
@@ -569,7 +585,7 @@ A team creates a separate consumer group for every micro-feature (12 projections
 // @KafkaListener(topics = "account.events", groupId = "proj-history")
 // @KafkaListener(topics = "account.events", groupId = "proj-velocity")
 // ... 9 more groups ...
-// = 36 consumer instances x 32 partitions = 1152 fetch sessions on broker
+// = 12x the fetch traffic for the same data, 12 groups to operate
 
 // GOOD OPTION 1: multiplex event types within a single listener
 // One consumer group dispatches to multiple projection handlers
@@ -625,7 +641,7 @@ public void project(ConsumerRecord<String, byte[]> record) {
 - [ ] Each projection is a separate Kafka consumer group
 - [ ] Projection consumers use `read_committed` isolation level
 - [ ] All INSERT statements include `ON CONFLICT (event_id) DO NOTHING` for idempotency
-- [ ] UPDATE statements include an `event_offset < ?` guard to prevent stale overwrites
+- [ ] UPDATE statements are guarded (aggregate version, or `event_offset < ?`) so redelivered events are no-ops
 - [ ] Payment authorisation queries the write-side aggregate, not the projection
 - [ ] Consumer group lag is monitored and alerted (threshold: > 10,000 events lag)
 - [ ] Projection rebuild uses shadow table to avoid unavailability
@@ -638,9 +654,9 @@ public void project(ConsumerRecord<String, byte[]> record) {
 ---
 
 <!-- KNOWLEDGE-CHECK
-{"questions":[{"text":"Why should payment authorisation (checking if sufficient funds exist) query the write-side aggregate rather than the balance projection?","options":["Projections are stored in a different database that is slower to query","The balance projection may be seconds behind the write side due to Kafka consumer lag, meaning a recently debited account could appear to have sufficient funds in the projection","Projections do not store balance information","The write-side aggregate is always faster to query than a PostgreSQL table"],"correct":1,"explanation":"Projections are updated asynchronously by a Kafka consumer. If the consumer is even one second behind, a projection-based authorisation could approve a payment for an account that was just debited by another concurrent transaction. Authorisation requires the current, strongly-consistent state from the write-side aggregate."},{"text":"A projection consumer has a bug that causes it to calculate account balances incorrectly. After fixing the bug, what is the correct procedure to get accurate projections?","options":["Deploy the fix and wait for the next event to trigger a re-calculation","Truncate the projection table, reset the consumer group offset to 0 (earliest), and restart the consumer to replay all events","Manually update the incorrect rows in the projection table","Create a database migration script that corrects the balance calculations"],"correct":1,"explanation":"Event sourcing enables exactly this scenario. Because all events are stored in Kafka, you can truncate the projection table, reset the consumer group offset to 0, and replay all events through the corrected projection logic. The result is a fully accurate projection derived deterministically from the event log."},{"text":"A projection consumer uses INSERT INTO account_transactions ... ON CONFLICT (event_id) DO NOTHING. Why is this critical for correctness?","options":["It improves query performance by avoiding duplicate index entries","It makes the projection consumer idempotent — if the same event is consumed twice (due to consumer restart before offset commit), the second application is safely ignored, preventing duplicate transaction history rows","It prevents the Kafka consumer from polling the same partition twice","It is required by the read_committed isolation level"],"correct":1,"explanation":"Kafka guarantees at-least-once delivery by default — after a consumer restart, events may be redelivered. Without ON CONFLICT DO NOTHING on the idempotency key (event_id), a redelivered MoneyDeposited event would insert a second row in account_transactions, showing a deposit twice in the customer's history. The idempotency guard makes the consumer safe to replay."}]}
+{"questions": [{"text": "Why should payment authorisation (checking if sufficient funds exist) query the write-side aggregate rather than the balance projection?", "options": ["Projections are stored in a different database that is slower to query", "The balance projection may be seconds behind the write side due to Kafka consumer lag, meaning a recently debited account could appear to have sufficient funds in the projection", "Projections do not store balance information", "The write-side aggregate is always faster to query than a PostgreSQL table"], "correct": 1, "explanation": "Projections are updated asynchronously by a Kafka consumer. If the consumer is even one second behind, a projection-based authorisation could approve a payment for an account that was just debited. Authorisation needs the current state from the write side — and the debit itself must be appended with a concurrency check (expected version or row lock), otherwise two concurrent authorisations can both pass."}, {"text": "A projection consumer has a bug that causes it to calculate account balances incorrectly. After fixing the bug, what is the correct procedure to get accurate projections?", "options": ["Deploy the fix and wait for the next event to trigger a re-calculation", "Truncate the projection table, reset the consumer group offset to 0 (earliest), and restart the consumer to replay all events", "Manually update the incorrect rows in the projection table", "Create a database migration script that corrects the balance calculations"], "correct": 1, "explanation": "Event sourcing enables exactly this. Because all events are stored in Kafka, you can rebuild the projection by replaying every event (from the earliest retained offset) through the corrected logic — simply by truncating and resetting the consumer group, or, without downtime, by filling a shadow table with a new consumer group and swapping the tables. The result is a fully accurate projection derived deterministically from the event log."}, {"text": "A projection consumer uses INSERT INTO account_transactions ... ON CONFLICT (event_id) DO NOTHING. Why is this critical for correctness?", "options": ["It improves query performance by avoiding duplicate index entries", "It makes the projection consumer idempotent — if the same event is consumed twice (due to consumer restart before offset commit), the second application is safely ignored, preventing duplicate transaction history rows", "It prevents the Kafka consumer from polling the same partition twice", "It is required by the read_committed isolation level"], "correct": 1, "explanation": "Kafka guarantees at-least-once delivery by default — after a consumer restart, events may be redelivered. Without ON CONFLICT DO NOTHING on the idempotency key (event_id), a redelivered MoneyDeposited event would insert a second row in account_transactions, showing a deposit twice in the customer's history. The idempotency guard makes the consumer safe to replay."}]}
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{"title":"Build a Multi-Projection CQRS System for Account Events","difficulty":"advanced","estimatedMinutes":70,"tasks":[{"id":"1","description":"Create three independent projection consumers for the account.events topic: (a) AccountBalanceProjection with groupId=proj-balance maintaining account_summary table, (b) PaymentHistoryProjection with groupId=proj-history maintaining account_transactions table, (c) FraudVelocityProjection with groupId=proj-fraud maintaining fraud_velocity table. Each must use read_committed isolation, ON CONFLICT DO NOTHING idempotency, and handle at least 4 event types. Write integration tests using EmbeddedKafka that publish 20 events and verify all three projections are consistent."},{"id":"2","description":"Implement a ProjectionLagMonitor that uses AdminClient to calculate consumer group lag for all three projection groups every 30 seconds. Expose the lag as a Prometheus gauge metric (kafka_projection_lag with label group). Write a test that pauses a consumer, publishes 100 events, and asserts the lag metric exceeds 100 before the consumer resumes."},{"id":"3","description":"Implement the shadow-table rebuild strategy for the AccountBalanceProjection: create account_summary_rebuild as a copy of account_summary with no data, reset consumer group offsets to 0 for proj-balance, let the consumer write to the shadow table during replay, and when lag reaches 0, atomically rename the tables in a single transaction. Write a test that verifies GET /accounts/{id}/balance returns non-empty responses throughout the rebuild."},{"id":"4","description":"Implement an AccountEventUpcaster that handles MoneyDeposited schema version 1 (no reference field) and version 2 (with reference field). The upcaster reads the schemaVersion header and returns a fully populated MoneyDeposited regardless of version. Integrate it into the PaymentHistoryProjection consumer. Write a test that publishes both v1 and v2 MoneyDeposited events and verifies both appear correctly in account_transactions with synthetic references for v1 events."}]}
+{"title": "Build a Multi-Projection CQRS System for Account Events", "difficulty": "advanced", "estimatedMinutes": 70, "tasks": [{"id": "1", "description": "Create three independent projection consumers for the account.events topic: (a) AccountBalanceProjection with groupId=proj-balance maintaining account_summary table, (b) PaymentHistoryProjection with groupId=proj-history maintaining account_transactions table, (c) FraudVelocityProjection with groupId=proj-fraud maintaining fraud_velocity table. Each must use read_committed isolation, ON CONFLICT DO NOTHING idempotency, and handle at least 4 event types. Write integration tests using EmbeddedKafka that publish 20 events and verify all three projections are consistent."}, {"id": "2", "description": "Implement a ProjectionLagMonitor that uses AdminClient to calculate consumer group lag for all three projection groups every 30 seconds. Expose the lag as a Prometheus gauge metric (kafka_projection_lag with label group). Write a test that pauses a consumer, publishes 100 events, and asserts the lag metric exceeds 100 before the consumer resumes."}, {"id": "3", "description": "Implement the shadow-table rebuild strategy for the AccountBalanceProjection: create account_summary_rebuild with LIKE account_summary INCLUDING ALL, run a NEW consumer group (proj-balance-v2, auto.offset.reset=earliest) that writes to the shadow table while the live group keeps the live table current, and when the v2 lag reaches 0, rename the tables in a single database transaction. Write a test that verifies GET /accounts/{id}/balance returns non-empty responses throughout the rebuild."}, {"id": "4", "description": "Implement an AccountEventUpcaster that handles MoneyDeposited schema version 1 (no reference field) and version 2 (with reference field). The upcaster reads the schemaVersion header and returns a fully populated MoneyDeposited regardless of version. Integrate it into the PaymentHistoryProjection consumer. Write a test that publishes both v1 and v2 MoneyDeposited events and verifies both appear correctly in account_transactions with synthetic references for v1 events."}]}
 -->

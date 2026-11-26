@@ -90,18 +90,24 @@ By the end of this lesson you will be able to:
 ### 1.2 Manual Dump via jcmd
 
 ```bash
-# Capture heap dump without killing the process
-jcmd <pid> GC.heap_dump /tmp/payment-service-heap.hprof
+# Capture heap dump without killing the process.
+# By default only LIVE objects are dumped: the JVM runs a full GC first,
+# so no separate GC.run is needed. The JVM is paused while the dump is
+# written (seconds for large heaps) -- take the instance out of traffic.
+jcmd <pid> GC.heap_dump /var/tmp/payment-service-heap.hprof
 
-# Force GC before dump (reduces false positives from short-lived garbage)
-jcmd <pid> GC.run
-jcmd <pid> GC.heap_dump /tmp/payment-service-heap-postgc.hprof
+# Include unreachable objects too (no forced GC)
+jcmd <pid> GC.heap_dump -all /var/tmp/payment-service-heap-all.hprof
+
+# Heap dumps contain customer data (account numbers, names...) --
+# store and transfer them like production data, and delete them after use.
 ```
 
 ### 1.3 Heap Histogram (Lightweight — No Dump File Required)
 
 ```bash
-# Fast histogram -- shows object counts and sizes by class
+# Histogram -- object counts and sizes by class (live objects only:
+# it triggers a full GC first; add -all to skip that)
 jcmd <pid> GC.class_histogram | head -50
 
 # Output:
@@ -117,12 +123,16 @@ jcmd <pid> GC.class_histogram | head -50
 If `PaymentRequest` count keeps growing between histograms captured 5 minutes apart, you have a leak.
 
 ```bash
-# Script: capture histograms at intervals and diff
+# Script: capture histograms at intervals and compare instance counts by class
 for i in 1 2 3; do
   jcmd "$PID" GC.class_histogram > /tmp/histogram-$i.txt
   sleep 300  # 5 minutes
 done
-diff /tmp/histogram-1.txt /tmp/histogram-3.txt | grep "^[<>]" | head -30
+# Join on class name (last column) and print the biggest growth in instances
+awk 'NR==FNR && $1 ~ /:$/ {before[$4]=$2; next}
+     $1 ~ /:$/ {print $2 - before[$4], $4}' \
+  /tmp/histogram-1.txt /tmp/histogram-3.txt | sort -rn | head -20
+# (a plain diff is useless: the rows re-order as sizes change)
 ```
 
 ---
@@ -131,15 +141,16 @@ diff /tmp/histogram-1.txt /tmp/histogram-3.txt | grep "^[<>]" | head -30
 
 This distinction is fundamental to MAT analysis.
 
-**Shallow heap**: The memory consumed by the object itself — the object header plus its direct fields. For a `String`, this is typically 24 bytes (header + char[] reference + offset + count fields).
+**Shallow heap**: The memory consumed by the object itself — the object header plus its direct fields. For a `String` on a 64-bit JVM with compressed references, this is typically 24 bytes (12-byte header + `value` array reference + cached `hash` + `coder` byte, padded). The character data lives in a separate `byte[]`.
 
 **Retained heap**: The memory that would be freed if this object were collected — shallow heap plus all objects exclusively reachable through it.
 
 ```
 Example:
   PaymentBatch object:
-    shallow heap:  48 bytes  (the batch object itself)
-    retained heap: 48 MB     (the batch + all 10,000 PaymentRequest objects it holds)
+    shallow heap:  32 bytes  (the batch object itself)
+    retained heap: ~2-3 MB   (the batch + all 10,000 PaymentRequest objects
+                              of ~200 bytes each that only it references)
 
 MAT shows retained heap because that's what you save by fixing a leak.
 ```
@@ -148,14 +159,15 @@ MAT shows retained heap because that's what you save by fixing a leak.
 // RetainedHeapExample.java
 
 public class PaymentBatch {
-    private final String batchId;                      // shallow: reference (8 bytes)
-    private final List<PaymentRequest> payments;       // shallow: reference (8 bytes)
-    private final Map<String, BigDecimal> runningTotals; // shallow: reference (8 bytes)
-    private final Instant createdAt;                   // shallow: reference (8 bytes)
+    private final String batchId;                      // shallow: reference (4 bytes*)
+    private final List<PaymentRequest> payments;       // shallow: reference (4 bytes*)
+    private final Map<String, BigDecimal> runningTotals; // shallow: reference (4 bytes*)
+    private final Instant createdAt;                   // shallow: reference (4 bytes*)
+    // * with compressed references (the default for heaps < 32 GB); 8 without
 
-    // Shallow heap of PaymentBatch: ~48 bytes (header + 4 references)
+    // Shallow heap of PaymentBatch: ~32 bytes (12-byte header + 4 references, padded)
     //
-    // Retained heap of PaymentBatch: ~48 bytes
+    // Retained heap of PaymentBatch: ~32 bytes
     //   + List (48 bytes) + underlying array (~8 KB for 1000 entries)
     //   + each PaymentRequest (~200 bytes * 1000 = 200 KB)
     //   + Map + underlying arrays + BigDecimal entries
@@ -173,7 +185,7 @@ public class PaymentBatch {
 
 ```bash
 # Download Eclipse MAT
-# https://eclipse.org/mat/downloads.php
+# https://eclipse.dev/mat/downloads.php
 
 # Launch with enough heap for large dumps
 ./MemoryAnalyzer -vmargs -Xmx16g
@@ -194,7 +206,7 @@ MAT Dominator Tree view:
   Object                              Retained Heap    % of Total Heap
   ─────────────────────────────────────────────────────────────────────
   FraudHistoryCache                   2.1 GB           52%        <-- LEAK
-  ├─ HashMap$Entry[]                  2.0 GB           50%
+  ├─ HashMap$Node[]                  2.0 GB           50%
   │   ├─ FraudEvent (2.4M instances)  1.8 GB           45%
   │   │   ├─ byte[] (feature vectors) 1.6 GB           40%
   │   └─ ...
@@ -202,6 +214,7 @@ MAT Dominator Tree view:
   ├─ ArrayList                        790 MB           19%
   │   └─ AuditEntry (5M instances)    780 MB           19%
 
+(Illustrative output.)
 Diagnosis: FraudHistoryCache is retaining 2.1 GB.
   Likely cause: unbounded cache with no eviction policy.
   Fix: add size limit or TTL (Caffeine or Redis).
@@ -216,7 +229,7 @@ MAT Path to GC Roots for a suspected leaked object:
 
 [Leaked FraudEvent instance]
   └── retained by FraudHistoryCache$CacheEntry.value
-      └── retained by HashMap$Entry.value
+      └── retained by HashMap$Node.value
           └── retained by FraudHistoryCache.cache (field)
               └── retained by FraudHistoryCache.INSTANCE (static field)
                   └── GC ROOT: java.lang.Class (FraudHistoryCache)
@@ -231,7 +244,7 @@ The cache has no eviction -- every fraud event since service start is retained.
 
 ### 4.1 ThreadLocal Leaks
 
-`ThreadLocal` variables in combination with thread pools create leaks. When a thread pool thread is reused, the previous request's `ThreadLocal` data is still present on the thread.
+`ThreadLocal` variables in combination with thread pools create leaks. When a thread pool thread is reused, the previous request's `ThreadLocal` data is still present on the thread. The memory held is bounded by the number of threads, but each value can keep a large object graph alive — and stale data can leak *into the next request* (a correctness and security problem: one customer's context seen while serving another). With class reloading (redeploys in an app server) it can also pin a whole class loader.
 
 ```java
 // LEAK: ThreadLocal without cleanup in a thread pool context
@@ -247,6 +260,10 @@ public class PaymentContextHolder {
 
     public static PaymentContext getContext() {
         return CONTEXT.get();
+    }
+
+    public static void remove() {
+        CONTEXT.remove();
     }
 
     // If remove() is never called, the PaymentContext stays on the thread
@@ -270,8 +287,9 @@ public class PaymentContextFilter implements Filter {
     }
 }
 
-// Better: Spring's RequestContextHolder handles this automatically
-// Or: use a scope-based approach with @RequestScope beans
+// Alternatives: Spring's RequestContextHolder (cleared by Spring's own
+// filters), @RequestScope beans, or Java's ScopedValue (final in JDK 25),
+// which is bound to a block of code and cannot outlive it
 ```
 
 ### 4.2 Static Cache Without Eviction
@@ -326,7 +344,10 @@ public class PaymentEventBus {
     // If the bus is a singleton (common in Spring), it retains all listeners forever
 }
 
-// LEAK: Anonymous inner class registered as listener
+// LEAK when the registering object is SHORT-LIVED (prototype/request-scoped
+// beans, per-session objects): each instance registers a listener and is
+// then kept alive by the singleton bus. (For a singleton like this one the
+// cost is small, but the pattern is the same.)
 @Service
 public class FraudMonitor {
 
@@ -335,10 +356,10 @@ public class FraudMonitor {
 
     @PostConstruct
     public void init() {
-        // Anonymous class holds an implicit reference to FraudMonitor
+        // The lambda calls an instance method, so it captures 'this':
         // FraudMonitor cannot be GC'd as long as the event bus is alive
         eventBus.register(event -> {
-            // 'this' (FraudMonitor) is captured implicitly
+            // 'this' (FraudMonitor) is captured
             this.analyseForFraud(event);
         });
     }
@@ -351,8 +372,12 @@ public class FraudMonitor {
 @Service
 public class FraudMonitor {
 
-    private final PaymentEventBus eventBus;
+    private final PaymentEventBus eventBus;   // the bus now also has deregister()
     private PaymentEventListener registeredListener;
+
+    public FraudMonitor(PaymentEventBus eventBus) {
+        this.eventBus = eventBus;
+    }
 
     @PostConstruct
     public void init() {
@@ -377,8 +402,10 @@ public class FraudMonitor {
 public class FraudApiClient {
 
     public FraudScore check(PaymentRequest request) throws IOException {
-        // Creates a new HttpClient with its own thread pool on EVERY call
-        // These are never closed -- threads and connections leak
+        // Creates a new HttpClient on EVERY call: each has its own selector
+        // thread and connection pool. Nothing closes them (close() only
+        // exists since JDK 21), so they linger until the GC happens to
+        // collect them -- under load, threads and sockets pile up
         HttpClient client = HttpClient.newHttpClient();
         HttpRequest httpRequest = HttpRequest.newBuilder()
             .uri(URI.create(FRAUD_API_URL))
@@ -416,20 +443,28 @@ public class FraudApiClient {
 }
 ```
 
-### 4.5 String Interning Leaks
+### 4.5 Unbounded Maps Keyed by User Input
 
 ```java
-// LEAK: Interning user-provided strings fills the string pool (PermGen/Metaspace-adjacent)
+// LEAK: an unbounded map keyed by user input
 public class PaymentRouter {
 
-    private final Map<String, Route> routeCache = new HashMap<>();
+    private final Map<String, Route> routeCache = new HashMap<>();   // also not thread-safe
 
     public Route getRoute(String paymentType) {
-        // NEVER intern user-provided strings
-        // The string pool is never GC'd for interned strings
-        String internedType = paymentType.intern();  // WRONG
-        return routeCache.computeIfAbsent(internedType, this::loadRoute);
+        // Every distinct value a caller sends ("SEPA", "sepa", "SEPA ", random
+        // junk from a fuzzer...) adds a permanent entry
+        return routeCache.computeIfAbsent(paymentType.intern(), this::loadRoute);
+        // intern() does not help: since Java 7 the string table lives in the
+        // heap and unreferenced interned strings ARE collected -- but here the
+        // map keeps every key alive, and a huge string table costs GC time
     }
+}
+
+// FIX: validate against the known set (an enum), or use a bounded cache
+public Route getRoute(String paymentType) {
+    PaymentType type = PaymentType.valueOf(paymentType.trim().toUpperCase(Locale.ROOT)); // rejects junk
+    return routes.get(type);   // EnumMap filled at startup -- fixed size
 }
 ```
 
@@ -443,8 +478,9 @@ The allocation profiler samples object allocations using TLAB (Thread-Local Allo
 # Profile allocations for 60 seconds
 ./asprof -e alloc -d 60 -f /tmp/payment-alloc.html <pid>
 
-# Profile with allocation size threshold (only show allocations > 1 KB)
-./asprof -e alloc -d 60 --alloc 1k -f /tmp/payment-alloc-large.html <pid>
+# Sample more often: one sample per 1 KB allocated (default 512 KB).
+# Smaller interval = more detail and more overhead
+./asprof -e alloc -d 60 --alloc 1k -f /tmp/payment-alloc-detailed.html <pid>
 ```
 
 **Reading allocation flame graphs:**
@@ -465,9 +501,9 @@ PaymentAuthorisationService.authorise (100%)
 
 **Action items from allocation profile:**
 
-1. `byte[] in ObjectMapper` -- switch to pooled byte buffers or pre-computed writers
-2. `BigDecimal multiplication` -- cache intermediate results, pre-scale constants
-3. `PaymentRequest builder` -- consider object pooling for ultra-high-throughput paths
+1. `byte[] in ObjectMapper` -- write straight to the output stream (`writer.writeValue(outputStream, msg)`) instead of building an intermediate `byte[]`, and reuse a pre-built writer
+2. `BigDecimal multiplication` -- create constants once, avoid repeated `setScale`, or use `long` minor units in hot loops
+3. `PaymentRequest builder` -- remove intermediate copies; object pooling rarely pays off with modern GCs (short-lived objects are cheap) and adds bugs
 
 ---
 
@@ -479,46 +515,42 @@ PaymentAuthorisationService.authorise (100%)
 import jdk.jfr.consumer.RecordingStream;
 
 @Component
+@Slf4j
 public class JfrMemoryMonitor implements ApplicationRunner, DisposableBean {
 
-    private final MeterRegistry meterRegistry;
+    private final AtomicLong heapUsedAfterGc = new AtomicLong();
     private RecordingStream stream;
 
     public JfrMemoryMonitor(MeterRegistry meterRegistry) {
-        this.meterRegistry = meterRegistry;
+        // Register the gauge ONCE; JFR events only update the holder
+        Gauge.builder("app.heap.used.after.gc.bytes", heapUsedAfterGc, AtomicLong::get)
+             .register(meterRegistry);
     }
 
     @Override
     public void run(ApplicationArguments args) {
         stream = new RecordingStream();
 
-        // Track allocation in TLAB -- fired when TLAB is exhausted
-        stream.enable("jdk.ObjectAllocationInNewTLAB")
-              .withThreshold(Duration.ZERO);
+        // Heap summary is emitted before and after every GC
+        stream.enable("jdk.GCHeapSummary");
 
-        // Track large allocations outside TLAB
-        stream.enable("jdk.ObjectAllocationOutsideTLAB")
-              .withThreshold(Duration.ZERO);
-
-        // Track heap usage
-        stream.enable("jdk.GCHeapSummary").withPeriod(Duration.ofSeconds(10));
+        // Allocations outside a TLAB are the large ones; skip the stack
+        // trace to keep the overhead low. (Do NOT enable
+        // jdk.ObjectAllocationInNewTLAB in production -- it is very frequent;
+        // jdk.ObjectAllocationSample, JDK 16+, is the throttled alternative.)
+        stream.enable("jdk.ObjectAllocationOutsideTLAB").withoutStackTrace();
 
         stream.onEvent("jdk.GCHeapSummary", event -> {
-            long usedHeap = event.getLong("heapUsed");
-            long committedHeap = event.getLong("heapSpace.committedSize");
-
-            Gauge.builder("jvm.heap.used.bytes.jfr", () -> usedHeap)
-                 .register(meterRegistry);
+            if ("After GC".equals(event.getString("when"))) {
+                heapUsedAfterGc.set(event.getLong("heapUsed"));
+            }
         });
 
         stream.onEvent("jdk.ObjectAllocationOutsideTLAB", event -> {
-            String className = event.getClass("objectClass").getName();
             long size = event.getLong("allocationSize");
-
-            // Alert on unexpectedly large allocations
-            if (size > 10 * 1024 * 1024) {  // > 10 MB
+            if (size > 10 * 1024 * 1024) {  // > 10 MB: unexpectedly large
                 log.warn("Large allocation outside TLAB: {} bytes of {}",
-                    size, className);
+                    size, event.getClass("objectClass").getName());
             }
         });
 
@@ -564,9 +596,13 @@ public class MemoryLeakDetector implements ApplicationRunner {
     }
 
     private void checkHeapTrend() {
-        MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
-        long usedHeap = memory.getHeapMemoryUsage().getUsed();
-        long maxHeap = memory.getHeapMemoryUsage().getMax();
+        // Use heap usage AFTER the last GC: plain "used" includes garbage
+        // and jumps up and down with every collection
+        long usedHeap = ManagementFactory.getMemoryPoolMXBeans().stream()
+            .filter(p -> p.getType() == MemoryType.HEAP && p.getCollectionUsage() != null)
+            .mapToLong(p -> p.getCollectionUsage().getUsed())
+            .sum();
+        long maxHeap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getMax();
 
         heapSamples.addLast(usedHeap);
         if (heapSamples.size() > SAMPLE_COUNT) {
@@ -579,9 +615,9 @@ public class MemoryLeakDetector implements ApplicationRunner {
 
             // If heap is growing > 50 MB per 5 minutes consistently, alert
             if (trend > 50 * 1024 * 1024) {
-                log.warn("Possible memory leak: heap growing at {:.1f} MB per 5 minutes. " +
-                    "Current usage: {} MB / {} MB",
-                    trend / (1024 * 1024),
+                log.warn("Possible memory leak: heap growing at {} MB per 5 minutes. " +
+                    "Current usage after GC: {} MB / {} MB",
+                    String.format("%.1f", trend / (1024 * 1024)),
                     usedHeap / (1024 * 1024),
                     maxHeap / (1024 * 1024)
                 );
@@ -623,7 +659,7 @@ For every production payment service deployment:
 - [ ] All ThreadLocal usages have `remove()` in `finally` blocks
 - [ ] All event listener registrations have corresponding deregistration on shutdown
 - [ ] HttpClient / RestTemplate instances are singletons (not per-request)
-- [ ] No `String.intern()` on user-provided input
+- [ ] No unbounded maps keyed by user input (and no `String.intern()` on it)
 - [ ] Heap histogram baseline captured post-startup for drift comparison
 - [ ] `jcmd` heap histogram script in runbook for on-call engineers
 

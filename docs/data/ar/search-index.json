@@ -2778,7 +2778,7 @@
         "replication",
         "failover"
       ],
-      "body": "Database High Availability — PostgreSQL HA Patterns > [!NOTE] > PostgreSQL is the default relational database for fintech applications. Its built-in streaming replication, combined with Patroni for automated failover and PgBouncer for connection management, provides enterprise-grade HA without Oracle licensing costs. For payment systems, the choice of synchronous vs asynchronous replication is not a performance trade-off — it is a data durability trade-off with direct financial consequences. HA "
+      "body": "--- id: track-06-lesson-11 title: \"الإتاحة العالية لقواعد البيانات — أنماط PostgreSQL HA\" slug: database-ha track: track-06 trackName: \"الإتاحة العالية والموثوقية والمرونة\" sequence: 11 difficulty: advanced estimatedMinutes: 85 status: published tags: [PostgreSQL, HA, Patroni, replication, failover] prerequisites: [track-06-lesson-02] --- التوفر العالي لقاعدة البيانات — أنماط التوفر العالي في PostgreSQL ‏PostgreSQL هي قاعدة البيانات العلائقية الافتراضية لتطبيقات التقنية المالية. ونسخها المتدفق ا"
     },
     {
       "id": "track-06-lesson-12",
@@ -2799,7 +2799,7 @@
         "ISR",
         "leader-election"
       ],
-      "body": "Kafka High Availability — Replication and Partition Leadership > [!NOTE] > Kafka's durability guarantees are only as strong as your configuration. The defaults (replication.factor=1, acks=1) mean you can lose messages on a single broker failure. For payment event processing, losing a \"PAYMENT_DEBITED\" event means the debit is unrecorded and the customer's balance is wrong. The correct configuration for fintech — replication.factor=3, min.insync.replicas=2, acks=all — provides durability guarante"
+      "body": "--- id: track-06-lesson-12 title: \"الإتاحة العالية في Kafka — النسخ المتماثل وقيادة الأقسام\" slug: kafka-ha track: track-06 trackName: \"الإتاحة العالية والموثوقية والمرونة\" sequence: 12 difficulty: advanced estimatedMinutes: 80 status: published tags: [Kafka, HA, replication-factor, ISR, leader-election] prerequisites: [track-06-lesson-02] --- التوفر العالي لـ Kafka — النسخ وقيادة الأقسام ضمانات الديمومة في Kafka قوية بقدر إعدادك فقط. فمنذ Kafka 3.0 صارت القيم الافتراضية للمنتج آمنة ( acks=all و"
     },
     {
       "id": "track-06-lesson-13",
@@ -2814,7 +2814,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Security teams implement rate limiting to prevent credential stuffing and API abuse. Reliability engineers implement rate limiting for a different reason: to protect downstream services from being overwhelmed by legitimate traffic. A payment processing service that sends 10,000 transaction queries per second to a fraud-scoring API is not attacking it — but the effect is indistinguishable. Rate limiting as a reliability tool is about defining sustainable load, enforcing it at the boundary, and de"
+      "body": "--- id: \"track-06-lesson-13\" title: \"تحديد المعدّل من أجل الموثوقية — حماية الخدمات اللاحقة\" track: \"track-06\" track-name: \"الإتاحة العالية والموثوقية والمرونة\" sequence: 13 slug: \"rate-limiting-reliability\" difficulty: \"advanced\" estimated-minutes: 70 status: \"published\" last-updated: \"2026-11-09\" prerequisites: - \"track-06-lesson-12\" tags: - \"rate-limiting\" - \"token-bucket\" - \"sliding-window\" - \"Resilience4j\" - \"Redis\" - \"Bucket4j\" java-versions: [17, 21] topics: - \"Rate Limiting for Reliabili"
     },
     {
       "id": "track-06-lesson-14",
@@ -2835,7 +2835,7 @@
         "degraded-mode",
         "Resilience4j"
       ],
-      "body": "Fallback Patterns — Static, Cached, and Degraded Responses > [!NOTE] > A circuit breaker that opens and returns an error to the caller has not solved a reliability problem — it has merely made the failure visible. Fallback patterns are what happen after the circuit opens: the system continues operating, with reduced fidelity, using the best available data. The art is knowing which degraded response is acceptable for each use case. Fallback Taxonomy | Type | Use Case | Trade-off | |---|---|---| |"
+      "body": "--- id: track-06-lesson-14 title: \"أنماط البدائل — الاستجابات الثابتة والمخزّنة والمخفّضة\" slug: fallback-patterns track: track-06 trackName: \"الإتاحة العالية والموثوقية والمرونة\" sequence: 14 difficulty: advanced estimatedMinutes: 70 status: published tags: [fallback, cache, static-response, degraded-mode, Resilience4j] prerequisites: [track-06-lesson-02, track-06-lesson-04] --- أنماط الرجوع (Fallback) — الردود الثابتة والمخزنة والمتدهورة قاطع الدائرة الذي يفتح ويعيد خطأً إلى المستدعي لم يحل مش"
     },
     {
       "id": "track-06-lesson-15",
@@ -2856,7 +2856,7 @@
         "runbook",
         "escalation"
       ],
-      "body": "Incident Management — On-Call Engineering in Finance > [!NOTE] > A P1 incident at a bank at 2 AM is not like a P1 incident at a tech startup. Payment processing failures have direct financial consequences for customers — funds held, payments declined, businesses unable to pay suppliers. Regulatory bodies in many jurisdictions require notification within hours for outages affecting a material number of customers. Incident management in fintech must be systematic, documented, and fast. Incident Se"
+      "body": "--- id: track-06-lesson-15 title: \"إدارة الحوادث — المناوبة الهندسية في القطاع المالي\" slug: incident-management track: track-06 trackName: \"الإتاحة العالية والموثوقية والمرونة\" sequence: 15 difficulty: advanced estimatedMinutes: 75 status: published tags: [incident-management, on-call, PagerDuty, runbook, escalation] prerequisites: [track-06-lesson-01] --- إدارة الحوادث — هندسة المناوبة في التمويل حادث P1 في بنك الساعة الثانية فجرًا ليس كحادث P1 في شركة تقنية ناشئة. فإخفاقات معالجة الدفع لها عو"
     },
     {
       "id": "track-06-lesson-16",
@@ -2877,7 +2877,7 @@
         "five-whys",
         "action-items"
       ],
-      "body": "Post-Incident Reviews — Blameless Culture and RCA > [!NOTE] > A post-incident review that finds a person to blame produces one outcome: engineers learn not to be associated with failures. A blameless PIR that asks \"what allowed this to happen?\" produces a different outcome: systems get safer. The goal is to extract maximum learning from every incident, not to assign fault. Why Blameless PIRs Matter in Finance Financial institutions have a compliance instinct toward accountability and blame: some"
+      "body": "--- id: track-06-lesson-16 title: \"مراجعات ما بعد الحوادث — ثقافة عدم اللوم وتحليل السبب الجذري\" slug: post-incident-review track: track-06 trackName: \"الإتاحة العالية والموثوقية والمرونة\" sequence: 16 difficulty: advanced estimatedMinutes: 70 status: published tags: [post-incident, blameless, RCA, five-whys, action-items] prerequisites: [track-06-lesson-15] --- مراجعات ما بعد الحوادث — ثقافة عدم اللوم وتحليل السبب الجذري مراجعة ما بعد الحادث التي تبحث عن شخص تلومه تنتج نتيجة واحدة: يتعلم المهند"
     },
     {
       "id": "track-06-lesson-17",
@@ -2898,7 +2898,7 @@
         "Gatling",
         "k6"
       ],
-      "body": "Reliability Testing — Load, Soak, and Spike Testing > [!NOTE] > Performance testing for fintech systems is not optional. Payment processing has known peak patterns — month-end salary payments, holiday shopping, event-triggered spikes — that arrive at predictable times. The difference between a system that handles Black Friday and one that collapses is a soak test that found the memory leak three months earlier. Test Type Taxonomy | Test Type | Duration | Purpose | What It Finds | |---|---|---|--"
+      "body": "--- id: track-06-lesson-17 title: \"اختبار الموثوقية — اختبارات الحمل والتحمّل والذروة\" slug: reliability-testing track: track-06 trackName: \"الإتاحة العالية والموثوقية والمرونة\" sequence: 17 difficulty: advanced estimatedMinutes: 80 status: published tags: [load-testing, soak-testing, spike-testing, Gatling, k6] prerequisites: [track-06-lesson-01] --- اختبار الموثوقية — اختبارات الحمل والتحمل الطويل والقفزات اختبار الأداء لأنظمة التقنية المالية ليس اختياريًا. فلمعالجة الدفع أنماط ذروة معروفة — م"
     },
     {
       "id": "track-06-lesson-18",
@@ -2919,7 +2919,7 @@
         "staff-engineer",
         "SLO"
       ],
-      "body": "Principal Engineer's Reliability Decision Framework > [!NOTE] > Reliability decisions in fintech carry consequences beyond technical debt. A payment system with an SLO of 99.9% means 44 minutes of downtime per month is acceptable by design. If that downtime occurs on the last business day of the month when payroll runs, those 44 minutes affect thousands of employees receiving late pay. Principal engineers must translate business context into reliability targets, and reliability targets into arch"
+      "body": "--- id: track-06-lesson-18 title: \"إطار المهندس الرئيسي لقرارات الموثوقية\" slug: reliability-decision-framework track: track-06 trackName: \"الإتاحة العالية والموثوقية والمرونة\" sequence: 18 difficulty: principal estimatedMinutes: 65 status: published tags: [decision-framework, reliability, trade-offs, staff-engineer, SLO] prerequisites: [track-06-lesson-01, track-06-lesson-02, track-06-lesson-04] --- إطار قرارات الموثوقية لكبير المهندسين لقرارات الموثوقية في التقنية المالية عواقب تتجاوز الدَّين "
     },
     {
       "id": "track-07-lesson-01",
@@ -2940,7 +2940,7 @@
         "JIT",
         "bytecode"
       ],
-      "body": "JVM Internals — Memory Model, Class Loading, and JIT > [!NOTE] > Understanding JVM internals is prerequisite to meaningful performance engineering. Without a mental model of how Java allocates memory, compiles code, and manages threads, you are guessing at optimisations. The JVM Memory Model The JVM partitions memory into distinct regions, each with different lifecycle and garbage collection behaviour. Heap Regions — Where Your Objects Live Eden Space — New objects are allocated here. Fast bump-"
+      "body": "--- id: track-07-lesson-01 title: \"مكونات JVM الداخلية — نموذج الذاكرة وتحميل الأصناف وJIT\" slug: jvm-internals track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 1 difficulty: advanced estimatedMinutes: 90 status: published tags: [JVM, memory-model, class-loading, JIT, bytecode] prerequisites: [] --- داخليات JVM — نموذج الذاكرة وتحميل الأصناف وJIT فهم داخليات JVM شرط مسبق لهندسة أداء ذات معنى. فدون نموذج ذهني لطريقة تخصيص Java للذاكرة، وترجمتها للشيفرة، وإدارتها للخيوط، أن"
     },
     {
       "id": "track-07-lesson-02",
@@ -2955,7 +2955,7 @@
       "estimatedMinutes": 85,
       "status": "published",
       "tags": "",
-      "body": "Garbage collection pauses are among the most insidious performance problems in JVM-based fintech applications. They are intermittent, they are invisible in APM dashboards unless you correlate carefully, and their root causes are buried in raw GC log output that most engineers never open. A single 400 ms stop-the-world pause during a payment authorization flow looks identical to a network timeout from the caller's perspective — but the fix is completely different. This lesson teaches you to read "
+      "body": "--- id: \"track-07-lesson-02\" title: \"تحليل جمع المهملات — قراءة سجلات GC\" track: \"track-07\" track-name: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 2 slug: \"gc-analysis\" difficulty: \"advanced\" estimated-minutes: 85 status: \"published\" last-updated: \"2026-11-08\" prerequisites: - \"track-07-lesson-01\" tags: - \"GC\" - \"G1GC\" - \"ZGC\" - \"GC-log\" - \"GC-pause\" - \"GCEasy\" java-versions: [17, 21] topics: - \"GC Log Configuration\" - \"GC Log Anatomy\" - \"Pause Cause Taxonomy\" - \"GCEasy Analysis\" - \"Pause Fre"
     },
     {
       "id": "track-07-lesson-03",
@@ -2970,7 +2970,7 @@
       "estimatedMinutes": 85,
       "status": "published",
       "tags": "",
-      "body": "Overview Garbage collection pauses are among the most insidious latency sources in Java-based payment systems. A 200 ms stop-the-world pause during peak settlement is not a JVM curiosity — it is a customer-visible outage, a potential SLA breach, and in some jurisdictions a regulatory reporting event. Understanding and tuning the garbage collector is therefore a core competency for any engineer operating high-throughput financial infrastructure on the JVM. This lesson dissects the two collectors "
+      "body": "--- id: \"track-07-lesson-03\" title: \"ضبط GC — G1GC وZGC للخدمات المالية منخفضة الكمون\" track: \"track-07\" track-name: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 3 slug: \"gc-tuning\" difficulty: \"advanced\" estimated-minutes: 85 status: \"published\" last-updated: \"2026-11-08\" prerequisites: [\"track-07-lesson-01\", \"track-07-lesson-02\"] tags: - \"GC-tuning\" - \"G1GC\" - \"ZGC\" - \"heap-sizing\" - \"latency\" java-versions: [17, 21] topics: - \"G1GC Architecture and Region Model\" - \"G1GC Tuning Flags\" - \"ZGC "
     },
     {
       "id": "track-07-lesson-04",
@@ -2985,7 +2985,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "Overview Intuition is a poor guide to Java performance. The JVM's JIT compiler, CPU branch predictor, instruction-level parallelism, and memory hierarchy combine to produce behaviour that consistently surprises experienced engineers. A method that \"looks fast\" may be inlined away by the JIT. A loop that \"looks slow\" may be auto-vectorised. Without measurement, you are guessing. JMH (Java Microbenchmark Harness) is the tool built by JVM performance engineers to measure correctly. It handles JIT w"
+      "body": "--- id: \"track-07-lesson-04\" title: \"قياس الأداء بـ JMH — القياس بالطريقة الصحيحة\" track: \"track-07\" track-name: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 4 slug: \"jmh-benchmarking\" difficulty: \"advanced\" estimated-minutes: 80 status: \"published\" last-updated: \"2026-11-08\" prerequisites: [\"track-07-lesson-03\"] tags: - \"JMH\" - \"benchmarking\" - \"warm-up\" - \"throughput\" - \"latency\" java-versions: [17, 21] topics: - \"JMH Maven Setup\" - \"Benchmark Annotation\" - \"State and Scope\" - \"Warmup and Mea"
     },
     {
       "id": "track-07-lesson-05",
@@ -3000,7 +3000,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "Overview Code review and JMH benchmarks tell you what is fast in isolation. CPU profiling tells you what is actually burning CPU in production under real load. The two answers are often completely different. A payment serialisation method that benchmarks at 2 microseconds per call may be responsible for 40% of CPU time in production because it is called 200 million times per day. A fraud check that runs in 10 ms per call may dominate the latency profile because it is on the critical path of ever"
+      "body": "--- id: \"track-07-lesson-05\" title: \"تحليل استهلاك المعالج — إيجاد الدوال الساخنة بـ async-profiler\" track: \"track-07\" track-name: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 5 slug: \"cpu-profiling\" difficulty: \"advanced\" estimated-minutes: 80 status: \"published\" last-updated: \"2026-11-08\" prerequisites: [\"track-07-lesson-04\"] tags: - \"CPU-profiling\" - \"async-profiler\" - \"flame-graph\" - \"JFR\" - \"hot-method\" java-versions: [17, 21] topics: - \"async-profiler Usage\" - \"CPU Mode Profiling\" - \"Flam"
     },
     {
       "id": "track-07-lesson-06",
@@ -3015,7 +3015,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "Overview Memory leaks in Java are insidious. They do not cause immediate failure. They cause gradual heap growth, increasingly frequent GC cycles, progressively longer pause times, and finally an at 3 AM during peak settlement processing. The JVM's GC does not eliminate memory leaks — it eliminates garbage. If a reference is held (intentionally or accidentally), the object is not garbage, and GC cannot collect it. In financial services, the consequences of memory leaks extend beyond service avai"
+      "body": "--- id: \"track-07-lesson-06\" title: \"تحليل الذاكرة — فحص الكومة واكتشاف التسرّب\" track: \"track-07\" track-name: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 6 slug: \"memory-profiling\" difficulty: \"advanced\" estimated-minutes: 80 status: \"published\" last-updated: \"2026-11-08\" prerequisites: [\"track-07-lesson-05\"] tags: - \"memory-profiling\" - \"heap-dump\" - \"MAT\" - \"object-retention\" - \"memory-leak\" java-versions: [17, 21] topics: - \"Heap Dump Analysis with Eclipse MAT\" - \"Dominator Tree\" - \"Retain"
     },
     {
       "id": "track-07-lesson-07",
@@ -3030,7 +3030,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "Overview The connection pool is the bridge between your Java application and the database. Too few connections and threads queue waiting, latency spikes, and throughput collapses. Too many connections and PostgreSQL's per-connection memory overhead causes the database server to swap, delivering worse performance than a smaller pool would. For payment services where every transaction touches the database — balance checks, ledger inserts, audit logs — getting connection pool configuration right is"
+      "body": "--- id: \"track-07-lesson-07\" title: \"ضبط JDBC — مجمّعات الاتصالات والعمليات الدفعية\" track: \"track-07\" track-name: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 7 slug: \"jdbc-tuning\" difficulty: \"advanced\" estimated-minutes: 80 status: \"published\" last-updated: \"2026-11-08\" prerequisites: [\"track-07-lesson-04\"] tags: - \"JDBC\" - \"HikariCP\" - \"batch-insert\" - \"prepared-statement\" - \"connection-pool\" java-versions: [17, 21] topics: - \"HikariCP Configuration\" - \"Connection Pool Sizing Formula\" - \"Pr"
     },
     {
       "id": "track-07-lesson-08",
@@ -3051,7 +3051,7 @@
         "sequential-scan",
         "PostgreSQL"
       ],
-      "body": "Query Optimization — EXPLAIN ANALYZE and Index Usage > [!NOTE] > A query that runs in 2 ms with 10,000 rows will often run in 20 seconds with 10 million rows. Financial databases grow relentlessly — understanding how PostgreSQL plans and executes queries is not optional for engineers building payment infrastructure. The EXPLAIN ANALYZE Output Format PostgreSQL's is the definitive tool for understanding query execution. It combines the planner's cost estimates with actual runtime measurements. A "
+      "body": "--- id: track-07-lesson-08 title: \"تحسين الاستعلامات — EXPLAIN ANALYZE واستخدام الفهارس\" slug: query-optimization track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 8 difficulty: advanced estimatedMinutes: 85 status: published tags: [query-optimization, EXPLAIN, index, sequential-scan, PostgreSQL] prerequisites: [track-07-lesson-07] --- تحسين الاستعلامات — EXPLAIN ANALYZE واستخدام الفهارس الاستعلام الذي يعمل في 2 مللي ثانية مع 10,000 صف كثيرًا ما سيعمل في 20 ثانية مع 10 ملا"
     },
     {
       "id": "track-07-lesson-09",
@@ -3072,7 +3072,7 @@
         "partial-index",
         "covering-index"
       ],
-      "body": "Index Design — B-Tree, Hash, and Partial Indexes > [!NOTE] > Indexes are the single highest-leverage performance tool in relational databases, but every index has a write-time cost. A poorly designed index strategy taxes every INSERT, UPDATE, and DELETE. In a payment system processing thousands of transactions per second, this tax compounds rapidly. B-Tree Indexes — The Default Workhorse B-tree (balanced tree) is PostgreSQL's default index type. Understanding its structure is essential for desig"
+      "body": "--- id: track-07-lesson-09 title: \"تصميم الفهارس — B-Tree وHash والفهارس الجزئية\" slug: index-design track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 9 difficulty: advanced estimatedMinutes: 80 status: published tags: [index, B-tree, hash-index, partial-index, covering-index] prerequisites: [track-07-lesson-08] --- تصميم الفهارس — B-Tree وHash والفهارس الجزئية الفهارس أعلى أدوات الأداء أثرًا في قواعد البيانات العلائقية، لكن لكل فهرس كلفة وقت الكتابة. واستراتيجية فهارس سيئ"
     },
     {
       "id": "track-07-lesson-10",
@@ -3093,7 +3093,7 @@
         "TTL",
         "invalidation"
       ],
-      "body": "Application Caching — Strategies, Invalidation, and TTL > [!NOTE] > Caching in financial systems is not a performance trick — it is a correctness tradeoff. Serving stale data for an account balance can cause overdrafts. Serving stale exchange rates can mis-price trades. Every cache decision in fintech must be justified by a written analysis of the worst-case staleness impact. Caching Patterns Overview Cache-Aside (Lazy Loading) The application manages the cache explicitly. On a cache miss, the a"
+      "body": "--- id: track-07-lesson-10 title: \"التخزين المؤقت في التطبيق — الاستراتيجيات والإبطال وTTL\" slug: application-caching track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 10 difficulty: advanced estimatedMinutes: 80 status: published tags: [caching, Cache-Aside, Write-Through, TTL, invalidation] prerequisites: [track-07-lesson-09] --- التخزين المؤقت في التطبيق — الاستراتيجيات والإبطال وTTL التخزين المؤقت في الأنظمة المالية ليس حيلة أداء — بل مفاضلة في الصحة. فتقديم بيانات قدي"
     },
     {
       "id": "track-07-lesson-11",
@@ -3114,7 +3114,7 @@
         "data-structures",
         "latency"
       ],
-      "body": "Redis Performance — Pipelining, Scripting, and Data Structures > [!NOTE] > Redis is single-threaded for command execution, which means its performance profile is entirely dominated by network round-trip time, not compute. Every architectural decision — pipelining, scripting, data structure selection — is about minimizing round trips and maximizing the work done per command. Redis Pipelining — Batching Commands to Reduce Round Trips Without pipelining, each command requires a full network round t"
+      "body": "--- id: track-07-lesson-11 title: \"أداء Redis — Pipelining والسكربتات وهياكل البيانات\" slug: redis-performance track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 11 difficulty: advanced estimatedMinutes: 75 status: published tags: [Redis, pipelining, Lua, data-structures, latency] prerequisites: [track-07-lesson-10] --- أداء Redis — خطوط الأوامر والسكربتات وهياكل البيانات ينفذ Redis الأوامر على خيط واحد (والإصدارات الأحدث تستخدم خيوطًا إضافية لإدخال/إخراج الشبكة فقط). ومعظم"
     },
     {
       "id": "track-07-lesson-12",
@@ -3135,7 +3135,7 @@
         "compression",
         "linger"
       ],
-      "body": "Kafka Producer Tuning — Throughput, Latency, and Financial Durability > [!NOTE] > Kafka producer configuration has a direct impact on throughput, end-to-end latency, and message durability. For financial systems, the default configuration is almost always wrong — it optimises for neither performance nor durability, sitting in an uncomfortable middle ground that serves neither goal well. Learning Objectives By the end of this lesson you will be able to: Explain the throughput vs latency trade-off"
+      "body": "--- id: track-07-lesson-12 title: \"ضبط منتِج Kafka — التجميع والضغط والإنتاجية\" slug: kafka-tuning track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 12 difficulty: advanced estimatedMinutes: 80 status: published tags: [Kafka, producer-tuning, batching, compression, linger] prerequisites: [track-07-lesson-01] --- ضبط منتج Kafka — الإنتاجية والزمن والديمومة المالية لإعداد منتج Kafka أثر مباشر على الإنتاجية، والزمن من الطرف إلى الطرف، وديمومة الرسائل. ومنذ Kafka 3.0 صارت الإع"
     },
     {
       "id": "track-07-lesson-13",
@@ -3150,7 +3150,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "HTTP/2 and gRPC Performance — Connection Multiplexing Modern fintech systems move enormous volumes of small messages between microservices: payment authorisations, fraud signals, balance inquiries, settlement confirmations. HTTP/1.1 was not designed for this workload. HTTP/2, and gRPC sitting on top of it, fundamentally change the performance profile of service-to-service communication. This lesson examines the protocol mechanics, the Java integration path, and the production trade-offs you must"
+      "body": "--- id: track-07-lesson-13 title: \"أداء HTTP/2 وgRPC — تعدد الإرسال على الاتصال\" slug: http2-grpc-performance track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 13 difficulty: advanced estimatedMinutes: 75 status: published tags: - HTTP2 - gRPC - multiplexing - protobuf - streaming - performance prerequisites: - track-07-lesson-12 --- أداء HTTP/2 وgRPC — تعدد إرسال الاتصالات تنقل أنظمة التقنية المالية الحديثة كميات هائلة من الرسائل الصغيرة بين الخدمات المصغرة: تفويضات الدفع"
     },
     {
       "id": "track-07-lesson-14",
@@ -3171,7 +3171,7 @@
         "executor",
         "sizing"
       ],
-      "body": "Thread Pool Sizing — Little's Law and Optimal Concurrency > [!NOTE] > Undersized thread pools cause request queuing and latency spikes under load. Oversized pools waste memory (each thread consumes ~1MB stack), increase context switching, and degrade throughput. Little's Law provides the mathematical foundation to size thread pools correctly for payment processors — but the formula requires measuring your actual service latency and arrival rate under production conditions. The Cost of Getting Th"
+      "body": "--- id: track-07-lesson-14 title: \"تحديد حجم مجمّعات الخيوط — قانون Little والتزامن الأمثل\" slug: thread-pool-sizing track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 14 difficulty: advanced estimatedMinutes: 75 status: published tags: [thread-pool, Little's-law, queuing-theory, executor, sizing] prerequisites: [] --- تحجيم مجمعات الخيوط — قانون Little والتزامن الأمثل مجمعات الخيوط الأصغر من اللازم تسبب اصطفاف الطلبات وقفزات الزمن تحت الحمل. والمجمعات الأكبر من اللازم تهدر"
     },
     {
       "id": "track-07-lesson-15",
@@ -3192,7 +3192,7 @@
         "pinning",
         "carrier-thread"
       ],
-      "body": "Virtual Threads Performance — Benchmarking Java 21 > [!NOTE] > Virtual threads are not faster than platform threads for CPU-bound work — they provide higher throughput for IO-bound workloads by allowing millions of concurrent lightweight threads without the memory overhead of platform threads. For payment processors that spend 90% of request time waiting on IO (database, fraud APIs, payment networks), virtual threads can increase throughput 5–10x with no code changes. What Are Virtual Threads? V"
+      "body": "--- id: track-07-lesson-15 title: \"أداء الخيوط الافتراضية — قياس Java 21\" slug: virtual-threads-performance track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 15 difficulty: advanced estimatedMinutes: 80 status: published tags: [virtual-threads, java-21, benchmarking, pinning, carrier-thread] prerequisites: [] --- أداء الخيوط الافتراضية — قياس Java 21 الخيوط الافتراضية ليست أسرع من خيوط المنصة للعمل المقيد بالمعالج — بل توفر إنتاجية أعلى للأحمال المقيدة بالإدخال/الإخراج بإت"
     },
     {
       "id": "track-07-lesson-16",
@@ -3213,7 +3213,7 @@
         "percentiles",
         "throughput"
       ],
-      "body": "Gatling Load Testing — Realistic Financial Scenarios > [!NOTE] > Load testing payment systems is fundamentally different from testing web applications. Financial load tests must model realistic transaction patterns (ramp-up, steady state, end-of-month spikes), use real-world data distributions (small transactions are more common than large ones), test idempotency behaviour, and validate that p99 latency stays below SLA thresholds under sustained load — not just under artificial uniform traffic. "
+      "body": "--- id: track-07-lesson-16 title: \"اختبار الحمل بـ Gatling — سيناريوهات مالية واقعية\" slug: gatling-load-testing track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 16 difficulty: advanced estimatedMinutes: 80 status: published tags: [Gatling, load-testing, simulation, percentiles, throughput] prerequisites: [] --- اختبار الحمل بـ Gatling — سيناريوهات مالية واقعية اختبار حمل أنظمة الدفع مختلف جوهريًا عن اختبار تطبيقات الويب. فيجب أن تحاكي اختبارات الحمل المالية أنماط معاملات"
     },
     {
       "id": "track-07-lesson-17",
@@ -3234,7 +3234,7 @@
         "allocation",
         "visualisation"
       ],
-      "body": "Flame Graphs — Visualising CPU and Memory Hotspots > [!NOTE] > Flame graphs are the most efficient tool for identifying CPU and memory hotspots in production JVM services. A single 30-second CPU flame graph of a payment authorization service often reveals the exact method consuming unexpected CPU — whether it is JSON serialization, JDBC result set mapping, or an inefficient fraud rule evaluation loop — without requiring code changes or service restarts. Flame Graph Anatomy A flame graph displays"
+      "body": "--- id: track-07-lesson-17 title: \"مخططات اللهب (Flame Graphs) — تصوير نقاط الضغط في المعالج والذاكرة\" slug: flame-graphs track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 17 difficulty: advanced estimatedMinutes: 75 status: published tags: [flame-graph, async-profiler, CPU, allocation, visualisation] prerequisites: [] --- مخططات اللهب — عرض النقاط الساخنة في المعالج والذاكرة مخططات اللهب (flame graphs) أكفأ أداة لتحديد النقاط الساخنة في المعالج والذاكرة في خدمات JVM الإنت"
     },
     {
       "id": "track-07-lesson-18",
@@ -3255,7 +3255,7 @@
         "padding",
         "jol"
       ],
-      "body": "Memory Layout — Object Padding, Cache Lines, and False Sharing > [!NOTE] > False sharing is a silent performance killer in concurrent financial systems. When two threads on different CPU cores modify fields that happen to share the same 64-byte cache line, they invalidate each other's cache on every write — causing 10–50x slowdowns in high-throughput counters, payment rate limiters, and concurrent balance accumulators. The fix is a single annotation, but you must first know where to look. Java O"
+      "body": "--- id: track-07-lesson-18 title: \"تخطيط الذاكرة — حشو الكائنات وخطوط الذاكرة والمشاركة الزائفة\" slug: memory-layout track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 18 difficulty: advanced estimatedMinutes: 75 status: published tags: [memory-layout, cache-line, false-sharing, padding, jol] prerequisites: [] --- تخطيط الذاكرة — حشو الكائنات وخطوط الذاكرة المخبئية والمشاركة الزائفة المشاركة الزائفة (false sharing) قاتل أداء صامت في الأنظمة المالية المتزامنة. فحين يعدّل خيط"
     },
     {
       "id": "track-07-lesson-19",
@@ -3270,7 +3270,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Database Partitioning — Range, Hash, and List Strategies A fintech transaction table that accumulates one billion rows over three years is not an edge case — it is the routine. A single monolithic PostgreSQL table at that scale produces three concrete problems: query plans must scan enormous B-tree indexes, and run for hours locking out maintenance windows, and dropping old data requires a full table scan via . Declarative partitioning, introduced as a first-class feature in PostgreSQL 10 and si"
+      "body": "--- id: track-07-lesson-19 title: \"تقسيم قواعد البيانات — استراتيجيات النطاق والتجزئة والقائمة\" slug: db-partitioning-strategies track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 19 difficulty: advanced estimatedMinutes: 75 status: published tags: - partitioning - range-partition - hash-partition - list-partition - PostgreSQL - performance prerequisites: - track-07-lesson-18 --- تقسيم قاعدة البيانات — استراتيجيات النطاق والتجزئة والقائمة جدول معاملات في التقنية المالية يرا"
     },
     {
       "id": "track-07-lesson-20",
@@ -3285,7 +3285,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Reactive vs Blocking — Performance Profile Comparison Choosing between a blocking and a reactive programming model is one of the most consequential architectural decisions in a high-throughput fintech system. This lesson provides a detailed, benchmark-driven comparison of both models so you can make the right choice for each service in your platform — not just follow a trend. The Thread-Per-Request Model Spring MVC (Servlet-based) assigns one thread to each incoming HTTP request for the entire d"
+      "body": "--- id: track-07-lesson-20 title: \"التفاعلي أم الحاجب — مقارنة ملامح الأداء\" slug: reactive-vs-blocking track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 20 difficulty: advanced estimatedMinutes: 75 status: published tags: - reactive - blocking - Project-Reactor - WebFlux - thread-model - throughput - R2DBC prerequisites: - track-07-lesson-19 --- التفاعلي مقابل الحاجب — مقارنة ملف الأداء الاختيار بين نموذج البرمجة الحاجب والتفاعلي من أكثر القرارات المعمارية أثرًا في نظام ت"
     },
     {
       "id": "track-07-lesson-21",
@@ -3306,7 +3306,7 @@
         "Nagle",
         "socket-timeout"
       ],
-      "body": "Network I/O Tuning — TCP, Keepalive, and Buffer Sizing > [!NOTE] > Payment systems make thousands of network calls per second — to databases, payment gateways, fraud services, and messaging systems. A misconfigured TCP socket can add 40ms to every payment that hits a card network. At 1,000 TPS that is 40,000ms of unnecessary latency per second, manifesting as p99 degradation that no amount of algorithmic optimization can fix. TCP_NODELAY — Disabling the Nagle Algorithm The Nagle algorithm was de"
+      "body": "--- id: track-07-lesson-21 title: \"ضبط إدخال/إخراج الشبكة — TCP وKeepalive وأحجام المخازن\" slug: network-io-tuning track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 21 difficulty: advanced estimatedMinutes: 75 status: published tags: [TCP, keepalive, buffer-size, Nagle, socket-timeout] prerequisites: [track-07-lesson-20] --- ضبط إدخال/إخراج الشبكة — TCP وKeepalive وتحجيم المخازن تجري أنظمة الدفع آلاف الاستدعاءات الشبكية في الثانية — إلى قواعد البيانات، وبوابات الدفع، وخدما"
     },
     {
       "id": "track-07-lesson-22",
@@ -3327,7 +3327,7 @@
         "staff-engineer",
         "bottleneck"
       ],
-      "body": "Principal Engineer's Performance Decision Framework > [!NOTE] > Performance optimization without measurement is guesswork that makes code complex and fragile. The principal engineer's role is not to implement every optimization — it is to build a measurement culture, identify the highest-leverage bottlenecks, and prevent regression. Most performance work is wasted on the wrong problem. The Core Principle: Measure First, Always The single most important rule in performance engineering: Never opti"
+      "body": "--- id: track-07-lesson-22 title: \"إطار المهندس الرئيسي لقرارات الأداء\" slug: performance-decision-framework track: track-07 trackName: \"هندسة الأداء ومكونات JVM الداخلية\" sequence: 22 difficulty: principal estimatedMinutes: 65 status: published tags: [decision-framework, performance, trade-offs, staff-engineer, bottleneck] prerequisites: [track-07-lesson-08, track-07-lesson-09, track-07-lesson-10, track-07-lesson-11] --- إطار قرارات الأداء لكبير المهندسين تحسين الأداء دون قياس تخمين يجعل الشيفر"
     },
     {
       "id": "track-08-lesson-01",
@@ -3348,7 +3348,7 @@
         "isolation",
         "durability"
       ],
-      "body": "ACID Properties — Atomicity, Consistency, Isolation, Durability > [!NOTE] > ACID is not an abstract academic concept — it is the operational foundation of financial data integrity. Every transaction your system processes relies on these guarantees. Principal engineers must be able to reason about what happens when each one is violated. Why ACID Matters for Financial Systems Consider a money transfer: debit £500 from Account A, credit £500 to Account B. Without ACID: Without Atomicity — debit suc"
+      "body": "--- id: track-08-lesson-01 title: \"خصائص ACID — الذرية والاتساق والعزل والديمومة\" slug: acid-properties track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 1 difficulty: advanced estimatedMinutes: 85 status: published tags: [ACID, atomicity, consistency, isolation, durability] prerequisites: [] --- خصائص ACID — الذرية والاتساق والعزل والديمومة ‏ACID ليست مفهومًا أكاديميًا مجردًا — بل هي الأساس التشغيلي لسلامة البيانات المالية. فكل معاملة يعالجها نظامك تعتمد على هذه الضمانات. ويج"
     },
     {
       "id": "track-08-lesson-02",
@@ -3369,7 +3369,7 @@
         "serializable",
         "read-committed"
       ],
-      "body": "Transaction Isolation Levels — Read Anomalies and Fixes > [!NOTE] > Choosing the wrong isolation level in a financial system is not a performance issue — it is a correctness issue. Dirty reads, non-repeatable reads, and phantom reads translate directly into overdrafts, duplicate charges, and regulatory reporting errors. This lesson teaches you to reason about isolation precisely so you can make deliberate trade-offs rather than accepting defaults blindly. Why Isolation Matters in Fintech Every f"
+      "body": "--- id: track-08-lesson-02 title: \"مستويات عزل المعاملات — شذوذ القراءة وعلاجه\" slug: isolation-levels track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 2 difficulty: advanced estimatedMinutes: 85 status: published tags: [isolation-levels, dirty-read, phantom, serializable, read-committed] prerequisites: [] --- مستويات عزل المعاملات — شذوذ القراءة وإصلاحاته اختيار مستوى العزل الخطأ في نظام مالي ليس مشكلة أداء — بل مشكلة صحة. فالقراءات القذرة، والقراءات غير القابلة للتكرار، وال"
     },
     {
       "id": "track-08-lesson-03",
@@ -3390,7 +3390,7 @@
         "vacuum",
         "bloat"
       ],
-      "body": "MVCC — Multi-Version Concurrency Control Deep Dive > [!NOTE] > MVCC is what allows PostgreSQL to serve thousands of concurrent transactions without readers blocking writers. Understanding it at the internals level is essential for diagnosing mysterious query slowdowns, preventing transaction ID wraparound outages, and designing update-heavy financial schemas that do not silently accumulate bloat until they fall over. The Core Problem MVCC Solves Classic locking databases have one version of each"
+      "body": "--- id: track-08-lesson-03 title: \"MVCC — التحكم في التزامن متعدد الإصدارات بالتفصيل\" slug: mvcc track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 3 difficulty: advanced estimatedMinutes: 85 status: published tags: [MVCC, versioning, snapshot-isolation, vacuum, bloat] prerequisites: [] --- ‏MVCC — تعمق في التحكم في التزامن متعدد النسخ ‏MVCC هو ما يتيح لـ PostgreSQL خدمة آلاف المعاملات المتزامنة دون أن يحجب القرّاء الكتّاب. وفهمه على مستوى الداخليات أساسي لتشخيص تباطؤ الاستعلام"
     },
     {
       "id": "track-08-lesson-04",
@@ -3411,7 +3411,7 @@
         "advisory-lock",
         "deadlock"
       ],
-      "body": "PostgreSQL Locking — Row, Page, and Advisory Locks > [!NOTE] > PostgreSQL's locking system is a precision instrument. Used correctly, locks are what make concurrent financial transactions safe. Used carelessly, they produce deadlocks, lock queues, and silent correctness bugs. This lesson covers every lock mode, their interactions, and the patterns that make high-throughput financial systems both correct and fast. Lock Mode Hierarchy PostgreSQL defines eight table-level lock modes, ordered from l"
+      "body": "--- id: track-08-lesson-04 title: \"الأقفال في PostgreSQL — أقفال الصفوف والصفحات والأقفال الاستشارية\" slug: postgresql-locking track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 4 difficulty: advanced estimatedMinutes: 85 status: published tags: [PostgreSQL, locking, row-lock, advisory-lock, deadlock] prerequisites: [] --- الأقفال في PostgreSQL — أقفال الصفوف والصفحات والأقفال الاستشارية نظام الأقفال في PostgreSQL أداة دقيقة. فحين تُستخدم بشكل صحيح، تكون الأقفال ما يجعل المعامل"
     },
     {
       "id": "track-08-lesson-05",
@@ -3432,7 +3432,7 @@
         "BRIN",
         "covering-index"
       ],
-      "body": "Index Strategies — B-Tree, GIN, GiST, and BRIN > [!NOTE] > Index selection is one of the highest-leverage decisions in database engineering. The difference between a full table scan and an index scan on a 100-million-row transaction table is the difference between a 30-second query and a 5-millisecond one. This lesson teaches you to match index types to access patterns with precision, and to avoid the common mistake of over-indexing update-heavy financial tables. How PostgreSQL Chooses an Index "
+      "body": "--- id: track-08-lesson-05 title: \"استراتيجيات الفهرسة — B-Tree وGIN وGiST وBRIN\" slug: index-strategies track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 5 difficulty: advanced estimatedMinutes: 80 status: published tags: [index, B-tree, GIN, BRIN, covering-index] prerequisites: [] --- استراتيجيات الفهارس — B-Tree وGIN وGiST وBRIN اختيار الفهرس من أعلى القرارات أثرًا في هندسة قواعد البيانات. فالفرق بين مسح جدول كامل ومسح فهرس على جدول معاملات من 100 مليون صف هو الفرق بين استع"
     },
     {
       "id": "track-08-lesson-06",
@@ -3454,7 +3454,7 @@
         "pg_partman",
         "maintenance"
       ],
-      "body": "Table Partitioning — Range and Hash for Financial Data > A transaction table growing at 10 million rows per day reaches 3.6 billion rows in a year. Without partitioning, every VACUUM, REINDEX, and range query operates against the full dataset. Partitioning is not an optimisation — it is a maintenance prerequisite for any financial table at scale. Learning Objectives By the end of this lesson you will be able to: Explain the three reasons to partition financial tables and choose the right strateg"
+      "body": "--- id: track-08-lesson-06 title: \"تقسيم الجداول — بالنطاق والتجزئة للبيانات المالية\" slug: table-partitioning track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 6 difficulty: advanced estimatedMinutes: 75 status: published tags: [partitioning, PostgreSQL, range-partition, hash-partition, pg partman, maintenance] prerequisites: [track-08-lesson-05] --- تقسيم الجداول — النطاق والتجزئة للبيانات المالية جدول معاملات ينمو بمعدل 10 ملايين صف يوميًا يبلغ 3.6 مليار صف في عام. ودون تقس"
     },
     {
       "id": "track-08-lesson-07",
@@ -3469,7 +3469,7 @@
       "estimatedMinutes": 85,
       "status": "published",
       "tags": "",
-      "body": "A single PostgreSQL primary can sustain roughly 10,000 to 20,000 write transactions per second on modern NVMe hardware before CPU, WAL throughput, or lock contention becomes the ceiling. For a mid-sized payment processor handling 50,000 transactions per second at peak, that ceiling arrives faster than the engineering team expects. Vertical scaling buys time — a 192-core machine with 6 TB RAM exists, and it costs $80,000 per month. Horizontal scaling via sharding distributes the data and the writ"
+      "body": "--- id: track-08-lesson-07 title: \"تجزئة قواعد البيانات (Sharding) — استراتيجيات التوسع الأفقي\" slug: sharding track: track-08 track-name: \"بنية قواعد البيانات والبيانات\" sequence: 7 difficulty: advanced estimated-minutes: 85 status: published last-updated: \"2026-11-08\" tags: - sharding - horizontal-scaling - shard-key - re-sharding - hotspot prerequisites: - track-08-lesson-01 - track-08-lesson-06 components: mermaid: true prism: true knowledge-check: true practical-challenge: true --- نظرة عام"
     },
     {
       "id": "track-08-lesson-08",
@@ -3490,7 +3490,7 @@
         "consistency",
         "CQRS"
       ],
-      "body": "Read Replicas — Query Routing and Lag Management > [!NOTE] > Read replicas are deceptively simple to set up and surprisingly complex to operate correctly. The gap between \"replica is running\" and \"replica is production-safe\" contains subtle consistency traps, lag-induced bugs, and monitoring blind spots. This lesson covers the full lifecycle: replication mechanics, routing strategies, lag management, and consistency guarantees that financial applications actually require. PostgreSQL Streaming Re"
+      "body": "--- id: track-08-lesson-08 title: \"النسخ المقروءة — توجيه الاستعلامات وإدارة التأخر\" slug: read-replicas track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 8 difficulty: advanced estimatedMinutes: 75 status: published tags: [read-replica, replication-lag, query-routing, consistency, CQRS] prerequisites: [] --- نسخ القراءة — توجيه الاستعلامات وإدارة التأخر نسخ القراءة (read replicas) بسيطة الإعداد على نحو خادع ومعقدة التشغيل الصحيح على نحو مفاجئ. فالفجوة بين \"النسخة تعمل\" و\"النس"
     },
     {
       "id": "track-08-lesson-09",
@@ -3511,7 +3511,7 @@
         "online-migration",
         "backward-compatible"
       ],
-      "body": "Schema Evolution — Zero-Downtime Migrations > [!NOTE] > A payment database migration that takes a table lock at 09:00 on a Monday morning will block every transaction for the duration. Financial databases cannot afford downtime for schema changes. The expand-contract pattern and PostgreSQL's online DDL tools make zero-downtime migrations achievable — but they require discipline and a phased deployment approach. The Problem with Naive Migrations Each of the above operations acquires an lock. For "
+      "body": "--- id: track-08-lesson-09 title: \"تطور المخطط — الترحيل بدون توقف\" slug: schema-evolution track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 9 difficulty: advanced estimatedMinutes: 80 status: published tags: [schema-evolution, Flyway, Liquibase, online-migration, backward-compatible] prerequisites: [track-08-lesson-01] --- تطور المخطط — ترحيلات دون توقف ترحيل لقاعدة بيانات المدفوعات يأخذ قفل جدول في التاسعة صباح يوم الاثنين سيحجب كل معاملة طوال مدته. وقواعد البيانات المالية ل"
     },
     {
       "id": "track-08-lesson-10",
@@ -3532,7 +3532,7 @@
         "max-pool-size",
         "transaction-mode"
       ],
-      "body": "Connection Pooling — PgBouncer and HikariCP Tuning > [!NOTE] > PostgreSQL can sustain around 100–300 active connections before connection overhead degrades throughput. A payment platform with 20 microservices each running 10 instances with a pool of 20 connections each creates 4,000 potential connections — 10–40x over PostgreSQL's safe operating range. Connection pooling is not optional in production fintech systems. Why PostgreSQL Connections Are Expensive Each PostgreSQL connection is a separa"
+      "body": "--- id: track-08-lesson-10 title: \"تجميع الاتصالات — ضبط PgBouncer وHikariCP\" slug: connection-pooling track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 10 difficulty: advanced estimatedMinutes: 75 status: published tags: [connection-pool, PgBouncer, HikariCP, max-pool-size, transaction-mode] prerequisites: [track-08-lesson-01] --- تجميع الاتصالات — ضبط PgBouncer وHikariCP يستطيع PostgreSQL تحمّل نحو 100–300 اتصال نشط قبل أن تُضعف كلفة الاتصالات الإنتاجية. ومنصة دفع بها 20 خدم"
     },
     {
       "id": "track-08-lesson-11",
@@ -3553,7 +3553,7 @@
         "logical-replication",
         "streaming"
       ],
-      "body": "WAL and CDC — Change Data Capture with Debezium > [!NOTE] > The dual-write problem — keeping a database and a message broker in sync atomically — has caused some of the most expensive outages in financial services. Change Data Capture via the WAL is the correct architectural solution: the database is the single source of truth, and all downstream systems derive their state from the WAL stream, not from application-level dual writes. PostgreSQL WAL Internals The Write-Ahead Log (WAL) is PostgreSQ"
+      "body": "--- id: track-08-lesson-11 title: \"WAL وCDC — التقاط تغييرات البيانات باستخدام Debezium\" slug: wal-cdc track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 11 difficulty: advanced estimatedMinutes: 85 status: published tags: [WAL, CDC, Debezium, logical-replication, streaming] prerequisites: [track-08-lesson-01] --- ‏WAL وCDC — التقاط تغييرات البيانات باستخدام Debezium مشكلة الكتابة المزدوجة — إبقاء قاعدة البيانات ووسيط الرسائل متزامنين ذريًا — مصدر كلاسيكي لأحداث ضائعة، وأحداث ش"
     },
     {
       "id": "track-08-lesson-12",
@@ -3568,7 +3568,7 @@
       "estimatedMinutes": 65,
       "status": "published",
       "tags": "",
-      "body": "JSONB and Semi-Structured Data in PostgreSQL Financial systems frequently encounter data that does not fit neatly into a fixed relational schema: payment metadata varies by payment rail (SEPA mandate IDs, SWIFT BIC codes, Open Banking consent IDs), audit log payloads capture arbitrary system state, and feature flags carry heterogeneous configuration objects. PostgreSQL's JSONB type lets you store and index semi-structured data inside the relational engine — without sacrificing ACID guarantees or"
+      "body": "--- id: track-08-lesson-12 title: \"JSONB والبيانات شبه المنظمة في PostgreSQL\" slug: jsonb-semi-structured track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 12 difficulty: advanced estimatedMinutes: 65 status: published tags: - JSONB - PostgreSQL - GIN-index - jsonpath - schema-flexibility prerequisites: - track-08-lesson-11 --- ‏JSONB والبيانات شبه المهيكلة في PostgreSQL تصادف الأنظمة المالية كثيرًا بيانات لا تتلاءم بدقة مع مخطط علائقي ثابت: فبيانات الدفع الوصفية تختلف حسب قنا"
     },
     {
       "id": "track-08-lesson-13",
@@ -3583,7 +3583,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Time-Series Data — TimescaleDB and Hypertables Fintech platforms generate enormous volumes of time-ordered data: payment throughput metrics sampled every second, OHLCV candlestick data for every currency pair, fraud score time series per account, and system health metrics tied to business events. Vanilla PostgreSQL handles this workload poorly at scale. TimescaleDB — a PostgreSQL extension — transforms it into a first-class time-series database without sacrificing SQL compatibility or ACID guara"
+      "body": "--- id: track-08-lesson-13 title: \"بيانات السلاسل الزمنية — TimescaleDB والجداول الفائقة\" slug: time-series-timescaledb track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 13 difficulty: advanced estimatedMinutes: 70 status: published tags: - TimescaleDB - hypertable - time-series - continuous-aggregate - compression - financial-metrics prerequisites: - track-08-lesson-12 --- بيانات السلاسل الزمنية — TimescaleDB والجداول الفائقة تولّد منصات التقنية المالية كميات هائلة من البيانا"
     },
     {
       "id": "track-08-lesson-14",
@@ -3604,7 +3604,7 @@
         "bitemporal",
         "trigger"
       ],
-      "body": "Audit Tables — Temporal Tables and History Tracking > [!NOTE] > Audit logging is a compliance requirement in every regulated financial system. The question is not whether to build it, but how to build it correctly. Shadow tables driven by database triggers provide reliable, tamper-evident history that cannot be bypassed by application bugs. Bitemporal modelling adds the ability to answer \"what did we know, when did we know it\" — a question that arises in every regulatory investigation. Why Audit"
+      "body": "--- id: track-08-lesson-14 title: \"جداول التدقيق — الجداول الزمنية وتتبّع السجل التاريخي\" slug: audit-tables track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 14 difficulty: advanced estimatedMinutes: 75 status: published tags: [audit, temporal-table, history, bitemporal, trigger] prerequisites: [track-08-lesson-01, track-08-lesson-03] --- جداول التدقيق — الجداول الزمنية وتتبع السجل التاريخي سجل التدقيق متطلب امتثال في كل نظام مالي خاضع للتنظيم. والسؤال ليس هل تبنيه، بل كيف تب"
     },
     {
       "id": "track-08-lesson-15",
@@ -3625,7 +3625,7 @@
         "integration-testing",
         "migration-testing"
       ],
-      "body": "Database Testing — Property-Based and Integration Testing > [!NOTE] > Financial systems have a testing contract with their users: balances are always consistent, money is never created or destroyed, and concurrent operations produce correct results. This contract cannot be verified with mocked repositories. It requires real database integration tests that run on the actual schema, with the actual database engine, under concurrent load. This lesson builds that testing infrastructure. Why Database"
+      "body": "--- id: track-08-lesson-15 title: \"اختبار قواعد البيانات — الاختبار القائم على الخصائص واختبار التكامل\" slug: database-testing track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 15 difficulty: advanced estimatedMinutes: 75 status: published tags: [database-testing, Testcontainers, property-based, integration-testing, migration-testing] prerequisites: [track-08-lesson-01, track-08-lesson-09] --- اختبار قواعد البيانات — الاختبار القائم على الخصائص واختبار التكامل للأنظمة المالية "
     },
     {
       "id": "track-08-lesson-16",
@@ -3640,7 +3640,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Query Plan Analysis — EXPLAIN, ANALYZE, and Visualisation Understanding what PostgreSQL actually does when it executes a query is the single most important debugging skill for a database engineer. A query that runs in 2 ms on a table with 10,000 rows might take 45 seconds on a table with 50 million rows — not because the query changed, but because the execution strategy did. This lesson teaches you to read, interpret, and act on query execution plans. The Three Levels of EXPLAIN PostgreSQL provi"
+      "body": "--- id: track-08-lesson-16 title: \"تحليل خطط الاستعلام — EXPLAIN وANALYZE والتصوير\" slug: query-plan-analysis track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 16 difficulty: advanced estimatedMinutes: 70 status: published tags: - EXPLAIN - ANALYZE - query-plan - seq-scan - index-scan - PostgreSQL - performance prerequisites: - track-08-lesson-15 --- تحليل خطط الاستعلام — EXPLAIN وANALYZE والتصوير المرئي فهم ما يفعله PostgreSQL فعلًا حين ينفذ استعلامًا هو أهم مهارة تصحيح لمهند"
     },
     {
       "id": "track-08-lesson-17",
@@ -3661,7 +3661,7 @@
         "cross-shard",
         "PostgreSQL"
       ],
-      "body": "Distributed PostgreSQL — Citus and Distributed Queries > [!NOTE] > Citus extends PostgreSQL into a distributed database without sacrificing the SQL dialect, ACID guarantees, or existing tooling. For payment workloads that have outgrown a single PostgreSQL server's write capacity, Citus is the highest-fidelity scale-out option — before resorting to application-level sharding or migrating to a different database engine. Citus Architecture Citus uses a coordinator-worker topology: Coordinator: acce"
+      "body": "--- id: track-08-lesson-17 title: \"PostgreSQL الموزعة — Citus والاستعلامات الموزعة\" slug: distributed-postgresql track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 17 difficulty: principal estimatedMinutes: 85 status: published tags: [Citus, distributed, co-location, cross-shard, PostgreSQL] prerequisites: [track-08-lesson-06, track-08-lesson-07] --- ‏PostgreSQL الموزّع — Citus والاستعلامات الموزعة يوسّع Citus ‏PostgreSQL إلى قاعدة بيانات موزعة دون التضحية بلهجة SQL، أو ضمانات "
     },
     {
       "id": "track-08-lesson-18",
@@ -3682,7 +3682,7 @@
         "tiering",
         "S3"
       ],
-      "body": "Data Archival — Cold Storage and Tiered Data Management > [!NOTE] > The Bank Secrecy Act (BSA) requires retention of transaction records for at least 5 years; anti-money laundering regulations commonly require 7 years. Storing 7 years of transactions in a single hot PostgreSQL table is prohibitively expensive. Tiered archival moves old data to progressively cheaper storage while maintaining the ability to query it for compliance. Regulatory Retention Requirements Hot/Warm/Cold Tiering Strategy F"
+      "body": "--- id: track-08-lesson-18 title: \"أرشفة البيانات — التخزين البارد وإدارة البيانات متعددة المستويات\" slug: data-archival track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 18 difficulty: advanced estimatedMinutes: 70 status: published tags: [archival, cold-storage, data-lifecycle, tiering, S3] prerequisites: [track-08-lesson-06] --- أرشفة البيانات — التخزين البارد وإدارة البيانات على طبقات يشترط قانون السرية المصرفية الأمريكي (BSA) الاحتفاظ بسجلات المعاملات 5 سنوات على الأقل؛ و"
     },
     {
       "id": "track-08-lesson-19",
@@ -3703,7 +3703,7 @@
         "WAL-archiving",
         "recovery"
       ],
-      "body": "Backup and Recovery — Point-in-Time Recovery for Finance > [!NOTE] > \"You don't have a backup until you've restored it.\" This is not a cliché — it is the first principle of backup engineering. Financial systems that have never tested recovery from their backups will discover their backup was invalid during a production incident. Test recovery quarterly, measure RTO and RPO, and treat backup validation as a first-class engineering discipline. Recovery Objectives Defined Before configuring backups"
+      "body": "--- id: track-08-lesson-19 title: \"النسخ الاحتياطي والاستعادة — الاستعادة لنقطة زمنية في القطاع المالي\" slug: backup-recovery track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 19 difficulty: advanced estimatedMinutes: 75 status: published tags: [backup, PITR, pg basebackup, WAL-archiving, recovery] prerequisites: [track-08-lesson-11] --- النسخ الاحتياطي والاستعادة — الاستعادة لنقطة زمنية في المال \"ليس لديك نسخة احتياطية حتى تستعيدها.\" هذه ليست عبارة مبتذلة — إنها المبدأ الأول "
     },
     {
       "id": "track-08-lesson-20",
@@ -3724,7 +3724,7 @@
         "workload-simulation",
         "latency"
       ],
-      "body": "Database Benchmarking — pgbench and Custom Workloads > [!NOTE] > Database benchmarking in fintech serves two purposes: establishing a performance baseline before optimizations and validating infrastructure choices (instance type, storage configuration, connection pool sizing). Without a production-representative baseline, you cannot quantify the impact of any change. Without a reproducible benchmark, you are guessing. pgbench Built-In TPC-B Workload pgbench's default workload simulates the TPC-B"
+      "body": "--- id: track-08-lesson-20 title: \"قياس أداء قواعد البيانات — pgbench وأحمال العمل المخصصة\" slug: db-benchmarking track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 20 difficulty: advanced estimatedMinutes: 75 status: published tags: [pgbench, benchmarking, TPS, workload-simulation, latency] prerequisites: [track-08-lesson-01] --- قياس أداء قواعد البيانات — pgbench وأحمال العمل المخصصة يخدم قياس أداء قواعد البيانات في التقنية المالية غرضين: إرساء خط أساس للأداء قبل التحسينات، و"
     },
     {
       "id": "track-08-lesson-21",
@@ -3745,7 +3745,7 @@
         "serializable",
         "geo-partitioning"
       ],
-      "body": "NewSQL — CockroachDB and Google Spanner Architecture > [!NOTE] > NewSQL databases promise the best of both worlds: the SQL interface and ACID guarantees of traditional databases, with the horizontal scale-out of NoSQL. The tradeoff is latency — distributed transactions require multiple network round-trips for consensus. For financial systems, understanding where this latency materializes is essential for making an informed architectural choice. NewSQL Definition NewSQL databases share three prop"
+      "body": "--- id: track-08-lesson-21 title: \"NewSQL — بنية CockroachDB وGoogle Spanner\" slug: newsql track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 21 difficulty: advanced estimatedMinutes: 80 status: published tags: [NewSQL, CockroachDB, Spanner, serializable, geo-partitioning] prerequisites: [track-08-lesson-17] --- ‏NewSQL — بنية CockroachDB وGoogle Spanner تعد قواعد بيانات NewSQL بأفضل ما في العالمين: واجهة SQL وضمانات ACID لقواعد البيانات التقليدية، مع التوسع الأفقي لـ NoSQL. وا"
     },
     {
       "id": "track-08-lesson-22",
@@ -3766,7 +3766,7 @@
         "staff-engineer",
         "selection"
       ],
-      "body": "Principal Engineer's Database Decision Framework > [!NOTE] > The most expensive database mistake is choosing the wrong database before you understand your workload. The second most expensive is staying with the wrong database too long after the workload has evolved. The principal engineer's role is to establish the decision criteria, enforce measured evaluation, and prevent both premature optimization and premature migration. Database Selection Framework for Financial Services The selection proc"
+      "body": "--- id: track-08-lesson-22 title: \"إطار المهندس الرئيسي لقرارات قواعد البيانات\" slug: database-decision-framework track: track-08 trackName: \"بنية قواعد البيانات والبيانات\" sequence: 22 difficulty: principal estimatedMinutes: 65 status: published tags: [decision-framework, database, trade-offs, staff-engineer, selection] prerequisites: [track-08-lesson-21] --- إطار قرارات قواعد البيانات للمهندس الرئيسي أكلف خطأ في قواعد البيانات اختيار قاعدة البيانات الخطأ قبل أن تفهم حملك. وثاني أكلف خطأ البقاء"
     },
     {
       "id": "track-09-lesson-01",
@@ -3787,7 +3787,7 @@
         "consumer-group",
         "broker"
       ],
-      "body": "Kafka Architecture — Topics, Partitions, and Consumer Groups > [!NOTE] > Apache Kafka is the dominant messaging platform in financial services — not because it's simple, but because it provides the combination of durability, throughput, and replay capability that event-driven financial systems require. This lesson builds the architectural mental model needed to use Kafka correctly. Why Kafka Exists — The Problem It Solves Traditional message queues (RabbitMQ, ActiveMQ) delete messages after cons"
+      "body": "--- id: track-09-lesson-01 title: \"بنية Kafka — المواضيع والأقسام ومجموعات المستهلكين\" slug: kafka-architecture track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 1 difficulty: advanced estimatedMinutes: 90 status: published tags: [Kafka, topic, partition, consumer-group, broker] prerequisites: [] --- بنية Kafka — المواضيع والأقسام ومجموعات المستهلكين ‏Apache Kafka هي منصة الرسائل المهيمنة في الخدمات المالية — لا لأنها بسيطة، بل لأنها توفر مزيج الديمومة، والإنتاجية، وال"
     },
     {
       "id": "track-09-lesson-02",
@@ -3808,7 +3808,7 @@
         "idempotent",
         "ordering"
       ],
-      "body": "Kafka Producer — Acknowledgement, Batching, and Ordering > [!NOTE] > The Kafka producer is not a simple fire-and-forget client. In financial systems, every configuration knob — acks, retries, linger.ms, idempotence — directly maps to a durability and ordering guarantee. Getting these wrong means duplicate payments, lost transactions, or silent data corruption at scale. Overview The Kafka producer is responsible for serializing records, selecting a partition, batching messages for efficiency, and"
+      "body": "--- id: track-09-lesson-02 title: \"منتِج Kafka — الإقرار والتجميع والترتيب\" slug: kafka-producer track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 2 difficulty: advanced estimatedMinutes: 80 status: published tags: [Kafka, producer, acks, idempotent, ordering] prerequisites: [track-09-lesson-01] --- منتج Kafka — التأكيد والتجميع والترتيب منتج Kafka ليس عميلًا بسيطًا \"أرسل وانسَ\". ففي الأنظمة المالية، كل مقبض إعداد — acks، وretries، وlinger.ms، وidempotence — يقابل مباش"
     },
     {
       "id": "track-09-lesson-03",
@@ -3829,7 +3829,7 @@
         "rebalance",
         "commit-strategy"
       ],
-      "body": "Kafka Consumer — Offset Management and Rebalancing > [!NOTE] > Offset management is where most Kafka consumer bugs originate in production financial systems. The difference between at-most-once, at-least-once, and exactly-once processing is determined entirely by when you commit offsets relative to when you process messages. Get this wrong and you either lose payment events or reprocess them on every restart. Overview A Kafka consumer reads records from partitions, tracks its position (offset) w"
+      "body": "--- id: track-09-lesson-03 title: \"مستهلك Kafka — إدارة الإزاحات وإعادة التوازن\" slug: kafka-consumer track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 3 difficulty: advanced estimatedMinutes: 80 status: published tags: [Kafka, consumer, offset, rebalance, commit-strategy] prerequisites: [track-09-lesson-02] --- مستهلك Kafka — إدارة الإزاحات وإعادة التوازن إدارة الإزاحات هي منبع معظم أخطاء مستهلكي Kafka في الأنظمة المالية الإنتاجية. والفرق بين المعالجة مرة واحدة على ال"
     },
     {
       "id": "track-09-lesson-04",
@@ -3850,7 +3850,7 @@
         "state-store",
         "windowing"
       ],
-      "body": "Kafka Streams — Stateful Stream Processing > [!NOTE] > Kafka Streams is not just a streaming library — it is a distributed, fault-tolerant stateful computation engine that runs inside your Java application. For financial systems, this means you can compute running balances, detect fraud patterns, and aggregate payment volumes in real-time without a separate cluster like Flink or Spark. Overview Kafka Streams turns Kafka topics into a programmable computation graph. Unlike consumer-only patterns,"
+      "body": "--- id: track-09-lesson-04 title: \"Kafka Streams — معالجة التدفقات ذات الحالة\" slug: kafka-streams track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 4 difficulty: advanced estimatedMinutes: 85 status: published tags: [Kafka-Streams, KStream, KTable, state-store, windowing] prerequisites: [track-09-lesson-03] --- ‏Kafka Streams — معالجة التدفقات ذات الحالة ليست Kafka Streams مجرد مكتبة تدفق — بل محرك حوسبة ذو حالة، موزع ومتحمل للأعطال، يعمل داخل تطبيق Java الخاص بك. ولل"
     },
     {
       "id": "track-09-lesson-05",
@@ -3871,7 +3871,7 @@
         "EOS",
         "deduplication"
       ],
-      "body": "Exactly-Once Semantics — Transactions in Kafka > [!NOTE] > Duplicate payment events are a critical failure mode: a customer charged twice, a transfer executed twice, or a fraud signal counted twice. Kafka's exactly-once semantics (EOS) eliminate duplicates within the Kafka ecosystem through two mechanisms: idempotent producers and transactional producers. This lesson covers both mechanisms, their configuration, their limits, and how to build a consumer-side deduplication table as an independent "
+      "body": "--- id: track-09-lesson-05 title: \"المعالجة مرة واحدة فقط — المعاملات في Kafka\" slug: kafka-exactly-once track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 5 difficulty: advanced estimatedMinutes: 75 status: published tags: [exactly-once, idempotent-producer, kafka-transactions, EOS, deduplication] prerequisites: [track-09-lesson-04] --- دلالات مرة واحدة بالضبط — المعاملات في Kafka أحداث الدفع المكررة نمط فشل حرج: عميل يُخصم منه مرتين، أو تحويل يُنفذ مرتين، أو إشارة احت"
     },
     {
       "id": "track-09-lesson-06",
@@ -3893,7 +3893,7 @@
         "WAL",
         "Kafka-Connect"
       ],
-      "body": "Transactional Outbox Pattern with Debezium CDC > [!NOTE] > Writing to a database and publishing to Kafka in the same operation is impossible to do atomically without special infrastructure. If the database write succeeds but the Kafka publish fails, downstream services never learn about the event. If Kafka succeeds but the database write fails, the event describes something that never happened. The Transactional Outbox Pattern solves this by making Kafka publication a consequence of the database"
+      "body": "--- id: track-09-lesson-06 title: \"نمط Transactional Outbox مع Debezium CDC\" slug: outbox-cdc-debezium track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 6 difficulty: advanced estimatedMinutes: 75 status: published tags: [outbox, transactional-outbox, Debezium, CDC, WAL, Kafka-Connect] prerequisites: [track-09-lesson-05] --- نمط Outbox المعاملاتي مع Debezium CDC الكتابة إلى قاعدة بيانات والنشر إلى Kafka في العملية نفسها مستحيلة ذريًا دون بنية تحتية خاصة. فإذا نجحت كتاب"
     },
     {
       "id": "track-09-lesson-07",
@@ -3914,7 +3914,7 @@
         "schema-evolution",
         "compatibility"
       ],
-      "body": "Schema Registry — Avro, Protobuf, and Schema Evolution > [!NOTE] > Schemas are contracts. In financial systems where multiple teams produce and consume payment events, a schema change that silently breaks a downstream consumer can halt settlement, trigger double-reconciliation, or corrupt compliance records. Schema Registry is the enforcement layer that makes schema evolution safe, versioned, and auditable. Why Schema Registry Exists Without Schema Registry, Kafka messages are opaque bytes. Team"
+      "body": "--- id: track-09-lesson-07 title: \"سجل المخططات — Avro وProtobuf وتطور المخطط\" slug: schema-registry track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 7 difficulty: advanced estimatedMinutes: 75 status: published tags: [schema-registry, Avro, Protobuf, schema-evolution, compatibility] prerequisites: [kafka-architecture, kafka-producer, kafka-consumer] --- ‏Schema Registry — ‏Avro وProtobuf وتطور المخططات المخططات عقود. ففي الأنظمة المالية حيث تنتج فرق متعددة أحداث الدف"
     },
     {
       "id": "track-09-lesson-08",
@@ -3935,7 +3935,7 @@
         "SMT",
         "worker"
       ],
-      "body": "Kafka Connect — Source and Sink Connector Architecture > [!NOTE] > Kafka Connect is the integration layer of the Kafka ecosystem. Rather than writing custom producer/consumer code for every data source and sink, Connect provides a framework with proven, production-tested connectors for databases, object stores, search engines, and more. For financial systems, it handles the operational complexity of database polling, WAL reading, offset management, and retry logic — so your engineers focus on bu"
+      "body": "--- id: track-09-lesson-08 title: \"Kafka Connect — بنية موصلات المصدر والوجهة\" slug: kafka-connect track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 8 difficulty: advanced estimatedMinutes: 75 status: published tags: [Kafka-Connect, source-connector, sink-connector, SMT, worker] prerequisites: [kafka-architecture, outbox-cdc-debezium] --- ‏Kafka Connect — بنية موصّلات المصدر والمصب ‏Kafka Connect هي طبقة التكامل في منظومة Kafka. فبدل كتابة شيفرة منتج/مستهلك مخصصة لكل م"
     },
     {
       "id": "track-09-lesson-09",
@@ -3950,7 +3950,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "Event Sourcing with Kafka — Event Store Architecture Traditional systems store the current state of an entity — the account balance is 4,250.00. Event sourcing stores the facts that led to that state — deposit 1,000, withdraw 500, receive transfer 3,750. This distinction is fundamental in financial systems where the audit trail is not a secondary concern but the primary record. This lesson covers how Kafka implements event sourcing for payment aggregates, including snapshot strategies, replay me"
+      "body": "--- id: track-09-lesson-09 title: \"Event Sourcing مع Kafka — بنية مخزن الأحداث\" slug: event-sourcing-kafka track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 9 difficulty: advanced estimatedMinutes: 80 status: published tags: - event-sourcing - event-store - Kafka - append-only - snapshot - CQRS prerequisites: - track-09-lesson-08 --- ‏Event Sourcing مع Kafka — بنية مخزن الأحداث تخزّن الأنظمة التقليدية الحالة الحالية للكيان — رصيد الحساب 4,250.00. أما event sourcing فيخ"
     },
     {
       "id": "track-09-lesson-10",
@@ -3965,7 +3965,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "CQRS with Kafka — Read Model Projection Strategies Command Query Responsibility Segregation (CQRS) separates the data model used for writes from the data model used for reads. In a payment system, the write side appends events to Kafka; the read side maintains optimised PostgreSQL projections built by consuming those events. This lesson covers the full mechanics of building, monitoring, and rebuilding projections, including schema evolution and consistency tradeoffs. CQRS Architecture Overview T"
+      "body": "--- id: track-09-lesson-10 title: \"CQRS مع Kafka — استراتيجيات إسقاط نماذج القراءة\" slug: cqrs-kafka-projections track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 10 difficulty: advanced estimatedMinutes: 75 status: published tags: - CQRS - projection - read-model - Kafka-consumer - eventual-consistency - materialised-view prerequisites: - track-09-lesson-09 --- ‏CQRS مع Kafka — استراتيجيات إسقاط نماذج القراءة يفصل نمط فصل مسؤولية الأوامر عن الاستعلامات (CQRS) نموذج ال"
     },
     {
       "id": "track-09-lesson-11",
@@ -3980,7 +3980,7 @@
       "estimatedMinutes": 65,
       "status": "published",
       "tags": "",
-      "body": "Dead Letter Queues — Poison Pill Handling and Retry A single malformed payment event can halt all processing for a Kafka partition. Without a dead letter queue strategy, one bad message can silently block thousands of downstream consumers. This lesson covers poison pill detection, non-blocking retry topology, failure classification, and re-driving from the DLQ. The Poison Pill Problem A poison pill is a message that causes the consumer to throw an exception every time it attempts processing. Bec"
+      "body": "--- id: track-09-lesson-11 title: \"طوابير الرسائل الميتة — التعامل مع الرسائل السامة وإعادة المحاولة\" slug: dead-letter-queues track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 11 difficulty: advanced estimatedMinutes: 65 status: published tags: - DLQ - dead-letter-queue - poison-pill - retry - exponential-backoff - Spring-Kafka prerequisites: - track-09-lesson-10 --- طوابير الرسائل الميتة — التعامل مع الرسائل السامة وإعادة المحاولة يمكن لحدث دفع واحد مشوّه أن يوقف كل "
     },
     {
       "id": "track-09-lesson-12",
@@ -4001,7 +4001,7 @@
         "ACL",
         "mTLS"
       ],
-      "body": "Kafka Security — TLS, SASL, and ACLs > [!NOTE] > Kafka processes payment data, account events, and transaction streams — all categories requiring strict access control under PCI DSS, GDPR, and FCA regulations. A misconfigured Kafka cluster can expose financial data to any service on the network or allow a compromised service to publish fraudulent payment events. Security is not a post-launch concern — it must be designed into the architecture from day one. Kafka Security Layers Kafka has three i"
+      "body": "--- id: track-09-lesson-12 title: \"أمان Kafka — TLS وSASL وقوائم التحكم بالوصول\" slug: kafka-security track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 12 difficulty: advanced estimatedMinutes: 75 status: published tags: [Kafka, TLS, SASL, ACL, mTLS] prerequisites: [kafka-architecture, kafka-producer, kafka-consumer] --- أمن Kafka — ‏TLS وSASL وACL تعالج Kafka بيانات الدفع، وأحداث الحسابات، وتدفقات المعاملات — وكلها فئات تتطلب تحكمًا صارمًا في الوصول بموجب PCI DSS، وGD"
     },
     {
       "id": "track-09-lesson-13",
@@ -4022,7 +4022,7 @@
         "latency",
         "compression"
       ],
-      "body": "Kafka Performance Tuning — Throughput vs Latency > [!NOTE] > Kafka performance tuning requires understanding a fundamental trade-off: throughput and latency are in direct tension. Configurations that maximise throughput (larger batches, longer waits, compression) increase latency. Configurations that minimise latency (immediate sends, no batching) reduce throughput. Payment systems have different requirements across the pipeline — fraud detection needs <50ms, settlement can tolerate 500ms, compl"
+      "body": "--- id: track-09-lesson-13 title: \"ضبط أداء Kafka — الإنتاجية مقابل الكمون\" slug: kafka-performance track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 13 difficulty: advanced estimatedMinutes: 80 status: published tags: [Kafka, performance, throughput, latency, compression] prerequisites: [kafka-architecture, kafka-producer, kafka-consumer] --- ضبط أداء Kafka — الإنتاجية مقابل زمن الاستجابة يتطلب ضبط أداء Kafka فهم مفاضلة جوهرية: الإنتاجية وزمن الاستجابة في توتر مباشر. "
     },
     {
       "id": "track-09-lesson-14",
@@ -4043,7 +4043,7 @@
         "failover",
         "Kafka"
       ],
-      "body": "Multi-Region Kafka — MirrorMaker 2 and Replication > [!NOTE] > A single-region Kafka cluster is a single point of failure for all payment processing. Financial institutions require multi-region Kafka for disaster recovery, geographic compliance (data residency), and low-latency access from regional services. MirrorMaker 2, built on Kafka Connect, is the production-grade solution — but its offset translation mechanism and failover procedure require deep understanding to operate correctly. Why Mul"
+      "body": "--- id: track-09-lesson-14 title: \"Kafka متعدد المناطق — MirrorMaker 2 والنسخ المتماثل\" slug: multi-region-kafka track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 14 difficulty: principal estimatedMinutes: 85 status: published tags: [MirrorMaker, multi-region, geo-replication, failover, Kafka] prerequisites: [kafka-architecture, kafka-connect] --- ‏Kafka متعدد المناطق — MirrorMaker 2 والنسخ عنقود Kafka في منطقة واحدة نقطة فشل واحدة لكل معالجة المدفوعات. وتحتاج المؤسسات"
     },
     {
       "id": "track-09-lesson-15",
@@ -4058,7 +4058,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "Saga Pattern — Choreography and Orchestration A payment that spans multiple microservices — debit source, check fraud, notify beneficiary, credit destination — cannot be wrapped in a single database transaction. The saga pattern replaces the distributed two-phase commit with a sequence of local transactions and compensating transactions. This lesson covers both flavours (choreography and orchestration), the full payment saga lifecycle, and how to make compensations idempotent and durable. Why No"
+      "body": "--- id: track-09-lesson-15 title: \"نمط Saga — التنسيق الذاتي (Choreography) والتنسيق المركزي (Orchestration)\" slug: saga-pattern track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 15 difficulty: advanced estimatedMinutes: 80 status: published tags: - saga - choreography - orchestration - compensation - distributed-transaction - Axon prerequisites: - track-09-lesson-14 --- نمط Saga — التنسيق الذاتي والتنسيق المركزي لا يمكن تغليف دفعة تمتد عبر خدمات مصغّرة متعددة — خصم ال"
     },
     {
       "id": "track-09-lesson-16",
@@ -4079,7 +4079,7 @@
         "choreography",
         "decoupling"
       ],
-      "body": "Event-Driven Microservices — Integration Patterns > [!NOTE] > Event-driven integration is not just a technical pattern — it is an organisational pattern. Services that communicate via events can be deployed independently, owned by independent teams, and evolved without coordination. For a fintech processing hundreds of thousands of payments per day across dozens of microservices, this autonomy is the difference between a team that can deploy on Friday and one that cannot deploy without a product"
+      "body": "--- id: track-09-lesson-16 title: \"الخدمات المصغّرة القائمة على الأحداث — أنماط التكامل\" slug: event-driven-microservices track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 16 difficulty: advanced estimatedMinutes: 85 status: published tags: [event-driven, microservices, event-mesh, choreography, decoupling] prerequisites: [kafka-architecture, outbox-cdc-debezium, saga-pattern] --- الخدمات المصغّرة المدفوعة بالأحداث — أنماط التكامل التكامل المدفوع بالأحداث ليس مجرد نمط "
     },
     {
       "id": "track-09-lesson-17",
@@ -4100,7 +4100,7 @@
         "JMX",
         "Prometheus"
       ],
-      "body": "Kafka Monitoring — Consumer Lag and Broker Metrics > [!NOTE] > Kafka's operational health is invisible without active monitoring. A consumer group that is falling behind — processing payments slower than they arrive — will not throw an exception or log an obvious error. The only signal is a growing consumer lag metric. By the time a business stakeholder notices payments are delayed, the lag may represent hours of backlog. Build monitoring before you need it. What to Monitor Kafka monitoring oper"
+      "body": "--- id: track-09-lesson-17 title: \"مراقبة Kafka — تأخر المستهلكين ومقاييس الوسطاء\" slug: kafka-monitoring track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 17 difficulty: advanced estimatedMinutes: 70 status: published tags: [Kafka, monitoring, consumer-lag, JMX, Prometheus] prerequisites: [kafka-architecture, kafka-consumer] --- مراقبة Kafka — تأخر المستهلكين ومقاييس الوسطاء الصحة التشغيلية لـ Kafka غير مرئية دون مراقبة فعالة. فمجموعة المستهلكين التي تتأخر — تعالج الم"
     },
     {
       "id": "track-09-lesson-18",
@@ -4120,7 +4120,7 @@
         "global-order",
         "sequence-number"
       ],
-      "body": "Message Ordering — Global vs Partition-Level Guarantees > [!NOTE] > Kafka guarantees strict ordering within a partition, but not across partitions. For payment systems, this distinction is critical: processing a debit before its corresponding credit, or processing an account close before the final transaction, can corrupt financial data. Understanding and designing for Kafka's ordering guarantees is non-negotiable at the principal level. Kafka's Ordering Guarantee Implication for payment process"
+      "body": "--- id: track-09-lesson-18 title: \"ترتيب الرسائل — الضمانات الشاملة مقابل ضمانات القسم\" slug: message-ordering track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 18 difficulty: advanced estimatedMinutes: 75 status: published tags: [message-ordering, partition-key, global-order, sequence-number] prerequisites: [kafka-architecture, kafka-producer, kafka-consumer] --- ترتيب الرسائل — الضمانات الشاملة مقابل ضمانات مستوى القسم تضمن Kafka ترتيبًا صارمًا داخل القسم، لكن ليس عب"
     },
     {
       "id": "track-09-lesson-19",
@@ -4141,7 +4141,7 @@
         "queue",
         "log"
       ],
-      "body": "RabbitMQ vs Kafka — Choosing the Right Broker > [!NOTE] > Kafka and RabbitMQ are both excellent message brokers, but they solve different problems. The wrong choice causes architectural friction for years. Using Kafka for task queues and RabbitMQ for event streaming are both common and painful mistakes. This lesson builds the mental model to choose correctly and design hybrid architectures when both are genuinely needed. Fundamental Architectural Difference The core difference is not about perfo"
+      "body": "--- id: track-09-lesson-19 title: \"RabbitMQ أم Kafka — اختيار الوسيط المناسب\" slug: rabbitmq-vs-kafka track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 19 difficulty: advanced estimatedMinutes: 75 status: published tags: [RabbitMQ, Kafka, comparison, queue, log] prerequisites: [kafka-architecture] --- ‏RabbitMQ مقابل Kafka — اختيار الوسيط الصحيح ‏Kafka وRabbitMQ كلاهما وسيط رسائل ممتاز، لكنهما يحلان مشكلات مختلفة. والاختيار الخاطئ يسبب احتكاكًا معماريًا لسنوات. واستخدا"
     },
     {
       "id": "track-09-lesson-20",
@@ -4162,7 +4162,7 @@
         "staff-engineer",
         "broker"
       ],
-      "body": "Principal Engineer's Messaging Decision Framework > [!NOTE] > As a principal or staff engineer, you are accountable for messaging architecture decisions that will constrain your platform for 3–5 years. The goal is not to pick the most sophisticated technology — it is to pick the right technology for your context, document your reasoning, and make the trade-offs explicit. This lesson is a checklist-driven framework, not a tutorial. Use it in architecture reviews, RFC documents, and technical stra"
+      "body": "--- id: track-09-lesson-20 title: \"إطار المهندس الرئيسي لقرارات أنظمة الرسائل\" slug: messaging-decision-framework track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 20 difficulty: principal estimatedMinutes: 65 status: published tags: [decision-framework, messaging, trade-offs, staff-engineer, broker] prerequisites: [kafka-architecture, rabbitmq-vs-kafka, kafka-security, kafka-performance] --- إطار قرارات المراسلة للمهندس الرئيسي بصفتك مهندسًا رئيسيًا أو مهندس طاقم (sta"
     },
     {
       "id": "track-10-lesson-01",
@@ -4183,7 +4183,7 @@
         "pod",
         "namespace"
       ],
-      "body": "Kubernetes for Financial Services — Architecture and Workloads > [!NOTE] > Kubernetes has become the standard deployment platform for financial services, but running regulated workloads on K8s requires different patterns than general application development. This lesson covers the K8s model and its application to financial production environments. Why Kubernetes for Financial Services Financial technology organisations migrate to Kubernetes for three reasons: Declarative infrastructure — the des"
+      "body": "--- id: track-10-lesson-01 title: \"Kubernetes للخدمات المالية — البنية وأحمال العمل\" slug: kubernetes-financial track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 1 difficulty: advanced estimatedMinutes: 90 status: published tags: [Kubernetes, K8s, deployment, pod, namespace] prerequisites: [] --- ‏Kubernetes للخدمات المالية — البنية وأحمال العمل أصبح Kubernetes منصة النشر القياسية للخدمات المالية، لكن تشغيل أحمال عمل خاضعة للتنظيم على K8s يتطلب أنماطًا مختلفة عن تطوير"
     },
     {
       "id": "track-10-lesson-02",
@@ -4204,7 +4204,7 @@
         "toleration",
         "resource-quota"
       ],
-      "body": "Pod Scheduling — Affinity, Taints, and Resource Requests > [!NOTE] > Misconfigured resource requests are the number one cause of noisy-neighbour incidents in multi-tenant financial Kubernetes clusters. Getting scheduling right keeps payment processing latency predictable under peak load and prevents a runaway batch job from starving the settlement service. Why Scheduling Matters in Fintech In a traditional financial platform, infrastructure teams carved up physical servers with strict boundaries"
+      "body": "--- id: track-10-lesson-02 title: \"جدولة الـ Pods — التقارب والتلطيخ (Taints) وطلبات الموارد\" slug: pod-scheduling track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 2 difficulty: advanced estimatedMinutes: 80 status: published tags: [pod-scheduling, affinity, taint, toleration, resource-quota] prerequisites: [track-10-lesson-01] --- جدولة الـ Pods — التقارب، والـ Taints، وطلبات الموارد طلبات الموارد المضبوطة خطأً هي السبب الأول لحوادث \"الجار المزعج\" في عناقيد Kubernet"
     },
     {
       "id": "track-10-lesson-03",
@@ -4219,7 +4219,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Kubernetes Networking — CNI, Services, and Ingress Kubernetes networking is one of the most consequential design decisions in a fintech platform. Payment services, fraud detection engines, and core banking APIs all share the cluster network, making isolation, discoverability, and performance non-negotiable. This lesson covers every networking layer from the CNI-level flat network through Services, Ingress, and NetworkPolicy enforcement. The Kubernetes Pod Networking Model Kubernetes mandates a f"
+      "body": "--- id: track-10-lesson-03 title: \"الشبكات في Kubernetes — CNI والخدمات وIngress\" slug: k8s-networking track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 3 difficulty: advanced estimatedMinutes: 75 status: published tags: - Kubernetes - CNI - Service - Ingress - NetworkPolicy - Calico - DNS --- شبكات Kubernetes — ‏CNI، والخدمات، والـ Ingress شبكات Kubernetes من أكثر قرارات التصميم أثرًا في منصة تقنية مالية. فخدمات الدفع، ومحركات كشف الاحتيال، وواجهات الأنظمة المصرفية ا"
     },
     {
       "id": "track-10-lesson-04",
@@ -4240,7 +4240,7 @@
         "Flux",
         "declarative"
       ],
-      "body": "Helm and GitOps — Declarative Infrastructure with ArgoCD > [!NOTE] > GitOps is the deployment model that satisfies the change management requirements in ISO 27001, SOX, and PCI-DSS simultaneously. Every change to production passes through a pull request, every deployment is traceable to a Git commit, and rollback is . For financial institutions under regulatory scrutiny, this is not a convenience — it is a compliance mechanism. The GitOps Mental Model for Financial Services Traditional deploymen"
+      "body": "--- id: track-10-lesson-04 title: \"Helm وGitOps — البنية التحتية التصريحية مع ArgoCD\" slug: helm-gitops track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 4 difficulty: advanced estimatedMinutes: 80 status: published tags: [Helm, GitOps, ArgoCD, Flux, declarative] prerequisites: [track-10-lesson-03] --- ‏Helm وGitOps — بنية تحتية تصريحية مع ArgoCD ‏GitOps نموذج نشر يدعم ضوابط إدارة التغيير في ISO 27001، وSOX، وPCI-DSS في الوقت نفسه. فكل تغيير على الإنتاج يمر عبر طلب سح"
     },
     {
       "id": "track-10-lesson-05",
@@ -4255,7 +4255,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "Service Mesh — Istio Traffic Management and Observability A service mesh adds a dedicated infrastructure layer for service-to-service communication, handling encryption, retries, circuit breaking, and distributed tracing transparently — without changing application code. For fintech platforms where every inter-service call carries financial data, Istio's mutual TLS enforcement and fine-grained authorization policies provide security controls that satisfy PCI-DSS Requirement 4 (encryption in tran"
+      "body": "--- id: track-10-lesson-05 title: \"شبكة الخدمات — إدارة المرور والمراقبة في Istio\" slug: service-mesh-istio track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 5 difficulty: advanced estimatedMinutes: 80 status: published tags: - Istio - service-mesh - mTLS - VirtualService - DestinationRule - observability --- شبكة الخدمات (Service Mesh) — إدارة الحركة والرصد في Istio تضيف شبكة الخدمات طبقة بنية تحتية مخصصة للتواصل بين الخدمات، تتولى التشفير، وإعادة المحاولات، وقطع الد"
     },
     {
       "id": "track-10-lesson-06",
@@ -4276,7 +4276,7 @@
         "seccomp",
         "non-root"
       ],
-      "body": "Container Security — Image Scanning and Pod Security > [!NOTE] > A container is not a security boundary. Containers share the host kernel. If a payment processing container runs as root with excessive Linux capabilities, a vulnerability in that container can compromise the host node — and every other pod on it. The controls in this lesson are not bureaucratic checkbox exercises; they are the technical controls that prevent a container escape from becoming a cluster-wide breach. The Container Sec"
+      "body": "--- id: track-10-lesson-06 title: \"أمان الحاويات — فحص الصور وأمان الـ Pods\" slug: container-security track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 6 difficulty: advanced estimatedMinutes: 80 status: published tags: [container-security, Trivy, PSP, seccomp, non-root] prerequisites: [track-10-lesson-05] --- أمان الحاويات — فحص الصور وأمان الـ Pods الحاوية ليست حدًا أمنيًا. فالحاويات تتشارك نواة المضيف. وإذا كانت حاوية معالجة دفع تعمل بصلاحيات root مع قدرات Linux زا"
     },
     {
       "id": "track-10-lesson-07",
@@ -4297,7 +4297,7 @@
         "rotation",
         "encryption-at-rest"
       ],
-      "body": "Secret Management — Vault and External Secrets Operator > [!NOTE] > Hardcoded database credentials are the leading cause of financial data breaches. HashiCorp Vault with dynamic secrets means no one ever knows the production database password — not the DBA, not the application developer, not the platform engineer. The credential exists for the duration of the connection lease and is then destroyed. This is the gold standard for PCI-DSS key management. Why Kubernetes Secrets Alone Are Not Enough "
+      "body": "--- id: track-10-lesson-07 title: \"إدارة الأسرار — Vault وExternal Secrets Operator\" slug: secret-management track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 7 difficulty: advanced estimatedMinutes: 80 status: published tags: [secrets, HashiCorp-Vault, ESO, rotation, encryption-at-rest] prerequisites: [track-10-lesson-06] --- إدارة الأسرار — Vault وExternal Secrets Operator بيانات الاعتماد المسربة والمكتوبة في الشيفرة من أشيع نقاط بداية اختراقات البيانات. ومع الأسرار"
     },
     {
       "id": "track-10-lesson-08",
@@ -4312,7 +4312,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Cloud-Native Storage — Persistent Volumes and StatefulSets Stateful workloads in a fintech cluster — PostgreSQL for transaction records, Kafka for payment event streams, Redis for session data — require durable, high-performance storage with strict availability guarantees. Kubernetes provides the abstractions (PersistentVolume, PersistentVolumeClaim, StorageClass, StatefulSet) but the operational discipline — right storage class, correct reclaim policy, AZ-aware scheduling, automated backup — de"
+      "body": "--- id: track-10-lesson-08 title: \"التخزين السحابي الأصلي — الأقراص الدائمة وStatefulSets\" slug: cloud-native-storage track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 8 difficulty: advanced estimatedMinutes: 70 status: published tags: - PersistentVolume - StatefulSet - StorageClass - CSI - Velero - backup --- التخزين السحابي الأصلي — المجلدات الدائمة والـ StatefulSets تتطلب أحمال العمل ذات الحالة في عنقود تقنية مالية — PostgreSQL لسجلات المعاملات، وKafka لتدفقات أحدا"
     },
     {
       "id": "track-10-lesson-09",
@@ -4333,7 +4333,7 @@
         "auto-scaling",
         "event-driven-scaling"
       ],
-      "body": "Auto-Scaling — HPA, VPA, and KEDA for Financial Loads > [!NOTE] > Payment volumes are inherently spiky. Black Friday brings 10x normal load. Payroll runs drive hourly spikes. Market open and close create millisecond bursts. Static resource allocation either over-provisions (wasting money) or under-provisions (causing latency spikes and payment failures). Kubernetes auto-scaling — HPA, VPA, and KEDA — lets your platform adapt to these patterns automatically. Auto-Scaling Landscape HPA: CPU and Me"
+      "body": "--- id: track-10-lesson-09 title: \"التوسع التلقائي — HPA وVPA وKEDA للأحمال المالية\" slug: auto-scaling track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 9 difficulty: advanced estimatedMinutes: 80 status: published tags: [HPA, VPA, KEDA, auto-scaling, event-driven-scaling] prerequisites: [] --- التوسع التلقائي — HPA، وVPA، وKEDA للأحمال المالية أحجام المدفوعات متقلبة بطبيعتها. فالجمعة السوداء تجلب 10 أضعاف الحمل المعتاد. ودورات صرف الرواتب تسبب ذروات كل ساعة. وافتتاح"
     },
     {
       "id": "track-10-lesson-10",
@@ -4354,7 +4354,7 @@
         "workload-distribution",
         "DR"
       ],
-      "body": "Multi-Cluster Kubernetes — Federation and Workload Distribution > [!NOTE] > A single Kubernetes cluster is a single point of failure. For a payment platform processing millions of transactions per day, an entire cluster becoming unavailable — due to a Kubernetes control plane bug, a runaway operator, or a cloud region outage — is unacceptable. Multi-cluster architecture is not gold-plating; it is the minimum viable infrastructure for a financial platform with 99.99% uptime requirements. Why Mult"
+      "body": "--- id: track-10-lesson-10 title: \"Kubernetes متعدد العناقيد — الاتحاد وتوزيع أحمال العمل\" slug: multi-cluster track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 10 difficulty: principal estimatedMinutes: 85 status: published tags: [multi-cluster, federation, fleet, workload-distribution, DR] prerequisites: [] --- ‏Kubernetes متعدد العناقيد — الاتحاد وتوزيع أحمال العمل العنقود الواحد في Kubernetes نقطة فشل واحدة. ولمنصة دفع تعالج ملايين المعاملات يوميًا، فإن تعطل عنقود"
     },
     {
       "id": "track-10-lesson-11",
@@ -4375,7 +4375,7 @@
         "reserved-instances",
         "right-sizing"
       ],
-      "body": "Cloud Cost Engineering — FinOps for Financial Platforms > [!NOTE] > A fintech platform processing $100M/day in payments running on $500K/month of AWS infrastructure is not inherently justified — a well-architected platform should run the same workload for $150K/month. Cloud cost engineering is not about cutting corners; it is about eliminating waste while maintaining the reliability and performance that financial operations require. The FinOps Framework The Cloud Financial Management (FinOps) Fo"
+      "body": "--- id: track-10-lesson-11 title: \"هندسة التكلفة السحابية — FinOps للمنصات المالية\" slug: cloud-cost track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 11 difficulty: advanced estimatedMinutes: 70 status: published tags: [FinOps, cloud-cost, spot-instances, reserved-instances, right-sizing] prerequisites: [] --- هندسة التكلفة السحابية — FinOps للمنصات المالية منصة تقنية مالية تعالج مدفوعات بـ 100 مليون دولار يوميًا وتعمل على بنية AWS بـ 500 ألف دولار شهريًا ليست مبررة "
     },
     {
       "id": "track-10-lesson-12",
@@ -4396,7 +4396,7 @@
         "golden-path",
         "paved-road"
       ],
-      "body": "Platform Engineering — Internal Developer Platform Design > [!NOTE] > A payment engineer should be able to go from idea to production deployment in one day without understanding Kubernetes YAML, IAM policies, Terraform modules, or PCI-DSS compliance controls. Platform engineering abstracts this complexity behind golden-path templates, self-service provisioning, and a developer portal — letting payment engineers focus on payment logic instead of infrastructure. The platform team is a product team"
+      "body": "--- id: track-10-lesson-12 title: \"هندسة المنصات — تصميم منصة داخلية للمطورين\" slug: platform-engineering track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 12 difficulty: principal estimatedMinutes: 85 status: published tags: [platform-engineering, IDP, developer-experience, golden-path, paved-road] prerequisites: [] --- هندسة المنصات — تصميم منصة المطوّرين الداخلية يجب أن يستطيع مهندس المدفوعات الانتقال من الفكرة إلى النشر في الإنتاج في يوم واحد دون فهم YAML في Kuber"
     },
     {
       "id": "track-10-lesson-13",

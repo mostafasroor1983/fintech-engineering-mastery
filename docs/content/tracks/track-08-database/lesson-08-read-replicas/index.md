@@ -63,7 +63,7 @@ FROM pg_stat_replication;
 
 **Asynchronous (default):** Primary commits before replica confirms. Potential data loss on primary failure equal to the replication lag.
 
-**Synchronous:** Primary waits for replica acknowledgment before returning success to the client. Zero data loss, but adds replica round-trip latency to every write.
+**Synchronous:** Primary waits for replica acknowledgment before returning success to the client. No acknowledged commit is lost if the primary fails (as long as you fail over to a synchronous standby), but every write pays the replica round trip — and if no synchronous standby is available, commits wait.
 
 ```sql
 -- Configure synchronous replication for a critical replica
@@ -119,21 +119,33 @@ SELECT
     pg_last_xact_replay_timestamp() AS last_applied_at;
 ```
 
+**Careful:** `now() - pg_last_xact_replay_timestamp()` is the time since the last *replayed transaction*. When the primary is idle (no writes), it keeps growing although the replica is fully caught up. Compare LSNs (`pg_last_wal_receive_lsn()` vs `pg_last_wal_replay_lsn()`, or the primary's `pg_stat_replication.replay_lag`), or have the primary write a heartbeat row every few seconds so the timestamp stays meaningful.
+
 ### 2.3 Prometheus Metrics for Replication Lag
 
 ```java
 @Component
+@Slf4j
 public class ReplicationLagMetrics {
 
-    private final JdbcTemplate primaryJdbc;
     private final JdbcTemplate replicaJdbc;
-    private final MeterRegistry meterRegistry;
-    private final AtomicLong replicaLagSeconds = new AtomicLong(0);
+    private final AtomicLong replicaLagSeconds = new AtomicLong(Long.MAX_VALUE);
+
+    public ReplicationLagMetrics(@Qualifier("replicaJdbc") JdbcTemplate replicaJdbc,
+                                 MeterRegistry meterRegistry) {
+        this.replicaJdbc = replicaJdbc;
+        // Register the gauge ONCE; the scheduled job only updates the holder
+        Gauge.builder("db.replication.lag.seconds", replicaLagSeconds, AtomicLong::get)
+            .description("Replication lag in seconds (Long.MAX_VALUE = unknown)")
+            .tag("replica", "read_replica_1")
+            .register(meterRegistry);
+    }
 
     @Scheduled(fixedDelay = 5000)  // Check every 5 seconds
     public void measureReplicationLag() {
         try {
-            // Query the replica for its own lag
+            // Assumes the primary writes a heartbeat row every second, so the
+            // replay timestamp does not grow while the system is idle
             Long lagSeconds = replicaJdbc.queryForObject(
                 """
                 SELECT EXTRACT(EPOCH FROM (
@@ -141,14 +153,8 @@ public class ReplicationLagMetrics {
                 ))::BIGINT AS lag_seconds
                 """, Long.class);
 
-            long lag = lagSeconds != null ? lagSeconds : 0;
-            replicaLagSeconds.set(lag);
-
-            Gauge.builder("db.replication.lag.seconds",
-                replicaLagSeconds, AtomicLong::get)
-                .description("Replication lag in seconds")
-                .tag("replica", "read_replica_1")
-                .register(meterRegistry);
+            // NULL = nothing replayed yet: treat as UNKNOWN, not as "fresh"
+            replicaLagSeconds.set(lagSeconds != null ? lagSeconds : Long.MAX_VALUE);
 
         } catch (Exception e) {
             log.error("Failed to measure replication lag", e);
@@ -248,6 +254,8 @@ public class ReplicationRoutingDataSource
 }
 ```
 
+The lookup key is evaluated when a **connection is obtained**. With JPA, `@Transactional` grabs the connection at the start of the transaction, so the routing decision must be made before that (next section). Wrapping the routing DataSource in Spring's `LazyConnectionDataSourceProxy` delays fetching the physical connection until the first statement, which makes routing more forgiving.
+
 ### 3.2 AOP for Automatic Routing
 
 ```java
@@ -261,7 +269,10 @@ public @interface ReadFromReplica {
 ```java
 @Aspect
 @Component
-@Order(1)  // Must run BEFORE @Transactional (Order 2)
+// Must run BEFORE @Transactional. The transaction advisor has the lowest
+// precedence by default, so any higher-precedence order such as 1 works.
+// (Note: "@annotation(...)" matches method-level annotations only.)
+@Order(1)
 public class ReadReplicaRoutingAspect {
 
     @Around("@annotation(readFromReplica)")
@@ -316,7 +327,7 @@ Time 2: Replication lag = 500ms
 Result: Confirmation page shows "payment not found" or old balance
 ```
 
-This is catastrophic for a payment confirmation flow. Users will retry, creating duplicate payments.
+This is dangerous for a payment confirmation flow: users may retry and, without idempotency protection, create duplicate payments.
 
 ### 4.2 Session-Based Read-Your-Writes
 
@@ -326,16 +337,20 @@ public class ConsistencyAwareAccountService {
 
     private final ReplicationRoutingDataSource routingDataSource;
 
+    private final ReadConsistencyContext readConsistencyContext;
+
     /**
-     * After a write, force subsequent reads to primary for the given duration.
-     * Uses a session-scoped flag stored in a request-scoped bean.
+     * After a write, force this USER's reads to the primary for a while.
+     * The confirmation page is usually a NEW HTTP request, so the flag must
+     * outlive the current request: keep it in the user's session (or a
+     * short-lived cookie / Redis entry keyed by user).
      */
     @Transactional
     public Payment createPayment(PaymentRequest request) {
         Payment payment = paymentRepository.save(Payment.from(request));
 
-        // Signal: for the rest of this request session, read from primary
-        ReadConsistencyContext.requirePrimaryFor(Duration.ofSeconds(5));
+        // For the next few seconds, this user's reads go to the primary
+        readConsistencyContext.requirePrimaryFor(Duration.ofSeconds(5));
 
         return payment;
     }
@@ -343,9 +358,13 @@ public class ConsistencyAwareAccountService {
 ```
 
 ```java
+// Session scope: survives the redirect to the confirmation page.
+// (Injected into the singleton routing DataSource through a scoped proxy;
+//  outside an HTTP request -- scheduled jobs, consumers -- there is no
+//  session, so the routing code must treat that case as "not required".)
 @Component
-@RequestScope
-public class ReadConsistencyContext {
+@SessionScope
+public class ReadConsistencyContext implements Serializable {
 
     private Instant primaryRequiredUntil = Instant.MIN;
 
@@ -380,30 +399,32 @@ protected Object determineCurrentLookupKey() {
 
 ### 4.3 LSN-Based Read-Your-Writes (Advanced)
 
-A more precise approach: after a write, capture the primary's current LSN and wait for the replica to reach at least that point before reading from it.
+A more precise approach: after the write has **committed**, capture the primary's current LSN and wait for the replica to replay at least that far before reading from it. (Capturing the LSN inside the still-open transaction is wrong: the commit record comes later, so the replica could reach that LSN without seeing the payment. Switching DataSource inside an open transaction does not work either — the connection is already bound.)
 
 ```java
 @Service
 public class LsnAwareReadService {
 
-    @Transactional
+    // NOT @Transactional: the write must commit before we look at the LSN
     public PaymentConfirmation submitAndConfirm(PaymentRequest request) {
-        // 1. Write to primary
-        Payment payment = paymentRepository.save(Payment.from(request));
+        // 1. Write to primary and COMMIT
+        Payment payment = primaryTx.execute(status ->
+            paymentRepository.save(Payment.from(request)));
 
-        // 2. Capture current LSN after write
+        // 2. Capture the primary's WAL position AFTER the commit
         String primaryLsn = primaryJdbc.queryForObject(
             "SELECT pg_current_wal_lsn()::text", String.class);
 
         // 3. Wait for replica to catch up to this LSN (up to 2 seconds)
         boolean replicaCaughtUp = waitForReplicaLsn(primaryLsn, Duration.ofSeconds(2));
 
-        // 4. Read from replica if caught up, primary if not
+        // 4. Read in a NEW transaction: replica if caught up, primary if not
         if (replicaCaughtUp) {
             RoutingDataSourceContext.setDataSourceType(DataSourceType.REPLICA);
         }
         try {
-            return paymentRepository.findConfirmationById(payment.getId());
+            return readOnlyTx.execute(status ->
+                paymentRepository.findConfirmationById(payment.getId()));
         } finally {
             RoutingDataSourceContext.clearDataSourceType();
         }
@@ -430,6 +451,8 @@ public class LsnAwareReadService {
 ## 5. Replica for Reporting Queries
 
 Heavy reporting queries (generating monthly statements, running risk aggregations, compliance reports) should never run against the primary. They create long-running transactions that block VACUUM and compete with transactional workloads.
+
+On a replica they meet a different problem: **recovery conflicts**. When the primary vacuums away row versions that a long replica query still needs, the replica must either pause WAL replay (lag grows) or cancel the query (`canceling statement due to conflict with recovery`). The knobs: `max_standby_streaming_delay` (how long replay may wait — a dedicated reporting replica can afford minutes, a replica used for fresh reads cannot) and `hot_standby_feedback = on` (no cancellations, but the primary keeps dead rows longer — more bloat there). This is one more reason to keep reporting on its own replica.
 
 ### 5.1 Dedicated Reporting Replica
 
@@ -511,10 +534,10 @@ public interface AccountCommandRepository
     // Uses primary datasource
 }
 
-// QUERY side: reads from replica
+// QUERY side: reads from replica (the routing comes from @ReadFromReplica on
+// the calling service -- a @Qualifier on the repository does not route)
 @Repository
-@Qualifier("replica")
-public interface AccountQueryRepository {
+public interface AccountQueryRepository extends Repository<Account, String> {
 
     @Query(value = """
         SELECT
@@ -563,6 +586,8 @@ public class AccountCommandService {
     public Account openAccount(OpenAccountRequest request) {
         Account account = Account.open(request);
         account = commandRepo.save(account);
+        // Publish via an outbox row in this same transaction (track 05),
+        // so the event cannot be lost or sent for a rolled-back account
         eventPublisher.publish(new AccountOpenedEvent(account));
         return account;
     }
@@ -592,14 +617,22 @@ public class AdaptiveReplicaRouter {
         Duration tolerance = operationLagTolerances
             .getOrDefault(operationName, Duration.ofSeconds(5));
 
+        // Zero tolerance = ALWAYS primary. (Lag is measured in whole seconds,
+        // so a replica 0.8 s behind reports 0 -- "0 <= 0" would wrongly
+        // send fraud checks to it.)
+        if (tolerance.isZero()) {
+            return DataSourceType.PRIMARY;
+        }
+
         long lagSeconds = lagMetrics.getCurrentLagSeconds();
 
         if (lagSeconds <= tolerance.toSeconds()) {
             return DataSourceType.REPLICA;
         } else {
+            // Tag by operation only: putting the lag VALUE in a tag would
+            // create a new time series for every value (cardinality explosion)
             Metrics.counter("db.routing.fallback_to_primary",
-                "operation", operationName,
-                "lag_seconds", String.valueOf(lagSeconds))
+                "operation", operationName)
                 .increment();
             return DataSourceType.PRIMARY;
         }
@@ -635,7 +668,12 @@ public class ReplicaCircuitBreaker {
             return primaryFallback.get();
         }
 
-        return circuitBreaker.executeSupplier(replicaQuery);
+        try {
+            return circuitBreaker.executeSupplier(replicaQuery);
+        } catch (Exception e) {
+            // Replica failed (or the breaker just opened): use the primary
+            return primaryFallback.get();
+        }
     }
 }
 ```
@@ -677,6 +715,8 @@ SELECT
 
 ```yaml
 # prometheus-rules.yaml
+# (metric names depend on your exporter -- e.g. postgres_exporter or a
+#  custom gauge such as db_replication_lag_seconds from the code above)
 groups:
   - name: postgresql_replication
     rules:
@@ -698,7 +738,9 @@ groups:
           summary: "PostgreSQL replication lag > 60s — replica routing disabled"
 
       - alert: PostgreSQLReplicationDown
-        expr: pg_replication_lag_seconds == -1
+        # the lag gauge from section 2.3 reports Long.MAX_VALUE = "unknown"
+        # (replica unreachable or nothing replayed)
+        expr: db_replication_lag_seconds > 1e9
         for: 30s
         labels:
           severity: critical
@@ -714,8 +756,11 @@ groups:
 # postgresql.conf on primary
 wal_level = replica           # Minimum for streaming replication
 max_wal_senders = 10          # Max concurrent WAL sender processes
-wal_keep_size = 1GB           # Keep this much WAL for lagging replicas
+wal_keep_size = 1GB           # Keep this much WAL for lagging replicas (PG13+)
+
+# postgresql.conf on the standby
 hot_standby = on              # Allow queries on standbys (on by default)
+max_standby_streaming_delay = 30s   # how long replay may wait for queries
 
 # Replication slot (for persistent WAL retention — use with Debezium/CDC)
 # WARNING: slots that fall behind cause WAL accumulation and disk fill
@@ -771,19 +816,34 @@ Read replicas in fintech require more than connection strings — they require a
   "questions": [
     {
       "text": "A user submits a payment at time T=0. The payment is written to the primary. At T=0.3s, the user is redirected to a confirmation page. The confirmation page query is routed to a read replica with 500ms replication lag. What problem occurs and what is the most reliable fix?",
-      "options": ["No problem occurs because 500ms lag is within acceptable bounds", "The confirmation page shows stale data or 'payment not found', potentially causing the user to retry and create a duplicate payment; fix by forcing reads to the primary for a short window after writes", "The replica will refuse the query due to lag detection", "Increase max_wal_senders to reduce replication lag"],
+      "options": [
+        "No problem occurs because 500ms lag is within acceptable bounds",
+        "The confirmation page shows stale data or 'payment not found', potentially causing the user to retry and create a duplicate payment; fix by forcing reads to the primary for a short window after writes",
+        "The replica will refuse the query due to lag detection",
+        "Increase max_wal_senders to reduce replication lag"
+      ],
       "correct": 1,
-      "explanation": "This is the read-your-writes consistency problem. After a write to the primary, a read from a lagging replica may return the previous state, causing the user to see 'payment not found'. This can lead to duplicate payment retries. The fix is to track that a write occurred (using a session context or LSN-based approach) and force subsequent reads to the primary for a short duration or until the replica catches up."
+      "explanation": "This is the read-your-writes consistency problem. After a write to the primary, a read from a lagging replica may return the previous state, so the user sees 'payment not found' and may retry. The fix is to remember that this user just wrote (in the session, a short-lived cookie, or by LSN) and send their reads to the primary for a short window, or until the replica has replayed past the write's commit."
     },
     {
       "text": "Which Spring annotation order is required for AbstractRoutingDataSource AOP routing to work correctly with @Transactional?",
-      "options": ["@Transactional must run before @ReadFromReplica", "@ReadFromReplica AOP aspect must run BEFORE @Transactional (Order 1 vs Order 2) so the DataSource is selected before the connection is opened", "The order does not matter because they operate on different concerns", "@Transactional and routing must be in separate service layers"],
+      "options": [
+        "@Transactional must run before @ReadFromReplica",
+        "The @ReadFromReplica aspect must run BEFORE @Transactional (e.g. @Order(1); the transaction advisor has the lowest precedence by default) so the DataSource is selected before the connection is opened",
+        "The order does not matter because they operate on different concerns",
+        "@Transactional and routing must be in separate service layers"
+      ],
       "correct": 1,
       "explanation": "Spring's transaction management opens a database connection when @Transactional begins. If the routing aspect runs after @Transactional, the DataSource lookup key has already been used and the connection is already from the wrong source. The routing aspect must run first (lower order number = higher priority) so the correct DataSource is selected before the connection is obtained."
     },
     {
       "text": "A payment platform has a fraud check service that reads account history to detect anomalies. The fraud check must reflect data written within the last 500ms. The replication lag is currently 8 seconds. What should the routing datasource do?",
-      "options": ["Route to the replica and accept the stale data", "Route to the primary because the replica's lag (8s) exceeds the operation's tolerance (0.5s), and increment a fallback counter metric", "Block the fraud check until the replica catches up", "Disable replication and use only the primary"],
+      "options": [
+        "Route to the replica and accept the stale data",
+        "Route to the primary because the replica's lag (8s) exceeds the operation's tolerance (0.5s), and increment a fallback counter metric",
+        "Block the fraud check until the replica catches up",
+        "Disable replication and use only the primary"
+      ],
       "correct": 1,
       "explanation": "Lag-aware routing must compare the current replication lag against the specific operation's tolerance. For fraud checks requiring fresh data (0.5s tolerance), an 8-second lagging replica would return dangerously stale data. The routing logic should fall back to the primary and record a metric. This is the adaptive routing pattern where different operations have different lag tolerances."
     }
@@ -797,10 +857,22 @@ Read replicas in fintech require more than connection strings — they require a
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Implement ReplicationLagMetrics that polls the replica every 5 seconds using pg_last_xact_replay_timestamp() and exposes the lag as a Micrometer Gauge. The metric must be set to Long.MAX_VALUE when the replica is unreachable, and the isReplicaAcceptablyFresh(long maxLagSeconds) method must return false when lag is unknown."},
-    {"id": "2", "description": "Implement ReplicationRoutingDataSource extending AbstractRoutingDataSource with a determineCurrentLookupKey() that: (a) always routes to primary if ReadConsistencyContext.isPrimaryRequired() is true, (b) routes to replica only if REPLICA is requested AND lag is acceptable, and (c) falls back to primary with a logged warning when lag exceeds the threshold. Write a unit test with a mocked lagMetrics that verifies all three routing paths."},
-    {"id": "3", "description": "Create a @ReadFromReplica AOP aspect with @Order(1) that sets the DataSource context before @Transactional opens a connection. Apply it to a TransactionHistoryService.getHistory() method. Write an integration test using Testcontainers that verifies the query executes on the replica connection (by checking pg_stat_activity.client_addr or connection pool name)."},
-    {"id": "4", "description": "Implement LSN-based read-your-writes consistency for the payment confirmation flow: after inserting a payment, capture pg_current_wal_lsn() from the primary, then poll the replica's pg_last_wal_replay_lsn() until it reaches the captured LSN or a 2-second timeout expires. If the replica catches up, read confirmation from replica; otherwise fall back to primary. Measure and log the wait time as a metric."}
+    {
+      "id": "1",
+      "description": "Implement ReplicationLagMetrics that polls the replica every 5 seconds using pg_last_xact_replay_timestamp() and exposes the lag as a Micrometer Gauge. The metric must be set to Long.MAX_VALUE when the replica is unreachable, and the isReplicaAcceptablyFresh(long maxLagSeconds) method must return false when lag is unknown."
+    },
+    {
+      "id": "2",
+      "description": "Implement ReplicationRoutingDataSource extending AbstractRoutingDataSource with a determineCurrentLookupKey() that: (a) always routes to primary if ReadConsistencyContext.isPrimaryRequired() is true, (b) routes to replica only if REPLICA is requested AND lag is acceptable, and (c) falls back to primary with a logged warning when lag exceeds the threshold. Write a unit test with a mocked lagMetrics that verifies all three routing paths."
+    },
+    {
+      "id": "3",
+      "description": "Create a @ReadFromReplica AOP aspect with @Order(1) that sets the DataSource context before @Transactional opens a connection. Apply it to a TransactionHistoryService.getHistory() method. Write an integration test using Testcontainers that verifies the query executes on the replica connection (by checking pg_stat_activity.client_addr or connection pool name)."
+    },
+    {
+      "id": "4",
+      "description": "Implement LSN-based read-your-writes consistency for the payment confirmation flow: commit the payment insert first, then capture pg_current_wal_lsn() from the primary, then poll the replica's pg_last_wal_replay_lsn() until it reaches the captured LSN or a 2-second timeout expires. If the replica catches up, read the confirmation from the replica in a new transaction; otherwise fall back to primary. Measure and log the wait time as a metric."
+    }
   ]
 }
 -->

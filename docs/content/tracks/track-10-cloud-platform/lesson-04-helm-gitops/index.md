@@ -15,7 +15,7 @@ prerequisites: [track-10-lesson-03]
 # Helm and GitOps — Declarative Infrastructure with ArgoCD
 
 > [!NOTE]
-> GitOps is the deployment model that satisfies the change management requirements in ISO 27001, SOX, and PCI-DSS simultaneously. Every change to production passes through a pull request, every deployment is traceable to a Git commit, and rollback is `git revert`. For financial institutions under regulatory scrutiny, this is not a convenience — it is a compliance mechanism.
+> GitOps is a deployment model that supports the change management controls of ISO 27001, SOX, and PCI-DSS at the same time. Every change to production passes through a pull request, every deployment is traceable to a Git commit, and rollback is `git revert`. For financial institutions under regulatory scrutiny, this is not just a convenience — it is a large part of the compliance evidence (auditors still look at access control, break-glass procedures and the CI pipeline itself).
 
 ## The GitOps Mental Model for Financial Services
 
@@ -64,6 +64,9 @@ description: "Real-time payment processing service for retail banking platform"
 type: application
 version: 2.4.1          # Chart version — bump on chart changes
 appVersion: "2.4.1"     # Application version — matches Docker image tag
+# Note: since 2025 Bitnami publishes most charts/images only under a paid
+# offering (old versions moved to a "legacy" repository). Check the source
+# and licence of every dependency; mirror approved charts in your own registry.
 dependencies:
 - name: postgresql
   version: "12.5.6"
@@ -156,7 +159,8 @@ redis:
   enabled: false
 
 config:
-  javaOpts: "-Xms100m -Xmx400m -XX:+UseG1GC"
+  javaOpts: "-XX:MaxRAMPercentage=70 -XX:+UseG1GC"   # heap follows the memory limit
+  springProfile: default
   logLevel: INFO
   metricsEnabled: true
 
@@ -205,7 +209,8 @@ ingress:
     - api.payments.internal
 
 config:
-  javaOpts: "-Xms400m -Xmx800m -XX:+UseG1GC -XX:MaxGCPauseMillis=100"
+  javaOpts: "-XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:MaxGCPauseMillis=100"
+  springProfile: production
   logLevel: WARN    # reduce log volume in production
 
 compliance:
@@ -235,8 +240,8 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "payment-processor.labels" . | nindent 4 }}
-  annotations:
-    deployment.kubernetes.io/revision: "1"
+  # (no deployment.kubernetes.io/revision annotation -- the Deployment
+  #  controller owns it)
 spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
@@ -283,12 +288,6 @@ spec:
               - key: compliance
                 operator: In
                 values: [pci-dss]
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-          - labelSelector:
-              matchLabels:
-                {{- include "payment-processor.selectorLabels" . | nindent 16 }}
-            topologyKey: kubernetes.io/hostname
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: topology.kubernetes.io/zone
@@ -297,6 +296,12 @@ spec:
           matchLabels:
             {{- include "payment-processor.selectorLabels" . | nindent 12 }}
         minDomains: 3
+      - maxSkew: 1                         # spread over nodes without
+        topologyKey: kubernetes.io/hostname   # needing one node per pod
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            {{- include "payment-processor.selectorLabels" . | nindent 12 }}
       {{- end }}
       terminationGracePeriodSeconds: 60
       containers:
@@ -310,30 +315,34 @@ spec:
           name: http
           protocol: TCP
         env:
-        - name: JAVA_OPTS
+        - name: JAVA_TOOL_OPTIONS          # read by every JVM, whatever the start script
           value: {{ .Values.config.javaOpts | quote }}
         - name: SPRING_PROFILES_ACTIVE
-          value: {{ .Release.Name | quote }}
+          value: {{ .Values.config.springProfile | quote }}
         - name: LOG_LEVEL
           value: {{ .Values.config.logLevel | quote }}
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
+        startupProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          periodSeconds: 5
+          failureThreshold: 30
         readinessProbe:
           httpGet:
             path: /actuator/health/readiness
             port: 8080
-          initialDelaySeconds: 15
           periodSeconds: 5
         livenessProbe:
           httpGet:
             path: /actuator/health/liveness
             port: 8080
-          initialDelaySeconds: 30
           periodSeconds: 10
         lifecycle:
           preStop:
-            exec:
-              command: ["/bin/sh", "-c", "sleep 15"]
+            sleep:            # native sleep action (Kubernetes 1.30+)
+              seconds: 15
         volumeMounts:
         - name: tmp
           mountPath: /tmp
@@ -383,11 +392,29 @@ compliance: {{ .Values.compliance.pciDss | ternary "pci-dss" "standard" | quote 
 {{- end }}
 
 {{/*
+Chart name and version, used by the helm.sh/chart label
+*/}}
+{{- define "payment-processor.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Selector labels
 */}}
 {{- define "payment-processor.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "payment-processor.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Name of the service account to use
+*/}}
+{{- define "payment-processor.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- default (include "payment-processor.fullname" .) .Values.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.serviceAccount.name }}
+{{- end }}
 {{- end }}
 ```
 
@@ -416,7 +443,7 @@ spec:
 
   source:
     repoURL: https://github.com/example-bank/k8s-platform.git
-    targetRevision: main
+    targetRevision: main      # production state = what is merged to main
     path: apps/payment-processor/production
     helm:
       valueFiles:
@@ -456,12 +483,10 @@ spec:
     kind: Deployment
     jsonPointers:
     - /spec/replicas    # HPA manages replicas; ignore ArgoCD diff
-  - group: ""
-    kind: Secret
-    jsonPointers:
-    - /data             # External Secrets Operator manages secret data
+  # (Secrets created by External Secrets Operator are not in Git, so Argo CD
+  #  does not track them -- no ignore rule needed; Git holds the ExternalSecret)
 
-  # Health assessment customisation
+  # Number of past sync revisions kept for history / rollback
   revisionHistoryLimit: 10
 ```
 
@@ -539,12 +564,13 @@ Developer                Git Repo              ArgoCD          Cluster
     |-- merge to main -----> |                     |               |
     |                        |-- webhook --------> |               |
     |                        |             ArgoCD detects diff     |
-    |                        |             health checks pass      |
     |                        |                     |-- sync -----> |
-    |                        |                     |   kubectl     |
-    |                        |                     |   apply       |
+    |                        |                     |   (apply      |
+    |                        |                     |   manifests)  |
     |                        |                     |               |
+    |                        |             rollout health checked  |
     |                        |             ArgoCD reports Synced   |
+    |                        |             + Healthy               |
 ```
 
 ### Environment Promotion Strategy
@@ -578,8 +604,10 @@ Promotion flow:
 Never store secrets in Helm values or Git. Use External Secrets Operator (ESO) to sync secrets from Vault into Kubernetes Secrets.
 
 ```yaml
-# ExternalSecret resource — ArgoCD manages this manifest
-apiVersion: external-secrets.io/v1beta1
+# ExternalSecret resource — ArgoCD manages this manifest.
+# If this file is a Helm TEMPLATE, Helm would try to render the {{ .host }}
+# placeholders below itself -- escape them: {{ "{{" }} .host }}
+apiVersion: external-secrets.io/v1      # v1beta1 in older ESO releases
 kind: ExternalSecret
 metadata:
   name: payment-processor-db-credentials
@@ -673,13 +701,13 @@ spec:
       selfHeal: true
 ```
 
-This single root Application, when synced, creates or updates all child Application resources in ArgoCD. Each child Application then manages its own microservice deployment.
+This single root Application, when synced, creates or updates all child Application resources in ArgoCD. Each child Application then manages its own microservice deployment. For many similar services, an **ApplicationSet** (with a Git directory or list generator) is the more modern way to generate the child Applications from one template.
 
 ---
 
 ## 7. Image Update Automation
 
-For non-production environments, Argo CD Image Updater automatically bumps image tags when new images are pushed:
+For non-production environments, Argo CD Image Updater automatically bumps image tags when new images are pushed. The example shows the annotation-based configuration of the 0.x releases; Image Updater 1.x moved this configuration into an `ImageUpdater` custom resource — check the version you run:
 
 ```yaml
 # Annotation on ArgoCD Application — staging auto-updates on new image push
@@ -706,11 +734,11 @@ Production should never use automatic image updates. Require explicit PR approva
 
 - [ ] All chart `values.yaml` files committed to Git — no secrets
 - [ ] Branch protection: require 2 approvals and passing CI before merge to main
-- [ ] ArgoCD `selfHeal: true` — manual kubectl changes are reverted within 3 minutes
+- [ ] ArgoCD `selfHeal: true` — manual kubectl changes are reverted automatically (usually within seconds; Git itself is polled every 3 minutes unless a webhook is set up)
 - [ ] ArgoCD `prune: true` — resources deleted from Git are removed from cluster
 - [ ] `ignoreDifferences` configured for HPA-managed replicas (avoid revert loop)
 - [ ] ArgoCD AppProject RBAC: developers can sync, only leads can delete
-- [ ] Image tags pinned in Git — no `latest` tags in production
+- [ ] Image tags pinned in Git (ideally by digest) — no `latest` tags in production
 - [ ] ExternalSecret resources managed by ArgoCD, not secret values
 - [ ] Environment promotion requires explicit PR (not automatic)
 - [ ] ArgoCD audit log shipped to SIEM (every sync is a production change event)
@@ -719,7 +747,7 @@ Production should never use automatic image updates. Require explicit PR approva
 
 ## Summary
 
-Helm gives you parameterisable, versioned Kubernetes application packages. GitOps via ArgoCD connects Git to the cluster, turning your repository into the deployment authority. For financial services, this combination solves the deployment traceability and rollback requirements of ISO 27001 and PCI-DSS with no additional tooling — the Git history is the audit log, branch protection enforces four-eyes approval, and ArgoCD's self-heal makes drift from approved state an observable, alertable event rather than a silent configuration deviation.
+Helm gives you parameterisable, versioned Kubernetes application packages. GitOps via ArgoCD connects Git to the cluster, turning your repository into the deployment authority. For financial services, this combination covers most of the deployment traceability and rollback requirements of ISO 27001 and PCI-DSS — the Git history is the audit log, branch protection enforces four-eyes approval, and ArgoCD's self-heal makes drift from approved state an observable, alertable event rather than a silent configuration deviation.
 
 <!--KNOWLEDGE-CHECK
 {
@@ -733,7 +761,7 @@ Helm gives you parameterisable, versioned Kubernetes application packages. GitOp
         "ArgoCD deletes and recreates the deployment to ensure full consistency"
       ],
       "correct": 1,
-      "explanation": "selfHeal=true means ArgoCD continuously compares the live cluster state against the Git-desired state and automatically syncs any drift. A manual kubectl patch creates a divergence — the live replica count differs from Git. Within the next sync interval (typically 3 minutes), ArgoCD detects the drift and applies the Git state, reverting the manual change. This is the core GitOps guarantee: Git is the single source of truth, and all changes must go through Git to persist."
+      "explanation": "selfHeal=true means ArgoCD continuously compares the live cluster state against the Git-desired state and automatically syncs any drift. A manual kubectl patch creates a divergence — the live replica count differs from Git. ArgoCD watches the live resources, so it usually notices the change within seconds and re-applies the Git state, reverting the manual change (Git itself is polled every 3 minutes by default, or instantly with a webhook). This is the core GitOps guarantee: Git is the single source of truth, and changes must go through Git to persist. (If replicas are listed in ignoreDifferences because an HPA manages them, this particular change would NOT be reverted.)"
     },
     {
       "text": "A Helm chart has environment-specific values files: values.yaml (defaults), values-staging.yaml (staging overrides), values-production.yaml (production overrides). A developer sets replicaCount=1 in values.yaml but the production values file has no replicaCount key. How many replicas does the production deployment have?",
@@ -770,7 +798,7 @@ Helm gives you parameterisable, versioned Kubernetes application packages. GitOp
     "Create a Helm chart for a payment-api service with Chart.yaml (apiVersion: v2, version: 1.0.0), values.yaml with configurable replicaCount/image/resources/pciCompliance flag, a Deployment template that conditionally adds securityContext fields when pciCompliance=true, and environment-specific values files (values-staging.yaml with 1 replica, values-production.yaml with 3 replicas and resource limits). Verify rendering with helm template and helm lint.",
     "Configure an ArgoCD Application pointing to the Helm chart in a Git repository for the production environment. Enable automated sync with prune=true and selfHeal=true. Apply the Application and verify the payment-api deployment is created. Then manually kubectl scale the deployment to 5 replicas and confirm ArgoCD reverts it to 3 within the sync interval.",
     "Create an ArgoCD AppProject for the payments team restricting: sourceRepos to the company GitHub org only, destinations to the payments namespace only, and clusterResourceWhitelist to an empty list. Create an ArgoCD Application within this project. Attempt to deploy a ClusterRole from the same repository and verify it is rejected by the AppProject restrictions.",
-    "Implement External Secrets with a ClusterSecretStore connecting to HashiCorp Vault. Create an ExternalSecret that pulls the database password from Vault path secret/payments/db and materialises it as a Kubernetes Secret. Add a refreshInterval of 1 hour. Write a test that rotates the secret in Vault and verifies the Kubernetes Secret is updated within the refresh interval without restarting the application pod."
+    "Implement External Secrets with a ClusterSecretStore connecting to HashiCorp Vault. Create an ExternalSecret that pulls the database password from Vault path secret/payments/db and materialises it as a Kubernetes Secret, with a refreshInterval of 1 hour. Write a test that rotates the secret in Vault and verifies the Kubernetes Secret is updated within the refresh interval, and show how the application picks up the new value (mounted secret file that is re-read, or an automatic rollout via a checksum annotation or a reloader)."
   ]
 }
 -->

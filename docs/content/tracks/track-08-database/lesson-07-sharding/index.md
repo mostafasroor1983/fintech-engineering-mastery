@@ -28,7 +28,9 @@ components:
   practical-challenge: true
 ---
 
-A single PostgreSQL primary can sustain roughly 10,000 to 20,000 write transactions per second on modern NVMe hardware before CPU, WAL throughput, or lock contention becomes the ceiling. For a mid-sized payment processor handling 50,000 transactions per second at peak, that ceiling arrives faster than the engineering team expects. Vertical scaling buys time — a 192-core machine with 6 TB RAM exists, and it costs $80,000 per month. Horizontal scaling via sharding distributes the data and the write load across many smaller nodes, each of which is cheap, replaceable, and independently scalable.
+## Overview
+
+A single PostgreSQL primary on modern NVMe hardware can sustain many thousands of write transactions per second — the exact ceiling depends heavily on transaction size, indexes and durability settings — before CPU, WAL throughput, or lock contention becomes the limit. For a payment processor handling tens of thousands of transactions per second at peak, that ceiling arrives faster than the engineering team expects. Vertical scaling buys time — very large machines (hundreds of cores, terabytes of RAM) exist, but they are expensive and still a single point of scale. Horizontal scaling via sharding distributes the data and the write load across many smaller nodes, each of which is cheap, replaceable, and independently scalable.
 
 Sharding is not free. It introduces a routing layer, removes the ability to run arbitrary cross-shard joins, and complicates transactions. This lesson teaches you to make the right trade-offs: when sharding is warranted, how to choose a shard key that avoids hotspots, how to route queries in Java, and how to safely re-shard a live database without downtime.
 
@@ -47,11 +49,11 @@ By the end of this lesson you will be able to:
 
 ## Business Context
 
-In Q3 2021, Robinhood's brokerage platform experienced a catastrophic outage during a GameStop trading surge. At peak, options trading volume hit 850% of its daily average. Their database layer, backed by a single primary cluster, hit connection and write throughput limits within 90 minutes of market open. Order placement began failing. Within 2 hours, 2,900 customers reported being unable to close positions. The SEC investigation estimated $70 million in customer harm from the inability to trade during volatile price movements.
+*Composite example:* a retail trading platform sees order volume jump to many times its daily average during a market frenzy. Its database layer, built around a single primary cluster, hits connection and write-throughput limits within the first hour of trading. Order placement starts failing exactly when customers most need to close positions — a direct customer-harm and regulatory problem.
 
-The root cause was not a software bug. It was an architectural assumption: that one primary database node would always have sufficient headroom. The team had indexes, read replicas, and caching — but no horizontal write-scale strategy. When GameStop moved, the write path had nowhere to go.
+The root cause is not a software bug. It is an architectural assumption: that one primary database node will always have enough headroom. The team has indexes, read replicas, and caching — but no horizontal write-scale strategy. When the surge comes, the write path has nowhere to go.
 
-Sharding, applied to the orders and positions tables, would have distributed writes across dozens of nodes proportional to account ID, eliminating the single-node ceiling.
+Sharding the orders and positions tables by account ID would spread those writes across many nodes and remove the single-node ceiling (at the price of the complexity discussed below).
 
 ## When to Shard — Recognising the Ceiling
 
@@ -69,8 +71,13 @@ Sharding adds significant operational complexity. It is justified only when you 
 Signals that the primary has hit its ceiling:
 
 ```
--- Check WAL generation rate (MB/s) — above 500 MB/s is a warning
-SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') / 1024 / 1024 AS wal_mb;
+-- WAL generation rate: sample the WAL position twice and divide by the
+-- interval (a single reading is just total WAL since the cluster started)
+SELECT pg_current_wal_lsn();          -- e.g. at 12:00:00 -> 1A/2B000000
+-- ... 60 seconds later ...
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), '1A/2B000000') / 60)
+       AS wal_per_second;
+-- Compare with what your disks, replicas and backups can sustain
 
 -- Check average active connections at peak
 SELECT count(*) FROM pg_stat_activity WHERE state = 'active';
@@ -93,13 +100,15 @@ The shard key determines how data is distributed across shards. A bad shard key 
 
 **Good shard key: `account_id`**
 
-Account IDs (UUID v4 or high-cardinality integer) produce a near-uniform distribution of writes. No single account generates significantly more writes than any other, so the write load distributes evenly.
+Account IDs (UUID v4 or high-cardinality integer) produce a near-uniform distribution of writes across shards. Watch for exceptions: a few very large accounts (big merchants, corporate treasuries) can still make one shard hot — such accounts may need special handling.
 
 ```sql
 -- payments distributed by account_id — even distribution
 -- With 8 shards and 1 million accounts, each shard serves ~125,000 accounts
 SELECT
-    hashtext(account_id::text) % 8 AS shard_id,
+    -- hashtext() returns a SIGNED 32-bit value: mask off the sign bit,
+    -- or "%" yields negative shard numbers
+    (hashtext(account_id::text) & 2147483647) % 8 AS shard_id,
     count(*) AS payment_count
 FROM payments
 GROUP BY 1
@@ -119,7 +128,8 @@ ORDER BY 1;
 Time-based shard keys route all current writes to a single shard — the one containing the current time range. All historical shards are read-only. This recreates the single-node write bottleneck in a more expensive configuration.
 
 ```sql
--- Range sharding by date — all December 2026 writes go to shard 7
+-- Range sharding by date (shown with partition syntax for brevity)
+-- — all December 2026 writes go to shard 7
 -- Shards 0-6 (older months) receive zero writes — they are cold
 -- Shard 7 receives 100% of writes — a severe hotspot
 -- This is the worst possible shard key for a write-heavy payment table
@@ -152,7 +162,7 @@ Shard 3: account_id  60000000  –  7FFFFFFF
 Shard for key k = hash(k) mod N
 ```
 
-Consistent hashing is the preferred variant: when a new shard is added, only 1/N of the data moves rather than rehashing everything.
+Consistent hashing is the preferred variant: when a shard is added to N existing ones, only about 1/(N+1) of the keys move, instead of almost all of them as with plain `hash mod N`.
 
 ```mermaid
 graph TD
@@ -300,11 +310,15 @@ public MerchantSettlementSummary calculateMerchantSettlement(
                 SELECT COALESCE(SUM(amount), 0)
                 FROM payments
                 WHERE merchant_id = ?
-                  AND DATE(created_at) = ?
+                  AND created_at >= ? AND created_at < ?   -- index-friendly range
                   AND status = 'SETTLED'
                 """,
                 BigDecimal.class,
-                merchantId, settlementDate
+                merchantId,
+                // settlement day in UTC (DATE(created_at) would depend on the
+                // session time zone and prevent index use)
+                settlementDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime(),
+                settlementDate.plusDays(1).atStartOfDay(ZoneOffset.UTC).toOffsetDateTime()
             ), fanOutExecutor
         ))
         .toList();
@@ -322,19 +336,22 @@ public MerchantSettlementSummary calculateMerchantSettlement(
 
 ## Online Re-Sharding — Dual-Write Split Strategy
 
-When a shard grows too large, it must be split into two smaller shards without downtime. The dual-write strategy allows this:
+When a shard grows too large, it must be split without downtime. The order of the phases matters: **start capturing new writes before you copy history**, otherwise changes made during the copy are lost.
 
-**Phase 1 — Seed:** create the new shard and copy the half of the data it will own.
+**Phase 1 — Capture new writes:** from now on, every insert, update and delete for keys that will move is also applied to the new shard — by application dual-write (below) or, more reliably, by change data capture / logical replication from the old shard (Lesson 11).
+
+**Phase 2 — Backfill:** copy the existing rows the new ring assigns to the new shard. With consistent hashing, ownership comes from the ring, not from `hash mod N`, so compute the target shard with the same router code (or a SQL function implementing the same hash) and copy with an upsert, so rows already written by Phase 1 are not overwritten with older data.
 
 ```sql
--- On the new shard (shard_4): copy the upper half of shard_3's key space
+-- On the new shard (shard_4), reading shard_3 through postgres_fdw
+-- (or an export/import): copy only rows the NEW ring assigns to shard_4
 INSERT INTO payments
-SELECT * FROM shard_3.payments
-WHERE hashtext(account_id::text) % 16 >= 8;
--- This seeds the new shard with historical data
+SELECT * FROM shard_3_fdw.payments p
+WHERE new_ring_owner(p.account_id) = 'shard_4'   -- same hash as the router
+ON CONFLICT (id) DO NOTHING;                     -- keep newer dual-written rows
 ```
 
-**Phase 2 — Dual-Write:** update the router to write new records to both the original and new shard for the affected key range.
+**Dual-write sketch** (application-level; every write path, including updates and deletes, must do this):
 
 ```java
 // During the split window: dual-write
@@ -351,7 +368,13 @@ public void insert(Payment payment) {
 }
 ```
 
-**Phase 3 — Verify and Cut Over:** once the new shard's data is confirmed consistent (compare row counts, checksums), update the routing table to direct reads to the new shard and stop dual-writing.
+Plain dual-write has a weakness: if the second write fails, the shards diverge. Record failures and repair them, or prefer CDC, which replays the old shard's committed changes in order.
+
+**Phase 3 — Verify:** compare row counts and checksums per key range between the old and new shard.
+
+**Phase 4 — Cut over:** switch the router so the moved keys read and write only on the new shard; stop dual-writing.
+
+**Phase 5 — Clean up:** after a safety period, delete the moved rows from the old shard.
 
 ## Vitess and Citus — Managed Sharding Layers
 
@@ -371,28 +394,33 @@ SELECT account_id, SUM(amount) FROM payments GROUP BY account_id;
 ```
 
 > [!NOTE]
-> **Shard count planning:** over-shard initially. With 8 shards today and 32 projected shards at 5× growth, design the shard count as 32 from day one. Each physical machine hosts 4 shards. As load grows, move shards to dedicated machines — no data movement required. Under-sharding forces a painful re-shard under production load.
+> **Shard count planning:** over-shard initially. With 8 machines today and 32 projected at 5× growth, create 32 logical shards from day one, with each machine hosting 4 of them. As load grows, move whole logical shards to new machines — this copies a shard as a unit, but never re-splits or re-hashes keys. Under-sharding forces a painful re-shard under production load.
 
 ## Distributed Transactions — Why to Avoid Them
 
-A payment that updates a balance on shard 2 and an audit entry on shard 7 requires a cross-shard transaction. Two-phase commit (2PC) is technically possible but introduces:
+A transfer that debits the payer's account on shard 2 and credits the payee's account on shard 7 requires a cross-shard operation. Two-phase commit (2PC) is technically possible but introduces:
 
-- **Availability risk:** if the coordinator crashes after prepare but before commit, shards hold locks indefinitely
+- **Availability risk:** if the coordinator crashes after prepare but before commit, the prepared transactions keep their locks until someone resolves them
 - **Latency:** 2PC adds two round trips — prepare and commit — to every transaction
 - **Operational complexity:** in-doubt transactions require manual intervention
 
 The correct alternative is the Saga pattern: decompose the cross-shard operation into a sequence of single-shard transactions, each with a compensating rollback action. The Saga coordinator is a service, not a database protocol. See Track 05, Lesson 14.
 
 ```java
-// Cross-shard payment: account debit (shard A) + audit entry (shard B)
+// Cross-shard transfer: debit payer (shard A) + credit payee (shard B)
 // Use a Saga — not 2PC
-public PaymentResult processPayment(PaymentRequest req) {
-    // Step 1: debit account on shard A
-    // Step 2: write audit entry on shard B  
-    // If step 2 fails: compensating action credits account on shard A
+public PaymentResult processTransfer(TransferRequest req) {
+    // Step 1 (shard A, one local transaction): debit the payer and post the
+    //         amount to an "in-flight" clearing account, so the books always
+    //         balance while the money is between shards
+    // Step 2 (shard B): credit the payee, idempotent by transfer id
+    // If step 2 fails permanently: compensating step on shard A moves the
+    //         amount from the clearing account back to the payer
+    // (Audit entries belong in the SAME local transaction as each step, or
+    //  in an outbox -- not in a separate saga step.)
     return sagaOrchestrator.execute(
-        new DebitAccountStep(req.getAccountId(), req.getAmount()),
-        new WriteAuditStep(req.getCorrelationId(), req.getAmount())
+        new DebitToClearingStep(req.getPayerAccountId(), req.getAmount(), req.getTransferId()),
+        new CreditFromClearingStep(req.getPayeeAccountId(), req.getAmount(), req.getTransferId())
     );
 }
 ```
@@ -415,7 +443,7 @@ public PaymentResult processPayment(PaymentRequest req) {
 
 2. **ShardRouter implementation:** implement the `ShardRouter` class from this lesson with a `routeFor(String shardKey)` method. Write a JUnit 5 test that verifies: (a) the same key always routes to the same shard, (b) keys distribute approximately evenly across 8 shards (within 15% of ideal), and (c) adding a 9th shard moves fewer than 15% of keys (consistent hashing property).
 
-3. **Re-sharding plan:** your 8-shard cluster must grow to 16 shards. Write step-by-step operational runbook: seed phase SQL, dual-write Java code, verification query (checksum comparison between old and new shard), and cut-over procedure. Include rollback steps for each phase.
+3. **Re-sharding plan:** your 8-shard cluster must grow to 16 shards. Write a step-by-step operational runbook: start capturing writes, backfill SQL, dual-write Java code, verification query (checksum comparison between old and new shard), and cut-over procedure. Include rollback steps for each phase.
 
 4. **Cross-shard merchant settlement:** implement a `MerchantSettlementService.calculateDailySettlement(UUID merchantId, LocalDate date)` method that fans out to all shards in parallel using `CompletableFuture`, merges the totals, and handles partial shard failures gracefully (log and continue with available data, flagging the result as incomplete).
 
@@ -424,21 +452,36 @@ public PaymentResult processPayment(PaymentRequest req) {
   "questions": [
     {
       "text": "A payment platform shards its payments table by account_id (UUID v4). A merchant settlement query needs the total amount paid to merchant_id = X yesterday. How does this query execute in the sharded system?",
-      "options": ["It routes directly to the shard containing merchant_id X", "It fans out to all shards in parallel, each executing the WHERE merchant_id = ? filter, and results are merged in the application layer", "It fails because merchant_id is not the shard key", "It uses a global index to identify which shard holds merchant X's payments"],
+      "options": [
+        "It routes directly to the shard containing merchant_id X",
+        "It fans out to all shards in parallel, each executing the WHERE merchant_id = ? filter, and results are merged in the application layer",
+        "It fails because merchant_id is not the shard key",
+        "It uses a global index to identify which shard holds merchant X's payments"
+      ],
       "correct": 1,
       "explanation": "Because merchant_id is not the shard key, the router cannot determine which shard(s) contain payments for a given merchant. The query must fan out to all shards in parallel. Each shard filters locally and returns its partial total. The application layer merges these into the final settlement amount."
     },
     {
       "text": "What is the fundamental problem with using created_at (timestamp) as a shard key for a write-heavy payments table?",
-      "options": ["Timestamps have insufficient cardinality for even distribution", "All current writes route to the single shard covering the current time range, creating a severe write hotspot while all other shards receive zero writes", "Range queries become impossible across time boundaries", "Consistent hashing cannot be applied to timestamp values"],
+      "options": [
+        "Timestamps have insufficient cardinality for even distribution",
+        "All current writes route to the single shard covering the current time range, creating a severe write hotspot while all other shards receive zero writes",
+        "Range queries become impossible across time boundaries",
+        "Consistent hashing cannot be applied to timestamp values"
+      ],
       "correct": 1,
       "explanation": "Time-based shard keys create temporal hotspots: 100% of current writes go to the shard containing the current timestamp range. All historical shards become read-only cold storage. This defeats the purpose of sharding, which is to distribute write load. Use account_id (UUID v4) for uniform write distribution."
     },
     {
       "text": "During a shard split (8 shards → 16 shards), what is the purpose of the dual-write phase?",
-      "options": ["To create a backup of the original shard data", "To verify that the new shard's data matches the original shard before cutover", "To write new records to both the original shard and the new shard simultaneously, ensuring the new shard stays current while historical data is being seeded", "To test the routing logic without affecting production traffic"],
+      "options": [
+        "To create a backup of the original shard data",
+        "To verify that the new shard's data matches the original shard before cutover",
+        "To write new records to both the original shard and the new shard simultaneously, ensuring the new shard stays current while historical data is being seeded",
+        "To test the routing logic without affecting production traffic"
+      ],
       "correct": 2,
-      "explanation": "During a shard split, the new shard needs to receive both historical data (seeded via bulk copy) and new writes happening during the migration. Dual-write ensures the new shard stays synchronized with the original during the seeding phase. Once the new shard is fully caught up and verified, the router is updated to direct reads to the new shard and dual-writing stops."
+      "explanation": "During a shard split, the new shard needs both historical data (backfilled by bulk copy) and every write that happens during the migration. Dual-write (or CDC) keeps the new shard in step with the original; it must START BEFORE the backfill, and the backfill must not overwrite newer rows (upsert), or changes made during the copy are lost. Once the new shard is verified, the router sends the moved keys only to the new shard and dual-writing stops."
     }
   ]
 }
@@ -450,10 +493,22 @@ public PaymentResult processPayment(PaymentRequest req) {
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Implement the ShardRouter class using consistent hashing with 150 virtual nodes per shard. Write JUnit 5 tests verifying: (a) the same key always routes to the same shard across 10,000 calls, (b) 1 million random UUIDs distribute within 15% of ideal across 8 shards, and (c) adding a 9th shard moves fewer than 15% of keys from their original shard assignment."},
-    {"id": "2", "description": "Implement ShardedPaymentRepository with insert(Payment) and findById(UUID paymentId, UUID accountId) methods. The findById method must route by accountId (the shard key), not paymentId. Write a test that inserts 1,000 payments across 8 shards and verifies each can be retrieved using its accountId."},
-    {"id": "3", "description": "Implement MerchantSettlementService.calculateDailySettlement(UUID merchantId, LocalDate date) using CompletableFuture to fan out to all shards in parallel. The method must handle individual shard failures gracefully: log the error, mark the result as INCOMPLETE, and return the partial sum from available shards rather than failing the entire request."},
-    {"id": "4", "description": "Design and document a re-sharding runbook for splitting shard 3 of an 8-shard cluster into two shards (creating shard 8). Include: (a) the SQL to seed shard 8 with the upper half of shard 3's key space, (b) the dual-write Java code that detects which keys are in the split range, (c) a checksum verification query comparing row counts between old and new shards, and (d) rollback steps for each phase if inconsistency is detected."}
+    {
+      "id": "1",
+      "description": "Implement the ShardRouter class using consistent hashing with 150 virtual nodes per shard. Write JUnit 5 tests verifying: (a) the same key always routes to the same shard across 10,000 calls, (b) 1 million random UUIDs distribute within 15% of ideal across 8 shards, and (c) adding a 9th shard moves fewer than 15% of keys from their original shard assignment."
+    },
+    {
+      "id": "2",
+      "description": "Implement ShardedPaymentRepository with insert(Payment) and findById(UUID paymentId, UUID accountId) methods. The findById method must route by accountId (the shard key), not paymentId. Write a test that inserts 1,000 payments across 8 shards and verifies each can be retrieved using its accountId."
+    },
+    {
+      "id": "3",
+      "description": "Implement MerchantSettlementService.calculateDailySettlement(UUID merchantId, LocalDate date) using CompletableFuture to fan out to all shards in parallel. The method must handle individual shard failures gracefully: log the error, mark the result as INCOMPLETE, and return the partial sum from available shards rather than failing the entire request."
+    },
+    {
+      "id": "4",
+      "description": "Design and document a re-sharding runbook for splitting shard 3 of an 8-shard cluster into two shards (creating shard 8). Include: (a) starting write capture (dual-write or CDC) before any copying, (b) SQL to backfill shard 8 with the rows the new ring assigns to it (upsert), (c) the dual-write Java code that detects which keys are in the split range, (d) a checksum verification query comparing rows between old and new shards, and (e) rollback steps for each phase if inconsistency is detected."
+    }
   ]
 }
 -->

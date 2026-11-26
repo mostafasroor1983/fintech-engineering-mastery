@@ -19,12 +19,14 @@ prerequisites: []
 
 ## Why Kafka Exists — The Problem It Solves
 
-Traditional message queues (RabbitMQ, ActiveMQ) delete messages after consumption. This creates a fundamental problem for financial systems:
+Traditional message queues (classic RabbitMQ queues, ActiveMQ) delete messages once they are consumed and acknowledged. This creates problems for financial systems:
 
 - **Replay** — if a consumer has a bug, you cannot re-process historical events
-- **Multiple consumers** — adding a new service (analytics, compliance) requires a separate queue copy
-- **Throughput** — queue-based systems struggle beyond ~100k messages/second
-- **Ordering** — delivery ordering guarantees conflict with high availability
+- **Multiple consumers** — adding a new service (analytics, compliance) requires its own queue, fed from the moment it is created (no history)
+- **Throughput** — a single queue is usually limited by one node; very high volumes need careful sharding
+- **Ordering** — with competing consumers on one queue, strict ordering is hard to keep once messages are redelivered or processed in parallel
+
+(RabbitMQ has since added *streams*, a log-style structure — Lesson 19 compares the two.)
 
 Kafka solves these by being a **distributed, partitioned, replicated commit log**. Messages are written to a persistent log. Consumers read from the log at their own pace. The log is not deleted after consumption — it is retained for a configurable period.
 
@@ -82,17 +84,20 @@ Partitions are the unit of:
 **Partition selection** determines which partition a message goes to:
 ```java
 // Explicit key — messages with the same key always go to the same partition
+// (as long as the partition count does not change)
 // This guarantees ordering for a given account
-ProducerRecord<String, PaymentEvent> record = new ProducerRecord<>(
+ProducerRecord<String, PaymentEvent> keyed = new ProducerRecord<>(
     "payments",
     payment.getAccountId(),   // partition key — all events for this account go to same partition
     paymentEvent
 );
 
-// Round-robin (no key) — maximises throughput, no ordering guarantee
-ProducerRecord<String, PaymentEvent> record = new ProducerRecord<>(
+// No key — spread across partitions, no ordering guarantee.
+// (Not strict round-robin: since Kafka 2.4 the "sticky" partitioner fills
+//  a batch for one partition, then moves on -- bigger batches, same spread)
+ProducerRecord<String, PaymentEvent> unkeyed = new ProducerRecord<>(
     "payments",
-    null,                     // no key — round-robin across partitions
+    null,                     // no key
     paymentEvent
 );
 ```
@@ -102,11 +107,12 @@ ProducerRecord<String, PaymentEvent> record = new ProducerRecord<>(
 | Factor | Recommendation |
 |---|---|
 | Consumer parallelism | Partitions ≥ max consumers in group |
-| Throughput | Each partition handles ~10-100 MB/s; size for 3-5x headroom |
+| Throughput | Measure per-partition throughput on your hardware (often tens of MB/s); size for 3-5x headroom |
 | Ordering requirement | Key-based routing; order only guaranteed within a partition |
-| Rebalance frequency | More partitions = longer rebalance |
+| Rebalance and overhead | More partitions = more work in rebalances, leader elections and replication |
+| Future growth | Adding partitions later CHANGES the key → partition mapping (per-key ordering breaks during the switch) — choose generously up front |
 
-For a financial payments topic expecting 1M events/day peak: 12-24 partitions is typical.
+For a payments topic with 1M events/day (~12/s on average, a few hundred/s at peak), throughput needs very few partitions; the count is driven by consumer parallelism and growth — 12-24 partitions is a common choice.
 
 ### Replication — Durability and High Availability
 
@@ -126,7 +132,7 @@ Properties props = new Properties();
 props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBrokers);
 props.put(ProducerConfig.ACKS_CONFIG, "all");                     // all ISR must acknowledge
 props.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);      // retry forever
-props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);        // exactly-once semantics
+props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);        // no duplicates from retries (per partition)
 props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5); // idempotent: safe to have 5
 props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120_000);    // 2 minutes total delivery timeout
 props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 30_000);      // 30 seconds per request attempt
@@ -180,35 +186,38 @@ KafkaConsumer<String, PaymentEvent> consumer = new KafkaConsumer<>(props,
 ```
 
 > [!WARNING]
-> **Never use `enable.auto.commit=true` in financial systems.** Auto-commit advances the offset on a timer, regardless of whether processing succeeded. This can cause silent data loss: the offset advances, the process crashes before persisting the result, and the message is never processed.
+> **Avoid `enable.auto.commit=true` in financial systems.** Auto-commit commits, on a timer during `poll()`, the offsets of records returned by earlier polls — it does not know whether your processing succeeded. If records are handed to other threads, buffered, or written asynchronously, the offset can be committed before the work is durable; a crash then loses those messages silently. Manual commits put the commit point exactly where processing is finished. (Spring Kafka's listener containers already disable Kafka's auto-commit and commit for you according to their `AckMode`.)
 
 ### Manual Offset Commit Pattern
 
 ```java
-// Commit only after successful processing — at-least-once delivery
+// Commit only after successful processing — at-least-once delivery.
+// Failures are NOT handled by "just not acknowledging": the consumer would
+// simply continue with the next records, and the next acknowledge() would
+// commit past the failed one. Instead, throw -- the container's
+// DefaultErrorHandler seeks back, retries with back-off, and finally hands
+// the record to a DeadLetterPublishingRecoverer (topic payments.DLT).
 @KafkaListener(topics = "payments", groupId = "settlement-service",
                containerFactory = "manualAckKafkaListenerContainerFactory")
 public void processPayment(ConsumerRecord<String, PaymentEvent> record,
                            Acknowledgment ack) {
-    try {
-        // Process the payment
-        settlementService.processPayment(record.value());
-        
-        // Only commit offset after successful processing
-        ack.acknowledge();
-        
-    } catch (TransientException e) {
-        // Transient failure (DB timeout, etc.) — do not commit
-        // Kafka will redeliver this message after session timeout
-        log.warn("Transient failure processing payment {}, will retry", 
-            record.value().getId(), e);
-        // Do NOT call ack.acknowledge()
-        
-    } catch (PermanentException e) {
-        // Permanent failure (invalid message) — commit offset but send to DLQ
-        deadLetterQueueService.send("payments.dlq", record, e);
-        ack.acknowledge();  // advance past the bad message
-    }
+    // Process the payment (idempotent: redelivery must be harmless)
+    settlementService.processPayment(record.value());
+
+    // Only commit offset after successful processing
+    ack.acknowledge();
+    // TransientException (DB timeout, etc.) -> propagates -> retried
+    // PermanentException (invalid message) -> registered as not-retryable
+    //   -> published to the DLT at once, then the offset moves on
+}
+
+@Bean
+DefaultErrorHandler errorHandler(KafkaTemplate<Object, Object> template) {
+    DefaultErrorHandler handler = new DefaultErrorHandler(
+        new DeadLetterPublishingRecoverer(template),
+        new ExponentialBackOff(500, 2.0));               // 0.5s, 1s, 2s, ...
+    handler.addNotRetryableExceptions(PermanentException.class);
+    return handler;
 }
 ```
 
@@ -229,7 +238,7 @@ sequenceDiagram
     C->>DB: Process offset 101 → persist result  
     Note over C: Crash before processing 102 and committing
 
-    C->>K: Reconnect — last committed offset was 99
+    C->>K: Reconnect — committed offset is 100 (= next record to read)
     K->>C: Redeliver: messages [offset 100, 101, 102]
     
     Note over C,DB: Offsets 100 and 101 are redelivered\nMust be idempotent to handle re-processing
@@ -237,32 +246,46 @@ sequenceDiagram
 
 **At-Least-Once** (manual commit after processing): messages may be redelivered. Processing must be **idempotent** — safe to execute multiple times.
 
-**Exactly-Once** (Kafka transactions): consume, process, and produce in a single atomic transaction. More complex but eliminates duplicates.
+**Exactly-Once** (Kafka transactions): consume, process, and produce in a single atomic transaction. More complex, and it only covers Kafka-to-Kafka work: the output records and the consumer offsets commit together. Side effects outside Kafka (database writes, HTTP calls) are not part of the transaction and still need idempotency. Downstream consumers must read with `isolation.level=read_committed`.
 
 ```java
 // Exactly-once: consume from input topic, produce to output topic atomically
+// (producer has transactional.id set; consumer has enable.auto.commit=false
+//  and isolation.level=read_committed)
+producer.initTransactions();
 consumer.subscribe(List.of("payment-instructions"));
 
 while (true) {
     ConsumerRecords<String, PaymentInstruction> records = consumer.poll(Duration.ofMillis(100));
-    
+    if (records.isEmpty()) continue;
+
     producer.beginTransaction();
     try {
         for (ConsumerRecord<String, PaymentInstruction> record : records) {
-            PaymentResult result = processPayment(record.value());
-            
+            PaymentResult result = processPayment(record.value());   // pure computation
+
             // Produce result to output topic
-            producer.send(new ProducerRecord<>("payment-results", 
+            producer.send(new ProducerRecord<>("payment-results",
                 record.key(), result));
         }
-        
+
         // Commit offsets AND output messages in a single atomic transaction
+        // (offset to commit = last processed offset + 1, per partition)
         Map<TopicPartition, OffsetAndMetadata> offsets = calculateOffsets(records);
         producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
         producer.commitTransaction();
-        
-    } catch (Exception e) {
+
+    } catch (ProducerFencedException e) {
+        producer.close();     // another instance took over this transactional.id
+        throw e;
+    } catch (KafkaException e) {
         producer.abortTransaction();  // rolls back both output messages and offset commit
+        // Rewind the consumer: otherwise the next poll() would continue
+        // AFTER the aborted batch and those records would be skipped
+        for (TopicPartition tp : records.partitions()) {
+            OffsetAndMetadata committed = consumer.committed(Set.of(tp)).get(tp);
+            consumer.seek(tp, committed != null ? committed.offset() : 0L);
+        }
     }
 }
 ```
@@ -297,7 +320,9 @@ Map<String, String> accountBalancesConfig = Map.of(
     "cleanup.policy",     "compact",
     "min.cleanable.dirty.ratio", "0.1",
     "segment.ms",         String.valueOf(Duration.ofHours(24).toMillis()),
-    "delete.retention.ms", String.valueOf(Duration.ofHours(1).toMillis())
+    // how long delete markers (tombstones) are kept: a consumer offline
+    // longer than this can miss deletions -- size it to your longest outage
+    "delete.retention.ms", String.valueOf(Duration.ofDays(1).toMillis())
 );
 
 // Sending a compacted message: same key = later message replaces earlier
@@ -345,7 +370,7 @@ producer.send(new ProducerRecord<>(
         "Auto-commit is incompatible with Avro serialisation"
       ],
       "correct": 1,
-      "explanation": "Auto-commit advances the offset every `auto.commit.interval.ms` (default 5 seconds), independent of whether processing succeeded. If a payment is polled at T=0, auto-committed at T=5, and the consumer crashes at T=4 before persisting the payment result, the offset is committed (advanced) and the payment is never reprocessed — it is silently lost."
+      "explanation": "Auto-commit commits offsets every auto.commit.interval.ms (default 5 seconds) during poll(), for records returned by earlier polls — it does not know whether processing succeeded. If the application processes records asynchronously (hands them to a thread pool, buffers writes), the offset of a payment can be committed while its processing is still in flight; if the consumer then crashes, the payment is never redelivered — it is silently lost. Manual commits after durable processing avoid this."
     },
     {
       "id": "q4",
@@ -365,25 +390,25 @@ producer.send(new ProducerRecord<>(
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Kafka Architecture \u2014 Topics, Partitions, and Consumer Groups \u2014 Production Implementation",
+  "title": "Kafka Architecture — Topics, Partitions, and Consumer Groups — Production Implementation",
   "difficulty": "advanced",
   "estimatedMinutes": 90,
   "tasks": [
     {
       "id": "1",
-      "description": "Calculate partition count"
+      "description": "Calculate the partition count for a payments topic: 5M events/day today with peaks of 10x the average, 3x growth expected in two years, and a settlement service that needs up to 24 parallel consumers. Show the throughput calculation, the parallelism requirement, and explain why adding partitions later would break per-account ordering."
     },
     {
       "id": "2",
-      "description": "Write the topic creation command"
+      "description": "Write the topic creation command (kafka-topics.sh or AdminClient) for the payments topic with replication factor 3, min.insync.replicas=2, a 7-day retention, and the partition count from task 1. Also create a compacted account-balances topic and explain each setting you chose."
     },
     {
       "id": "3",
-      "description": "Write the producer configuration"
+      "description": "Write the producer configuration for financial-grade durability (acks=all, idempotence, delivery timeout, account_id as key) and a test that proves events for one account arrive in order in a single partition, while events for different accounts are spread across partitions."
     },
     {
       "id": "4",
-      "description": "Design the consumer group strategy"
+      "description": "Design the consumer group strategy for settlement (processing) and audit (independent reader): group ids, manual commits, a DefaultErrorHandler with back-off and a dead-letter topic, and idempotent processing keyed on payment id. Write a test that kills a consumer mid-batch and verifies that no payment is lost and duplicates have no effect."
     }
   ]
 }

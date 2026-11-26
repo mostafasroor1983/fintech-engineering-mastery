@@ -187,12 +187,13 @@ The `@Benchmark` annotation marks a method as a benchmark entry point. JMH gener
 ```java
 // PaymentHashBenchmark.java
 
+import com.google.common.hash.Hashing;
 import org.openjdk.jmh.annotations.*;
-import org.openjdk.jmh.infra.Blackhole;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 
 @BenchmarkMode(Mode.AverageTime)
-@OutputTimeUnit(TimeUnit.MICROSECONDS)
+@OutputTimeUnit(TimeUnit.NANOSECONDS)
 @Warmup(iterations = 5, time = 1, timeUnit = TimeUnit.SECONDS)
 @Measurement(iterations = 10, time = 1, timeUnit = TimeUnit.SECONDS)
 @Fork(2)
@@ -207,18 +208,19 @@ public class PaymentHashBenchmark {
     }
 
     @Benchmark
-    public int hashCode_string(Blackhole bh) {
-        // JVM may cache String.hashCode(), but let's measure
-        int h = paymentId.hashCode();
-        bh.consume(h);
-        return h;
+    public int hashCode_string() {
+        // Careful: String caches its hash code after the first call, so this
+        // mostly measures a field read -- a classic "benchmark measures the
+        // wrong thing" trap. Returning the value is enough for JMH to consume it.
+        return paymentId.hashCode();
     }
 
     @Benchmark
-    public int hashCode_murmur(Blackhole bh) {
-        int h = MurmurHash3.hash32(paymentId.getBytes(), 0);
-        bh.consume(h);
-        return h;
+    public int hashCode_murmur() {
+        // Guava's Murmur3: encodes the String and hashes it on every call
+        return Hashing.murmur3_32_fixed()
+            .hashString(paymentId, StandardCharsets.UTF_8)
+            .asInt();
     }
 }
 ```
@@ -230,7 +232,9 @@ public class PaymentHashBenchmark {
 `@State` controls object lifecycle and sharing across threads.
 
 ```java
-// StateScope.java
+// StateScope.java  (each @State class must be public, with a public
+// no-arg constructor -- in real code put them in separate files or make
+// them public static nested classes of the benchmark)
 
 // Scope.Benchmark: ONE instance shared across all threads (simulates shared singleton)
 @State(Scope.Benchmark)
@@ -309,13 +313,14 @@ public class LedgerBenchmarkState {
 ## 5. BenchmarkMode — Choosing the Right Measurement
 
 ```java
-// BenchmarkModeExamples.java
+// BenchmarkModeExamples.java -- pick ONE per benchmark (or pass several
+// in one annotation: @BenchmarkMode({Mode.Throughput, Mode.AverageTime}))
 
 @BenchmarkMode(Mode.Throughput)         // ops/second -- for high-frequency operations
 @BenchmarkMode(Mode.AverageTime)        // average time per op -- for latency analysis
 @BenchmarkMode(Mode.SampleTime)         // distribution of times -- for P99/P999 analysis
-@BenchmarkMode(Mode.SingleShotTime)     // cold performance -- for startup benchmarks
-@BenchmarkMode(Mode.All)               // run all modes
+@BenchmarkMode(Mode.SingleShotTime)     // one call per iteration -- cold/startup cost
+@BenchmarkMode(Mode.All)                // run all modes
 ```
 
 **For payment services:**
@@ -408,7 +413,7 @@ public class PaymentLatencyBenchmark {
     iterations = 5,                     // 5 warmup iterations (discarded)
     time = 1,                           // each iteration lasts 1 second
     timeUnit = TimeUnit.SECONDS,
-    batchSize = 1                       // 1 benchmark call per batch
+    batchSize = 1                       // only used by SingleShotTime mode
 )
 @Measurement(
     iterations = 10,                    // 10 measurement iterations (kept)
@@ -422,29 +427,32 @@ public class PaymentLatencyBenchmark {
 - **Serialisation benchmarks**: 5 warmup iterations of 1s each is usually sufficient
 - **Database-touching benchmarks**: May need 10+ warmup iterations to warm caches and connection pools
 - **JIT-intensive benchmarks** (complex object graph traversal): 10+ warmup iterations
-- **Short methods** (< 100 ns): Use `batchSize = 1000` to amortise invocation overhead
+- **Short methods** (< 100 ns): JMH already calls them in a tight loop and amortises its own overhead; use `NANOSECONDS` as the output unit. (`batchSize` only applies to `SingleShotTime` mode — it groups calls when a single call is too short to time on its own.)
 
 ```java
-// Short-method benchmark requiring batch size
-@Warmup(iterations = 5, time = 1, batchSize = 1000)
-@Measurement(iterations = 10, time = 1, batchSize = 1000)
+// Short-method benchmark: nanosecond output, no special batching needed
+@Warmup(iterations = 5, time = 1)
+@Measurement(iterations = 10, time = 1)
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
+@Fork(2)
 public class CurrencyLookupBenchmark {
 
+    // Do NOT name this class "State": it would shadow the @State annotation
     @State(Scope.Benchmark)
-    public static class State {
-        final Map<String, Currency> currencies = Map.of(
+    public static class Currencies {
+        Map<String, Currency> byCode = Map.of(
             "USD", Currency.getInstance("USD"),
             "EUR", Currency.getInstance("EUR"),
             "GBP", Currency.getInstance("GBP"),
             "JPY", Currency.getInstance("JPY")
         );
+        String code = "USD";   // non-final field: the key is not a constant
     }
 
     @Benchmark
-    public Currency lookupUSD(State state) {
-        return state.currencies.get("USD");
+    public Currency lookup(Currencies state) {
+        return state.byCode.get(state.code);
     }
 }
 ```
@@ -572,33 +580,29 @@ public void processTransaction(Blackhole bh) {
 
 ### 8.3 Constant Folding Prevention
 
-The JIT can also fold constant inputs at compile time, making your benchmark measure the constant-folding overhead rather than the actual computation:
+The JIT can also fold constant inputs at compile time: if every input is a compile-time constant, the result can be computed once and the benchmark measures almost nothing:
 
 ```java
-// WRONG: JIT may precompute this at JIT time
+// WRONG: all inputs are constants -- the JIT may precompute the result
 @State(Scope.Benchmark)
 public class ConstantFoldingProblem {
-    private final String accountId = "ACC-001";  // final == constant!
+    private static final double PRINCIPAL = 10_000.0;  // static final == constant
 
     @Benchmark
-    public int hash_problem() {
-        return accountId.hashCode();  // JIT may compute this once and cache forever
+    public double interest_problem() {
+        return PRINCIPAL * Math.pow(1.0 + 0.05 / 365, 365);  // may be folded
     }
 }
 
-// CORRECT: Use @State fields that are not final
+// CORRECT: read inputs from non-final @State fields
 @State(Scope.Benchmark)
 public class ConstantFoldingFixed {
-    private String accountId;  // not final
-
-    @Setup
-    public void setup() {
-        accountId = "ACC-" + System.nanoTime();  // non-deterministic at JIT time
-    }
+    private double principal = 10_000.0;   // not final, not static
+    private double annualRate = 0.05;
 
     @Benchmark
-    public int hash_correct() {
-        return accountId.hashCode();
+    public double interest_correct() {
+        return principal * Math.pow(1.0 + annualRate / 365, 365);
     }
 }
 ```
@@ -625,9 +629,11 @@ public class MonetaryArithmeticBenchmark {
 
     private BigDecimal[] amounts;
     private double[] amountsDouble;
+    private BigDecimal rate;   // created once, in setup
 
     @Setup
     public void setup() {
+        rate = new BigDecimal("0.025");
         amounts = new BigDecimal[operationCount];
         amountsDouble = new double[operationCount];
         Random rng = new Random(42);
@@ -685,12 +691,10 @@ public class MonetaryArithmeticBenchmark {
         return total;
     }
 
-    // Benchmark: BigDecimal with pre-cached instances (common optimisation)
+    // Benchmark: same calculation, but the rate is parsed once (in setup)
+    // instead of from a String on every call -- a common, cheap optimisation
     @Benchmark
     public BigDecimal feeCalc_bigDecimalCached() {
-        // Using valueOf instead of new BigDecimal() -- JVM caches common values
-        BigDecimal rate = new BigDecimal("0.025");
-        BigDecimal scale = BigDecimal.valueOf(100);
         BigDecimal total = BigDecimal.ZERO;
         for (BigDecimal amount : amounts) {
             BigDecimal fee = amount.multiply(rate)
@@ -702,21 +706,21 @@ public class MonetaryArithmeticBenchmark {
 }
 ```
 
-**Typical results** (Java 21, modern hardware):
+**Illustrative results** (Java 21, modern x86 laptop — your numbers will differ):
 
 ```
 Benchmark                                    (operationCount)  Mode  Cnt    Score    Error  Units
-MonetaryArithmeticBenchmark.sumBigDecimal              100    avgt   60  312.456 ± 12.123  us/op
+MonetaryArithmeticBenchmark.sumBigDecimal              100    avgt   60    1.210 ±  0.040  us/op
 MonetaryArithmeticBenchmark.sumDouble                  100    avgt   60    0.045 ±  0.001  us/op
-MonetaryArithmeticBenchmark.feeCalc_bigDecimal         100    avgt   60  891.234 ± 45.678  us/op
-MonetaryArithmeticBenchmark.feeCalc_double             100    avgt   60    0.123 ±  0.003  us/op
+MonetaryArithmeticBenchmark.feeCalc_bigDecimal         100    avgt   60    6.480 ±  0.210  us/op
+MonetaryArithmeticBenchmark.feeCalc_double             100    avgt   60    0.350 ±  0.010  us/op
 ```
 
-**BigDecimal is ~2000-7000x slower than double for arithmetic operations.**
+**BigDecimal is typically tens of times slower than double** (here ~20–30x), and it allocates a new object for every result. In absolute terms that is still only nanoseconds per operation — for most payment services it is not the bottleneck.
 
 Implications for payment systems:
 - Use `BigDecimal` for all monetary values stored and transmitted
-- For high-frequency internal computations (risk aggregations, real-time P&L), consider `long` (cents) representation
+- For high-frequency internal computations (risk aggregations, real-time P&L), consider a `long` in minor units (cents) — exact, fast and allocation-free, as long as you handle overflow (`Math.addExact`) and currencies with 0 or 3 decimal places
 - Never use `double` for final monetary values — rounding errors accumulate
 
 ---
@@ -727,24 +731,21 @@ Run benchmarks with these flags to minimise noise:
 
 ```bash
 java -jar target/benchmarks.jar \
-  -jvmArgs "-XX:+UseG1GC \
-            -Xms2g -Xmx2g \
-            -XX:+AlwaysPreTouch \
-            -XX:-TieredCompilation \
-            -XX:+PrintCompilation \
-            -server" \
+  -jvmArgsAppend "-Xms2g -Xmx2g -XX:+AlwaysPreTouch" \
   -prof gc \
   PaymentSerializationBenchmark
+# Keep the JVM's default tiered compilation -- that is what production runs.
+# Run on a quiet machine: fixed CPU frequency, no other heavy processes.
 ```
 
 Key flags:
 
 | Flag | Purpose |
 |---|---|
+| `-Xms` = `-Xmx` | Fixed heap size — no resizing during measurement |
 | `-XX:+AlwaysPreTouch` | Pre-fault all heap pages at startup, eliminating OS page-fault noise |
-| `-XX:-TieredCompilation` | Use only C2 compiler (maximum optimisation level), consistent with long-running production |
-| `-server` | Force server JVM mode |
-| `-XX:CompileThreshold=100` | Lower JIT threshold — useful for quick benchmarks but changes inlining |
+| Same GC as production | GC choice changes allocation and barrier costs |
+| Avoid `-XX:-TieredCompilation`, `-XX:+PrintCompilation` | Disabling tiers is *not* what production runs; printing compilations adds noise to the output (`-server` is a no-op on 64-bit JVMs, and `CompileThreshold` is ignored with tiered compilation) |
 
 **Important**: always use `@Fork(2)` or higher. Each fork starts a fresh JVM process, ensuring JVM state from previous benchmarks does not contaminate results.
 
@@ -758,8 +759,8 @@ JMH supports profilers via the `-prof` flag:
 # GC profiler -- shows GC overhead per benchmark operation
 java -jar target/benchmarks.jar -prof gc PaymentSerializationBenchmark
 
-# async-profiler integration (requires async-profiler on classpath)
-java -jar target/benchmarks.jar -prof async PaymentSerializationBenchmark
+# async-profiler integration (needs the async-profiler native library)
+java -jar target/benchmarks.jar -prof async:libPath=/opt/async-profiler/lib/libasyncProfiler.so PaymentSerializationBenchmark
 
 # Stack profiler -- basic sampling profiler
 java -jar target/benchmarks.jar -prof stack PaymentSerializationBenchmark
@@ -771,9 +772,15 @@ java -jar target/benchmarks.jar -prof jfr PaymentSerializationBenchmark
 GC profiler output example:
 
 ```
-Benchmark                             Score    Error  Units  gc.alloc.rate  gc.alloc.rate.norm  gc.count
-PaymentSerializationBenchmark.json    8.234 ±  0.123  us/op   2048.123 MB/s          16876.000  B/op  42
-PaymentSerializationBenchmark.proto   2.112 ±  0.034  us/op    512.456 MB/s           1082.000  B/op  11
+Benchmark                                          (serializerType)  Mode  Cnt      Score     Error   Units
+PaymentSerializationBenchmark.serialize                       JSON  avgt   20      8.234 ±   0.123   us/op
+PaymentSerializationBenchmark.serialize:gc.alloc.rate         JSON  avgt   20   2048.123 ±  31.000  MB/sec
+PaymentSerializationBenchmark.serialize:gc.alloc.rate.norm    JSON  avgt   20  16876.000 ±   0.010    B/op
+PaymentSerializationBenchmark.serialize:gc.count              JSON  avgt   20     42.000            counts
+PaymentSerializationBenchmark.serialize                   PROTOBUF  avgt   20      2.112 ±   0.034   us/op
+PaymentSerializationBenchmark.serialize:gc.alloc.rate     PROTOBUF  avgt   20    512.456 ±   9.000  MB/sec
+PaymentSerializationBenchmark.serialize:gc.alloc.rate.norm PROTOBUF avgt   20   1082.000 ±   0.010    B/op
+PaymentSerializationBenchmark.serialize:gc.count          PROTOBUF  avgt   20     11.000            counts
 ```
 
 This reveals that the JSON serialiser allocates **15x more memory per operation** — a critical finding for GC tuning decisions.
@@ -785,6 +792,7 @@ This reveals that the JSON serialiser allocates **15x more memory per operation*
 ```java
 // BenchmarkRunner.java -- programmatic execution (useful for CI integration)
 
+import org.openjdk.jmh.annotations.Mode;
 import org.openjdk.jmh.results.RunResult;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
@@ -792,12 +800,15 @@ import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
 
 import java.util.Collection;
+import java.util.concurrent.TimeUnit;
 
 public class BenchmarkRunner {
 
     public static void main(String[] args) throws RunnerException {
         Options opts = new OptionsBuilder()
-            .include(PaymentSerializationBenchmark.class.getSimpleName())
+            .include(PaymentSerializationBenchmark.class.getSimpleName() + "\\.serialize$")
+            .mode(Mode.Throughput)              // override the class's AverageTime
+            .timeUnit(TimeUnit.SECONDS)         // so the score is ops/sec
             .warmupIterations(5)
             .measurementIterations(10)
             .forks(2)
@@ -807,15 +818,18 @@ public class BenchmarkRunner {
 
         Collection<RunResult> results = new Runner(opts).run();
 
-        // Assert performance requirements in CI
+        // Assert performance requirements in CI.
+        // Absolute thresholds are only meaningful on dedicated, stable hardware;
+        // on shared CI runners, compare against a baseline from the SAME machine.
         for (RunResult result : results) {
             double score = result.getPrimaryResult().getScore();
-            String benchmarkName = result.getPrimaryResult().getLabel();
+            String name = result.getParams().getBenchmark() + " " + result.getParams().getParam("serializerType")
+                + "/" + result.getParams().getParam("lineItemCount");
 
-            // Fail build if serialisation throughput drops below 50,000 ops/sec
-            if (benchmarkName.contains("serialize") && score < 50_000) {
+            // Fail the build if single-item serialisation drops below 50,000 ops/sec
+            if ("1".equals(result.getParams().getParam("lineItemCount")) && score < 50_000) {
                 throw new AssertionError(
-                    "Performance regression: " + benchmarkName +
+                    "Performance regression: " + name +
                     " scored " + score + " ops/sec (expected > 50,000)"
                 );
             }
@@ -851,7 +865,7 @@ public class BenchmarkRunner {
 
 3. What is the difference between `@Setup(Level.Trial)`, `@Setup(Level.Iteration)`, and `@Setup(Level.Invocation)`? When would you use each?
 
-4. A `BigDecimal` addition benchmark shows 10x worse performance than expected. You notice the `@State` field holding the `BigDecimal` values is `final`. What is the likely cause?
+4. A `double` interest-calculation benchmark reports a suspiciously tiny time (well under a nanosecond per operation). You notice its inputs are `static final` constants. What is the likely cause?
 
 5. You benchmark JSON serialisation and find the throughput is 1,000,000 ops/sec. The GC profiler shows 500 MB/s allocation rate. The service runs at 100,000 TPS in production. Estimate the GC allocation pressure and explain what this means for heap sizing.
 
@@ -900,15 +914,15 @@ public class BenchmarkRunner {
       "explanation": "The JIT compiler can eliminate computations whose results are provably unused. A void @Benchmark method with an unconsumed local variable may be optimised to a no-op. Fix by returning the result (JMH consumes it) or passing it to a Blackhole parameter."
     },
     {
-      "text": "BigDecimal arithmetic benchmarks show 10x worse performance than expected. The @State field holding the values is declared `final`. What is the likely cause?",
+      "text": "A double interest-calculation benchmark reports a suspiciously tiny score (well under a nanosecond per operation). Its inputs are declared `static final`. What is the likely cause?",
       "options": [
-        "BigDecimal is not thread-safe and causes contention in @State(Scope.Benchmark)",
-        "The JIT constant-folds the final field and inlines the computed result, eliminating the actual work and making the benchmark measure near-zero",
+        "double arithmetic is not thread-safe and causes contention in @State(Scope.Benchmark)",
+        "The JIT constant-folds the static final inputs and computes the result once, so the benchmark measures almost no work",
         "JMH requires @State fields to be volatile to prevent instruction reordering",
         "The final keyword prevents @Setup methods from initialising the field correctly"
       ],
       "correct": 1,
-      "explanation": "If a @State field is final, the JIT may constant-fold it at compile time, treating the value as a compile-time constant. The benchmark then measures the cost of using a constant rather than a variable, which is essentially zero for arithmetic. Remove the final modifier from @State fields."
+      "explanation": "When all inputs are compile-time constants (static final fields or literals), the JIT can compute the result once and reuse it. The benchmark then measures the cost of returning a constant — essentially zero. Read inputs from non-final, non-static @State fields so the JIT must do the real work on every call."
     }
   ]
 }

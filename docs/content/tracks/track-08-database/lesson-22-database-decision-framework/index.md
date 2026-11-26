@@ -34,11 +34,13 @@ Step 1: Do you need ACID transactions?
   NO  -> NoSQL may be appropriate (Cassandra for time-series, Redis for cache)
          (Note: very few financial use cases can safely use eventual consistency)
 
-Step 2: What is your write throughput requirement?
+Step 2: What is your WRITE throughput requirement? (rough guides)
   < 10,000 TPS    -> Single PostgreSQL with optimized indexes
-  10K-30K TPS     -> PostgreSQL with read replicas + connection pooling
-  30K-100K TPS    -> Citus (distributed PostgreSQL)
-  > 100K TPS      -> CockroachDB or Spanner
+  10K-30K TPS     -> Tuned single primary: bigger hardware, batching,
+                     partitioning, connection pooling
+                     (read replicas only offload READS, not writes)
+  30K-100K TPS    -> Citus (distributed PostgreSQL) or app-level sharding
+  > 100K TPS      -> Citus at scale, CockroachDB or Spanner
   (Note: measure actual workload before assuming you need high end)
 
 Step 3: What is your geographic distribution requirement?
@@ -58,24 +60,31 @@ The isolation level determines what anomalies are possible. Financial systems mu
 
 ```sql
 -- PostgreSQL isolation levels (from weakest to strongest)
+-- (READ UNCOMMITTED is accepted but behaves like READ COMMITTED)
 
 -- READ COMMITTED (PostgreSQL default):
--- Sees committed data at the START of each statement (not transaction)
--- Anomalies possible: non-repeatable reads, phantom reads
--- Use for: read-only reporting queries, dashboard data
--- NOT for: balance updates, transaction writes
+-- Each STATEMENT sees data committed before it started (not the transaction)
+-- Anomalies possible: non-repeatable reads, phantoms, lost updates for
+--   read-then-write code
+-- Safe for writes when the write itself is atomic or locked:
+--   UPDATE accounts SET balance = balance - 500 WHERE id = ? AND balance >= 500
+--   or SELECT ... FOR UPDATE before the read-compute-write
+-- Use for: most OLTP code WITH explicit row locks / atomic updates, reads
 
--- REPEATABLE READ:
--- Sees data committed before transaction started
--- Anomalies possible: phantom reads (new rows inserted by others can be invisible)
--- PostgreSQL's implementation also prevents phantom reads in practice
--- Use for: multi-statement reads that must see consistent snapshot
+-- REPEATABLE READ (snapshot isolation in PostgreSQL):
+-- The whole transaction sees one snapshot taken at its first statement
+-- Prevents non-repeatable reads AND phantoms (stronger than the SQL standard)
+-- A concurrent update of a row you modify -> serialization failure (retry)
+-- Still allows WRITE SKEW (two transactions each read, then write
+--   different rows based on what they read)
+-- Use for: consistent multi-statement reads (reports, exports)
 
--- SERIALIZABLE:
--- Strongest isolation: transactions appear to execute serially
--- No anomalies possible
--- Cost: higher lock contention, serialization failures under high concurrency
--- Use for: ALL financial writes (balance updates, transaction inserts)
+-- SERIALIZABLE (Serializable Snapshot Isolation):
+-- Transactions behave as if run one at a time -- no anomalies
+-- Cost: no extra blocking, but serialization failures (SQLSTATE 40001)
+--   under contention -> every transaction needs a retry loop
+-- Use for: complex invariants spanning several rows/tables (write skew
+--   risks) where explicit locking is hard to get right
 ```
 
 ```java
@@ -83,14 +92,16 @@ The isolation level determines what anomalies are possible. Financial systems mu
 @Service
 public class PaymentService {
 
-    // Financial writes: always SERIALIZABLE
+    // Financial write with a multi-row invariant: SERIALIZABLE -- the
+    // CALLER must retry on ConcurrencyFailureException (SQLSTATE 40001).
+    // Alternative: READ COMMITTED + SELECT ... FOR UPDATE / atomic updates.
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public void processPayment(PaymentRequest request) {
         // balance check + debit + transaction insert
     }
 
-    // Idempotency check: READ_COMMITTED is sufficient
-    // (we re-check inside a serializable transaction anyway)
+    // Idempotency pre-check: READ_COMMITTED is sufficient -- the real
+    // guarantee is a UNIQUE constraint on the idempotency key at insert
     @Transactional(isolation = Isolation.READ_COMMITTED, readOnly = true)
     public Optional<Transaction> checkIdempotency(String key) {
         return transactionRepository.findByIdempotencyKey(key);
@@ -133,29 +144,33 @@ For each table, answer these questions:
 
 6. After creating indexes: measure impact
    -> pg_stat_user_indexes: idx_scan should be > 0 within 2 weeks
-   -> Drop unused indexes
+      (check replicas too: an index used only by replica queries shows 0
+       scans on the primary)
+   -> Drop unused indexes (DROP INDEX CONCURRENTLY)
 ```
 
 ```sql
 -- Index decision checklist query
--- Run after 2 weeks in production to identify unused and bloated indexes
+-- Run after 2+ weeks in production to identify unused indexes.
+-- (pg_stat_user_indexes columns are relname / indexrelname; counters run
+--  since the last statistics reset, which survives restarts since PG15)
 
 SELECT
-    schemaname,
-    tablename,
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS size,
-    idx_scan AS scans_since_restart,
+    s.schemaname,
+    s.relname       AS table_name,
+    s.indexrelname  AS index_name,
+    pg_size_pretty(pg_relation_size(s.indexrelid)) AS size,
+    s.idx_scan      AS scans_since_stats_reset,
     CASE
-        WHEN idx_scan = 0 THEN 'UNUSED - consider dropping'
-        WHEN idx_scan < 100 THEN 'RARELY USED - review'
+        WHEN s.idx_scan = 0 THEN 'UNUSED - consider dropping'
+        WHEN s.idx_scan < 100 THEN 'RARELY USED - review'
         ELSE 'ACTIVE'
     END AS recommendation
-FROM pg_stat_user_indexes
-LEFT JOIN pg_index ON pg_index.indexrelid = pg_stat_user_indexes.indexrelid
-WHERE indisprimary = false
-  AND indisunique = false
-ORDER BY idx_scan ASC, pg_relation_size(indexrelid) DESC
+FROM pg_stat_user_indexes s
+JOIN pg_index i ON i.indexrelid = s.indexrelid
+WHERE NOT i.indisprimary
+  AND NOT i.indisunique          -- unique indexes enforce rules even if unused
+ORDER BY s.idx_scan ASC, pg_relation_size(s.indexrelid) DESC
 LIMIT 30;
 ```
 
@@ -166,7 +181,8 @@ Partition when:
   - Table size exceeds 100GB (without partitioning, VACUUM becomes slow)
   - Query patterns consistently filter by a date range (partition by date)
   - Archival strategy requires removing old data (detach + drop partition)
-  - Write throughput benefits from distributing WAL across partitions (hash partition)
+  - Hot indexes/tables need smaller units for maintenance (VACUUM, REINDEX)
+    -- note: partitioning does NOT spread WAL; one server has one WAL stream
 
 Do NOT partition when:
   - Table is small (< 10GB): partitioning overhead not worth it
@@ -205,46 +221,52 @@ Long retention (3-7+ years, regulatory requirement):
 ## 6. Connection Pool Right-Sizing
 
 ```
-Formula: pool_size_per_instance = (vCPU_count * 2) + disk_spindle_count
+Starting point (PostgreSQL wiki / HikariCP "About Pool Sizing"):
+  useful ACTIVE connections = (DATABASE server cores * 2) + effective_spindles
+  -- a TOTAL for all clients together, not a per-application-instance number
 
-Practical rules:
-  - For NVMe SSD: treat as 1 "spindle" (effectively random_page_cost ~ 1.0)
-  - For cloud instances: use the formula, then validate with pgbench
+Example: DB server with 16 cores, NVMe (count as ~1 spindle) -> ~33
 
-Total PostgreSQL connections = instances * pool_size_per_instance + ops_headroom
+With PgBouncer (transaction mode):
+  default_pool_size     ~ 30-35   (server connections per db/user pair)
+  max_db_connections    ~ 40      (hard cap towards PostgreSQL)
+  max_connections (PG)  = 40 + ~20 for ops/admin/monitoring = 60
+  App pools: 10 instances * 10 = 100 client connections
+  max_client_conn       >= 100 (+ headroom for deploys/scale-out)
 
-Example: 10 instances, 4 vCPU each, NVMe
-  pool_per_instance = (4*2) + 1 = 9 -> round to 10
-  total = 10 * 10 = 100
-  Add 20 for ops/admin/monitoring: max_connections = 120
+Without PgBouncer:
+  per-instance pool ~ 33 / 10 instances = 3-4
 
-PgBouncer configuration (transaction mode):
-  default_pool_size = max_connections * 1.2 = 144 -> round to 150
-  max_client_conn = instances * pool_per_instance * 2 = 200
+Per-instance check with Little's law:
+  connections busy = transactions per second * seconds each one holds a
+  connection (e.g. 400/s * 0.010 s = 4), plus headroom -- then load test
 
-Adjust max_connections in PostgreSQL:
-  ALTER SYSTEM SET max_connections = 120;
-  SELECT pg_reload_conf();
+Changing max_connections requires a RESTART (pg_reload_conf is not enough):
+  ALTER SYSTEM SET max_connections = 60;   -- then restart PostgreSQL
 ```
 
 ```java
-// Self-documenting pool configuration
+// Self-documenting pool configuration: the size is DERIVED from measured
+// numbers (Little's law), so the reasoning is visible in code review
 @Configuration
 public class DatabasePoolConfig {
 
-    private static final int VCPU_COUNT = 4;
-    private static final int DISK_SPINDLES = 1;  // NVMe SSD
-    private static final int POOL_SIZE = (VCPU_COUNT * 2) + DISK_SPINDLES;  // = 9
-    private static final int OPS_HEADROOM = 2;  // admin connections per instance
+    private static final double PEAK_TX_PER_SECOND   = 400;    // per instance, measured
+    private static final double AVG_HOLD_SECONDS     = 0.010;  // 10 ms per transaction
+    private static final double HEADROOM             = 2.0;    // bursts, slow periods
+    private static final int    POOL_SIZE =
+        (int) Math.ceil(PEAK_TX_PER_SECOND * AVG_HOLD_SECONDS * HEADROOM);  // = 8
 
     @Bean
-    public HikariConfig hikariConfig() {
+    public HikariDataSource dataSource(DataSourceProperties props) {
         HikariConfig config = new HikariConfig();
-        config.setMaximumPoolSize(POOL_SIZE + OPS_HEADROOM);  // 11
-        config.setMinimumIdle(POOL_SIZE / 2);                 // 4
-        config.setPoolName(String.format(
-            "payments-pool-%dvCPU-%ddisks", VCPU_COUNT, DISK_SPINDLES));
-        return config;
+        config.setJdbcUrl(props.getUrl());
+        config.setUsername(props.getUsername());
+        config.setPassword(props.getPassword());
+        config.setMaximumPoolSize(POOL_SIZE);
+        config.setMinimumIdle(POOL_SIZE);          // fixed-size pool (HikariCP advice)
+        config.setPoolName("payments-pool-" + POOL_SIZE);
+        return new HikariDataSource(config);
     }
 }
 ```
@@ -263,7 +285,8 @@ Do NOT use read replicas for:
   - Any read that affects a subsequent write in the same transaction
   - Idempotency checks (must read from primary to avoid race conditions)
 
-Replication lag monitoring:
+Replication lag monitoring (on the replica; this grows while the primary
+is idle, so pair it with a heartbeat write or LSN comparison -- Lesson 08):
   SELECT NOW() - pg_last_xact_replay_timestamp() AS replication_lag;
   -- Alert if lag > 5 seconds for payment-related replicas
   -- Alert if lag > 60 seconds for reporting replicas
@@ -274,25 +297,27 @@ Replication lag monitoring:
 public class RoutingDataSourceConfig {
 
     @Bean
-    public DataSource routingDataSource(
+    @Primary
+    public DataSource dataSource(
             @Qualifier("primary") DataSource primary,
             @Qualifier("replica") DataSource replica) {
-        return new AbstractRoutingDataSource() {
+        AbstractRoutingDataSource routing = new AbstractRoutingDataSource() {
             @Override
             protected Object determineCurrentLookupKey() {
                 return TransactionSynchronizationManager.isCurrentTransactionReadOnly()
                     ? "replica"
                     : "primary";
             }
-
-            {
-                setTargetDataSources(Map.of(
-                    "primary", primary,
-                    "replica", replica
-                ));
-                setDefaultTargetDataSource(primary);
-            }
         };
+        routing.setTargetDataSources(Map.of("primary", primary, "replica", replica));
+        routing.setDefaultTargetDataSource(primary);
+        routing.afterPropertiesSet();   // not a bean itself -> call it explicitly
+
+        // The lazy proxy fetches the real connection only at the first
+        // statement -- by then the transaction's read-only flag is set.
+        // Without it, JPA grabs the connection at transaction start and the
+        // lookup key is decided too early.
+        return new LazyConnectionDataSourceProxy(routing);
     }
 }
 ```
@@ -316,8 +341,8 @@ public class AccountService {
     }
 }
 
-// CORRECT: Single query with JOIN
-@Query("""
+// CORRECT: Single query with JOIN (native SQL: LATERAL is not JPQL)
+@Query(nativeQuery = true, value = """
     SELECT a.id, a.balance, a.currency,
            t.id AS txn_id, t.amount AS txn_amount, t.created_at
     FROM accounts a
@@ -338,7 +363,8 @@ List<AccountWithTransactionsRow> findAccountsWithRecentTransactions(
 
 ```sql
 -- PostgreSQL does NOT automatically index foreign key columns
--- Without the index, every FK constraint check requires a sequential scan
+-- (inserts into the child check the PARENT's primary key index -- that is
+--  fine; the problem is the other direction)
 
 -- WRONG: transactions.account_id is a FK but has no index
 CREATE TABLE transactions (
@@ -354,63 +380,68 @@ CREATE TABLE transactions (
 -- CORRECT: Always index FK columns
 CREATE INDEX idx_transactions_account_id ON transactions (account_id);
 
--- Detection query: find FK columns without indexes
+-- Detection query: foreign keys whose columns are not the LEADING columns
+-- of any index (an index where the FK column comes second does not help;
+-- also handles multi-column FKs and schemas)
 SELECT
-    tc.table_name,
-    kcu.column_name,
-    ccu.table_name AS referenced_table
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-    ON kcu.constraint_name = tc.constraint_name
-JOIN information_schema.constraint_column_usage ccu
-    ON ccu.constraint_name = tc.constraint_name
-WHERE tc.constraint_type = 'FOREIGN KEY'
+    c.conrelid::regclass   AS table_name,
+    c.conname              AS fk_name,
+    pg_get_constraintdef(c.oid) AS definition
+FROM pg_constraint c
+WHERE c.contype = 'f'
   AND NOT EXISTS (
     SELECT 1
     FROM pg_index i
-    JOIN pg_attribute a ON a.attrelid = i.indrelid
-        AND a.attnum = ANY(i.indkey)
-    WHERE i.indrelid = (tc.table_name)::regclass
-      AND a.attname = kcu.column_name
+    WHERE i.indrelid = c.conrelid
+      -- first N index columns (indkey is 0-based) contain the N FK columns
+      AND (i.indkey::int2[])[0:cardinality(c.conkey) - 1] @> c.conkey
   );
 ```
 
 ### Anti-Pattern 3: Over-Normalisation
 
 ```sql
--- WRONG: separate table for currency, joined on every query
-CREATE TABLE currency_codes (
-    code  CHAR(3) PRIMARY KEY,
-    name  VARCHAR(50)
+-- WRONG: surrogate integer key for a stable code -> a JOIN everywhere
+CREATE TABLE currencies (
+    id          SERIAL PRIMARY KEY,
+    code        CHAR(3) UNIQUE NOT NULL,
+    minor_units SMALLINT NOT NULL
 );
 
 CREATE TABLE transactions (
     id          UUID PRIMARY KEY,
-    currency_id CHAR(3) REFERENCES currency_codes(code)
+    currency_id INT NOT NULL REFERENCES currencies(id)
+);
+-- Every query that shows 'EUR' must JOIN currencies just to turn 7 into
+-- 'EUR'; every insert must look the id up first
+
+-- CORRECT: use the natural code as the key -- no JOIN for display, and
+-- the foreign key still guarantees only known currencies are stored
+CREATE TABLE currencies (
+    code        CHAR(3) PRIMARY KEY,           -- ISO 4217
+    minor_units SMALLINT NOT NULL              -- JPY 0, EUR 2, KWD 3
 );
 
--- Every transaction query requires a JOIN to currency_codes for a 3-char string
--- Benefit: none (currency codes never change, referential integrity available via CHECK)
--- Cost: JOIN overhead on every transaction query
-
--- CORRECT: denormalize stable reference data
 CREATE TABLE transactions (
     id       UUID PRIMARY KEY,
-    currency CHAR(3) NOT NULL
-        CHECK (currency IN ('USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD'))
+    currency CHAR(3) NOT NULL REFERENCES currencies(code)
 );
--- No JOIN needed, constraint validates values, easy to extend with ALTER TABLE
+-- Join to currencies only when you need its metadata (e.g. minor units).
+-- Prefer this FK over a hard-coded CHECK (currency IN (...)): ISO codes do
+-- change (e.g. HRK was replaced by EUR in 2023), and adding a row is
+-- easier than re-validating a CHECK constraint on a huge table.
 ```
 
 ### Anti-Pattern 4: SELECT * in Hot Paths
 
 ```java
-// WRONG: loading all 50 columns when only 3 are needed
-@Query("SELECT * FROM transactions WHERE account_id = :id ORDER BY created_at DESC LIMIT 50")
+// WRONG: loading all 50 columns when only 5 are needed
+@Query(nativeQuery = true,
+       value = "SELECT * FROM transactions WHERE account_id = :id ORDER BY created_at DESC LIMIT 50")
 List<Transaction> findRecent(@Param("id") UUID accountId);
 
-// CORRECT: project only needed columns
-@Query("""
+// CORRECT: project only needed columns (into an interface projection)
+@Query(nativeQuery = true, value = """
     SELECT id, amount, currency, status, created_at
     FROM transactions
     WHERE account_id = :id
@@ -465,9 +496,11 @@ For any new database design or significant modification, verify:
 ```
 Schema design:
 [ ] All foreign keys have indexes
-[ ] Primary keys use UUID (not sequential int) for distributed safety
+[ ] Primary key type chosen deliberately: BIGINT identity, or UUID
+    (prefer time-ordered UUIDv7 for index locality) when ids are generated
+    outside the database or across shards
 [ ] Timestamps use TIMESTAMPTZ (not TIMESTAMP without timezone)
-[ ] Monetary amounts use NUMERIC(19,4) (not FLOAT or DOUBLE)
+[ ] Monetary amounts use NUMERIC(19,4) or integer minor units (never FLOAT/DOUBLE)
 [ ] Status columns use VARCHAR with CHECK constraint (not unconstrained text)
 
 Query patterns:
@@ -477,7 +510,8 @@ Query patterns:
 [ ] All queries against large tables include the partition key
 
 Transactions:
-[ ] Financial writes use SERIALIZABLE isolation
+[ ] Every financial write has an explicit concurrency strategy:
+    SERIALIZABLE + retry loop, or row locks / atomic conditional updates
 [ ] No external service calls inside transactions
 [ ] No unbounded transactions (each has a maximum duration)
 [ ] Idempotency implemented for all write operations
@@ -490,7 +524,7 @@ Operations:
 [ ] Backup and PITR tested quarterly
 [ ] Replication lag monitored and alerted
 [ ] Table bloat monitored (autovacuum health)
-[ ] Index bloat monitored and REINDEX scheduled
+[ ] Index bloat monitored; REINDEX CONCURRENTLY when needed
 
 Governance:
 [ ] All schema changes use expand-contract pattern
@@ -505,7 +539,7 @@ Governance:
 The principal engineer does not write most of the SQL — they establish the standards that prevent the common mistakes, and they escalate the conversations that need escalation.
 
 **Standards to establish**:
-1. Serializable isolation for all financial writes — not negotiable
+1. An explicit, reviewed concurrency strategy for every financial write (SERIALIZABLE with retries, or row locks / atomic conditional updates) — not negotiable
 2. EXPLAIN ANALYZE review required before merging any new query on a large table
 3. Performance baseline in CI — regressions fail the build
 4. Quarterly backup restore test — scheduled, not optional
@@ -525,21 +559,36 @@ The principal engineer does not write most of the SQL — they establish the sta
   "questions": [
     {
       "text": "A payment service uses READ COMMITTED isolation. Two transactions run concurrently: Transaction A reads account balance = 1000, Transaction B reads account balance = 1000, both compute new balance = 1000 - 500 = 500, and both write balance = 500. The final balance is 500 instead of the correct 0. What is this anomaly called and what isolation level prevents it?",
-      "options": ["Phantom read; prevented by REPEATABLE READ", "Lost update; prevented by REPEATABLE READ or SERIALIZABLE, or by using SELECT FOR UPDATE within READ COMMITTED", "Dirty read; prevented by READ COMMITTED", "Non-repeatable read; prevented by SERIALIZABLE only"],
+      "options": [
+        "Phantom read; prevented by REPEATABLE READ",
+        "Lost update; prevented by REPEATABLE READ or SERIALIZABLE, or by using SELECT FOR UPDATE within READ COMMITTED",
+        "Dirty read; prevented by READ COMMITTED",
+        "Non-repeatable read; prevented by SERIALIZABLE only"
+      ],
       "correct": 1,
       "explanation": "A lost update occurs when two transactions read the same value, compute an update independently, and the second writer overwrites the first writer's update. REPEATABLE READ prevents lost updates in PostgreSQL because it detects that the row was modified after the transaction's snapshot was taken and raises a serialisation failure. Alternatively, SELECT FOR UPDATE within READ COMMITTED acquires a row lock preventing the second read until the first transaction commits, causing the second transaction to read the updated balance of 500 and correctly produce 0."
     },
     {
       "text": "An engineering team reports that a new payment query runs fine in development but causes production slowdowns. Investigation reveals the query produces N+1 database calls: one query to fetch 100 payments, then one query per payment to fetch the associated merchant. What is the correct fix and why does this pattern specifically harm financial systems?",
-      "options": ["Add a database index on merchant_id to make each of the N queries faster", "Replace the N+1 pattern with a JOIN or a batch query (WHERE merchant_id IN (...)) to fetch all merchants in one round trip; in financial systems N+1 under high transaction volume multiplies database load by the page size, turning a 100-row query into 101 database round trips", "Switch to a NoSQL database that handles nested document lookups more efficiently", "Increase the connection pool size to handle the additional queries"],
+      "options": [
+        "Add a database index on merchant_id to make each of the N queries faster",
+        "Replace the N+1 pattern with a JOIN or a batch query (WHERE merchant_id IN (...)) to fetch all merchants in one round trip; in financial systems N+1 under high transaction volume multiplies database load by the page size, turning a 100-row query into 101 database round trips",
+        "Switch to a NoSQL database that handles nested document lookups more efficiently",
+        "Increase the connection pool size to handle the additional queries"
+      ],
       "correct": 1,
       "explanation": "N+1 is an ORM anti-pattern where fetching a collection of N entities triggers N additional queries for associated data. For payment systems processing thousands of requests per second, N+1 on a 100-item page produces 101 queries per request. At 1,000 RPS this is 101,000 queries/second instead of 1,000 — a 100x amplification. The fix is JOIN, eager loading (@EntityGraph in JPA), or batch loading with an IN clause. Indexing makes each query slightly faster but does not fix the fundamental amplification."
     },
     {
       "text": "A principal engineer is reviewing a proposed database migration that adds a NOT NULL column with a DEFAULT value to the payments table (500 million rows). The developer plans to run ALTER TABLE payments ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0. What is the production risk and what is the safer approach?",
-      "options": ["No risk; PostgreSQL stores DEFAULT values without rewriting the table for NOT NULL columns with a constant default since PostgreSQL 11", "High risk on PostgreSQL < 11: the ALTER TABLE rewrites all 500 million rows, holding an ACCESS EXCLUSIVE lock for hours; on PostgreSQL 11+ with a constant default there is no rewrite, but the approach is still risky if any triggers or replication lag applies", "High risk on all PostgreSQL versions; always use a nullable column first, backfill, then add NOT NULL constraint", "No risk as long as the migration runs during off-hours in a maintenance window"],
+      "options": [
+        "No risk; PostgreSQL stores DEFAULT values without rewriting the table for NOT NULL columns with a constant default since PostgreSQL 11",
+        "High risk on PostgreSQL < 11: the ALTER TABLE rewrites all 500 million rows, holding an ACCESS EXCLUSIVE lock for hours; on PostgreSQL 11+ with a constant default there is no rewrite, but the approach is still risky if any triggers or replication lag applies",
+        "High risk on all PostgreSQL versions; always use a nullable column first, backfill, then add NOT NULL constraint",
+        "No risk as long as the migration runs during off-hours in a maintenance window"
+      ],
       "correct": 0,
-      "explanation": "Since PostgreSQL 11, adding a NOT NULL column with a constant default value is a metadata-only operation — PostgreSQL stores the default in the catalog and returns it for existing rows without rewriting the table. The lock duration is milliseconds. This is a significant improvement from earlier versions that required a full table rewrite. However, if the DEFAULT involves a function call (e.g., DEFAULT now()), PostgreSQL still rewrites the table on older versions. The principal engineer should verify the PostgreSQL version and confirm the default is a constant before approving the migration."
+      "explanation": "Since PostgreSQL 11, adding a column with a non-volatile default (a constant, or a stable expression such as now(), evaluated once) is a metadata-only operation — PostgreSQL stores the default in the catalog and returns it for existing rows without rewriting the table. Only a VOLATILE default (random(), clock_timestamp(), gen_random_uuid()) still forces a full rewrite. The statement still needs a brief ACCESS EXCLUSIVE lock, so run it with a short lock_timeout to avoid queueing behind long transactions. The principal engineer should confirm the PostgreSQL version and that the default is not volatile."
     }
   ]
 }
@@ -557,7 +606,7 @@ The principal engineer does not write most of the SQL — they establish the sta
     },
     {
       "id": "2",
-      "description": "Create a DatabaseDecisionFramework class with a method selectIsolationLevel(TransactionProfile profile) that returns the appropriate PostgreSQL isolation level. The TransactionProfile includes: isFinancialWrite (bool), involvesConcurrentUpdates (bool), requiresPhantomProtection (bool), acceptsHigherLatency (bool). Implement the decision tree: SERIALIZABLE for financial writes with concurrent updates, REPEATABLE READ for reads requiring phantom protection, READ COMMITTED as default. Write tests for all 8 combinations of the boolean flags."
+      "description": "Create a DatabaseDecisionFramework class with a method selectIsolationLevel(TransactionProfile profile) that returns the appropriate PostgreSQL isolation level. The TransactionProfile includes: isFinancialWrite (bool), involvesConcurrentUpdates (bool), requiresPhantomProtection (bool), acceptsHigherLatency (bool). Implement the decision tree: SERIALIZABLE for financial writes with concurrent updates, REPEATABLE READ for reads requiring phantom protection, READ COMMITTED as default. Write tests for all 16 combinations of the four boolean flags."
     },
     {
       "id": "3",
@@ -565,7 +614,7 @@ The principal engineer does not write most of the SQL — they establish the sta
     },
     {
       "id": "4",
-      "description": "Implement a PrincipalEngineerChecklist bean that runs at application startup and validates: (a) all @Transactional methods on payment-critical services use a non-default isolation level annotation, (b) no repository method is named findAll without a @Query annotation limiting results, (c) all foreign key columns have corresponding indexes (checked via information_schema.table_constraints JOIN pg_indexes), (d) pg_stat_user_tables shows no table with seq_scan > idx_scan * 10 for tables over 10,000 rows. Log a startup WARNING for each violation found."
+      "description": "Implement a PrincipalEngineerChecklist bean that runs at application startup and validates: (a) all @Transactional methods on payment-critical services declare an explicit isolation level or are marked with a documented locking strategy, (b) no repository method is named findAll without a @Query annotation limiting results, (c) all foreign key columns have corresponding indexes (checked via information_schema.table_constraints JOIN pg_indexes), (d) pg_stat_user_tables shows no table with seq_scan > idx_scan * 10 for tables over 10,000 rows. Log a startup WARNING for each violation found."
     }
   ]
 }

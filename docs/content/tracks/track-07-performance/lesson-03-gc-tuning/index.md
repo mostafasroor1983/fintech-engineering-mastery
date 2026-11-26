@@ -50,7 +50,7 @@ references:
 
 Garbage collection pauses are among the most insidious latency sources in Java-based payment systems. A 200 ms stop-the-world pause during peak settlement is not a JVM curiosity — it is a customer-visible outage, a potential SLA breach, and in some jurisdictions a regulatory reporting event. Understanding and tuning the garbage collector is therefore a core competency for any engineer operating high-throughput financial infrastructure on the JVM.
 
-This lesson dissects the two collectors that dominate production fintech deployments: **G1GC** (the default since Java 9) and **ZGC** (production-ready since Java 15, with generational support in Java 21). You will understand their internal mechanics, learn which flags actually move the needle, size heaps correctly for payment workload shapes, and diagnose GC problems from logs before they become incidents.
+This lesson dissects the two collectors that dominate production fintech deployments: **G1GC** (the default since Java 9) and **ZGC** (production-ready since Java 15; generational since Java 21, and generational-only since Java 24). You will understand their internal mechanics, learn which flags actually move the needle, size heaps correctly for payment workload shapes, and diagnose GC problems from logs before they become incidents.
 
 > [!NOTE]
 > The single most impactful GC tuning decision is usually heap size and object allocation rate — not collector flag tweaking. Profile allocation first, tune flags second.
@@ -71,7 +71,7 @@ By the end of this lesson you will be able to:
 
 ## 1. Why GC Pauses Hurt Finance More Than Other Domains
 
-Consider a card-present POS authorisation path. The issuer has 150 ms to respond before the terminal times out. The network round trip consumes ~40 ms. TLS handshake and connection setup consume another ~20 ms. The remaining ~90 ms is the entire budget for your Java service — including deserialization, database lookup, fraud check, and serialisation.
+Consider a card authorisation path where your organisation has set an internal latency budget of 150 ms end-to-end (scheme timeouts are longer, but your own SLO is what customers feel). The network round trips and TLS consume ~60 ms. A database round trip takes another ~20 ms. The remaining ~70 ms is the entire budget for your Java code — deserialisation, fraud check, business logic and serialisation.
 
 A single G1GC full GC pause on a service with a 4 GB heap and poor tuning can easily consume 500 ms. Even a mixed GC pause with default settings can reach 50–80 ms. The math is unforgiving.
 
@@ -87,7 +87,7 @@ Three scenarios where GC pauses cause direct financial harm:
 
 1. **Real-time authorisation** — pause breaches issuer response timeout; transaction declines
 2. **Market data processing** — stale prices during pause window cause missed fills or bad executions
-3. **Settlement batch windows** — 2-hour regulatory window; GC-induced slowdown risks deadline miss
+3. **Settlement batch windows** — fixed cut-off times; GC-induced slowdown risks missing the deadline
 
 ---
 
@@ -115,7 +115,8 @@ Young GC (stop-the-world)
   -> Triggered when Eden fills
 
 Concurrent Marking (mostly concurrent)
-  -> Initial Mark (piggybacks on Young GC -- STW)
+  -> Concurrent Start (piggybacks on a Young GC -- STW;
+     called "Initial Mark" before JDK 9 logs)
   -> Root Region Scan (concurrent)
   -> Concurrent Mark (concurrent)
   -> Remark (STW, short)
@@ -123,11 +124,11 @@ Concurrent Marking (mostly concurrent)
 
 Mixed GC (stop-the-world)
   -> Evacuates remaining young + selected old regions
-  -> Runs for G1MixedGCCountTarget cycles (default: 8)
+  -> Spread over up to G1MixedGCCountTarget collections (default: 8)
 
-Full GC (stop-the-world -- MUST NEVER HAPPEN IN PRODUCTION)
-  -> Single-threaded serial compaction
-  -> Triggered when G1 cannot evacuate live objects
+Full GC (stop-the-world -- treat every one in production as an incident)
+  -> Compacts the whole heap (parallel since JDK 10, but still long)
+  -> Triggered when G1 cannot evacuate live objects or find free regions
 ```
 
 ---
@@ -156,13 +157,14 @@ Do not set this below 10 ms with G1GC — below that threshold G1 cannot collect
 ```
 
 Region size controls two important things:
-1. **Humongous object threshold** — objects larger than 50% of a region are "humongous" and bypass normal collection
+1. **Humongous object threshold** — objects of 50% of a region or more are "humongous" and get dedicated regions outside Eden
 2. **Mixed GC granularity** — smaller regions allow finer-grained incremental collection
 
 **Sizing formula:**
 
 ```
-Target region size = heap_size / 2048
+Default region size = heap_size / 2048, rounded to a power of two
+(between 1 MB and 32 MB unless set explicitly)
 
 Examples:
   4 GB heap  -> 2 MB  regions (2048 regions)
@@ -192,28 +194,31 @@ For payment services with spiky allocation (e.g., batch processing that fills ol
 
 Lower IHOP gives G1 more runway to complete marking before the heap fills.
 
+Note: since JDK 9 G1 uses **adaptive IHOP** by default (`-XX:+G1UseAdaptiveIHOP`) — the value you set is only the starting point, and G1 then learns a better threshold from observed marking times and allocation rates. Lower it only when GC logs show marking repeatedly finishing too late ("to-space exhausted" or Full GCs).
+
 ### 3.4 G1NewSizePercent and G1MaxNewSizePercent
 
 ```bash
+-XX:+UnlockExperimentalVMOptions   # both flags below are EXPERIMENTAL
 -XX:G1NewSizePercent=20
 -XX:G1MaxNewSizePercent=40
 ```
 
-Controls the minimum and maximum young generation size as a percentage of the heap. Payment services with high short-lived object rates (request/response objects) benefit from a larger young gen, reducing promotion to old gen.
+Controls the minimum and maximum young generation size as a percentage of the heap (defaults: 5% and 60%). Payment services with high short-lived object rates (request/response objects) can benefit from a larger minimum young gen, reducing promotion to old gen. Use with care: G1 resizes the young generation to meet the pause goal, and narrowing its range takes that tool away. Never set `-Xmn`/`NewSize` with G1 — it disables pause-time-driven young sizing.
 
 ### 3.5 ParallelGCThreads and ConcGCThreads
 
 ```bash
--XX:ParallelGCThreads=8      # STW parallel threads (default: num CPUs)
+-XX:ParallelGCThreads=8      # STW parallel threads (default: = CPUs up to 8, then 8 + 5/8 of the rest)
 -XX:ConcGCThreads=2          # Concurrent marking threads
 ```
 
-`ConcGCThreads` defaults to `ParallelGCThreads / 4`. On containers with limited CPU, explicitly set both to avoid G1 miscalculating available parallelism.
+`ConcGCThreads` defaults to about `ParallelGCThreads / 4`. Modern JVMs read the container's CPU limit; if your platform hides it (or you use CPU shares only), set `-XX:ActiveProcessorCount` or both thread counts explicitly.
 
 **Container-aware heap sizing** (Java 10+, essential for Kubernetes deployments):
 
 ```bash
--XX:+UseContainerSupport          # Enabled by default in Java 10+
+-XX:+UseContainerSupport          # Enabled by default in Java 10+ (and 8u191+)
 -XX:MaxRAMPercentage=75.0         # Use 75% of container memory as heap
 -XX:InitialRAMPercentage=50.0     # Start at 50%
 ```
@@ -239,6 +244,7 @@ Controls the minimum and maximum young generation size as a percentage of the he
  * -XX:MaxGCPauseMillis=50
  * -XX:G1HeapRegionSize=8m
  * -XX:InitiatingHeapOccupancyPercent=30
+ * -XX:+UnlockExperimentalVMOptions
  * -XX:G1NewSizePercent=20
  * -XX:G1MaxNewSizePercent=40
  * -XX:G1MixedGCCountTarget=8
@@ -248,7 +254,7 @@ Controls the minimum and maximum young generation size as a percentage of the he
  * -XX:ConcGCThreads=2
  * -XX:+ParallelRefProcEnabled
  * -XX:+UseStringDeduplication
- * -XX:+DisableExplicitGC
+ * -XX:+ExplicitGCInvokesConcurrent
  * -Xlog:gc*:file=/var/log/app/gc.log:time,uptime,level,tags:filecount=10,filesize=50m
  */
 public final class PaymentServiceJvmConfig {
@@ -263,7 +269,7 @@ public final class PaymentServiceJvmConfig {
 
 ### 4.1 Why -Xms Equals -Xmx
 
-Setting initial heap equal to maximum heap prevents the JVM from resizing the heap at runtime, which involves an OS mmap/munmap call that can itself cause latency spikes. For latency-sensitive payment services, pre-allocate the full heap at startup.
+Setting initial heap equal to maximum heap prevents the JVM from growing and shrinking the heap at runtime. Resizing means committing and uncommitting memory with the OS, and growth happens exactly when load rises — the worst moment for extra latency. For latency-sensitive payment services, pre-allocate the full heap at startup.
 
 ---
 
@@ -273,7 +279,7 @@ ZGC is a concurrent, region-based collector designed for two properties:
 - **Sub-millisecond pause times** (typically < 1 ms, regardless of heap size)
 - **Linear pause time scaling** — 10 GB or 10 TB heaps have similar pause times
 
-ZGC achieves this via **load barriers** — bytecode inserted at every heap reference load that performs concurrent relocation without stopping all application threads. The cost is a ~10–15% throughput overhead compared to G1GC.
+ZGC achieves this via **barriers** — small pieces of machine code that the JIT inserts at heap reference loads (and, in generational ZGC, stores). They let ZGC move objects concurrently without stopping the application threads. The cost is some throughput and CPU compared to G1GC; how much depends on the workload, so measure it.
 
 ### 5.1 ZGC Phases (Generational ZGC, Java 21+)
 
@@ -293,14 +299,14 @@ Old Collection (concurrent + tiny STW):
   Old Relocate         (concurrent)
 ```
 
-The generational model (Java 21+) dramatically reduces CPU overhead compared to non-generational ZGC, making it viable for high-throughput services.
+The generational model (Java 21+) greatly reduces CPU and memory overhead compared to the old non-generational ZGC. It became the default ZGC mode in Java 23, and the non-generational mode was removed in Java 24.
 
 ### 5.2 ZGC Configuration
 
 ```bash
-# Java 21+ Generational ZGC (recommended)
+# Generational ZGC (recommended)
 -XX:+UseZGC
--XX:+ZGenerational
+-XX:+ZGenerational   # needed on Java 21-22 only; default on 23, obsolete on 24+
 
 # Heap: larger is generally better for ZGC
 # ZGC needs headroom for concurrent relocation
@@ -320,8 +326,8 @@ The generational model (Java 21+) dramatically reduces CPU overhead compared to 
 ZGC needs more headroom than G1GC because it relocates objects concurrently while the application runs. During relocation, both the old and new copies of an object may be live simultaneously.
 
 ```
-ZGC heap sizing rule of thumb:
-  heap = max_live_data * 4
+ZGC heap sizing starting point (verify with load tests):
+  heap = max_live_data * 3 to 4
 
 Examples:
   Max live data: 2 GB  ->  heap: 8 GB  (minimum)
@@ -329,16 +335,16 @@ Examples:
   Max live data: 8 GB  ->  heap: 32 GB
 ```
 
-If you observe `OutOfMemoryError` with ZGC, the allocation rate is likely exceeding the concurrent relocation bandwidth. Increase heap size or reduce allocation rate.
+If ZGC logs show **allocation stalls** (application threads waiting for memory), the allocation rate is outrunning concurrent collection. Increase heap size, give ZGC more CPU, or reduce the allocation rate. Stalls show up as latency spikes long before any `OutOfMemoryError`.
 
 ---
 
 ## 6. Humongous Objects — The Silent G1GC Killer
 
-An object is "humongous" in G1GC if it exceeds **50% of the region size**. Humongous objects are:
-- Allocated directly in old-generation regions
-- Never compacted (until Full GC)
-- Collected only during concurrent marking cycles (not young GC)
+An object is "humongous" in G1GC if it is **at least 50% of the region size**. Humongous objects are:
+- Allocated in dedicated, contiguous regions outside Eden (counted as old generation)
+- Never moved by normal collections — they can fragment the heap
+- Reclaimed at young GC only if they are primitive arrays nobody references ("eager reclaim"); otherwise only after a concurrent marking cycle
 
 A common source of humongous objects in payment services:
 
@@ -381,12 +387,15 @@ public class PaymentBatchProcessor {
 ### 6.1 Detecting Humongous Allocations via GC Logs
 
 ```
-# In GC log -- look for lines like:
-[2026-11-08T14:23:01.234+0000][gc,humongous] GC(45) Humongous allocation request size: 8388608 (8.0M)
-[2026-11-08T14:23:01.235+0000][gc,humongous] GC(45) Humongous allocation in region: 42
+# In GC logs -- look for:
+# 1) young pauses whose CAUSE is a humongous allocation
+[2026-11-08T14:23:01.234+0000][gc] GC(45) Pause Young (Concurrent Start) (G1 Humongous Allocation) 5120M->4864M(8192M) 31.204ms
+# 2) humongous region counts (with -Xlog:gc+heap=info)
+[2026-11-08T14:23:01.234+0000][gc,heap] GC(45) Humongous regions: 96->64
+# 3) per-object detail with -Xlog:gc+humongous=debug (verbose; staging only)
 ```
 
-**Programmatic detection using GC notification listener:**
+**Programmatic detection using GC notification listener** (this counts GC cycles *triggered* by humongous allocations — a good proxy for how often they hurt you):
 
 ```java
 // HumongousAllocationMonitor.java
@@ -406,8 +415,8 @@ public class HumongousAllocationMonitor {
     private final Counter humongousAllocCounter;
 
     public HumongousAllocationMonitor(MeterRegistry meterRegistry) {
-        this.humongousAllocCounter = Counter.builder("jvm.gc.humongous.allocations")
-            .description("Count of humongous object allocation events")
+        this.humongousAllocCounter = Counter.builder("app.gc.humongous.triggered")
+            .description("GC cycles triggered by humongous allocations")
             .register(meterRegistry);
 
         installGcListener();
@@ -455,11 +464,11 @@ If your code legitimately needs large objects (e.g., caching encoded payment mes
 
 ## 7. GC Overhead and Throughput Limits
 
-The JVM throws `OutOfMemoryError: GC overhead limit exceeded` when more than **98% of time is spent in GC** and less than **2% of heap is recovered**. These flags control the threshold:
+With the Parallel collector, the JVM throws `OutOfMemoryError: GC overhead limit exceeded` when more than **98% of time is spent in GC** and less than **2% of heap is recovered** (`-XX:+UseGCOverheadLimit`). Do not rely on this check with G1 or ZGC — on most JDK versions they do not implement it, so a struggling service just gets slower and slower. These flags tune the threshold where it applies:
 
 ```bash
--XX:GCTimeLimit=90           # Throw OOME if > 90% time in GC
--XX:GCHeapFreeLimit=5        # Throw OOME if < 5% heap freed
+-XX:GCTimeLimit=98           # default: OOME if > 98% of time in GC ...
+-XX:GCHeapFreeLimit=2        # ... and < 2% of the heap freed
 ```
 
 For payment services, alert long before hitting these limits:
@@ -469,37 +478,47 @@ For payment services, alert long before hitting these limits:
 
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
-import org.springframework.boot.ApplicationArguments;
-import org.springframework.boot.ApplicationRunner;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 
 @Component
-public class GcOverheadMonitor implements ApplicationRunner {
+public class GcOverheadMonitor {
 
-    private final MeterRegistry meterRegistry;
+    private long lastGcTimeMs = totalPauseTimeMs();
+    private long lastWallMs   = System.currentTimeMillis();
+    private volatile double recentOverhead = 0.0;   // read by the gauge
 
     public GcOverheadMonitor(MeterRegistry meterRegistry) {
-        this.meterRegistry = meterRegistry;
-    }
-
-    @Override
-    public void run(ApplicationArguments args) {
-        // Alert threshold: > 5% of wall time in GC is a warning sign
-        Gauge.builder("jvm.gc.overhead.estimate", this, GcOverheadMonitor::calculateGcOverhead)
-            .description("Estimated fraction of time spent in GC (0.0-1.0)")
+        // Registered ONCE; the gauge reads the latest sampled value.
+        // Alert threshold: > 5% of wall time in GC pauses is a warning sign
+        Gauge.builder("app.gc.overhead.recent", this, m -> m.recentOverhead)
+            .description("Fraction of wall time spent in GC pauses over the last interval (0.0-1.0)")
             .register(meterRegistry);
     }
 
-    private double calculateGcOverhead() {
-        long totalGcTimeMs = ManagementFactory.getGarbageCollectorMXBeans().stream()
+    // Measure the RECENT window: an average since JVM start hides today's problem
+    @Scheduled(fixedRate = 10_000)
+    void sample() {
+        long gc = totalPauseTimeMs();
+        long now = System.currentTimeMillis();
+        long wall = now - lastWallMs;
+        if (wall > 0) {
+            recentOverhead = (double) (gc - lastGcTimeMs) / wall;
+        }
+        lastGcTimeMs = gc;
+        lastWallMs = now;
+    }
+
+    private static long totalPauseTimeMs() {
+        return ManagementFactory.getGarbageCollectorMXBeans().stream()
+            // G1 (JDK 20+) and ZGC also expose beans that time CONCURRENT
+            // work, e.g. "G1 Concurrent GC" or "ZGC Major Cycles" -- skip them
+            .filter(b -> !b.getName().contains("Concurrent") && !b.getName().contains("Cycles"))
             .mapToLong(GarbageCollectorMXBean::getCollectionTime)
             .sum();
-
-        long uptimeMs = ManagementFactory.getRuntimeMXBean().getUptime();
-        return uptimeMs > 0 ? (double) totalGcTimeMs / uptimeMs : 0.0;
     }
 }
 ```
@@ -508,7 +527,7 @@ public class GcOverheadMonitor implements ApplicationRunner {
 
 ## 8. GC Log Analysis
 
-Always enable GC logging in production. The overhead is negligible (< 0.1%) and the diagnostic value is immense.
+Always enable GC logging in production. The overhead is small (typically well under 1%) and the diagnostic value is immense.
 
 ### 8.1 Logging Flags (Java 9+ Unified Logging)
 
@@ -619,13 +638,13 @@ public class GcLogAnalyzer {
 | Criterion | G1GC | ZGC (Generational, Java 21) |
 |---|---|---|
 | Pause time P99 | 20-100 ms (tunable) | < 1 ms |
-| Throughput overhead | Low (~5%) | Moderate (~10-15%) |
+| Throughput overhead | Low | Somewhat higher (workload-dependent) |
 | Heap minimum | 1 GB workable | 4 GB+ recommended |
 | Configuration complexity | Moderate | Low (self-tuning) |
 | CPU overhead | Low | Moderate (concurrent phases) |
 | Best for | Batch, settlement, medium latency | Real-time auth, market data |
-| Java version | Java 8+ | Java 21+ for GenZGC |
-| Humongous objects | Problematic | Handled transparently |
+| Java version | Java 8+ (default since 9) | Java 21+ for GenZGC (default ZGC mode since 23) |
+| Large objects | Humongous regions — problematic | No humongous-region problem (large objects get their own pages) |
 | Container awareness | Good (Java 10+) | Excellent |
 
 ### 9.1 Recommended Selection by Service Type
@@ -645,7 +664,7 @@ Fraud Detection (rule evaluation, medium latency):
 
 Market Data Processor (< 10 ms latency):
   -> ZGC with GenerationalZGC
-  -> Heap: 2x max live data minimum
+  -> Heap: 3-4x max live data
 ```
 
 ---
@@ -665,7 +684,8 @@ Market Data Processor (< 10 ms latency):
 -XX:+UseG1GC
 -XX:MaxGCPauseMillis=50
 -XX:G1HeapRegionSize=8m
--XX:InitiatingHeapOccupancyPercent=30
+-XX:InitiatingHeapOccupancyPercent=30   # initial value; adaptive IHOP adjusts it
+-XX:+UnlockExperimentalVMOptions
 -XX:G1NewSizePercent=20
 -XX:G1MaxNewSizePercent=40
 -XX:G1MixedGCCountTarget=8
@@ -675,11 +695,13 @@ Market Data Processor (< 10 ms latency):
 -XX:ConcGCThreads=2
 -XX:+ParallelRefProcEnabled
 
-# ---- String deduplication (saves 10-20% heap for many services) ----
+# ---- String deduplication (can save heap in String-heavy services) ----
 -XX:+UseStringDeduplication
 
-# ---- Prevent application code from triggering Full GC ----
--XX:+DisableExplicitGC
+# ---- Turn System.gc() into a concurrent cycle instead of a Full GC ----
+# (prefer this to -XX:+DisableExplicitGC: the JDK calls System.gc() to
+#  free direct buffers, and disabling it can cause direct-memory OOMEs)
+-XX:+ExplicitGCInvokesConcurrent
 
 # ---- Metaspace: cap to avoid runaway class loading ----
 -XX:MetaspaceSize=256m
@@ -694,13 +716,13 @@ Market Data Processor (< 10 ms latency):
 -XX:+ExitOnOutOfMemoryError
 
 # ---- Container support ----
--XX:+UseContainerSupport
+-XX:+UseContainerSupport      # default; shown for clarity
 -XX:ActiveProcessorCount=8
 
 # ---- Alternative: ZGC for stricter latency requirements ----
 # Replace the GC section above with:
 # -XX:+UseZGC
-# -XX:+ZGenerational
+# -XX:+ZGenerational          # Java 21-22 only
 # -Xms16g -Xmx16g
 # -XX:SoftMaxHeapSize=12g
 ```
@@ -715,7 +737,7 @@ Before deploying a new service or after a GC incident, verify:
 - [ ] `-Xms` equals `-Xmx` (prevents heap resize latency spikes)
 - [ ] GC logging enabled with file rotation
 - [ ] `HeapDumpOnOutOfMemoryError` and `ExitOnOutOfMemoryError` set
-- [ ] `DisableExplicitGC` set (prevents `System.gc()` from triggering Full GC)
+- [ ] `ExplicitGCInvokesConcurrent` set (so `System.gc()` from libraries does not cause a Full GC)
 - [ ] Micrometer `JvmGcMetrics` registered (auto-registers with Spring Boot Actuator)
 - [ ] Alert on: GC pause P99 > 100 ms, Full GC count > 0, heap usage > 85%
 - [ ] Region size checked against max object size (avoid humongous allocations)
@@ -758,23 +780,23 @@ Before deploying a new service or after a GC incident, verify:
       "text": "What is the difference between `-XX:MaxGCPauseMillis` and a hard pause limit in G1GC?",
       "options": [
         "They are identical — G1GC always meets the target",
-        "MaxGCPauseMillis is a soft goal; G1GC adjusts region sizes to try to meet it but may exceed it",
+        "MaxGCPauseMillis is a soft goal; G1GC adjusts the young generation size and the number of old regions per mixed collection to try to meet it, but may exceed it",
         "MaxGCPauseMillis sets a hard limit; exceeding it triggers an OutOfMemoryError",
         "MaxGCPauseMillis only applies to ZGC, not G1GC"
       ],
       "correct": 1,
-      "explanation": "MaxGCPauseMillis is a soft goal. G1GC uses it to guide region sizing and mixed GC scheduling, but it cannot guarantee the target will never be exceeded, especially under memory pressure or when the heap is nearly full."
+      "explanation": "MaxGCPauseMillis is a soft goal. G1GC uses it to size the young generation and to decide how many old regions each mixed collection takes, but it cannot guarantee the target will never be exceeded, especially under memory pressure or when the heap is nearly full."
     },
     {
       "text": "Why should `-Xms` be set equal to `-Xmx` in a low-latency payment service?",
       "options": [
         "It reduces total memory consumption",
-        "It prevents the JVM from performing heap resizing operations, which cause OS mmap/munmap latency spikes",
+        "It prevents the JVM from growing and shrinking the heap at runtime, which commits/uncommits memory and can add latency exactly when load rises",
         "It enables ZGC to operate in generational mode",
         "It disables G1GC humongous allocation handling"
       ],
       "correct": 1,
-      "explanation": "When Xms equals Xmx, the JVM pre-allocates the full heap at startup. This eliminates runtime heap resize operations (mmap/munmap OS calls) that can introduce latency spikes — especially problematic for sub-50ms SLA payment authorisation services."
+      "explanation": "When Xms equals Xmx, the heap starts at its full size and never resizes. This removes runtime grow/shrink work (committing and uncommitting memory with the OS), which tends to happen when load changes — especially unwelcome for sub-50ms SLA payment authorisation services. Add -XX:+AlwaysPreTouch to also touch the pages at startup."
     },
     {
       "text": "A payment service with an 8 GB heap and 8 MB G1 regions experiences frequent humongous allocations for 5 MB byte arrays. What is the correct fix?",
@@ -785,7 +807,7 @@ Before deploying a new service or after a GC incident, verify:
         "Set `-XX:InitiatingHeapOccupancyPercent=10` to trigger earlier collection"
       ],
       "correct": 2,
-      "explanation": "Humongous objects are those larger than half the region size. With 8 MB regions, objects larger than 4 MB are humongous. Setting G1HeapRegionSize=16m makes the threshold 8 MB, so 5 MB arrays become normal young-gen objects."
+      "explanation": "Humongous objects are those of at least half the region size. With 8 MB regions, objects of 4 MB or more are humongous. Setting G1HeapRegionSize=16m makes the threshold 8 MB, so 5 MB arrays become normal young-gen objects. (Reducing the object size — e.g. by streaming — is the other fix.)"
     }
   ]
 }

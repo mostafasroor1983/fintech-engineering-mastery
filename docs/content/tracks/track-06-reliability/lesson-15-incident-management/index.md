@@ -176,6 +176,7 @@ public class PaymentProcessingIncidentRunbook {
      *      --describe --group payment-processor
      *    - If lag > 10,000 on payment-events: consumer is behind
      *    - Scale consumer pods: kubectl scale deployment payment-processor --replicas=10
+     *      (only helps up to the topic's partition count — extra consumers sit idle)
      *
      * 6. Check database
      *    patronictl list  -- check leader is healthy
@@ -323,53 +324,73 @@ public class IncidentCommunicationService {
 
 ## 6. Regulatory Notification Requirements
 
-In the UK, the Payment Services Regulator requires notification of major incidents within 1 business day. The European Banking Authority (EBA) requires notification of major ICT incidents within 4 hours of initial assessment. The US OCC expects prompt notification for incidents affecting national banks.
+Reporting rules differ by jurisdiction — your Compliance team owns the exact obligations:
+
+- **EU — DORA** (since January 2025): an incident is first *classified* against DORA's criteria (clients affected, duration, geographic spread, data losses, economic impact, critical services). For a **major** incident the initial notification is due within **4 hours of classification** and no later than **24 hours after detection**, followed by an intermediate report within 72 hours and a final report within one month.
+- **UK**: payment service providers must report major operational or security incidents to the FCA without undue delay, and firms must tell the FCA/PRA promptly about anything they would reasonably expect to be notified of (Principle 11, SUP 15).
+- **US**: banks must notify their primary federal regulator within **36 hours** of determining that a "notification incident" has occurred (OCC/Fed/FDIC 2021 rule).
+
+The service below starts the clock at **classification**, not at the start of the outage, and it alerts people — the decision to notify and the report itself stay with Compliance.
 
 ```java
 @Service
 public class RegulatoryIncidentNotificationService {
 
-    private static final int EBA_NOTIFICATION_THRESHOLD_CUSTOMERS = 5_000;
-    private static final Duration EBA_INITIAL_NOTIFICATION_DEADLINE =
-            Duration.ofHours(4);
+    // INTERNAL trigger to start a formal DORA classification — NOT the legal
+    // threshold (DORA's classification criteria are broader and more detailed)
+    private static final int CLASSIFICATION_REVIEW_THRESHOLD_CUSTOMERS = 5_000;
+    private static final Duration DORA_AFTER_CLASSIFICATION = Duration.ofHours(4);
+    private static final Duration DORA_AFTER_DETECTION      = Duration.ofHours(24);
 
     private final ComplianceOfficerContactService complianceContacts;
     private final AlertService alertService;
+    private final IncidentRepository incidentRepo;
 
-    // Check if regulatory notification is required
-    public RegulatoryNotificationDecision assess(Incident incident) {
+    // Should Compliance classify this incident now?
+    public boolean needsClassificationReview(Incident incident) {
         boolean exceedsCustomerThreshold =
-                incident.getAffectedCustomers() >= EBA_NOTIFICATION_THRESHOLD_CUSTOMERS;
+                incident.getAffectedCustomers() >= CLASSIFICATION_REVIEW_THRESHOLD_CUSTOMERS;
         boolean exceedsDurationThreshold =
                 incident.getDurationMinutes() >= 60;
         boolean isPaymentSystemDown =
                 incident.getAffectedService().equals("payment-core")
                 && incident.getSeverity() == IncidentSeverity.P1;
-
-        boolean notificationRequired = exceedsCustomerThreshold
-                || (exceedsDurationThreshold && isPaymentSystemDown);
-
-        if (notificationRequired) {
-            Instant deadline = incident.getStartedAt()
-                    .plus(EBA_INITIAL_NOTIFICATION_DEADLINE);
-            return RegulatoryNotificationDecision.builder()
-                    .required(true)
-                    .deadline(deadline)
-                    .jurisdiction("EU_EBA")
-                    .contactRequired(complianceContacts.getOnDutyOfficer())
-                    .build();
-        }
-
-        return RegulatoryNotificationDecision.notRequired();
+        return exceedsCustomerThreshold || (exceedsDurationThreshold && isPaymentSystemDown);
     }
 
-    // Alert compliance team when notification threshold approaching
+    // Once Compliance has classified the incident as MAJOR: the deadline
+    public RegulatoryNotificationDecision assess(Incident incident) {
+        if (incident.getClassifiedMajorAt() == null) {
+            return RegulatoryNotificationDecision.notRequired();
+        }
+        Instant byClassification = incident.getClassifiedMajorAt().plus(DORA_AFTER_CLASSIFICATION);
+        Instant byDetection      = incident.getDetectedAt().plus(DORA_AFTER_DETECTION);
+        Instant deadline = byClassification.isBefore(byDetection) ? byClassification : byDetection;
+        return RegulatoryNotificationDecision.builder()
+                .required(true)
+                .deadline(deadline)
+                .jurisdiction("EU_DORA")
+                .contactRequired(complianceContacts.getOnDutyOfficer())
+                .build();
+    }
+
+    // Alert compliance team: classification needed, or a deadline approaching
     @Scheduled(fixedRate = 300_000)  // every 5 minutes
     public void checkActiveIncidents() {
         List<Incident> activeP1s = incidentRepo.findActiveByMinSeverity(
                 IncidentSeverity.P1);
 
         for (Incident incident : activeP1s) {
+            if (incident.getClassifiedMajorAt() == null
+                    && needsClassificationReview(incident)
+                    && !incident.isClassificationRequested()) {
+                alertService.critical("REGULATORY_CLASSIFICATION_NEEDED",
+                        "Incident " + incident.getIncidentId()
+                        + " needs DORA major-incident classification by Compliance now.");
+                incident.setClassificationRequested(true);
+                incidentRepo.save(incident);
+            }
+
             RegulatoryNotificationDecision decision = assess(incident);
             if (decision.isRequired() && !incident.isRegulatoryNotified()) {
                 long minutesToDeadline = Duration.between(
@@ -403,7 +424,7 @@ public class EscalationMatrix {
                     new EscalationStep(20, "VP Engineering",              "phone + sms"),
                     new EscalationStep(30, "CTO",                        "phone"),
                     new EscalationStep(45, "Compliance Officer",          "phone"),  // regulatory risk
-                    new EscalationStep(60, "CEO",                        "phone")   // per regulatory requirement
+                    new EscalationStep(60, "CEO",                        "phone")   // per internal policy
             ),
             IncidentSeverity.P2, List.of(
                     new EscalationStep(0,  "Primary on-call engineer",    "phone + sms"),
@@ -529,19 +550,34 @@ Incident management in fintech differs from general software engineering: financ
   "questions": [
     {
       "text": "Why should the Incident Commander (IC) NOT be the same person as the Tech Lead (TL) during a P1 incident?",
-      "options": ["It violates regulatory separation of duties", "The IC managing communications would constantly interrupt the TL's technical investigation, slowing resolution", "One person cannot hold two roles in an on-call system", "The IC requires executive authority that engineers cannot have"],
+      "options": [
+        "It violates regulatory separation of duties",
+        "The IC managing communications would constantly interrupt the TL's technical investigation, slowing resolution",
+        "One person cannot hold two roles in an on-call system",
+        "The IC requires executive authority that engineers cannot have"
+      ],
       "correct": 1,
       "explanation": "The IC role (managing communication cadence, escalation, regulatory notifications, stakeholder updates) requires constant attention to external communication. If the same person is also debugging the technical problem, every stakeholder update interrupts the investigation. Separating the roles allows the TL to focus entirely on the technical problem while the IC ensures communication obligations are met."
     },
     {
-      "text": "Under EBA ICT incident reporting guidelines, within what timeframe must an initial notification be sent to regulators for a major incident?",
-      "options": ["1 hour", "4 hours", "24 hours", "36 hours"],
+      "text": "Under the EU's DORA incident-reporting rules, within what timeframe must the initial notification be sent to the competent authority once an incident is classified as major?",
+      "options": [
+        "1 hour",
+        "4 hours",
+        "24 hours",
+        "36 hours"
+      ],
       "correct": 1,
-      "explanation": "The EBA Guidelines on ICT Risk Management require an initial notification within 4 hours of a major ICT incident being identified. This requires automated incident duration monitoring and proactive compliance officer notification — waiting for a human to remember to check the clock is not sufficient."
+      "explanation": "Under DORA (applying since January 2025), the initial notification is due within 4 hours of classifying an incident as major, and no later than 24 hours after the firm detected it; an intermediate report follows within 72 hours and a final report within one month. Because the clock starts at classification, incident tooling must prompt Compliance to classify quickly — and track the deadlines automatically rather than relying on someone remembering to check the clock."
     },
     {
       "text": "A P1 incident starts at 02:00 AM. What is the maximum time before the VP Engineering should be notified according to the escalation matrix in this lesson?",
-      "options": ["5 minutes", "10 minutes", "20 minutes", "30 minutes"],
+      "options": [
+        "5 minutes",
+        "10 minutes",
+        "20 minutes",
+        "30 minutes"
+      ],
       "correct": 2,
       "explanation": "The escalation matrix shows: T+0 primary on-call, T+5 secondary on-call, T+10 Engineering Manager, T+20 VP Engineering. The VP is notified 20 minutes after the incident starts if unresolved, regardless of time of day."
     }
@@ -555,10 +591,22 @@ Incident management in fintech differs from general software engineering: financ
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Implement an AlertRoutingService that classifies alert severity by financial impact per minute (P1 >= $10k/min, P2 >= $1k/min, P3 >= 1% error rate), creates PagerDuty incidents with routing keys by affected service, and posts structured messages to Slack war-room channels with runbook and dashboard links."},
-    {"id": "2", "description": "Build a RegulatoryIncidentNotificationService that: tracks active P1 incidents, determines if EBA notification is required (> 5,000 customers OR > 60 minutes of payment-core downtime), and sends critical alerts to the compliance officer when the 4-hour notification deadline is within 60 minutes."},
-    {"id": "3", "description": "Create an IncidentTimelineService that records every significant incident event (ALERT_FIRED, IC_ASSIGNED, ACTION_TAKEN, ROOT_CAUSE_IDENTIFIED, etc.) with timestamp and actor, and can produce an ordered timeline for PIR documentation."},
-    {"id": "4", "description": "Implement an IncidentCommunicationService that creates a Slack war-room channel for P1 incidents, posts structured initial messages with IC/TL assignments and runbook links, formats regular status updates as 'T+N min: status, error rate, affected customers, current action, ETA', and mirrors P1 updates to a #leadership-incidents channel."}
+    {
+      "id": "1",
+      "description": "Implement an AlertRoutingService that classifies alert severity by financial impact per minute (P1 >= $10k/min, P2 >= $1k/min, P3 >= 1% error rate), creates PagerDuty incidents with routing keys by affected service, and posts structured messages to Slack war-room channels with runbook and dashboard links."
+    },
+    {
+      "id": "2",
+      "description": "Build a RegulatoryIncidentNotificationService that: tracks active P1 incidents, asks Compliance for a DORA major-incident classification when internal triggers are met (> 5,000 customers OR > 60 minutes of payment-core downtime), computes the notification deadline from the classification time (4 hours, and at most 24 hours after detection), and sends critical alerts to the compliance officer when the deadline is within 60 minutes."
+    },
+    {
+      "id": "3",
+      "description": "Create an IncidentTimelineService that records every significant incident event (ALERT_FIRED, IC_ASSIGNED, ACTION_TAKEN, ROOT_CAUSE_IDENTIFIED, etc.) with timestamp and actor, and can produce an ordered timeline for PIR documentation."
+    },
+    {
+      "id": "4",
+      "description": "Implement an IncidentCommunicationService that creates a Slack war-room channel for P1 incidents, posts structured initial messages with IC/TL assignments and runbook links, formats regular status updates as 'T+N min: status, error rate, affected customers, current action, ETA', and mirrors P1 updates to a #leadership-incidents channel."
+    }
   ]
 }
 -->

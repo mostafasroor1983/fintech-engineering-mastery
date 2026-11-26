@@ -35,26 +35,28 @@ Worker-1  Worker-2  Worker-3  Worker-4
 (shards)  (shards)  (shards)  (shards)
 ```
 
-- **Coordinator**: accepts client connections, parses SQL, creates distributed query plans, aggregates results
+- **Coordinator**: accepts client connections, parses SQL, creates distributed query plans, aggregates results (since Citus 11, workers can also accept and route queries, which spreads this load)
 - **Workers**: store shards of distributed tables, execute partial queries
 - **Shard**: a physical PostgreSQL table on a worker, containing a subset of rows
 
-Each distributed table is split into N shards (default 32) distributed across workers.
+Each distributed table is split into N shards (default 32, setting `citus.shard_count`) distributed across workers.
 
 ## 2. Citus Extension Setup
 
 ```sql
--- Install on coordinator and all workers
+-- On coordinator and all workers: postgresql.conf needs
+--   shared_preload_libraries = 'citus'   (restart), then:
 CREATE EXTENSION citus;
 
--- Add worker nodes to the coordinator
-SELECT master_add_node('worker-1.internal', 5432);
-SELECT master_add_node('worker-2.internal', 5432);
-SELECT master_add_node('worker-3.internal', 5432);
-SELECT master_add_node('worker-4.internal', 5432);
+-- Add worker nodes to the coordinator (Citus 10+ names; the old
+-- master_add_node / master_get_active_worker_nodes are deprecated)
+SELECT citus_add_node('worker-1.internal', 5432);
+SELECT citus_add_node('worker-2.internal', 5432);
+SELECT citus_add_node('worker-3.internal', 5432);
+SELECT citus_add_node('worker-4.internal', 5432);
 
 -- Verify cluster
-SELECT * FROM master_get_active_worker_nodes();
+SELECT * FROM citus_get_active_worker_nodes();
 ```
 
 ## 3. Distribution Column Selection
@@ -65,7 +67,7 @@ Principles for choosing the distribution column:
 1. The column appears in most queries' WHERE clauses (enables shard pruning)
 2. High cardinality (many distinct values distribute data evenly)
 3. Used as the join key between frequently joined tables (enables co-location)
-4. Immutable after insert (changing the distribution key requires re-sharding)
+4. Immutable after insert (Citus does not allow updating the distribution column of a row)
 
 ```sql
 -- For a payment system, account_id is the natural distribution column:
@@ -81,7 +83,9 @@ CREATE TABLE transactions (
     amount       NUMERIC(19,4) NOT NULL,
     currency     CHAR(3) NOT NULL,
     status       VARCHAR(20) NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- primary keys / unique constraints must include the distribution column
+    PRIMARY KEY (account_id, id)
 );
 
 SELECT create_distributed_table('transactions', 'account_id');
@@ -92,15 +96,19 @@ SELECT create_distributed_table('transactions', 'account_id');
 -- live on the same worker shard)
 CREATE TABLE accounts (
     id           UUID PRIMARY KEY,
-    account_number VARCHAR(20) UNIQUE NOT NULL,
+    -- UNIQUE (account_number) is NOT allowed here: a unique constraint on a
+    -- distributed table must include the distribution column. Enforce it
+    -- with a separate lookup table distributed on account_number.
+    account_number VARCHAR(20) NOT NULL,
     balance      NUMERIC(19,4) NOT NULL DEFAULT 0,
     currency     CHAR(3) NOT NULL,
     status       VARCHAR(20) NOT NULL
 );
 
-SELECT create_distributed_table('accounts', 'id');
--- accounts distributed on 'id' column, transactions on 'account_id'
--- Both are the same logical concept -> they will be co-located
+SELECT create_distributed_table('accounts', 'id', colocate_with => 'transactions');
+-- accounts distributed on 'id', transactions on 'account_id': same type
+-- (UUID), same shard count -> one co-location group. Citus would group
+-- them by default too; colocate_with makes the intent explicit.
 ```
 
 ## 4. Table Co-location
@@ -118,19 +126,19 @@ WHERE logicalrelid IN ('transactions'::regclass, 'accounts'::regclass);
 EXPLAIN SELECT t.id, t.amount, a.account_number
 FROM transactions t
 JOIN accounts a ON t.account_id = a.id
-WHERE t.account_id = 'acct-001';
+WHERE t.account_id = '11111111-1111-1111-1111-111111111111';
 
--- Coordinator plan output:
+-- Coordinator plan output (simplified):
 -- Custom Scan (Citus Adaptive)  (cost=0.00..0.00 rows=0 width=0)
 --   Task Count: 1              <- only 1 shard queried! shard pruning works
---   Tasks Shown: One of 1
+--   Tasks Shown: All
 --   ->  Task
 --         Node: host=worker-2 port=5432 dbname=payments
---         ->  Index Scan on transactions_102345 t
---               Index Cond: (account_id = 'acct-001')
---               ->  Hash Join
---                     Hash Cond: (t.account_id = a.id)
---                     ->  Seq Scan on accounts_102346 a
+--         ->  Nested Loop
+--               ->  Index Scan using accounts_pkey_102346 on accounts_102346 a
+--                     Index Cond: (id = '1111...')
+--               ->  Index Scan using transactions_pkey_102345 on transactions_102345 t
+--                     Index Cond: (account_id = '1111...')
 -- The join happens entirely on worker-2 — no cross-node data movement
 ```
 
@@ -141,24 +149,29 @@ Citus supports 2-phase commit (2PC) for distributed transactions, but with impor
 ```sql
 -- Single-shard transactions: fully ACID, same as regular PostgreSQL
 BEGIN;
-UPDATE accounts SET balance = balance - 100 WHERE id = 'acct-001';
-INSERT INTO transactions (account_id, amount, ...) VALUES ('acct-001', 100, ...);
+UPDATE accounts SET balance = balance - 100 WHERE id = '11111111-1111-1111-1111-111111111111';
+INSERT INTO transactions (account_id, amount, ...) VALUES ('11111111-1111-1111-1111-111111111111', 100, ...);
 COMMIT;
 -- Both rows go to the same shard (co-located) -> single-node ACID
 
 -- Cross-shard transactions: 2PC (slower, more failure modes)
 BEGIN;
-UPDATE accounts SET balance = balance - 100 WHERE id = 'acct-001'; -- shard A
-UPDATE accounts SET balance = balance + 100 WHERE id = 'acct-999'; -- shard B
-INSERT INTO transactions (account_id, amount, ...) VALUES ('acct-001', -100, ...);
-INSERT INTO transactions (account_id, amount, ...) VALUES ('acct-999',  100, ...);
+UPDATE accounts SET balance = balance - 100 WHERE id = '11111111-1111-1111-1111-111111111111'; -- shard A
+UPDATE accounts SET balance = balance + 100 WHERE id = '99999999-9999-9999-9999-999999999999'; -- shard B
+INSERT INTO transactions (account_id, amount, ...) VALUES ('11111111-1111-1111-1111-111111111111', -100, ...);
+INSERT INTO transactions (account_id, amount, ...) VALUES ('99999999-9999-9999-9999-999999999999',  100, ...);
 COMMIT;
 -- This requires 2PC across shards:
 -- 1. Coordinator sends PREPARE TRANSACTION to both workers
 -- 2. Both workers prepare (write to WAL, hold locks)
 -- 3. Coordinator sends COMMIT PREPARED
--- If coordinator crashes between steps 2 and 3: orphaned prepared transactions
--- Must be resolved manually: SELECT recover_prepared_transactions();
+-- If the coordinator crashes between steps 2 and 3, prepared transactions
+-- are left holding their locks. Citus's maintenance daemon resolves them
+-- automatically from its commit log (or run: SELECT recover_prepared_transactions();)
+--
+-- Also note: a cross-shard commit is atomic, but there is no single global
+-- snapshot -- a concurrent reader on another node may briefly see the
+-- change on one shard and not yet on the other.
 ```
 
 **Design principle**: Structure your data model so that most transactions touch a single shard. For payment transfers between accounts, use a saga or ledger pattern that makes individual writes idempotent rather than requiring 2PC across shards.
@@ -182,7 +195,7 @@ SELECT create_reference_table('currencies');
 SELECT t.id, t.amount, c.name AS currency_name
 FROM transactions t
 JOIN currencies c ON t.currency = c.code
-WHERE t.account_id = 'acct-001';
+WHERE t.account_id = '11111111-1111-1111-1111-111111111111';
 ```
 
 Other candidates for reference tables in a payment system:
@@ -210,45 +223,38 @@ ORDER BY hour DESC;
 -- Plan shows:
 -- Custom Scan (Citus Adaptive)
 --   Task Count: 32  <- all shards queried in parallel
---   ->  Partial GroupAggregate (on each worker)
---         ->  Seq Scan on transactions_XXXXX (partition pruned by date)
+--   ->  Task: HashAggregate (partial aggregate on each shard)
+--         ->  Seq Scan on transactions_XXXXX
+--               Filter: (created_at >= (now() - '24:00:00'::interval))
 
 -- Performance: 4 workers * 8 shards each = 32 parallel partial aggregates
 -- Then coordinator combines 32 partial results
--- Wall time ≈ single-shard time (not 32x sequential)
+-- Wall time ≈ time of the slowest shard task, if workers have enough
+-- cores and connections to run their tasks in parallel
 ```
 
 ## 8. Citus for High-Write Payment Workloads
 
 ```sql
--- Write throughput comparison
+-- Write throughput comparison (illustrative -- measure your own workload)
 
 -- Single PostgreSQL (1 writer):
--- INSERT throughput: ~10,000 TPS (NVMe SSD, WAL bottleneck)
+-- INSERT throughput: ~10,000 TPS (NVMe SSD, WAL / CPU bound)
 
 -- Citus (4 workers, 32 shards):
--- INSERT throughput: ~35,000-40,000 TPS (shards distribute WAL across workers)
--- Linear scaling is not achieved due to coordinator overhead,
--- but 3-4x improvement is typical
+-- INSERT throughput: ~35,000-40,000 TPS (each worker writes its own WAL)
+-- Not perfectly linear: routing through the coordinator costs CPU and a
+-- network hop (Citus 11+ lets clients connect to any node to spread this)
 
--- Check shard distribution balance
+-- Check shard distribution balance (citus_shards view, Citus 10+)
 SELECT
-    worker_node,
-    COUNT(*) AS shard_count,
-    SUM(shard_size) AS total_bytes
-FROM (
-    SELECT
-        nodename AS worker_node,
-        shardid,
-        result::bigint AS shard_size
-    FROM run_command_on_shards(
-        'transactions',
-        'SELECT pg_relation_size(%s)'
-    )
-    JOIN pg_dist_shard_placement USING (shardid)
-) sub
-GROUP BY worker_node
-ORDER BY worker_node;
+    nodename                         AS worker_node,
+    COUNT(*)                         AS shard_count,
+    pg_size_pretty(SUM(shard_size))  AS total_size
+FROM citus_shards
+WHERE table_name = 'transactions'::regclass
+GROUP BY nodename
+ORDER BY nodename;
 ```
 
 ## 9. Comparison with Application-Level Sharding
@@ -258,11 +264,11 @@ ORDER BY worker_node;
 | Transparency | Fully transparent — standard SQL | Application must route queries manually |
 | Cross-shard queries | Handled automatically (2PC/routing) | Application must federate |
 | Schema changes | Standard DDL (replicated) | Must apply to all shards manually |
-| Rebalancing | `rebalance_table_shards()` | Custom ETL required |
+| Rebalancing | `citus_rebalance_start()` (online shard moves) | Custom ETL required |
 | Operational complexity | Medium (Citus expertise) | High (custom sharding logic) |
 | Join support | Full (within co-location group) | Limited (must join in application) |
 | Learning curve | Medium (SQL expertise + Citus) | High (custom distributed systems) |
-| Write throughput | 3-5x vs single node | Near-linear with more shards |
+| Write throughput | Grows with worker count (minus routing overhead) | Grows with shard count (routing is in the app) |
 
 ```java
 // Application-level sharding: routing logic must be in the application
@@ -272,7 +278,10 @@ public class ShardedTransactionRepository {
     private final Map<Integer, JdbcTemplate> shardTemplates;
 
     private int getShard(UUID accountId) {
-        return Math.abs(accountId.hashCode()) % shardTemplates.size();
+        // floorMod, not Math.abs(...) % n: Math.abs(Integer.MIN_VALUE) is
+        // negative. (And mod-N routing moves most keys when N changes --
+        // see Lesson 07 for consistent hashing.)
+        return Math.floorMod(accountId.hashCode(), shardTemplates.size());
     }
 
     public Transaction save(Transaction transaction) {
@@ -299,14 +308,17 @@ public class ShardedTransactionRepository {
 ```
 
 **When to choose application-level sharding over Citus**:
-- When shard count needs to exceed what Citus supports (thousands of shards)
-- When different shards need entirely different schemas (multi-tenant isolation)
+- When shards must live in independently operated clusters or even different database engines
+- When different tenants need entirely different schemas (note: Citus 12+ also offers schema-based sharding — one schema per tenant — which covers many such cases)
 - When shard placement needs fine-grained control (geo-residency enforcement)
 - When the team already has application-sharding expertise and infrastructure
 
-## 10. Cloud-Managed Citus — Azure Cosmos DB for PostgreSQL
+## 10. Cloud-Managed Citus — Azure
 
-```yaml
+> [!NOTE]
+> Microsoft's managed Citus was first sold as "Hyperscale (Citus)", then as Azure Cosmos DB for PostgreSQL. Microsoft has since steered new projects to **elastic clusters** in Azure Database for PostgreSQL (Flexible Server), also built on Citus. Check the current offering before you start; the Terraform below shows the Cosmos DB for PostgreSQL resource as an example.
+
+```hcl
 # terraform/azure-cosmos-postgres.tf
 resource "azurerm_cosmosdb_postgresql_cluster" "payments" {
   name                = "payments-distributed"
@@ -325,7 +337,7 @@ resource "azurerm_cosmosdb_postgresql_cluster" "payments" {
   node_server_edition     = "MemoryOptimized"
 
   citus_version = "12.1"
-  postgresql_version = "16"
+  sql_version   = "16"
 
   ha_enabled = true
 
@@ -336,7 +348,7 @@ resource "azurerm_cosmosdb_postgresql_cluster" "payments" {
 }
 ```
 
-Azure Cosmos DB for PostgreSQL (formerly Azure Database for PostgreSQL - Hyperscale) provides managed Citus with:
+Managed Citus on Azure provides:
 - Automated backups and PITR
 - High availability with standby replicas
 - Automated minor version updates
@@ -347,9 +359,9 @@ Azure Cosmos DB for PostgreSQL (formerly Azure Database for PostgreSQL - Hypersc
 Decision criteria for adopting Citus:
 
 ```
-Choose Citus when:
-  - Single PostgreSQL server write throughput is saturated (> 10,000 TPS writes)
-  - Data volume exceeds single-server storage (> 10TB of hot data)
+Choose Citus when (thresholds are rough guides, not hard limits):
+  - Single PostgreSQL server write throughput is saturated (e.g. > 10,000 TPS writes on your hardware)
+  - Data volume is beyond what one server handles comfortably (e.g. > 10TB of hot data)
   - Team has strong PostgreSQL expertise
   - Queries are predominantly account-scoped (shard pruning works well)
   - Regulatory requirements allow distributed storage within a jurisdiction
@@ -363,7 +375,7 @@ Do NOT choose Citus when:
 ```
 
 > [!WARNING]
-> The distribution column in Citus is immutable for the lifetime of the distributed table. Changing it requires re-distributing all data, which is a significant operational event. Spend considerable time validating the distribution column choice with realistic query patterns before creating distributed tables in production. A wrong choice costs weeks of re-sharding work.
+> The distribution column is very hard to change later. `alter_distributed_table(..., distribution_column => ...)` exists, but it rewrites and moves all data while holding heavy locks — a significant operational event on a large table. Spend considerable time validating the distribution column choice with realistic query patterns before creating distributed tables in production. A wrong choice costs weeks of re-sharding work.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -399,7 +411,7 @@ Do NOT choose Citus when:
         "When geo-residency requires specific rows to live in specific data centers — Citus handles this automatically"
       ],
       "correct": 1,
-      "explanation": "Citus is the right choice when: (1) you have outgrown single-node PostgreSQL write capacity, (2) your query patterns are account-scoped so shard pruning works, and (3) you want to avoid baking sharding logic into every service. Application-level sharding is preferable when you need thousands of shards, per-tenant schema isolation, fine-grained geo-placement, or when the team already has application sharding infrastructure. The key advantage of Citus is transparency — standard SQL works without change, and cross-shard queries (while slower) are handled automatically."
+      "explanation": "Citus is the right choice when: (1) you have outgrown single-node PostgreSQL write capacity, (2) your query patterns are account-scoped so shard pruning works, and (3) you want to avoid baking sharding logic into every service. Application-level sharding is preferable when shards must live in independent clusters or engines, when you need fine-grained geo-placement under your own control, or when the team already has application sharding infrastructure. The key advantage of Citus is transparency — standard SQL works without change, and cross-shard queries (while slower) are handled automatically."
     }
   ]
 }

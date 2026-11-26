@@ -49,6 +49,8 @@ references:
   - "Azul — ZGC documentation"
 ---
 
+## Overview
+
 Garbage collection pauses are among the most insidious performance problems in JVM-based fintech applications. They are intermittent, they are invisible in APM dashboards unless you correlate carefully, and their root causes are buried in raw GC log output that most engineers never open. A single 400 ms stop-the-world pause during a payment authorization flow looks identical to a network timeout from the caller's perspective — but the fix is completely different. This lesson teaches you to read GC logs fluently, identify the pause causes that matter most in payment systems, and extract quantitative signal from raw log output before reaching for a tuning knob.
 
 ## Learning Objectives
@@ -57,24 +59,24 @@ By the end of this lesson you will be able to:
 
 - Configure the JVM to emit structured GC logs using the Unified Logging (`-Xlog`) framework
 - Parse a G1GC log entry and identify heap before/after, pause duration, and pause cause
-- Classify pause causes (Allocation Failure, Metadata GC Threshold, Humongous Allocation, Ergonomics) and explain the remediation for each
+- Classify pause causes (G1 Evacuation Pause, G1 Humongous Allocation, Metadata GC Threshold, Allocation Failure) and explain the remediation for each
 - Use GCEasy or GCViewer to visualise pause frequency, throughput, and heap utilisation trends
 - Identify a high-pause-frequency pattern (> 1 pause/sec) from raw log output
 - Estimate the JVM's live set from GC log data and use it to right-size heap
 - Correlate GC pause timestamps with p99 latency spikes from your APM or access logs
-- Interpret `-XX:+PrintAdaptiveSizePolicy` output to understand how the JVM adjusts generation sizes
+- Interpret `-Xlog:gc+ergo*` output (the successor of the removed `-XX:+PrintAdaptiveSizePolicy`) to understand how the JVM adjusts generation sizes
 
 ## Business Context
 
-A European payment processor ran a Java 17 / G1GC order-matching service on 16 GB heap. During peak trading hours (09:00–10:30 CET) the platform's p99 order acknowledgement latency spiked from 4 ms to 380–520 ms every 90–120 seconds. The on-call team escalated to the database team, who found no slow queries. Network team found no packet loss. After two weeks of inconclusive investigation an SRE enabled GC logging and uploaded the log to GCEasy.
+*Composite example:* a European payment processor runs a Java 17 / G1GC order-matching service on a 16 GB heap. During peak trading hours (09:00–10:30 CET) the platform's p99 order acknowledgement latency spiked from 4 ms to 380–520 ms every 90–120 seconds. The on-call team escalated to the database team, who found no slow queries. Network team found no packet loss. After two weeks of inconclusive investigation an SRE enabled GC logging and uploaded the log to GCEasy.
 
 The analysis revealed:
 - **Average GC pause: 310 ms** (G1 Mixed GC)
 - **Pause frequency: 1.2 pauses/sec** during peak — 72 pauses per minute
-- **Root cause: G1 Humongous Allocations** — the service was deserialising 32 MB FIX messages into `byte[]` arrays, each triggering a synchronous humongous region allocation
-- **Resolution**: chunked streaming deserialisation reduced individual allocations below the 8 MB region threshold; p99 dropped to 6 ms within one deploy
+- **Root cause: G1 Humongous Allocations** — the service was loading 32 MB batch payloads into single `byte[]` arrays; every one was humongous, filled old-generation regions and kept triggering extra GC cycles
+- **Resolution**: chunked streaming deserialisation kept individual allocations below the humongous threshold (half of the 8 MB region = 4 MB); p99 dropped to 6 ms within one deploy
 
-The incident cost €240,000 in SLA breach penalties. GC logging was available the whole time — it just was not enabled.
+The incident cost real money in SLA penalties. GC logging was available the whole time — it just was not enabled.
 
 ## Enabling GC Logging
 
@@ -96,9 +98,10 @@ For more surgical detail during tuning (not production):
 
 ```bash
 # Extended tuning flags — higher overhead, use in staging only
--Xlog:gc*,gc+heap=debug,gc+age=trace,gc+phases=debug:file=gc-detailed.log:time,uptime,level,tags
--XX:+PrintAdaptiveSizePolicy
--XX:+PrintTenuringDistribution
+# (The old -XX:+PrintAdaptiveSizePolicy / -XX:+PrintTenuringDistribution flags
+#  were removed in JDK 9 — the JVM refuses to start with them. Their output
+#  now comes from the gc+ergo and gc+age tags.)
+-Xlog:gc*,gc+heap=debug,gc+age=trace,gc+phases=debug,gc+ergo*=debug:file=gc-detailed.log:time,uptime,level,tags
 ```
 
 > [!NOTE]
@@ -120,7 +123,7 @@ Annotated breakdown:
 [12.456s]                        ← JVM uptime at pause start
 [info][gc]                       ← Log level and topic
 GC(42)                           ← GC event sequence number
-Pause Young (Normal)             ← Pause type and subtype
+Pause Young (Normal)             ← Pause type and subtype (Normal / Concurrent Start / Mixed)
 (G1 Evacuation Pause)            ← Pause CAUSE — most important field
 2048M->1536M(8192M)              ← Heap before → after (heap capacity)
 18.743ms                         ← Stop-the-world pause duration
@@ -129,7 +132,7 @@ Pause Young (Normal)             ← Pause type and subtype
 A G1 Mixed GC (the expensive one that also collects old-gen regions):
 
 ```
-[2026-11-08T09:16:45.332+0000][144.567s][info][gc] GC(97) Pause Mixed (G1 Evacuation Pause) 6144M->5888M(8192M) 287.441ms
+[2026-11-08T09:16:45.332+0000][144.567s][info][gc] GC(97) Pause Young (Mixed) (G1 Evacuation Pause) 6144M->5888M(8192M) 287.441ms
 [2026-11-08T09:16:45.332+0000][144.567s][info][gc,heap] GC(97) Eden regions: 512->0(512)
 [2026-11-08T09:16:45.332+0000][144.567s][info][gc,heap] GC(97) Survivor regions: 32->24(64)
 [2026-11-08T09:16:45.332+0000][144.567s][info][gc,heap] GC(97) Old regions: 1024->986(2048)
@@ -144,17 +147,18 @@ Understanding *why* the GC paused is more important than knowing how long it pau
 
 | Pause Cause | What It Means | Typical Fix |
 |---|---|---|
-| **G1 Evacuation Pause** | Eden full — scheduled young collection | Usually benign; tune `-XX:MaxGCPauseMillis` |
-| **Allocation Failure** | Eden full AND survivor/old cannot absorb survivors | Heap too small; increase `-Xmx` or reduce allocation rate |
-| **G1 Humongous Allocation** | Object > 50% region size, cannot fit in Eden | Reduce object size or increase `-XX:G1HeapRegionSize` |
-| **Metadata GC Threshold** | Metaspace full — class loading triggered GC | Set `-XX:MetaspaceSize` and `-XX:MaxMetaspaceSize` |
-| **Ergonomics** | GC self-tunes based on `MaxGCPauseMillis` target | Expected; watch if it triggers too frequently |
+| **G1 Evacuation Pause** | Eden full — scheduled young (or mixed) collection | Usually benign; tune `-XX:MaxGCPauseMillis` |
+| **G1 Humongous Allocation** | A humongous allocation (object ≥ 50% of a region) pushed old-gen occupancy past the marking threshold, so G1 starts a concurrent cycle with a young pause | Reduce object size (stream large payloads) or increase `-XX:G1HeapRegionSize` |
+| **Metadata GC Threshold** | Metaspace reached its current threshold — class loading triggered GC | Find class-loader leaks; set `-XX:MetaspaceSize` / `-XX:MaxMetaspaceSize` |
+| **Allocation Failure** | An allocation could not be satisfied (seen with Parallel/Serial GC, and on G1 Full GCs) | Heap too small or allocation rate too high |
+| **Ergonomics** | Parallel GC's self-tuning decided to collect (not a G1 cause) | Expected; watch if it triggers too frequently |
 | **G1 Compaction Pause** | Full GC fallback — G1 cannot reclaim enough space | Severe: heap too small or humongous leak |
 
 ```java17
 // Detecting humongous allocation candidates — objects > half region size
-// G1HeapRegionSize defaults: 1–32 MB based on heap size
-// With 8 GB heap → 8 MB regions → humongous threshold = 4 MB
+// G1HeapRegionSize defaults: heap / 2048, rounded to a power of 2 (1–32 MB)
+// With 8 GB heap → 4 MB regions → humongous threshold = 2 MB
+// With -XX:G1HeapRegionSize=8m → humongous threshold = 4 MB
 
 // PROBLEM: This allocates a humongous object per message
 public FIXMessage parseMessage(byte[] rawPayload) {
@@ -172,7 +176,7 @@ public void parseMessageStreaming(InputStream rawStream,
 
 ## GCEasy and GCViewer Analysis
 
-GCEasy (gc-easy.io) and GCViewer are the standard tools for visualising GC log data. Upload the log file and they produce:
+GCEasy (gceasy.io, a hosted service) and GCViewer (open source, runs locally) are common tools for visualising GC log data. GC logs can reveal host names and paths, so follow your data-governance rules before uploading production logs to a third-party service. Both tools produce:
 
 - **GC pause duration histogram** — identify p99 pause
 - **Pause frequency over time** — identify periodic patterns
@@ -195,7 +199,7 @@ Heap After Full GC:   3.2 GB    ← Live set = 3.2 GB
 
 ## Pause Frequency — The 1-per-Second Rule
 
-For a low-latency payment service, **more than one GC pause per second is a problem**. At that frequency, virtually every request will be affected by at least one pause.
+For a low-latency payment service, **more than one GC pause per second is a warning sign**. At that frequency a large share of requests overlap a pause — and, more importantly, the allocation rate is high enough that the old generation will fill and the expensive mixed collections will follow.
 
 ```mermaid
 gantt
@@ -254,7 +258,7 @@ The **live set** is the minimum amount of heap the application actually needs. I
 # Rising line = live set grows = memory leak
 
 # After Full GC specifically gives clearest live set signal:
-[09:12:44.001][gc] GC(201) Pause Full (Allocation Failure) 8190M->3201M(8192M) 4432ms
+[09:12:44.001][gc] GC(201) Pause Full (G1 Compaction Pause) 8190M->3201M(8192M) 4432ms
                                                                    ^^^^
                                                  Live set ≈ 3.2 GB
 ```
@@ -291,8 +295,13 @@ public class GCPauseMetrics {
                 String cause    = info.getGcCause();
                 String action   = info.getGcAction();
 
-                // Emit to Micrometer — shows up in Grafana alongside p99
-                registry.timer("jvm.gc.pause",
+                // Concurrent cycles also send notifications — their duration
+                // is NOT a pause. Keep only the stop-the-world events.
+                if (action.contains("concurrent") || cause.contains("Concurrent")) return;
+
+                // Micrometer's built-in JvmGcMetrics already publishes
+                // "jvm.gc.pause" — use another name, or just use that one.
+                registry.timer("app.gc.pause",
                     "cause",  cause,
                     "action", action)
                     .record(durationMs, TimeUnit.MILLISECONDS);
@@ -318,9 +327,9 @@ panels:
         legendFormat: "GC pause rate"
 ```
 
-## PrintAdaptiveSizePolicy for Tuning Guidance
+## Ergonomics Logging for Tuning Guidance
 
-`-XX:+PrintAdaptiveSizePolicy` (or `-Xlog:gc+ergo=debug` in Unified Logging) shows the JVM's internal reasoning about generation sizing:
+`-Xlog:gc+ergo*=debug` (the Unified Logging successor of the removed `-XX:+PrintAdaptiveSizePolicy`) shows the JVM's internal reasoning about generation sizing. Simplified example:
 
 ```
 [gc+ergo] GC(42) Heap expansion:
@@ -334,7 +343,7 @@ panels:
 ```
 
 This tells you:
-- Heap is expanding under load — size it larger upfront with `-XX:+AlwaysPreTouch`
+- Heap is expanding under load — set `-Xms` equal to `-Xmx` (and optionally `-XX:+AlwaysPreTouch` to commit the pages at startup instead of during traffic)
 - Pauses exceed `MaxGCPauseMillis` — G1 is backing off, which means reclamation will fall behind
 - The JVM is trying to self-tune but failing — manual tuning is needed
 
@@ -365,12 +374,12 @@ java \
     "question": "A GC log line shows: `Pause Young (Normal) (G1 Humongous Allocation) 4096M->3840M(8192M) 44ms`. What does this tell you and what is the most likely fix?",
     "options": [
       "The JVM paused because Eden was full during a normal young collection; fix by increasing Eden size",
-      "The JVM paused to allocate an object larger than 50% of the G1 region size; fix by reducing object sizes or increasing the region size",
+      "A humongous allocation (an object of at least 50% of a G1 region) pushed occupancy over the marking threshold and triggered this young pause; fix by reducing object sizes or increasing the region size",
       "The JVM is running low on Metaspace; fix by increasing -XX:MaxMetaspaceSize",
       "The JVM triggered a full GC because heap is exhausted; fix by increasing -Xmx"
     ],
     "correct": 1,
-    "explanation": "G1 Humongous Allocation means an object exceeded 50% of the G1 region size and had to be allocated directly into the old generation in humongous regions, bypassing Eden entirely. This is synchronous and stops the world. The fix is either to reduce the object size below the humongous threshold (e.g., stream-parse large payloads instead of materialising them) or to increase -XX:G1HeapRegionSize (e.g., to 16 MB so the threshold becomes 8 MB)."
+    "explanation": "'G1 Humongous Allocation' as the cause of a young pause means a humongous object — at least half a G1 region — was allocated in its own regions outside Eden, pushing old-generation occupancy past the threshold at which G1 starts a concurrent marking cycle; G1 then begins that cycle with a young pause. Frequent humongous allocations fill and fragment the heap. The fix is either to reduce the object size below the humongous threshold (e.g., stream-parse large payloads instead of materialising them) or to increase -XX:G1HeapRegionSize (e.g., to 16 MB so the threshold becomes 8 MB)."
   },
   {
     "id": "kc-gc02-02",
@@ -399,7 +408,7 @@ java \
     },
     {
       "id": "pc-gca-02",
-      "description": "Parse the following GC log snippet and extract: (a) pause cause, (b) heap before/after/capacity, (c) pause duration, (d) whether this indicates a problem. Snippet: `[2026-11-08T10:15:22.441+0000][3722.1s][info][gc] GC(1204) Pause Mixed (G1 Evacuation Pause) 7936M->7680M(8192M) 341.2ms`"
+      "description": "Parse the following GC log snippet and extract: (a) pause cause, (b) heap before/after/capacity, (c) pause duration, (d) whether this indicates a problem. Snippet: `[2026-11-08T10:15:22.441+0000][3722.1s][info][gc] GC(1204) Pause Young (Mixed) (G1 Evacuation Pause) 7936M->7680M(8192M) 341.2ms`"
     },
     {
       "id": "pc-gca-03",

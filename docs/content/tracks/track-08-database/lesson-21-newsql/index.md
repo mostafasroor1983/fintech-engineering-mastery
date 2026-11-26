@@ -43,7 +43,7 @@ CockroachDB is a distributed SQL database inspired by Google Spanner. It uses Ra
 
 ```
 Data organization:
-  - Data is split into 512MB "ranges"
+  - Data is split into "ranges" (up to 512 MiB each by default)
   - Each range is replicated across N nodes (default 3)
   - Each range has a Raft leader elected from its replicas
   - Writes go to the Raft leader; leader replicates to followers
@@ -59,8 +59,9 @@ Cluster example (3 nodes, 3 replicas):
 ### CockroachDB Setup and Schema
 
 ```sql
--- Connect to CockroachDB (PostgreSQL wire protocol compatible)
-cockroach sql --insecure --host=cockroach-1:26257
+-- Connect to CockroachDB (PostgreSQL wire protocol compatible), from a shell:
+--   cockroach sql --certs-dir=certs --host=cockroach-1:26257
+-- (--insecure is for local experiments only)
 
 -- Create the payments database
 CREATE DATABASE payments;
@@ -107,6 +108,8 @@ CREATE INDEX idx_transactions_status
 -- CockroachDB default isolation: SERIALIZABLE
 -- This is stronger than PostgreSQL's default READ COMMITTED
 -- (PostgreSQL requires SET default_transaction_isolation = 'serializable' explicitly)
+-- Recent CockroachDB versions (24.1+) also offer READ COMMITTED,
+-- which needs far fewer client-side retries -- but weaker guarantees
 
 -- Check isolation level
 SHOW transaction isolation level;
@@ -127,44 +130,47 @@ COMMIT;
 
 ```java
 @Service
+@Slf4j
 public class CockroachPaymentService {
 
     private final JdbcTemplate jdbcTemplate;
+    private final TransactionTemplate txTemplate;   // SERIALIZABLE by default on CockroachDB
 
     /**
      * CockroachDB retry logic for serializable transactions.
-     * CockroachDB can retry internally, but client-side retry handles
-     * external serialization failures.
+     * SQLSTATE 40001 is translated by Spring into a ConcurrencyFailureException
+     * (e.g. CannotSerializeTransactionException) -- a raw SQLException never
+     * reaches this method, so retrying on SQLException would never fire.
+     *
+     * The retry must wrap the WHOLE transaction: each attempt runs a fresh
+     * transaction via TransactionTemplate. (Putting @Retryable and
+     * @Transactional on the same method depends on proxy ordering -- easy to
+     * get wrong.)
      */
     @Retryable(
-        value = SQLException.class,
+        retryFor = ConcurrencyFailureException.class,
         maxAttempts = 5,
-        backoff = @Backoff(delay = 100, multiplier = 2)
+        backoff = @Backoff(delay = 50, multiplier = 2, random = true)  // jitter
     )
-    @Transactional(isolation = Isolation.SERIALIZABLE)
     public void transferFunds(UUID fromAccountId, UUID toAccountId, BigDecimal amount) {
-        try {
-            jdbcTemplate.update(
-                "UPDATE accounts SET balance = balance - ? WHERE id = ?",
-                amount, fromAccountId
-            );
+        txTemplate.executeWithoutResult(status -> {
+            int debited = jdbcTemplate.update(
+                "UPDATE accounts SET balance = balance - ? WHERE id = ? AND balance >= ?",
+                amount, fromAccountId, amount);
+            if (debited != 1) {
+                throw new InsufficientFundsException(fromAccountId);   // not retried
+            }
             jdbcTemplate.update(
                 "UPDATE accounts SET balance = balance + ? WHERE id = ?",
-                amount, toAccountId
-            );
-        } catch (DataAccessException e) {
-            if (isSerializationFailure(e)) {
-                log.info("Serialization conflict detected, retrying transfer");
-                throw e;  // @Retryable will retry
-            }
-            throw e;
-        }
+                amount, toAccountId);
+        });
     }
 
-    private boolean isSerializationFailure(DataAccessException e) {
-        return e.getMessage() != null &&
-               (e.getMessage().contains("SERIALIZATION_FAILURE") ||
-                e.getMessage().contains("40001"));
+    @Recover
+    void retriesExhausted(ConcurrencyFailureException e,
+                          UUID fromAccountId, UUID toAccountId, BigDecimal amount) {
+        log.error("Transfer {} -> {} failed after retries", fromAccountId, toAccountId, e);
+        throw e;
     }
 }
 ```
@@ -182,7 +188,8 @@ Conventional databases: use logical clocks (Lamport timestamps, sequence numbers
 
 Spanner TrueTime:
   - GPS receivers and atomic clocks in each Google data center
-  - API: TT.now() returns interval [earliest, latest] (uncertainty ≤ 7ms)
+  - API: TT.now() returns interval [earliest, latest] (uncertainty ε:
+    1-7ms in the original 2012 paper, usually well under that today)
   - Commit wait: Spanner waits until uncertainty passes before returning COMMIT
     to ensure the transaction timestamp is in the past for all observers
 
@@ -231,13 +238,14 @@ public class SpannerPaymentService {
     private final DatabaseClient spannerClient;
 
     public Optional<BigDecimal> getBalance(String accountId) {
-        // Single read: served from local replica, millisecond latency
+        // Strong read: sees all committed data; a nearby replica can serve it
+        // once it is up to date (it may need to check with the leader)
         Statement statement = Statement.newBuilder(
             "SELECT Balance FROM accounts WHERE AccountId = @accountId"
         ).bind("accountId").to(accountId).build();
 
         try (ResultSet rs = spannerClient
-                .singleUse(TimestampBound.strong())  // strongly consistent read
+                .singleUse(TimestampBound.strong())
                 .executeQuery(statement)) {
             if (rs.next()) {
                 return Optional.of(rs.getBigDecimal("Balance"));
@@ -247,70 +255,78 @@ public class SpannerPaymentService {
     }
 
     public void transferFunds(String fromId, String toId, BigDecimal amount) {
+        // run() retries the function automatically if Spanner aborts the
+        // transaction -- so the lambda must have no side effects outside it
         spannerClient.readWriteTransaction().run(txn -> {
             // Read both accounts in a single round trip
-            List<Struct> accounts = txn.read(
-                "accounts",
-                KeySet.newBuilder()
-                    .addKey(Key.of(fromId))
-                    .addKey(Key.of(toId))
-                    .build(),
-                Arrays.asList("AccountId", "Balance", "Status")
-            ).stream().collect(Collectors.toList());
+            Map<String, Struct> accounts = new HashMap<>();
+            try (ResultSet rs = txn.read(
+                    "accounts",
+                    KeySet.newBuilder()
+                        .addKey(Key.of(fromId))
+                        .addKey(Key.of(toId))
+                        .build(),
+                    Arrays.asList("AccountId", "Balance", "Status"))) {
+                while (rs.next()) {
+                    accounts.put(rs.getString("AccountId"), rs.getCurrentRowAsStruct());
+                }
+            }
 
-            // Validate
-            validateAccounts(accounts, amount);
+            // Validate (both exist, active, enough balance)
+            validateAccounts(accounts, fromId, toId, amount);
+
+            BigDecimal fromBalance = accounts.get(fromId).getBigDecimal("Balance");
+            BigDecimal toBalance   = accounts.get(toId).getBigDecimal("Balance");
 
             // Write mutations (applied atomically at commit)
-            List<Mutation> mutations = List.of(
+            txn.buffer(List.of(
                 Mutation.newUpdateBuilder("accounts")
                     .set("AccountId").to(fromId)
-                    .set("Balance").to(getBalance(accounts, fromId).subtract(amount))
+                    .set("Balance").to(fromBalance.subtract(amount))
                     .set("UpdatedAt").to(Value.COMMIT_TIMESTAMP)
                     .build(),
                 Mutation.newUpdateBuilder("accounts")
                     .set("AccountId").to(toId)
-                    .set("Balance").to(getBalance(accounts, toId).add(amount))
+                    .set("Balance").to(toBalance.add(amount))
                     .set("UpdatedAt").to(Value.COMMIT_TIMESTAMP)
-                    .build()
-            );
-
-            txn.buffer(mutations);
+                    .build()));
             return null;
         });
     }
 }
+// (UpdatedAt needs allow_commit_timestamp = true in its column options)
 ```
 
 ## 4. Geo-Partitioning for Data Residency (GDPR)
 
 Both CockroachDB and Spanner support geo-partitioning — placing data physically in specific regions.
 
+Note: placing the *primary* copy in a region is not automatically full data residency — also check where non-voting replicas, backups, logs and changefeeds end up.
+
 ### CockroachDB Geo-Partitioning
 
 ```sql
--- Enable enterprise features (required for zone configs)
-SET CLUSTER SETTING enterprise.license = 'your_license';
+-- Current CockroachDB: multi-region SQL abstractions (21.1+).
+-- (The older manual way -- PARTITION BY LIST + zone configs -- requires
+--  the partition column to be a PREFIX of the primary key, e.g.
+--  PRIMARY KEY (region, id); a plain "PRIMARY KEY (id)" table cannot be
+--  list-partitioned by region.)
 
--- Define partitioning on the accounts table
-ALTER TABLE accounts PARTITION BY LIST (region) (
-    PARTITION eu       VALUES IN ('EU'),
-    PARTITION us       VALUES IN ('US'),
-    PARTITION global   VALUES IN ('GLOBAL')
-);
+ALTER DATABASE payments PRIMARY REGION "europe-west1";
+ALTER DATABASE payments ADD REGION "us-east1";
 
--- Pin each partition to specific data center zones
-ALTER PARTITION eu OF TABLE accounts
-    CONFIGURE ZONE USING
-    constraints = '[+region=eu-west1]',
-    lease_preferences = '[[+region=eu-west1]]';
+-- Each row is homed in the region stored in the hidden crdb_region column
+ALTER TABLE accounts SET LOCALITY REGIONAL BY ROW;
 
-ALTER PARTITION us OF TABLE accounts
-    CONFIGURE ZONE USING
-    constraints = '[+region=us-east1]',
-    lease_preferences = '[[+region=us-east1]]';
+-- Set the home region from the customer's residency on insert
+INSERT INTO accounts (crdb_region, account_number, currency)
+VALUES ('europe-west1', 'EU-1001', 'EUR');
 
--- Now EU customer data physically lives in EU region
+-- Keep ALL replicas (including non-voting ones) inside the home region
+-- -- needed for strict data domiciling
+ALTER DATABASE payments PLACEMENT RESTRICTED;
+
+-- Now EU customer data physically lives in the EU region
 -- A query from Frankfurt accessing EU accounts has local latency (~2ms)
 -- A query from Frankfurt accessing US accounts has cross-Atlantic latency (~80ms)
 ```
@@ -335,10 +351,14 @@ For GDPR:
 This is the most important section for financial system architects.
 
 ```
+(illustrative orders of magnitude -- measure your own setup)
+
 CockroachDB write latency (Raft consensus):
   Single-region (3 replicas, same DC):   2-5ms per commit
-  Multi-region (3 replicas, 3 DCs):      RTT/2 per commit (e.g., 50ms for EU-US-APAC)
-  Cross-range 2PC:                       2 * RTT additional overhead
+  Multi-region (replicas in 3 regions):  ~ round trip to the nearest replica
+                                         that completes a majority (tens of ms)
+  Multi-range transactions:              "parallel commits" usually keep this
+                                         to about one consensus round
 
 Spanner write latency (Paxos + TrueTime):
   Regional (single region):              5-10ms (commit wait for TrueTime uncertainty)
@@ -351,7 +371,7 @@ PostgreSQL single-node comparison:
 
 ```java
 // Latency measurement comparison
-@Component
+// JMH sketch (the *State classes hold a JdbcTemplate per database)
 public class LatencyComparison {
 
     @Benchmark
@@ -450,25 +470,30 @@ public class CockroachConfig {
 
 // Key differences to handle in application code:
 // 1. Add retry logic for SERIALIZATION_FAILURE (40001)
-// 2. Remove sequence-based IDs (use UUID or CockroachDB's unique_rowid())
-// 3. Review FOR UPDATE SKIP LOCKED (not supported in CockroachDB pre-22.2)
-// 4. Test pg_advisory_lock (not supported)
-// 5. Test prepared statement behavior (minor differences)
+// 2. Avoid sequence-based IDs: sequences exist but serialise inserts on
+//    one range -- use UUIDs (or unique_rowid())
+// 3. Check FOR UPDATE SKIP LOCKED / NOWAIT support in your version
+// 4. pg_advisory_lock and friends are not supported
+// 5. Test prepared statement behaviour (minor differences)
 ```
 
 ```sql
 -- PostgreSQL-to-CockroachDB compatibility issues to test
--- 1. CHECK constraints evaluated differently
--- 2. Some type casts behave differently
--- 3. RETURNING on UPDATE (supported)
--- 4. ON CONFLICT DO NOTHING/UPDATE (supported)
--- 5. Window functions (supported since CockroachDB 20.2)
--- 6. LISTEN/NOTIFY (not supported — use Kafka instead)
--- 7. Stored procedures (limited support)
--- 8. Triggers (not supported — handle in application layer)
+-- (support changes quickly -- check the docs for YOUR version)
+-- 1. Some type casts and default types differ (e.g. INT is 64-bit)
+-- 2. RETURNING on UPDATE (supported)
+-- 3. ON CONFLICT DO NOTHING/UPDATE (supported)
+-- 4. Window functions (supported)
+-- 5. LISTEN/NOTIFY (not supported -- use changefeeds (CDC) / Kafka instead)
+-- 6. Stored procedures and PL/pgSQL (added in 23.x, still a subset)
+-- 7. Triggers (only in recent versions, 24.3+; check limitations)
+-- 8. Extensions such as PostGIS-style features or pg_trgm: some built in,
+--    most PostgreSQL extensions are not available
 ```
 
 ## 8. Summary — NewSQL Decision Matrix
+
+(Rough, illustrative ranges — real numbers depend heavily on hardware, schema and workload.)
 
 | Requirement | PostgreSQL | Citus | CockroachDB | Spanner |
 |---|---|---|---|---|
@@ -477,7 +502,7 @@ public class CockroachConfig {
 | Write latency p99 | <2ms | <5ms | 5-15ms | 10-50ms |
 | Multi-region active-active | No | No | Yes | Yes |
 | Operational complexity | Low | Medium | Medium | Low (managed) |
-| SQL compatibility | Full | Full | High (95%) | Medium (GoogleSQL) |
+| SQL compatibility | Full | Full | High (wire-compatible, some gaps) | GoogleSQL or PostgreSQL dialect (subset) |
 | Cost at scale | Medium | Medium | High | Very High |
 | Team expertise required | Standard | Intermediate | Advanced | Advanced |
 
@@ -489,21 +514,36 @@ public class CockroachConfig {
   "questions": [
     {
       "text": "A CockroachDB transaction fails with error: TransactionRetryWithProtoRefreshError: TransactionRetryError: retry txn (REASON_TS_CACHE_REJECTED). What is the correct application-level handling and why does CockroachDB require it?",
-      "options": ["Catch the error and immediately abort the entire operation; CockroachDB does not support retries at the application level", "Catch the error, roll back the transaction, and retry the entire transaction from the beginning using exponential backoff; CockroachDB uses optimistic concurrency control and cannot internally retry transactions that have already sent results to the client", "Increase the transaction timeout using SET statement_timeout; the error indicates a slow transaction that needs more time", "Switch to READ COMMITTED isolation; REASON_TS_CACHE_REJECTED only occurs under SERIALIZABLE isolation"],
+      "options": [
+        "Catch the error and immediately abort the entire operation; CockroachDB does not support retries at the application level",
+        "Catch the error, roll back the transaction, and retry the entire transaction from the beginning using exponential backoff; CockroachDB uses optimistic concurrency control and cannot internally retry transactions that have already sent results to the client",
+        "Increase the transaction timeout using SET statement_timeout; the error indicates a slow transaction that needs more time",
+        "Switch to READ COMMITTED isolation; REASON_TS_CACHE_REJECTED only occurs under SERIALIZABLE isolation"
+      ],
       "correct": 1,
-      "explanation": "CockroachDB uses optimistic concurrency control with MVCC. When a serialisability conflict is detected at commit time, it raises a retryable error rather than blocking. Because results may already have been streamed to the client, CockroachDB cannot internally retry the transaction — the application must catch the specific error type and retry the entire transaction logic from scratch. The CockroachDB JDBC driver provides a CockroachDB.runTransaction() helper that implements this retry loop with exponential backoff automatically."
+      "explanation": "CockroachDB uses optimistic concurrency control with MVCC. When a serialisability conflict is detected, it raises a retryable error (SQLSTATE 40001) rather than blocking. CockroachDB retries some transactions automatically on the server, but once results have been returned to the client it cannot — the application must roll back and run the whole transaction logic again, with backoff. Use your own retry loop (or Spring Retry around a TransactionTemplate), or Cockroach Labs' JDBC wrapper, which can retry transparently."
     },
     {
       "text": "Google Spanner uses TrueTime to assign globally ordered commit timestamps. A transaction commits with TrueTime interval [T-ε, T+ε] where ε is the clock uncertainty. What does Spanner do before making the committed data visible to readers?",
-      "options": ["It immediately makes the data visible and relies on readers to handle uncertainty by re-reading", "It waits for the commit wait period (at least 2ε) until the commit timestamp is guaranteed to be in the past before making the data visible, ensuring external consistency", "It uses a central timestamp oracle to resolve the uncertainty before assigning a final timestamp", "It requests a GPS time update to reduce ε before committing high-priority transactions"],
+      "options": [
+        "It immediately makes the data visible and relies on readers to handle uncertainty by re-reading",
+        "It waits for the commit wait period (at least 2ε) until the commit timestamp is guaranteed to be in the past before making the data visible, ensuring external consistency",
+        "It uses a central timestamp oracle to resolve the uncertainty before assigning a final timestamp",
+        "It requests a GPS time update to reduce ε before committing high-priority transactions"
+      ],
       "correct": 1,
-      "explanation": "Spanner's commit wait ensures external consistency: after choosing a commit timestamp T, Spanner waits until TrueTime.now().earliest > T before returning to the client. This guarantees that any transaction starting after the commit will receive a start timestamp strictly greater than T, ensuring it will see the committed data. The commit wait adds 0-7ms of latency (typical ε range) but is what makes Spanner's globally consistent reads possible without a centralised lock manager."
+      "explanation": "Spanner's commit wait ensures external consistency: after choosing a commit timestamp T, Spanner waits until TrueTime.now().earliest > T before making the commit visible and acknowledging it. Any transaction that starts afterwards therefore gets a timestamp greater than T and sees the committed data. The wait is about the clock uncertainty (a few milliseconds at most, usually much less today), and it is what gives Spanner globally consistent reads without a central timestamp oracle."
     },
     {
       "text": "A payment platform currently runs on PostgreSQL with 15K TPS at p99 = 8ms. The engineering team proposes migrating to CockroachDB for multi-region active-active capability. What should a principal engineer verify BEFORE approving the migration?",
-      "options": ["That CockroachDB supports all PostgreSQL extensions currently used, including pg_trgm and PostGIS", "That the team has exhausted PostgreSQL scaling options (read replicas, partitioning, connection pooling, index optimisation) and has a specific, measured multi-region requirement that justifies the operational complexity and 2-3x cost increase", "That the development team has completed CockroachDB certification training", "That the existing application code uses only ANSI SQL with no PostgreSQL-specific syntax"],
+      "options": [
+        "That CockroachDB supports all PostgreSQL extensions currently used, including pg_trgm and PostGIS",
+        "That the team has exhausted PostgreSQL scaling options (read replicas, partitioning, connection pooling, index optimisation) and has a specific, measured multi-region requirement that justifies the operational complexity and 2-3x cost increase",
+        "That the development team has completed CockroachDB certification training",
+        "That the existing application code uses only ANSI SQL with no PostgreSQL-specific syntax"
+      ],
       "correct": 1,
-      "explanation": "15K TPS at p99 = 8ms is well within PostgreSQL's capabilities with proper optimisation. CockroachDB's write latency p99 is typically 5-15ms even in a single region due to Raft consensus overhead, meaning the migration may actually worsen latency. A principal engineer must require: (a) evidence that PostgreSQL has been fully optimised, (b) a specific business requirement for multi-region active-active (not just disaster recovery, which active-passive handles), and (c) a cost-benefit analysis including the operational expertise investment and 2-3x higher licensing and compute costs."
+      "explanation": "15K TPS at p99 = 8ms is well within what an optimised PostgreSQL can do. CockroachDB's write latency is typically several milliseconds even in a single region because of Raft consensus, so the migration may worsen latency. A principal engineer must require: (a) evidence that PostgreSQL has been fully optimised, (b) a specific business requirement for multi-region active-active (not just disaster recovery, which active-passive handles), and (c) a cost-benefit analysis including the operational expertise needed and the usually much higher licensing and compute costs."
     }
   ]
 }
@@ -521,7 +561,7 @@ public class CockroachConfig {
     },
     {
       "id": "2",
-      "description": "Design a CockroachDB geo-partitioned schema for a payments table where EU customer data must remain in EU nodes and US customer data in US nodes. Use PARTITION BY LIST (region) with LOCATE IN region-specific localities. Write the CREATE TABLE and ALTER PARTITION statements. Then write a query that demonstrates follower reads for a reporting use case: SELECT ... AS OF SYSTEM TIME '-10s' to read from the nearest replica without crossing region boundaries."
+      "description": "Design a CockroachDB multi-region schema for a payments table where EU customer data must remain in EU nodes and US customer data in US nodes. Use the multi-region abstractions (PRIMARY REGION / ADD REGION, LOCALITY REGIONAL BY ROW with crdb_region set from customer residency, and PLACEMENT RESTRICTED). Write the DDL. Then write a query that demonstrates follower reads for a reporting use case: SELECT ... AS OF SYSTEM TIME follower_read_timestamp() to read from the nearest replica without crossing region boundaries."
     },
     {
       "id": "3",

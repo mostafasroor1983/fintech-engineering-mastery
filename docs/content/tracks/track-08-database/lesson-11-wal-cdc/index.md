@@ -15,7 +15,7 @@ prerequisites: [track-08-lesson-01]
 # WAL and CDC — Change Data Capture with Debezium
 
 > [!NOTE]
-> The dual-write problem — keeping a database and a message broker in sync atomically — has caused some of the most expensive outages in financial services. Change Data Capture via the WAL is the correct architectural solution: the database is the single source of truth, and all downstream systems derive their state from the WAL stream, not from application-level dual writes.
+> The dual-write problem — keeping a database and a message broker in sync atomically — is a classic source of lost events, ghost events and reconciliation breaks in financial systems. Change Data Capture via the WAL is a robust architectural answer: the database is the single source of truth, and downstream systems derive their state from the committed change stream, not from application-level dual writes.
 
 ## 1. PostgreSQL WAL Internals
 
@@ -30,19 +30,20 @@ Transaction COMMIT sequence:
 5. Checkpoint: dirty buffer pages eventually written to data files
 ```
 
-**Key insight**: The WAL is an immutable ordered log of every change made to the database. This makes it perfect for CDC — we can "replay" the WAL to discover what changed.
+**Key insight**: The WAL is an append-only, ordered log of every change made to the database. This makes it an excellent source for CDC — we can decode the WAL to discover what changed, in commit order.
 
 ### WAL Segments and LSN
 
 ```sql
 -- Current WAL write position (Log Sequence Number)
 SELECT pg_current_wal_lsn();
--- Returns: 2/8A123456 (in hex: segment/offset)
+-- Returns e.g. 2/8A123456: a 64-bit byte position in the WAL stream,
+-- printed as two hex halves (high 32 bits / low 32 bits)
 
--- WAL files on disk
+-- WAL files on disk (needs superuser or the pg_monitor role)
 SELECT * FROM pg_ls_waldir() ORDER BY modification DESC LIMIT 5;
 
--- Size of outstanding WAL (not yet replicated or archived)
+-- Total WAL generated since the cluster was initialised
 SELECT pg_size_pretty(
     pg_current_wal_lsn() - '0/0'::pg_lsn
 ) AS wal_generated_total;
@@ -72,17 +73,20 @@ SELECT
     slot_name,
     plugin,
     database,
+    active,
     confirmed_flush_lsn,
     pg_size_pretty(pg_wal_lsn_diff(
-        pg_current_wal_lsn(),
-        confirmed_flush_lsn
-    )) AS lag_bytes,
-    active
+        pg_current_wal_lsn(), confirmed_flush_lsn)) AS consumer_lag,
+    pg_size_pretty(pg_wal_lsn_diff(
+        pg_current_wal_lsn(), restart_lsn))         AS retained_wal
 FROM pg_replication_slots;
 
--- WARNING: Unused replication slots prevent WAL cleanup (WAL accumulates)
--- Monitor: lag_bytes should be < 100MB in a healthy system
--- Alert: lag_bytes > 1GB -> risk of disk exhaustion
+-- WARNING: a slot keeps WAL from restart_lsn onwards (and holds back
+-- catalog_xmin, so catalog vacuum stalls) until its consumer confirms
+-- Monitor: consumer_lag should be < 100MB in a healthy system
+-- Alert:   retained_wal > 1GB -> risk of disk exhaustion
+-- Safety cap (PG13+): max_slot_wal_keep_size = '50GB' -- beyond it the
+-- slot is invalidated (consumer must re-snapshot) instead of filling the disk
 ```
 
 ## 3. Debezium PostgreSQL Connector
@@ -101,21 +105,20 @@ Debezium is a Kafka Connect-based CDC platform that reads from the WAL and publi
     "database.user": "debezium_replication",
     "database.password": "${file:/secrets/db-password.properties:password}",
     "database.dbname": "payments",
-    "database.server.name": "payments",
 
     "plugin.name": "pgoutput",
     "publication.name": "debezium_publication",
+    "publication.autocreate.mode": "disabled",
     "slot.name": "debezium_payment_service",
 
     "table.include.list": "public.transactions,public.accounts,public.ledger_entries",
 
     "snapshot.mode": "initial",
-    "snapshot.isolation.mode": "read_committed",
 
     "heartbeat.interval.ms": "30000",
-    "heartbeat.action.query": "INSERT INTO debezium_heartbeat (last_heartbeat) VALUES (NOW()) ON CONFLICT (id) DO UPDATE SET last_heartbeat = EXCLUDED.last_heartbeat",
+    "heartbeat.action.query": "INSERT INTO debezium_heartbeat (id, last_heartbeat) VALUES (1, NOW()) ON CONFLICT (id) DO UPDATE SET last_heartbeat = EXCLUDED.last_heartbeat",
 
-    "decimal.handling.mode": "precise",
+    "decimal.handling.mode": "string",
     "time.precision.mode": "adaptive_time_microseconds",
 
     "topic.prefix": "payments",
@@ -133,6 +136,12 @@ Debezium is a Kafka Connect-based CDC platform that reads from the WAL and publi
 }
 ```
 
+Notes on the settings:
+- `decimal.handling.mode = string` keeps NUMERIC amounts exact and readable (`"100.5000"`). `precise` is also exact but appears as base64-encoded bytes in JSON; never use `double` for money.
+- The heartbeat query writes to a small table in the captured database, so the slot keeps advancing even when the captured tables are quiet.
+- `producer.override.*` only works if the Connect worker allows it (`connector.client.config.override.policy=All`).
+- `topic.prefix` replaced the old `database.server.name` in Debezium 2.x.
+
 ### PostgreSQL Setup for Debezium
 
 ```sql
@@ -148,19 +157,18 @@ CREATE PUBLICATION debezium_publication
     FOR TABLE transactions, accounts, ledger_entries
     WITH (publish = 'insert, update, delete');
 
--- Enable replica identity for UPDATE/DELETE events to include old row values
--- Without this, UPDATE events won't include the old column values
-ALTER TABLE transactions REPLICA IDENTITY FULL;
+-- Replica identity decides what the "before" image of UPDATE/DELETE holds.
+-- DEFAULT (the default): only the primary key columns.
+-- FULL: all old column values -- needed if consumers compute deltas or
+-- audit old values; costs extra WAL on every update/delete.
 ALTER TABLE accounts REPLICA IDENTITY FULL;
 ALTER TABLE ledger_entries REPLICA IDENTITY FULL;
-
--- Or use USING INDEX to only publish the primary key for old values:
-ALTER TABLE transactions REPLICA IDENTITY USING INDEX transactions_pkey;
+-- transactions keeps DEFAULT: consumers only need the new state
 ```
 
 ## 4. Debezium Event Structure
 
-Each Debezium event contains the before and after state of the row.
+Each Debezium event contains the before and after state of the row. The examples below show the full change-event envelope, i.e. *without* the `ExtractNewRecordState` ("unwrap") transform; with the unwrap transform from the configuration above, consumers receive only the flattened `after` state (plus a `__deleted` field for deletes).
 
 ```json
 // INSERT event for a new transaction
@@ -233,14 +241,16 @@ CREATE TABLE outbox_events (
     aggregate_id    UUID NOT NULL,
     event_type      VARCHAR(100) NOT NULL, -- 'TransactionCompleted', 'AccountCreated'
     payload         JSONB NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    processed_at    TIMESTAMPTZ            -- set by Debezium after publishing
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Index for Debezium to scan pending events
-CREATE INDEX idx_outbox_unprocessed
-    ON outbox_events (created_at)
-    WHERE processed_at IS NULL;
+-- Debezium reads the INSERTs from the WAL -- it never queries or updates
+-- this table. So rows can be deleted soon after they are written: either
+-- in the same transaction right after the INSERT (the WAL still carries
+-- the insert), or by a cleanup job, e.g. every hour:
+DELETE FROM outbox_events WHERE created_at < NOW() - INTERVAL '1 day';
+-- (Debezium then also sees the DELETE; the EventRouter ignores deletes
+--  of outbox rows, and tombstones.on.delete=false suppresses tombstones)
 ```
 
 ```java
@@ -295,6 +305,9 @@ public class TransactionService {
   "name": "payments-outbox-connector",
   "config": {
     "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    // database.*, plugin.name, topic.prefix as in the connector above --
+    // but its OWN slot: two connectors cannot share a replication slot
+    "slot.name": "debezium_outbox",
     "table.include.list": "public.outbox_events",
 
     "transforms": "outbox",
@@ -305,11 +318,14 @@ public class TransactionService {
     "transforms.outbox.table.field.event.payload": "payload",
     "transforms.outbox.route.by.field": "aggregate_type",
     "transforms.outbox.route.topic.replacement": "payments.${routedByValue}.events",
+    "transforms.outbox.table.fields.additional.placement": "event_type:header:eventType",
 
-    "tombstones.on.delete": "true",
+    "tombstones.on.delete": "false",
     "transforms.outbox.table.expand.json.payload": "true"
   }
 }
+// Message key = aggregate_id (per-aggregate ordering), value = the payload,
+// headers: "id" (the outbox row id -- use it to de-duplicate) and "eventType"
 // This routes TransactionCompleted events to: payments.Transaction.events
 // And AccountCreated events to: payments.Account.events
 ```
@@ -317,13 +333,16 @@ public class TransactionService {
 ## 6. Consuming Debezium Events in Java
 
 ```java
-// Spring Kafka consumer for transaction events
+// Spring Kafka consumer for transaction events.
+// CDC delivers AT LEAST once (a connector restart can replay events), so
+// the handler must be idempotent: record processed event ids.
 @Component
 @Slf4j
 public class TransactionEventConsumer {
 
     private final NotificationService notificationService;
     private final LedgerSyncService ledgerSyncService;
+    private final ProcessedEventRepository processedEvents;
     private final ObjectMapper objectMapper;
 
     @KafkaListener(
@@ -331,42 +350,47 @@ public class TransactionEventConsumer {
         groupId = "notification-service",
         containerFactory = "kafkaListenerContainerFactory"
     )
+    @Transactional
     public void consumeTransactionEvent(
-            @Payload String eventJson,
+            @Payload String payloadJson,
             @Header(KafkaHeaders.RECEIVED_KEY) String aggregateId,
-            Acknowledgment ack) {
+            @Header("id") String eventId,
+            @Header("eventType") String eventType) throws Exception {
 
-        try {
-            TransactionEvent event = objectMapper.readValue(eventJson, TransactionEvent.class);
-
-            switch (event.getEventType()) {
-                case "TransactionCompleted" -> handleCompleted(event);
-                case "TransactionFailed"    -> handleFailed(event);
-                case "TransactionReversed"  -> handleReversed(event);
-                default -> log.warn("Unknown event type: {}", event.getEventType());
-            }
-
-            ack.acknowledge();
-        } catch (Exception e) {
-            log.error("Failed to process event for transaction {}: {}",
-                aggregateId, e.getMessage(), e);
-            // Do NOT acknowledge — message will be redelivered
-            // After max retries, goes to DLQ
+        // Duplicate? (INSERT ... ON CONFLICT DO NOTHING returns 0 rows)
+        if (!processedEvents.markProcessed(eventId)) {
+            log.debug("Skipping duplicate event {}", eventId);
+            return;
         }
+
+        TransactionPayload payload =
+            objectMapper.readValue(payloadJson, TransactionPayload.class);
+
+        switch (eventType) {
+            case "TransactionCompleted" -> handleCompleted(payload);
+            case "TransactionFailed"    -> handleFailed(payload);
+            case "TransactionReversed"  -> handleReversed(payload);
+            default -> log.warn("Unknown event type {} for {}", eventType, aggregateId);
+        }
+        // No try/catch: an exception propagates to the container's
+        // DefaultErrorHandler, which retries with back-off and then sends
+        // the record to a dead-letter topic (DeadLetterPublishingRecoverer).
+        // Swallowing it and skipping ack would NOT cause redelivery -- the
+        // next acknowledged record commits past it.
     }
 
-    private void handleCompleted(TransactionEvent event) {
-        // Update read model
-        ledgerSyncService.syncTransaction(event.getPayload());
-        // Send push notification
-        notificationService.notifyTransactionComplete(event.getPayload());
+    private void handleCompleted(TransactionPayload payload) {
+        // Update read model (same DB transaction as the processed-event row)
+        ledgerSyncService.syncTransaction(payload);
+        // Push notification: at worst sent twice if we crash right after it
+        notificationService.notifyTransactionComplete(payload);
     }
 }
 ```
 
 ## 7. Monitoring Replication Lag
 
-Replication lag is the delay between a change being committed to PostgreSQL and Debezium publishing it to Kafka. For financial systems, lag > 5 seconds is a concern.
+Replication lag is the delay between a change being committed to PostgreSQL and Debezium publishing it to Kafka. For financial systems, lag > 5 seconds is a concern. The database shows lag in **bytes** (below); lag in **time** comes from Debezium's own metric `MilliSecondsBehindSource` (streaming metrics, JMX/Prometheus).
 
 ```sql
 -- Monitor replication slot lag
@@ -378,14 +402,14 @@ SELECT
         pg_current_wal_lsn(),
         confirmed_flush_lsn
     )) AS lag_size,
-    EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp()))::INT
-        AS lag_seconds_approx
+    wal_status        -- 'reserved' / 'extended' OK; 'unreserved' / 'lost' = danger (PG13+)
 FROM pg_replication_slots
 WHERE slot_type = 'logical';
 
 -- Alert when lag exceeds threshold
 -- lag_size > 100MB = replication slot is falling behind
--- lag_size > 1GB = risk of WAL disk exhaustion -> DROP SLOT if connector is dead
+-- lag_size > 1GB  = risk of WAL disk exhaustion -> restart the connector;
+--   dropping the slot is a deliberate human decision (it forces a re-snapshot)
 ```
 
 ```java
@@ -395,6 +419,14 @@ public class ReplicationLagMonitor {
 
     private final JdbcTemplate jdbcTemplate;
     private final MeterRegistry metrics;
+    // One holder per slot; each gauge is registered once, the first time
+    // the slot is seen, and only the holder is updated afterwards
+    private final Map<String, AtomicLong> lagBySlot = new ConcurrentHashMap<>();
+
+    public ReplicationLagMonitor(JdbcTemplate jdbcTemplate, MeterRegistry metrics) {
+        this.jdbcTemplate = jdbcTemplate;
+        this.metrics = metrics;
+    }
 
     @Scheduled(fixedRate = 10_000)
     public void reportReplicationLag() {
@@ -406,34 +438,35 @@ public class ReplicationLagMonitor {
             FROM pg_replication_slots
             WHERE slot_type = 'logical' AND database = 'payments'
             """,
-            rs -> {
-                while (rs.next()) {
-                    String slotName = rs.getString("slot_name");
-                    long lagBytes = rs.getLong("lag_bytes");
+            (RowCallbackHandler) rs -> {
+                String slotName = rs.getString("slot_name");
+                long lagBytes = rs.getLong("lag_bytes");
 
-                    metrics.gauge("cdc.replication.lag_bytes",
-                        Tags.of("slot", slotName), lagBytes);
+                lagBySlot.computeIfAbsent(slotName, name -> {
+                    AtomicLong holder = new AtomicLong();
+                    Gauge.builder("cdc.replication.lag_bytes", holder, AtomicLong::get)
+                        .tag("slot", name)
+                        .baseUnit("bytes")
+                        .register(metrics);
+                    return holder;
+                }).set(lagBytes);
 
-                    if (lagBytes > 100 * 1024 * 1024) {  // 100MB
-                        log.warn("Replication slot {} lag is {}MB — Debezium may be down",
-                            slotName, lagBytes / (1024 * 1024));
-                    }
-
-                    if (lagBytes > 1024 * 1024 * 1024) {  // 1GB
-                        log.error("CRITICAL: Replication slot {} lag is {}GB. " +
-                            "If connector is dead, drop the slot to prevent disk exhaustion.",
-                            slotName, lagBytes / (1024 * 1024 * 1024));
-                    }
+                if (lagBytes > 1024L * 1024 * 1024) {           // 1GB
+                    log.error("CRITICAL: Replication slot {} lag is {}MB. " +
+                        "Restart the connector; drop the slot only by a deliberate decision.",
+                        slotName, lagBytes / (1024 * 1024));
+                } else if (lagBytes > 100L * 1024 * 1024) {     // 100MB
+                    log.warn("Replication slot {} lag is {}MB — Debezium may be down",
+                        slotName, lagBytes / (1024 * 1024));
                 }
-            }
-        );
+            });
     }
 }
 ```
 
 ## 8. Handling Connector Failures and Restarts
 
-Debezium uses the replication slot's `confirmed_flush_lsn` to track progress. On restart, it resumes from where it left off — no events are lost.
+Debezium stores its position in Kafka Connect's offset topic and confirms it to the slot (`confirmed_flush_lsn`), so PostgreSQL can free older WAL. On restart, it resumes from the last committed offset — no events are lost, but events after that offset may be **delivered again**. Delivery is at-least-once, so consumers must be idempotent.
 
 ```bash
 # Check connector status via Kafka Connect REST API
@@ -447,10 +480,12 @@ curl -X POST \
 curl -X POST \
   http://kafka-connect:8083/connectors/payments-postgres-connector/restart
 
-# Monitor connector lag via Kafka Connect metrics (JMX or Prometheus)
-# kafka.connect:type=connector-task-metrics,connector=payments-postgres-connector
-#   source-record-active-count: records being processed
-#   source-record-write-rate: records/second being published to Kafka
+# Monitor connector lag via JMX (or Prometheus via the JMX exporter)
+# kafka.connect:type=source-task-metrics,connector=payments-postgres-connector,task=0
+#   source-record-active-count: records polled but not yet written to Kafka
+#   source-record-write-rate:   records/second being published to Kafka
+# debezium.postgres:type=connector-metrics,context=streaming,server=payments
+#   MilliSecondsBehindSource:   time lag behind the database
 ```
 
 ## 9. Snapshot Mode for Initial Data Load
@@ -461,20 +496,21 @@ When Debezium first connects to a database, it performs an initial snapshot to l
 // Snapshot configuration options
 {
   "snapshot.mode": "initial",
-  // Options:
+  // Options (Debezium 2.x):
   // "initial": snapshot existing data, then stream changes (default)
   // "initial_only": snapshot only, no streaming (for one-time data migration)
-  // "never": skip snapshot, only stream changes from now (risk: missing historical data)
-  // "always": re-snapshot on every connector restart (expensive, rarely correct)
-  // "when_needed": only if replication slot doesn't exist
+  // "no_data" (older name "never"): skip the data snapshot, only stream
+  //     changes from now (risk: consumers miss existing rows)
+  // "always": re-snapshot on every connector start (expensive, rarely right)
+  // "when_needed": snapshot only if no usable offset exists
+  //     (e.g. the slot was dropped or invalidated)
 
-  "snapshot.isolation.mode": "read_committed",
-  // "serializable": strictest but can cause contention on large tables
-  // "read_committed": less strict but no phantom reads in snapshot
-  // "repeatable_read": balance of consistency and concurrency
+  // The snapshot reads all tables in one REPEATABLE READ transaction that
+  // uses the snapshot exported when the slot is created, so it lines up
+  // exactly with the point where streaming starts -- no gap, no overlap.
 
   "snapshot.max.threads": "4",
-  // Parallel snapshot threads for faster initial load on large tables
+  // Parallel snapshot threads for faster initial load of many tables
 
   "snapshot.fetch.size": "10240"
   // Rows fetched per batch during snapshot (tune based on row size)
@@ -485,7 +521,6 @@ When Debezium first connects to a database, it performs an initial snapshot to l
 
 ```yaml
 # Docker Compose for local development
-version: '3.8'
 services:
   postgres:
     image: postgres:16
@@ -500,13 +535,21 @@ services:
       -c max_wal_senders=5
 
   kafka:
-    image: confluentinc/cp-kafka:7.5.0
+    image: apache/kafka:3.7.0          # single-node KRaft (no ZooKeeper)
     environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
 
   kafka-connect:
-    image: debezium/connect:2.5
+    image: quay.io/debezium/connect:2.5
     depends_on: [kafka, postgres]
     environment:
       BOOTSTRAP_SERVERS: kafka:9092
@@ -518,43 +561,85 @@ services:
       CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
     ports:
       - "8083:8083"
+# Locally there is one broker: use replication factor 1 in the connector's
+# topic.creation.default.replication.factor
 ```
 
 ```java
-// Integration test: verify CDC events are published
+// End-to-end test: PostgreSQL + Kafka + a real Debezium connector
+// (io.debezium:debezium-testing-testcontainers). An embedded Kafka alone
+// would not work: something must actually read the WAL and publish.
 @SpringBootTest
-@EmbeddedKafka(partitions = 1, topics = {"payments.Transaction.events"})
 @Testcontainers
-class DebeziumIntegrationTest {
+class OutboxCdcIntegrationTest {
+
+    static Network network = Network.newNetwork();
 
     @Container
+    static KafkaContainer kafka = new KafkaContainer(
+            DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))
+        .withNetwork(network).withNetworkAliases("kafka");
+
+    @Container
+    @ServiceConnection
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16")
-        .withCommand("-c", "wal_level=logical", "-c", "max_replication_slots=2");
+        .withNetwork(network).withNetworkAliases("postgres")
+        .withCommand("postgres", "-c", "wal_level=logical");
+
+    @Container
+    static DebeziumContainer connect = new DebeziumContainer("quay.io/debezium/connect:2.5")
+        .withNetwork(network)
+        .withKafka(kafka)
+        .dependsOn(kafka, postgres);
 
     @Autowired
     private TransactionService transactionService;
 
     @Test
-    void completingTransactionShouldPublishEvent() throws Exception {
-        // Arrange
-        UUID txnId = createTestTransaction();
+    void completingTransactionShouldPublishEvent() {
+        // Register the connector here, after Flyway (at context start) has
+        // created outbox_events
+        connect.registerConnector("outbox", ConnectorConfiguration
+            .forJdbcContainer(postgres)
+            .with("topic.prefix", "payments")
+            .with("plugin.name", "pgoutput")
+            .with("table.include.list", "public.outbox_events")
+            .with("transforms", "outbox")
+            .with("transforms.outbox.type", "io.debezium.transforms.outbox.EventRouter")
+            .with("transforms.outbox.table.field.event.key", "aggregate_id")
+            .with("transforms.outbox.table.field.event.payload", "payload")
+            .with("transforms.outbox.route.by.field", "aggregate_type")
+            .with("transforms.outbox.route.topic.replacement", "payments.${routedByValue}.events")
+            .with("transforms.outbox.table.fields.additional.placement", "event_type:header:eventType"));
 
-        // Act
+        UUID txnId = createTestTransaction();
         transactionService.completeTransaction(txnId);
 
-        // Assert: event should appear in Kafka (via outbox pattern)
-        ConsumerRecord<String, String> record = KafkaTestUtils.getSingleRecord(
-            consumer, "payments.Transaction.events", 5000
-        );
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(Map.of(
+                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers(),
+                ConsumerConfig.GROUP_ID_CONFIG, "test",
+                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"),
+                new StringDeserializer(), new StringDeserializer())) {
 
-        assertThat(record.key()).isEqualTo(txnId.toString());
-        assertThat(record.value()).contains("TransactionCompleted");
+            consumer.subscribe(List.of("payments.Transaction.events"));
+
+            await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                List<ConsumerRecord<String, String>> records = new ArrayList<>();
+                consumer.poll(Duration.ofMillis(500)).forEach(records::add);
+                assertThat(records).anySatisfy(r -> {
+                    // key is the aggregate_id (a JSON string with the default converter)
+                    assertThat(r.key()).contains(txnId.toString());
+                    assertThat(new String(r.headers().lastHeader("eventType").value()))
+                        .contains("TransactionCompleted");
+                });
+            });
+        }
     }
 }
 ```
 
 > [!WARNING]
-> Replication slots that are not consumed prevent PostgreSQL from cleaning up WAL segments. If a Debezium connector goes down and is not restarted, the WAL will grow indefinitely until the disk is full. Implement automated monitoring and alerting for replication slot lag, and document the procedure for safely dropping a stale slot: `SELECT pg_drop_replication_slot('slot_name');`. Dropping a slot means you will need to re-snapshot when the connector restarts.
+> Replication slots that are not consumed prevent PostgreSQL from cleaning up WAL segments. If a Debezium connector goes down and is not restarted, the WAL will grow indefinitely until the disk is full. Implement automated monitoring and alerting for replication slot lag, set `max_slot_wal_keep_size` (PG13+) as a last-resort cap, and document the procedure for safely dropping a stale slot: `SELECT pg_drop_replication_slot('slot_name');`. Dropping a slot means you will need to re-snapshot when the connector restarts.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -579,7 +664,7 @@ class DebeziumIntegrationTest {
         "shared_buffers must be set to 25% of RAM; risk is poor query performance affecting CDC throughput"
       ],
       "correct": 1,
-      "explanation": "wal_level = logical enables PostgreSQL to decode WAL into row-level change events that Debezium consumes. The critical operational risk is replication slot lag: a replication slot prevents PostgreSQL from cleaning up WAL segments that the slot has not yet consumed. If Debezium goes down without the slot being dropped, WAL accumulates indefinitely. A 24-hour outage on a 10,000 TPS system can generate hundreds of GB of WAL. Monitor slot lag (pg_replication_slots.confirmed_flush_lsn) and alert at 100MB lag, with automated procedures to drop the slot at 1GB to prevent disk exhaustion."
+      "explanation": "wal_level = logical lets PostgreSQL decode WAL into row-level change events that Debezium consumes. The critical operational risk is slot lag: a replication slot keeps every WAL segment its consumer has not yet confirmed. If Debezium is down and the slot stays, WAL accumulates without limit — a long outage on a busy system can retain hundreds of GB. Monitor slot lag (pg_replication_slots: confirmed_flush_lsn / restart_lsn), alert early (e.g. 100MB), set max_slot_wal_keep_size as a safety cap, and treat dropping the slot as a deliberate decision, because it forces a re-snapshot."
     },
     {
       "text": "A Debezium connector is configured with REPLICA IDENTITY DEFAULT on the accounts table. When a balance UPDATE is published, what does the 'before' field in the Debezium event contain?",
@@ -590,7 +675,7 @@ class DebeziumIntegrationTest {
         "The old balance field only, as it is the modified column"
       ],
       "correct": 1,
-      "explanation": "REPLICA IDENTITY DEFAULT (the PostgreSQL default) includes only the primary key in the 'before' image of UPDATE and DELETE events. This means consumers cannot see what the old balance was — only the primary key identifying which row changed. To get full before-image (old balance, old status, etc.), you must set REPLICA IDENTITY FULL or REPLICA IDENTITY USING INDEX. FULL includes all columns in the before image. This is important for downstream systems that need to audit changes or compute deltas."
+      "explanation": "REPLICA IDENTITY DEFAULT (the PostgreSQL default) puts only the primary key into the 'before' image of UPDATE and DELETE events. Consumers cannot see the old balance — only which row changed. To get the full before image (old balance, old status, etc.), set REPLICA IDENTITY FULL (all columns, at the cost of extra WAL). REPLICA IDENTITY USING INDEX gives only the columns of the chosen unique index. The full before image matters for downstream systems that audit changes or compute deltas."
     }
   ]
 }

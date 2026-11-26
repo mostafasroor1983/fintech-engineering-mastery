@@ -15,11 +15,11 @@ prerequisites: []
 # Thread Pool Sizing — Little's Law and Optimal Concurrency
 
 > [!NOTE]
-> Undersized thread pools cause request queuing and latency spikes under load. Oversized pools waste memory (each thread consumes ~1MB stack), increase context switching, and degrade throughput. Little's Law provides the mathematical foundation to size thread pools correctly for payment processors — but the formula requires measuring your actual service latency and arrival rate under production conditions.
+> Undersized thread pools cause request queuing and latency spikes under load. Oversized pools waste memory (each platform thread reserves a stack, ~1MB by default, plus kernel resources), increase context switching, and degrade throughput. Little's Law provides the mathematical foundation to size thread pools correctly for payment processors — but the formula requires measuring your actual service latency and arrival rate under production conditions.
 
 ## The Cost of Getting Thread Pool Sizing Wrong
 
-A payment processing service was experiencing p99 latency spikes from 85ms to 4.2 seconds during peak hours. The root cause: a thread pool configured with 50 threads (a "looks reasonable" number) for a service that receives 800 requests/second with 120ms average latency. Little's Law immediately tells you why this fails: you need L = λW = 800 × 0.120 = **96 concurrent threads** at steady state, leaving no headroom for spikes.
+*Composite example:* a payment processing service sees p99 latency spike from 85ms to over 4 seconds during peak hours. The root cause: a thread pool configured with 50 threads (a "looks reasonable" number) for a service that receives 800 requests/second with 120ms average latency. Little's Law immediately tells you why this fails: you need L = λW = 800 × 0.120 = **96 concurrent threads** at steady state, leaving no headroom for spikes.
 
 Misconfigured thread pools are among the most common sources of latency regressions in financial services — and among the easiest to fix once you understand the underlying queueing theory.
 
@@ -33,7 +33,7 @@ Little's Law states that in a stable queueing system:
 L = λ × W
 
 Where:
-  L = average number of requests in the system (threads in use)
+  L = average number of requests in the system (being served + waiting)
   λ = average arrival rate (requests per second)
   W = average time each request spends in the system (service latency in seconds)
 ```
@@ -48,14 +48,18 @@ Payment authorization service:
   W (avg latency)     = 150ms = 0.150s
   L (threads needed)  = 500 × 0.150 = 75 threads
 
-Add headroom for latency spikes (p99 latency ≈ 400ms):
-  L (p99 scenario)    = 500 × 0.400 = 200 threads
+Add headroom for a slowdown (if latency for ALL requests rose to
+today's p99 of ≈ 400ms, e.g. a slow downstream):
+  L (slow scenario)   = 500 × 0.400 = 200 threads
+  (Little's Law uses averages -- this is a planning heuristic, not a law)
 
 Sizing recommendation:
   corePoolSize   = 75   (steady state)
   maxPoolSize    = 200  (p99 spike headroom)
   queueCapacity  = 50   (small queue to fail fast vs accumulate backlog)
 ```
+
+**How `ThreadPoolExecutor` actually grows** (a frequent surprise): with a bounded queue it creates threads up to `corePoolSize`, then puts new tasks in the **queue**, and only when the queue is **full** does it add threads up to `maxPoolSize`. So "max" threads are only reached after the queue has filled — another reason to keep the queue small (or make core large enough for normal peaks).
 
 ---
 
@@ -66,8 +70,9 @@ Thread pool sizing depends heavily on whether your workload is CPU-bound or IO-b
 ### CPU-Bound Workloads
 
 ```
-Optimal threads = number of CPU cores (N_cpu)
+Optimal threads ≈ number of CPU cores (N_cpu)
                 = Runtime.getRuntime().availableProcessors()
+                  (container-aware: reflects the CPU limit on modern JVMs)
 
 For a fraud scoring service doing ML inference:
   N_cpu = 16 cores
@@ -105,38 +110,34 @@ This represents the classic IO-bound multiplier: each core can handle
 @Component
 public class ThreadPoolSizingMetrics {
 
+    private static final ThreadMXBean THREADS = ManagementFactory.getThreadMXBean();
     private final MeterRegistry meterRegistry;
 
+    public ThreadPoolSizingMetrics(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+    }
+
     /**
-     * Instrument service calls to measure IO wait vs CPU time.
-     * Run this in production under realistic load to get real W and C values.
+     * Measure, for one request, wall time and the CPU time this thread used.
+     * W (waiting) = wall - CPU;  C = CPU.
+     * Run under realistic load to get real W and C values.
      */
-    public <T> T measureWithIoBreakdown(
-            String operationName,
-            Callable<T> cpuWork,
-            Callable<T> ioWork) throws Exception {
-
-        long cpuStartNanos = System.nanoTime();
-        // Measure CPU setup (validation, serialization)
-        // ... (not shown for brevity)
-        long beforeIo = System.nanoTime();
-        T result = ioWork.call();  // actual IO call
-        long afterIo = System.nanoTime();
-
-        long cpuTimeNanos = beforeIo - cpuStartNanos;
-        long ioTimeNanos  = afterIo - beforeIo;
-
-        meterRegistry.timer(operationName + ".cpu.time")
-            .record(cpuTimeNanos, TimeUnit.NANOSECONDS);
-        meterRegistry.timer(operationName + ".io.time")
-            .record(ioTimeNanos, TimeUnit.NANOSECONDS);
-
-        // Log W/C ratio for sizing calculations
-        double ratio = (double) ioTimeNanos / cpuTimeNanos;
-        meterRegistry.gauge(operationName + ".io.to.cpu.ratio",
-            ratio);
-
-        return result;
+    public <T> T measure(String operationName, Callable<T> work) throws Exception {
+        long wallStart = System.nanoTime();
+        long cpuStart  = THREADS.getCurrentThreadCpuTime();   // CPU time, not wall time
+        try {
+            return work.call();
+        } finally {
+            long cpu  = THREADS.getCurrentThreadCpuTime() - cpuStart;
+            long wall = System.nanoTime() - wallStart;
+            meterRegistry.timer(operationName + ".cpu.time")
+                .record(cpu, TimeUnit.NANOSECONDS);
+            meterRegistry.timer(operationName + ".wait.time")
+                .record(Math.max(0, wall - cpu), TimeUnit.NANOSECONDS);
+            // Compute W/C in your dashboard from the two timers' means.
+            // (Do not call meterRegistry.gauge(name, double) per request: it
+            //  registers once and never updates.)
+        }
     }
 }
 ```
@@ -170,7 +171,7 @@ public class PaymentThreadPoolFactory {
 
         ThreadFactory namedFactory = new ThreadFactoryBuilder()
             .setNameFormat("payment-auth-%d")
-            .setDaemon(false)   // payment threads must complete before JVM exit
+            .setDaemon(false)   // non-daemon; still shut the pool down gracefully
             .build();
 
         ThreadPoolExecutor executor = new ThreadPoolExecutor(
@@ -232,16 +233,20 @@ Queue depth is a critical but often misunderstood parameter. A large queue hides
  * Scenario: Payment auth service, 150ms avg latency, 100 threads
  * Load test at 800 req/s (pool capacity ≈ 100/0.15 = 667 req/s)
  *
+ * Arrivals exceed capacity by 800 - 667 = 133 req/s, so the queue grows
+ * by ~133 requests EVERY SECOND for as long as the overload lasts.
+ *
  * With queue=1000:
- *   - Service appears healthy (no errors)
- *   - Queue fills to ~133 items above capacity
- *   - Each queued request waits 133 × 1/667s ≈ 200ms extra
- *   - p99 latency ≈ 150ms + 200ms = 350ms (hidden backlog)
+ *   - Service appears healthy (no errors) for ~7.5 s while the queue fills
+ *   - A full queue means each new request waits 1000 / 667 ≈ 1.5 s extra
+ *   - p99 latency ≈ 150ms + 1.5 s, and then rejections start anyway
+ *   - With queue=10_000: ~75 s of silent build-up and ~15 s waits
  *
  * With queue=50:
+ *   - Extra wait is at most 50 / 667 ≈ 75 ms
  *   - Service returns HTTP 503 when overloaded
  *   - Caller applies exponential backoff and retries
- *   - p99 latency for successful requests stays at 150ms
+ *   - Successful requests keep near-normal latency
  *   - Clients see failures immediately, not delayed timeouts
  *
  * Recommendation: Keep queue short. Fail fast is better than slow degradation.
@@ -275,6 +280,13 @@ public class QueueDepthExample {
 public class ThreadPoolMetricsRegistrar {
 
     private final MeterRegistry meterRegistry;
+    private final ThreadPoolExecutor pool;   // the pool the service REALLY uses
+
+    public ThreadPoolMetricsRegistrar(MeterRegistry meterRegistry,
+                                      @Qualifier("paymentAuthPool") ThreadPoolExecutor pool) {
+        this.meterRegistry = meterRegistry;
+        this.pool = pool;
+    }
 
     /**
      * Register all thread pool metrics with Micrometer.
@@ -283,8 +295,7 @@ public class ThreadPoolMetricsRegistrar {
      */
     @PostConstruct
     public void registerMetrics() {
-        ThreadPoolExecutor pool = PaymentThreadPoolFactory
-            .buildPaymentAuthorizationPool(75, 200, 50);
+        // (Creating a NEW pool here would monitor an executor nobody uses.)
 
         // Pool utilisation — alert > 80%
         Gauge.builder("thread.pool.active", pool, ThreadPoolExecutor::getActiveCount)
@@ -342,7 +353,7 @@ A complete worked example for a payment processor with real production numbers:
 /**
  * Payment Processing Service — Thread Pool Sizing Analysis
  *
- * Service profile (measured in production):
+ * Illustrative service profile:
  *   - Receives 1,200 payment requests/second at peak
  *   - Each request makes 3 downstream calls:
  *       1. Fraud service: 45ms avg, 95ms p99
@@ -365,8 +376,13 @@ A complete worked example for a payment processor with real production numbers:
  *
  *   Recommendation:
  *     corePoolSize  = 168   (Little's Law steady state)
- *     maxPoolSize   = 456   (Little's Law p99)
+ *     maxPoolSize   = 456   (slow-downstream scenario; only reached after
+ *                            the queue is full -- see "How ThreadPoolExecutor
+ *                            actually grows")
  *     queueCapacity = 50    (fail fast — small buffer only for burst smoothing)
+ *
+ *   Also check what the threads WAIT on: 456 threads calling a database
+ *   through a 30-connection pool just queue inside the connection pool.
  */
 @Configuration
 public class PaymentProcessorPoolConfig {
@@ -420,7 +436,8 @@ public class PaymentProcessorPoolConfig {
         executor.setMaxPoolSize(30);
         executor.setQueueCapacity(10_000);  // bulk can queue — latency less critical
         executor.setThreadNamePrefix("payment-bulk-");
-        executor.setThreadPriority(Thread.NORM_PRIORITY - 1);  // lower priority
+        // (Thread priorities are mostly ignored by the OS scheduler on Linux;
+        //  isolation comes from the SEPARATE pool, not from priority.)
         executor.initialize();
 
         ExecutorServiceMetrics.monitor(
@@ -472,8 +489,13 @@ public class VirtualThreadPoolConfig {
      * to virtual threads automatically. No explicit pool sizing needed
      * for IO-bound workloads.
      *
-     * CAVEAT: Avoid synchronized blocks in virtual thread paths —
-     * they cause carrier thread pinning (covered in lesson-15).
+     * CAVEATS:
+     * - Before JDK 24, blocking inside synchronized pins the carrier thread
+     *   (covered in lesson 15); JDK 24 (JEP 491) removed most of this.
+     * - Without a pool, nothing limits concurrency any more: 10,000 virtual
+     *   threads can all try to use a 30-connection DB pool or a rate-limited
+     *   gateway. Limit access to scarce resources explicitly (connection
+     *   pools, Semaphore, bulkheads).
      */
 }
 ```
@@ -486,63 +508,70 @@ For services where load varies dramatically between business hours and off-peak:
 
 ```java
 @Component
+@Slf4j
 public class AdaptivePoolSizer {
 
     private final ThreadPoolTaskExecutor pool;
     private final MeterRegistry meterRegistry;
+    private final AtomicInteger targetMax = new AtomicInteger();
+    private long lastCount = -1;
+    private double lastTotalSeconds;
+    private long lastSampleNanos;
+
+    public AdaptivePoolSizer(@Qualifier("paymentAuthorizationExecutor") ThreadPoolTaskExecutor pool,
+                             MeterRegistry meterRegistry) {
+        this.pool = pool;
+        this.meterRegistry = meterRegistry;
+        meterRegistry.gauge("thread.pool.target.size",
+            Tags.of("pool", "payment-auth"), targetMax);      // registered ONCE
+    }
 
     /**
-     * Dynamically resize pool based on observed Little's Law metrics.
-     * Runs every 30 seconds during business hours.
+     * Resize the pool from RECENT Little's Law inputs, every 30 seconds.
+     * Caution: if latency rises because a downstream is struggling, adding
+     * threads sends it MORE concurrent load. Keep firm upper bounds.
      */
     @Scheduled(fixedRate = 30_000)
     public void adjustPoolSize() {
-        // Get current arrival rate from Micrometer (req/s over last 60s)
-        double arrivalRate = getArrivalRate();
+        Timer timer = meterRegistry.find("http.server.requests")
+            .tag("uri", "/v1/payments/authorize").timer();
+        if (timer == null) return;
 
-        // Get current average latency from Micrometer (seconds)
-        double avgLatencySeconds = getAverageLatency();
-
-        // Little's Law: L = λW
-        int steadyStateThreads = (int) Math.ceil(arrivalRate * avgLatencySeconds);
-
-        // Add 50% headroom for latency spikes
-        int targetMax = (int) (steadyStateThreads * 1.5);
-
-        // Clamp to safe bounds
-        int newCore = Math.max(10, Math.min(steadyStateThreads, 500));
-        int newMax  = Math.max(newCore, Math.min(targetMax, 600));
-
-        if (newMax != pool.getMaxPoolSize()) {
-            log.info("Resizing payment pool: core={}->{} max={}->{} " +
-                "(arrivalRate={:.0f} req/s, avgLatency={:.0f}ms)",
-                pool.getCorePoolSize(), newCore,
-                pool.getMaxPoolSize(), newMax,
-                arrivalRate, avgLatencySeconds * 1000);
-
-            pool.setCorePoolSize(newCore);
-            pool.setMaxPoolSize(newMax);
-
-            meterRegistry.gauge("thread.pool.target.size",
-                Tags.of("pool", "payment-auth"), newMax);
+        long count = timer.count();
+        double totalSeconds = timer.totalTime(TimeUnit.SECONDS);
+        long now = System.nanoTime();
+        if (lastCount < 0) {                       // first sample: just remember
+            lastCount = count; lastTotalSeconds = totalSeconds; lastSampleNanos = now;
+            return;
         }
-    }
 
-    private double getArrivalRate() {
-        // Query Micrometer for recent request rate
-        return meterRegistry.find("http.server.requests")
-            .tag("uri", "/v1/payments/authorize")
-            .timer()
-            .map(t -> t.count() / t.totalTime(TimeUnit.SECONDS))
-            .orElse(100.0);  // fallback to safe default
-    }
+        long requests = count - lastCount;
+        double elapsed = (now - lastSampleNanos) / 1e9;
+        double arrivalRate = requests / elapsed;                     // λ: req/s
+        double avgLatency = requests > 0
+            ? (totalSeconds - lastTotalSeconds) / requests : 0.150;  // W: seconds
+        lastCount = count; lastTotalSeconds = totalSeconds; lastSampleNanos = now;
 
-    private double getAverageLatency() {
-        return meterRegistry.find("http.server.requests")
-            .tag("uri", "/v1/payments/authorize")
-            .timer()
-            .map(t -> t.mean(TimeUnit.SECONDS))
-            .orElse(0.150);  // fallback: 150ms default
+        // Little's Law: L = λW, plus 50% headroom, clamped to safe bounds
+        int steadyState = (int) Math.ceil(arrivalRate * avgLatency);
+        int newCore = Math.max(10, Math.min(steadyState, 500));
+        int newMax  = Math.max(newCore, Math.min((int) (steadyState * 1.5), 600));
+
+        if (newMax != pool.getMaxPoolSize() || newCore != pool.getCorePoolSize()) {
+            log.info("Resizing payment pool: core={}->{} max={}->{} (λ={} req/s, W={} ms)",
+                pool.getCorePoolSize(), newCore, pool.getMaxPoolSize(), newMax,
+                Math.round(arrivalRate), Math.round(avgLatency * 1000));
+
+            // Order matters: core may never exceed max (IllegalArgumentException)
+            if (newMax >= pool.getMaxPoolSize()) {
+                pool.setMaxPoolSize(newMax);
+                pool.setCorePoolSize(newCore);
+            } else {
+                pool.setCorePoolSize(newCore);
+                pool.setMaxPoolSize(newMax);
+            }
+            targetMax.set(newMax);
+        }
     }
 }
 ```
@@ -557,7 +586,7 @@ public class AdaptivePoolSizer {
 | `maxPoolSize = Integer.MAX_VALUE` | OOM under load — millions of threads created | Cap at Little's Law p99 estimate + buffer |
 | Same pool for real-time and batch | Batch jobs fill pool, block authorizations | Separate pools for real-time vs batch workloads |
 | Never monitoring pool metrics | Sizing issues invisible until outage | Alert on utilisation > 80% and queue depth > 20 |
-| `corePoolSize = maxPoolSize = 500` | 500 × 1MB stack = 500MB RSS even at idle | Use `allowCoreThreadTimeOut(true)` and low core |
+| `corePoolSize = maxPoolSize = 500` | 500 threads kept alive at idle, reserving ~500MB of stack address space plus kernel resources | Use `allowCoreThreadTimeOut(true)` and low core |
 | Hardcoded pool size in code | Cannot tune without redeploy | Externalize via `@Value` / Spring config |
 
 ---
@@ -573,7 +602,7 @@ public class AdaptivePoolSizer {
 │ 3. Calculate L = λW for steady state                            │
 │ 4. Calculate L_p99 = λ × W_p99 for spike headroom              │
 │ 5. Set corePoolSize = L (steady state)                          │
-│ 6. Set maxPoolSize = L_p99 (spike headroom)                     │
+│ 6. Set maxPoolSize = L_p99 (used only once the queue is full)   │
 │ 7. Set queueCapacity = small (10-100) for real-time services    │
 │ 8. Register pool metrics with Micrometer                        │
 │ 9. Alert on utilisation > 80%, queue depth > 20                 │

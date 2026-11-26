@@ -71,11 +71,14 @@ When you UPDATE a row, PostgreSQL does NOT modify the existing tuple in place. I
 UPDATE accounts SET balance = 1200.00 WHERE account_id = 'ACC-1001';
 
 -- After UPDATE (two tuples exist simultaneously):
--- Old: xmin=15420, xmax=15500, balance=1500.00  (dead to transactions >= 15500)
--- New: xmin=15500, xmax=0,     balance=1200.00  (visible to transactions >= 15500)
+-- Old: xmin=15420, xmax=15500, balance=1500.00
+--      (still visible to snapshots taken before 15500 committed)
+-- New: xmin=15500, xmax=0,     balance=1200.00
+--      (visible to snapshots taken after 15500 committed)
+-- Visibility depends on COMMIT status and snapshots, not on comparing ids
 ```
 
-This is why updates are more expensive than you might expect — they write new data to new pages.
+This is why updates are more expensive than you might expect — every update writes a whole new row version (and, unless it is a HOT update — section 8.2 — new index entries too).
 
 ### 2.3 DELETE
 
@@ -88,7 +91,8 @@ DELETE sets `xmax` on the existing tuple to the deleting transaction's ID. The t
 DELETE FROM accounts WHERE account_id = 'ACC-1001';
 
 -- After DELETE:
--- xmin=15420, xmax=15600, balance=1500.00  (dead to transactions >= 15600)
+-- xmin=15420, xmax=15600, balance=1500.00
+-- (invisible to snapshots taken after 15600 committed)
 -- The row still occupies space on disk — VACUUM needed to reclaim it
 ```
 
@@ -100,18 +104,19 @@ DELETE FROM accounts WHERE account_id = 'ACC-1001';
 
 When a transaction begins (or a statement executes, depending on isolation level), PostgreSQL captures a **snapshot** containing:
 
-- **xmin:** The lowest active transaction ID
-- **xmax:** The next unassigned transaction ID (highest committed + 1)
-- **xip_list:** List of active (not yet committed) transaction IDs in [xmin, xmax)
+- **xmin:** The lowest transaction ID still running (everything below it has finished)
+- **xmax:** One past the highest finished transaction ID (everything from here on is "in the future")
+- **xip_list:** Transaction IDs in [xmin, xmax) that were still running when the snapshot was taken
 
-A tuple is **visible** to a snapshot if:
-1. `tuple.xmin` is committed and less than snapshot's `xmax`, AND
-2. `tuple.xmin` is not in `xip_list` (i.e., not still running when snapshot was taken)
-3. `tuple.xmax` is 0, OR `tuple.xmax` is not yet committed, OR `tuple.xmax` >= snapshot's `xmax`
+Simplified, a tuple is **visible** to a snapshot if:
+1. `tuple.xmin` committed, is below the snapshot's `xmax`, and is not in `xip_list` (or it is the current transaction's own change), AND
+2. `tuple.xmax` is 0 (or the deleting transaction aborted), OR the deleting transaction is invisible to the snapshot — still in `xip_list`, at or above `xmax`, or not committed
 
 ```sql
 -- Inspect current transaction snapshot
-SELECT txid_current_snapshot();
+-- (pg_current_snapshot() since PostgreSQL 13; txid_current_snapshot() is the
+--  older, deprecated name)
+SELECT pg_current_snapshot();
 -- Returns something like: 15490:15502:15491,15499
 -- Format: xmin:xmax:xip_list
 -- xmin=15490: oldest active transaction
@@ -158,24 +163,23 @@ REPEATABLE READ prevents non-repeatable reads and phantom reads, but it does NOT
 -- ACC-1001: balance = 500
 -- ACC-1002: balance = 500
 
--- Transaction T1 (payment from ACC-1001):
+-- Transaction T1 (payment of 600 from ACC-1001):
 BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
--- T1 reads combined balance: 500 + 500 = 1000
--- T1 decides: 800 is ok (1000 - 800 = 200 >= 0)
--- T1 debits ACC-1001: balance becomes -300... wait, that's wrong
--- Actually T1 reads ACC-1001 = 500, wants to debit 600:
 SELECT SUM(balance) FROM accounts WHERE customer_id = 'CUST-001';
--- Returns 1000: proceed with 600 debit from ACC-1001
+-- Returns 1000: 1000 - 600 = 400 >= 0, so proceed
+UPDATE accounts SET balance = balance - 600 WHERE account_id = 'ACC-1001';
 
 -- Transaction T2 (concurrent payment from ACC-1002):
 BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 -- T2 also reads combined balance: 500 + 500 = 1000 (same snapshot!)
 SELECT SUM(balance) FROM accounts WHERE customer_id = 'CUST-001';
 -- Returns 1000: proceed with 600 debit from ACC-1002
+UPDATE accounts SET balance = balance - 600 WHERE account_id = 'ACC-1002';
 
 -- T1 commits: ACC-1001 = -100 (500 - 600)
 -- T2 commits: ACC-1002 = -100 (500 - 600)
--- Total balance = -200! Both transactions passed validation but combined they're wrong
+-- Total balance = -200! Both passed validation, but combined they're wrong.
+-- They updated DIFFERENT rows, so no row lock or update conflict stopped them.
 ```
 
 ### 4.2 Fixing Write Skew
@@ -310,7 +314,8 @@ FROM pgstattuple('accounts');
 ```
 
 ```sql
--- More comprehensive bloat query (works without pgstattuple extension)
+-- Dead tuples and table size per table (no extension needed; a rough
+-- signal, not an exact bloat measurement)
 SELECT
     schemaname,
     tablename,
@@ -333,11 +338,11 @@ ORDER BY n_dead_tup DESC;
 VACUUM FULL accounts;
 ```
 
-For production financial systems, use `pg_repack` which rewrites tables online with minimal locking:
+For production financial systems, use `pg_repack`, which rewrites tables online. It needs a primary key (or unique index) on the table, extra disk space for the copy, and takes short `ACCESS EXCLUSIVE` locks at the start and end:
 
 ```bash
-# Install pg_repack
-apt-get install postgresql-14-repack
+# Install pg_repack (package name matches your PostgreSQL major version)
+apt-get install postgresql-16-repack
 
 # Repack a bloated table online (no long locks)
 pg_repack -d payments_db -t accounts --no-kill-backend
@@ -349,9 +354,11 @@ pg_repack -d payments_db -i accounts_account_id_idx
 ### 6.3 Monitoring Index Bloat
 
 ```sql
--- Estimate index bloat
+-- Index sizes and usage
+-- (pg_stat_user_indexes names its columns relname / indexrelname)
 SELECT
-    indexname,
+    relname      AS tablename,
+    indexrelname AS indexname,
     pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
     idx_scan,
     idx_tup_read,
@@ -360,17 +367,20 @@ FROM pg_stat_user_indexes
 WHERE schemaname = 'public'
 ORDER BY pg_relation_size(indexrelid) DESC;
 
--- Check for unused indexes (candidates for removal)
+-- Check for unused indexes (candidates for removal -- but keep UNIQUE /
+-- primary key indexes, and check read replicas first: idx_scan counts
+-- only this server)
 SELECT
-    schemaname,
-    tablename,
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
-    idx_scan AS times_used
-FROM pg_stat_user_indexes
-WHERE idx_scan = 0
-  AND schemaname NOT IN ('pg_catalog')
-ORDER BY pg_relation_size(indexrelid) DESC;
+    s.schemaname,
+    s.relname      AS tablename,
+    s.indexrelname AS indexname,
+    pg_size_pretty(pg_relation_size(s.indexrelid)) AS index_size,
+    s.idx_scan AS times_used
+FROM pg_stat_user_indexes s
+JOIN pg_index i ON i.indexrelid = s.indexrelid
+WHERE s.idx_scan = 0
+  AND NOT i.indisunique
+ORDER BY pg_relation_size(s.indexrelid) DESC;
 ```
 
 ---
@@ -379,13 +389,13 @@ ORDER BY pg_relation_size(indexrelid) DESC;
 
 ### 7.1 The Wraparound Problem
 
-PostgreSQL uses 32-bit transaction IDs. At roughly 2 billion transactions, the ID wraps around. Any tuple with an `xmin` older than 2 billion transactions would appear to be "in the future" and become invisible — effectively data loss.
+PostgreSQL uses 32-bit transaction IDs compared in a circle: only about 2 billion IDs can be "in the past" at any time. A tuple whose `xmin` is older than that would suddenly appear to be "in the future" and become invisible. PostgreSQL prevents this data loss by **refusing to assign new transaction IDs** (no more writes) when the oldest unfrozen ID gets close to that limit — an outage until VACUUM has frozen the old rows.
 
-This is not theoretical. In production financial systems processing millions of transactions per day, wraparound is a real operational risk.
+This is not theoretical. In production financial systems processing millions of transactions per day, a wraparound-protection outage is a real operational risk.
 
 ### 7.2 How VACUUM FREEZE Works
 
-VACUUM FREEZE replaces `xmin` values in old tuples with a special "frozen" transaction ID (`FrozenTransactionId = 2`), which is always considered visible. This permanently marks a tuple as committed and removes it from wraparound risk.
+Freezing marks old tuples as "frozen": visible to every transaction, no matter how far the ID counter moves on. (Since PostgreSQL 9.4 this is a flag bit on the tuple; older versions overwrote `xmin` with `FrozenTransactionId = 2`.) Regular (auto)vacuum freezes tuples older than `vacuum_freeze_min_age`; `VACUUM FREEZE` freezes everything it can.
 
 ```sql
 -- Check current transaction ID distance from wraparound
@@ -397,23 +407,26 @@ FROM pg_database
 ORDER BY age(datfrozenxid) DESC;
 -- WARNING: If xid_age approaches 2 billion, you face a forced shutdown
 
--- Check per-table frozen XID age
+-- Check per-table frozen XID age (join on the OID, not the name:
+-- the same table name can exist in several schemas)
 SELECT
-    schemaname,
-    relname,
-    age(relfrozenxid) AS xid_age,
-    n_dead_tup
+    t.schemaname,
+    t.relname,
+    age(c.relfrozenxid) AS xid_age,
+    t.n_dead_tup
 FROM pg_class c
-JOIN pg_stat_user_tables t ON c.relname = t.relname
-ORDER BY age(relfrozenxid) DESC
+JOIN pg_stat_user_tables t ON c.oid = t.relid
+ORDER BY age(c.relfrozenxid) DESC
 LIMIT 20;
 ```
 
 ```ini
-# postgresql.conf: aggressive freeze settings for high-TPS systems
-vacuum_freeze_min_age = 50000000          # default: 50M — freeze at 50M xid age
-vacuum_freeze_table_age = 150000000       # default: 150M — force full scan
-autovacuum_freeze_max_age = 200000000     # default: 200M — force autovacuum
+# postgresql.conf: freeze settings (the DEFAULTS are shown -- start here,
+# and make sure autovacuum keeps up before changing them)
+vacuum_freeze_min_age = 50000000          # freeze tuples older than 50M xids
+vacuum_freeze_table_age = 150000000       # aggressive (whole-table) vacuum at 150M
+autovacuum_freeze_max_age = 200000000     # anti-wraparound autovacuum at 200M,
+                                          # even if autovacuum is disabled
 ```
 
 ### 7.3 Emergency Freeze
@@ -427,7 +440,13 @@ VACUUM FREEZE VERBOSE accounts;
 VACUUM FREEZE;
 ```
 
-PostgreSQL will also automatically enter a "read-only" emergency mode when any database's transaction ID age exceeds `autovacuum_freeze_max_age` and forcibly runs autovacuum. This can appear as a sudden performance degradation with no apparent cause — monitor `age(datfrozenxid)` proactively.
+What happens as the age grows:
+- Above `autovacuum_freeze_max_age` (200M): PostgreSQL forces **anti-wraparound autovacuums** — heavy whole-table scans that can appear as a sudden performance degradation with no apparent cause.
+- Above `vacuum_failsafe_age` (1.6B, PostgreSQL 14+): vacuum switches to a fast "failsafe" mode, skipping cost-based throttling and index cleanup.
+- About 40M IDs before the limit: warnings appear in the log.
+- About 3M IDs before the limit: PostgreSQL stops assigning transaction IDs — writes fail until the database is vacuumed.
+
+Monitor `age(datfrozenxid)` proactively and alert long before any of these.
 
 ---
 
@@ -548,7 +567,7 @@ SELECT pg_terminate_backend(pid);
 
 ### 9.2 Checking Replication Slots Blocking VACUUM
 
-Replication slots (used by CDC tools like Debezium) can block VACUUM if the downstream consumer falls behind:
+Replication slots (used by CDC tools like Debezium, and by replicas) cause two problems when the consumer falls behind or disappears: the primary keeps **all WAL** the slot has not consumed (the disk can fill up), and the slot's `xmin` / `catalog_xmin` stops VACUUM from removing rows newer than that point (logical slots hold back the system catalogs; physical slots with `hot_standby_feedback` hold back all tables).
 
 ```sql
 -- Check replication slot lag
@@ -557,14 +576,18 @@ SELECT
     plugin,
     slot_type,
     active,
+    xmin,
+    catalog_xmin,
     restart_lsn,
     confirmed_flush_lsn,
     pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))
         AS retained_wal_size
 FROM pg_replication_slots;
 
--- If retained WAL is large and growing, the consumer is lagging
--- This prevents VACUUM from reclaiming dead tuples
+-- If retained WAL is large and growing, the consumer is lagging.
+-- Safety net (PostgreSQL 13+): max_slot_wal_keep_size = '50GB' -- a slot
+-- that would need more WAL than this is invalidated instead of filling
+-- the disk (the consumer must then re-snapshot).
 ```
 
 ### 9.3 Full MVCC Health Check Query
@@ -617,8 +640,10 @@ vacuum_freeze_table_age = 150000000
 
 # Shared buffers and memory (affects how many dead tuples stay in memory)
 shared_buffers = 4GB                   # 25% of RAM
-work_mem = 64MB                        # per sort/hash operation
-maintenance_work_mem = 1GB             # used by VACUUM
+work_mem = 64MB                        # per sort/hash operation, per query node
+                                       # (x many connections: size carefully)
+maintenance_work_mem = 1GB             # manual VACUUM, CREATE INDEX
+autovacuum_work_mem = 512MB            # per autovacuum worker (x max_workers)
 ```
 
 ---
@@ -664,12 +689,12 @@ MVCC is the foundation of PostgreSQL's concurrency model. Every UPDATE and DELET
       "text": "A Debezium CDC connector's replication slot has been inactive for 48 hours due to a connector crash. What is the operational risk and correct remediation?",
       "options": [
         "No risk — PostgreSQL will automatically clean the stale slot after 24 hours",
-        "WAL segments cannot be cleaned up while the slot is active, potentially filling the disk; drop the slot with pg_drop_replication_slot() after ensuring the data gap can be recovered via re-snapshot",
-        "The slot will cause transaction ID wraparound because it holds old xmin values",
+        "WAL segments the slot has not consumed cannot be removed, so the disk can fill up; drop the slot with pg_drop_replication_slot() after making sure the data gap can be recovered via a re-snapshot",
+        "The slot only affects the replica or connector, never the primary database",
         "Restart PostgreSQL to clear the stale replication slot"
       ],
       "correct": 1,
-      "explanation": "Replication slots prevent PostgreSQL from cleaning WAL segments that the slot has not yet consumed. An inactive slot for 48 hours means 48 hours of WAL accumulation — which can easily fill a disk on a high-TPS payment database. PostgreSQL will NOT auto-clean stale slots. The correct remediation is: (1) verify the Debezium connector is truly dead, (2) drop the slot with pg_drop_replication_slot(), (3) restart the connector which will perform a re-snapshot and resume from the current WAL position. The gap in CDC events must be handled in the downstream system."
+      "explanation": "Replication slots prevent PostgreSQL from removing WAL segments that the slot has not yet consumed. An inactive slot for 48 hours means 48 hours of WAL accumulation — which can easily fill a disk on a high-TPS payment database. (A logical slot also holds back catalog_xmin, which delays vacuuming of the system catalogs.) PostgreSQL does not drop stale slots by itself; since version 13, max_slot_wal_keep_size can invalidate a slot that falls too far behind. Remediation: (1) verify the connector is truly dead, (2) drop the slot with pg_drop_replication_slot(), (3) restart the connector, which re-snapshots and resumes from the current WAL position. The gap in CDC events must be handled in the downstream system."
     }
   ]
 }
@@ -681,10 +706,22 @@ MVCC is the foundation of PostgreSQL's concurrency model. Every UPDATE and DELET
   "difficulty": "advanced",
   "estimatedMinutes": 55,
   "tasks": [
-    {"id": "1", "description": "Write a SQL monitoring query that produces a health report for each financial table (accounts, transactions, ledger_entries) showing: dead tuple percentage, time since last autovacuum, estimated pages of bloat, HOT update percentage, and transaction ID age. Classify each metric as OK/WARNING/CRITICAL with appropriate thresholds for a high-TPS payment system."},
-    {"id": "2", "description": "Using a Testcontainers PostgreSQL instance, demonstrate table bloat accumulation: insert 100,000 rows into an accounts table, then update all rows 5 times (500,000 total UPDATEs with no VACUUM). Measure the physical table size before and after to quantify bloat. Then run VACUUM ANALYZE and measure the size reduction."},
-    {"id": "3", "description": "Configure per-table autovacuum settings for an accounts table that receives 2,000 UPDATEs/second. The goal is to prevent dead tuples from exceeding 1% of live tuples at any time. Calculate the required autovacuum_vacuum_scale_factor and autovacuum_vacuum_cost_limit settings, then validate with a pgbench workload."},
-    {"id": "4", "description": "Build a Spring Boot scheduled job that monitors pg_stat_archiver and pg_replication_slots, fires PagerDuty-style alerts when WAL archiving lag exceeds 2 minutes or replication slot lag exceeds 100MB. Include a circuit breaker that drops a named replication slot after 1GB of lag accumulation (with appropriate logging and audit trail)."}
+    {
+      "id": "1",
+      "description": "Write a SQL monitoring query that produces a health report for each financial table (accounts, transactions, ledger_entries) showing: dead tuple percentage, time since last autovacuum, estimated pages of bloat, HOT update percentage, and transaction ID age. Classify each metric as OK/WARNING/CRITICAL with appropriate thresholds for a high-TPS payment system."
+    },
+    {
+      "id": "2",
+      "description": "Using a Testcontainers PostgreSQL instance, demonstrate table bloat accumulation: insert 100,000 rows into an accounts table, then update all rows 5 times (500,000 total UPDATEs with no VACUUM). Measure the physical table size before and after to quantify bloat. Then run VACUUM ANALYZE and measure the size reduction."
+    },
+    {
+      "id": "3",
+      "description": "Configure per-table autovacuum settings for an accounts table that receives 2,000 UPDATEs/second. The goal is to prevent dead tuples from exceeding 1% of live tuples at any time. Calculate the required autovacuum_vacuum_scale_factor and autovacuum_vacuum_cost_limit settings, then validate with a pgbench workload."
+    },
+    {
+      "id": "4",
+      "description": "Build a Spring Boot scheduled job that monitors pg_stat_archiver and pg_replication_slots and fires PagerDuty-style alerts when WAL archiving lag exceeds 2 minutes or replication slot lag exceeds 100MB. Configure max_slot_wal_keep_size as the database-side safety net, and document the runbook for dropping a dead slot (with audit trail) instead of dropping slots automatically from the application."
+    }
   ]
 }
 -->

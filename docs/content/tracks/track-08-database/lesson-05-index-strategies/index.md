@@ -76,7 +76,7 @@ ON transactions (account_id, transaction_date DESC);
 
 ### 2.2 Composite Index Column Order
 
-The most selective column should generally be first (reduces tree traversal):
+The usual rule: columns compared with **equality** first, the **range** (or sort) column last. Among the equality columns, order matters less — choose an order that also serves other queries, because only a leading prefix of the index can be used efficiently:
 
 ```sql
 -- Financial transaction lookup: account_id is highly selective, status is not
@@ -138,7 +138,7 @@ LIMIT 50;
 
 ### 3.2 When INCLUDE Is Worthwhile
 
-Index-only scans require the heap's visibility map to be current (maintained by VACUUM). Check index-only scan effectiveness:
+Index-only scans require the heap's visibility map to be current (maintained by VACUUM): pages changed since the last vacuum still need a heap visit. The most reliable check is `EXPLAIN (ANALYZE)` — it shows `Heap Fetches: N` on an Index Only Scan node. The statistics view gives a rough, cumulative picture:
 
 ```sql
 SELECT
@@ -148,8 +148,9 @@ SELECT
     idx_tup_fetch
 FROM pg_stat_user_indexes
 WHERE relname = 'transactions';
--- idx_tup_fetch = 0 means all scans are index-only (ideal)
--- idx_tup_fetch > 0 means heap fetches are occurring (VACUUM needed or INCLUDE)
+-- idx_tup_fetch counts live rows fetched from the heap by plain index scans;
+-- a value far below idx_tup_read suggests index-only scans are working.
+-- Confirm per query with EXPLAIN (ANALYZE) -> Heap Fetches
 ```
 
 ---
@@ -221,6 +222,8 @@ SELECT * FROM beneficiaries
 WHERE lower(name) = lower('John Smith');
 
 -- Date truncation for month-based aggregation
+-- (works because transaction_date is a DATE; on a TIMESTAMPTZ column
+--  date_trunc depends on the session time zone and cannot be indexed)
 CREATE INDEX idx_txn_month
 ON transactions (date_trunc('month', transaction_date));
 
@@ -231,9 +234,12 @@ FROM transactions
 WHERE date_trunc('month', transaction_date) = '2024-01-01'
 GROUP BY 1;
 
--- Last 4 digits of card number for masked display queries
+-- Last 4 digits of the card number for masked display / support search:
+-- store them in their own column (PCI DSS allows keeping the last four).
+-- The last characters of an encrypted value or hash are NOT the card's
+-- last four digits.
 CREATE INDEX idx_card_last4
-ON payment_cards (right(card_number_encrypted_hash, 4));
+ON payment_cards (card_last4, customer_id);
 ```
 
 ---
@@ -291,10 +297,15 @@ ON transactions USING GIN ((metadata->'risk_flags'));
 ### 6.3 Full-Text Search on Financial Descriptions
 
 ```sql
--- Add tsvector column for full-text search on transaction descriptions
+-- Add tsvector column for full-text search on transaction descriptions.
+-- PostgreSQL 12+: a generated column keeps it in sync automatically
+-- (this rewrites the table -- plan it like any table rewrite):
+--   ALTER TABLE transactions ADD COLUMN search_vector TSVECTOR
+--     GENERATED ALWAYS AS (to_tsvector('english', coalesce(description, ''))) STORED;
+-- Older approach: plain column + trigger, as below
 ALTER TABLE transactions ADD COLUMN search_vector TSVECTOR;
 
--- Populate from description
+-- Populate from description (in batches on a large table)
 UPDATE transactions
 SET search_vector = to_tsvector('english', description);
 
@@ -324,6 +335,9 @@ GiST (Generalized Search Tree) supports geometric, range, and custom data types.
 
 ```sql
 -- Exchange rates with validity periods (using tstzrange)
+-- "=" on plain columns inside a GiST exclusion constraint needs btree_gist
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
 CREATE TABLE exchange_rates (
     rate_id      BIGSERIAL PRIMARY KEY,
     from_currency CHAR(3) NOT NULL,
@@ -337,9 +351,9 @@ CREATE TABLE exchange_rates (
     )
 );
 
--- GiST index on the range column
-CREATE INDEX idx_exchange_rates_valid
-ON exchange_rates USING GIST (from_currency, to_currency, valid_during);
+-- The exclusion constraint already created a GiST index on
+-- (from_currency, to_currency, valid_during) -- the query below uses it.
+-- No separate index is needed.
 
 -- Query: find rate valid at a specific time
 SELECT rate
@@ -364,8 +378,8 @@ CREATE TABLE fee_schedules (
     )
 );
 
-CREATE INDEX idx_fee_schedule_range
-ON fee_schedules USING GIST (product_code, amount_range);
+-- (The exclusion constraint's GiST index also serves the lookup below;
+--  btree_gist is needed for "product_code WITH =".)
 
 -- Find applicable fee for a 500 transaction
 SELECT fee_percent
@@ -436,10 +450,11 @@ WHERE created_at >= NOW() - INTERVAL '1 day';
 
 ```sql
 -- Identify unused indexes (candidates for removal)
+-- (pg_stat_user_indexes names its columns relname / indexrelname)
 SELECT
     schemaname,
-    tablename,
-    indexname,
+    relname      AS tablename,
+    indexrelname AS indexname,
     pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
     idx_scan AS scan_count,
     idx_tup_read,
@@ -449,8 +464,9 @@ WHERE schemaname = 'public'
   AND idx_scan < 10  -- Used fewer than 10 times since last stats reset
 ORDER BY pg_relation_size(indexrelid) DESC;
 
--- Note: stats are reset by pg_stat_reset() or server restart
--- Run for at least a week before drawing conclusions
+-- Note: stats are reset by pg_stat_reset() or crash recovery (and on every
+-- restart before PostgreSQL 15). Cover at least a full business cycle, keep
+-- UNIQUE/primary-key indexes, and check read replicas (idx_scan is per server)
 ```
 
 ### 9.2 Missing Index Detection
@@ -475,26 +491,21 @@ LIMIT 20;
 ### 9.3 Index Bloat Check
 
 ```sql
--- B-tree index bloat estimation
+-- B-tree index bloat: measure it with pgstatindex() (pgstattuple extension)
+-- instead of rough formulas -- it reads the whole index, so run it off-peak
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
 SELECT
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS current_size,
-    round(100.0 * (relpages - estimated_pages) / NULLIF(relpages, 0), 2)
-        AS bloat_pct
-FROM (
-    SELECT
-        c.relname AS indexname,
-        c.oid AS indexrelid,
-        c.relpages,
-        ceil(c.reltuples * 1.0
-             / floor((8192 - 24) / (8 + 6))) AS estimated_pages
-    FROM pg_class c
-    JOIN pg_index i ON i.indexrelid = c.oid
-    WHERE c.relkind = 'i'
-      AND c.relname NOT LIKE 'pg_%'
-) sub
-WHERE relpages > 10
-ORDER BY bloat_pct DESC
+    c.relname AS indexname,
+    pg_size_pretty(pg_relation_size(c.oid)) AS current_size,
+    round(s.avg_leaf_density::numeric, 1)   AS leaf_density_pct,  -- ~90 when fresh
+    s.leaf_fragmentation
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_am am   ON am.oid = c.relam AND am.amname = 'btree'
+CROSS JOIN LATERAL pgstatindex(c.oid) s
+WHERE i.indrelid = 'transactions'::regclass
+ORDER BY s.avg_leaf_density
 LIMIT 20;
 ```
 
@@ -506,58 +517,83 @@ Always use `CONCURRENTLY` for index creation in production:
 
 ```java
 @Component
+@Slf4j
 public class SafeIndexCreator {
 
-    @Autowired
-    private JdbcTemplate jdbcTemplate;
+    private static final Pattern IDENTIFIER = Pattern.compile("[a-z_][a-z0-9_]*");
+
+    private final JdbcTemplate jdbcTemplate;   // plain auto-commit connection
+
+    public SafeIndexCreator(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
 
     /**
      * Creates an index concurrently without blocking production traffic.
-     * Note: Cannot be called inside a transaction (Spring @Transactional).
-     * CONCURRENTLY requires the statement to run outside any transaction block.
+     * CONCURRENTLY cannot run inside a transaction block -- never call this
+     * from a @Transactional method.
      */
     public void createIndexConcurrently(String indexName,
-                                         String tableName,
-                                         String columnExpression) {
-        // Check if index already exists
-        Integer count = jdbcTemplate.queryForObject(
-            "SELECT COUNT(*) FROM pg_indexes WHERE indexname = ?",
-            Integer.class, indexName);
+                                        String tableName,
+                                        String columnExpression) {
+        // Names are spliced into SQL: accept only simple identifiers.
+        // columnExpression must come from code, never from user input.
+        if (!IDENTIFIER.matcher(indexName).matches()
+                || !IDENTIFIER.matcher(tableName).matches()) {
+            throw new IllegalArgumentException("Invalid identifier");
+        }
 
-        if (count != null && count > 0) {
-            log.info("Index {} already exists, skipping creation", indexName);
+        // An earlier failed CONCURRENTLY run leaves an INVALID index behind.
+        // "IF NOT EXISTS" would then silently keep the broken index.
+        Boolean valid = jdbcTemplate.query(
+            "SELECT i.indisvalid FROM pg_index i " +
+            "JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = ?",
+            rs -> rs.next() ? rs.getBoolean(1) : null, indexName);
+
+        if (Boolean.TRUE.equals(valid)) {
+            log.info("Index {} already exists and is valid, skipping", indexName);
             return;
+        }
+        if (Boolean.FALSE.equals(valid)) {
+            log.warn("Index {} exists but is INVALID -- dropping it first", indexName);
+            jdbcTemplate.execute("DROP INDEX CONCURRENTLY " + indexName);
         }
 
         log.info("Creating index {} on {}", indexName, tableName);
-        // Note: executeUpdate on a non-transactional JdbcTemplate
-        jdbcTemplate.execute(String.format(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s (%s)",
-            indexName, tableName, columnExpression));
-
+        // Both statements must run on the SAME pooled connection
+        jdbcTemplate.execute((ConnectionCallback<Void>) con -> {
+            try (Statement st = con.createStatement()) {
+                st.execute("SET lock_timeout = '5s'");      // don't queue forever
+                st.execute(String.format(
+                    "CREATE INDEX CONCURRENTLY %s ON %s (%s)",
+                    indexName, tableName, columnExpression));
+                st.execute("RESET lock_timeout");           // clean pooled connection
+            }
+            return null;
+        });
         log.info("Index {} created successfully", indexName);
     }
 }
 ```
 
 ```sql
--- CONCURRENTLY takes two passes over the table:
+-- CONCURRENTLY scans the table twice and waits for running transactions
+-- between the phases:
 -- Pass 1: build index from current data
 -- Pass 2: catch any changes made during pass 1
--- This means it takes ~2x longer than a standard CREATE INDEX
--- but allows reads and writes throughout
+-- So it takes noticeably longer than a standard CREATE INDEX (and a long
+-- transaction elsewhere can stall it), but reads and writes continue
 
 CREATE INDEX CONCURRENTLY idx_txn_account_date_new
 ON transactions (account_id, transaction_date DESC)
 INCLUDE (amount, currency, status);
 
 -- Check for invalid indexes (failed CONCURRENTLY creates)
-SELECT indexname, indisvalid
-FROM pg_indexes
-JOIN pg_class ON pg_class.relname = indexname
-JOIN pg_index ON pg_index.indexrelid = pg_class.oid
-WHERE tablename = 'transactions'
-  AND NOT indisvalid;
+SELECT c.relname AS indexname, i.indisvalid
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+WHERE i.indrelid = 'transactions'::regclass
+  AND NOT i.indisvalid;
 -- Invalid indexes must be dropped and recreated
 ```
 
@@ -569,12 +605,14 @@ WHERE tablename = 'transactions'
 
 ```sql
 -- Core account lookup indexes
-CREATE UNIQUE INDEX idx_accounts_pk
-ON accounts (account_id);  -- Primary key (implicit)
+-- (The PRIMARY KEY on account_id already has its own unique index --
+--  never create a second one.)
 
 CREATE INDEX idx_accounts_customer
 ON accounts (customer_id)
-INCLUDE (account_id, balance, currency, status);  -- Covering for customer view
+INCLUDE (account_id, currency, status);  -- Covering for customer view
+-- balance is deliberately NOT included: it changes on every payment, and
+-- any indexed column prevents cheap HOT updates of the hottest table
 
 CREATE INDEX idx_accounts_active_iban
 ON accounts (iban)
@@ -593,7 +631,9 @@ CREATE INDEX idx_txn_reference
 ON transactions (reference_id)
 WHERE reference_id IS NOT NULL;  -- Deduplication lookups
 
--- Reporting index (separate from OLTP indexes)
+-- Reporting index -- every extra index slows every insert; consider
+-- running heavy reports on a read replica with its own needs in mind
+-- (replicas share the primary's indexes, so weigh the write cost)
 CREATE INDEX idx_txn_date_amount
 ON transactions (transaction_date, amount)
 INCLUDE (account_id, currency, merchant_category);
@@ -603,7 +643,8 @@ INCLUDE (account_id, currency, merchant_category);
 ### 11.2 Index Maintenance Schedule
 
 ```sql
--- Schedule regular REINDEX CONCURRENTLY for bloated indexes
+-- REINDEX CONCURRENTLY indexes whose MEASURED bloat calls for it
+-- (pgstatindex, section 9.3) -- not on a fixed schedule.
 -- Run during low-traffic windows
 REINDEX INDEX CONCURRENTLY idx_txn_account_date;
 
@@ -658,10 +699,22 @@ Effective index strategy for financial databases requires matching index types t
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Given a transactions table with columns (transaction_id, account_id, merchant_id, amount, currency, status, transaction_date, created_at, metadata JSONB), design and create the complete index strategy for these five query patterns: (a) account transaction history with date range, (b) pending transaction queue by account, (c) merchant settlement totals, (d) JSONB metadata containment search by processor, (e) append-only audit range queries. Justify each index type chosen."},
-    {"id": "2", "description": "Create a covering index for the account transaction history query pattern and verify with EXPLAIN (ANALYZE, BUFFERS) that PostgreSQL uses an Index Only Scan (zero heap fetches). Insert 100,000 rows and run VACUUM to ensure the visibility map is current before testing."},
-    {"id": "3", "description": "Write a SafeIndexCreator Java class that checks if an index already exists before attempting CREATE INDEX CONCURRENTLY, logs the creation progress, and handles the case where a previous CONCURRENTLY run left an invalid index (detected via pg_index.indisvalid). The class must not be called inside a @Transactional method."},
-    {"id": "4", "description": "Build an index monitoring dashboard query that reports: unused indexes (idx_scan < 10), indexes with high heap fetch ratios (idx_tup_fetch > 0 for read-heavy indexes), and estimated index bloat percentage. Schedule this as a weekly Prometheus metric collection job and set an alert if any index exceeds 30% bloat."}
+    {
+      "id": "1",
+      "description": "Given a transactions table with columns (transaction_id, account_id, merchant_id, amount, currency, status, transaction_date, created_at, metadata JSONB), design and create the complete index strategy for these five query patterns: (a) account transaction history with date range, (b) pending transaction queue by account, (c) merchant settlement totals, (d) JSONB metadata containment search by processor, (e) append-only audit range queries. Justify each index type chosen."
+    },
+    {
+      "id": "2",
+      "description": "Create a covering index for the account transaction history query pattern and verify with EXPLAIN (ANALYZE, BUFFERS) that PostgreSQL uses an Index Only Scan (zero heap fetches). Insert 100,000 rows and run VACUUM to ensure the visibility map is current before testing."
+    },
+    {
+      "id": "3",
+      "description": "Write a SafeIndexCreator Java class that checks if an index already exists before attempting CREATE INDEX CONCURRENTLY, logs the creation progress, and handles the case where a previous CONCURRENTLY run left an invalid index (detected via pg_index.indisvalid). The class must not be called inside a @Transactional method."
+    },
+    {
+      "id": "4",
+      "description": "Build an index monitoring report that lists: unused indexes (idx_scan < 10, excluding unique indexes), indexes whose queries still show many heap fetches (EXPLAIN ANALYZE \"Heap Fetches\" on key queries), and B-tree bloat measured with pgstatindex() (leaf density). Collect the numbers weekly as Prometheus metrics and alert when an index's leaf density drops below ~60%."
+    }
   ]
 }
 -->

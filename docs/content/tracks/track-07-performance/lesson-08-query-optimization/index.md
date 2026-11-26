@@ -73,14 +73,14 @@ Each node in the plan tree reports two cost tuples:
 
 | Field | Meaning |
 |---|---|
-| `cost=startup..total` | Planner's estimated cost in arbitrary units (8KB pages) |
+| `cost=startup..total` | Planner's estimated cost in arbitrary units (1.0 = one sequential 8 KB page read, `seq_page_cost`) |
 | `rows=N` | Planner's estimated output rows |
 | `width=N` | Estimated average row width in bytes |
-| `actual time=start..end` | Real wall-clock time in milliseconds |
-| `actual rows=N` | Rows actually produced by this node |
-| `loops=N` | How many times this node was executed |
+| `actual time=start..end` | Real wall-clock time in milliseconds, **per loop** |
+| `actual rows=N` | Rows actually produced by this node, **per loop** (average) |
+| `loops=N` | How many times this node was executed — multiply time and rows by it |
 
-**Critical insight**: When `rows` (estimate) diverges significantly from `actual rows` (reality), the planner made a bad decision based on stale statistics. Run `ANALYZE transactions;` and re-examine.
+**Critical insight**: When `rows` (estimate) diverges significantly from `actual rows` (reality), the planner chose its plan on wrong assumptions. Common causes: stale statistics (run `ANALYZE transactions;` and re-examine), correlated columns (see extended statistics in section 8), or expressions and functions the planner cannot estimate.
 
 ### Buffer Statistics
 
@@ -90,10 +90,10 @@ Buffers: shared hit=4821 read=1203
 
 - `shared hit` — pages found in PostgreSQL's shared buffer cache (fast, ~0.1 µs)
 - `read` — pages read from OS page cache or disk (slower, 0.1–10 ms)
-- `written` — dirty pages flushed during the query (indicates checkpoint pressure)
+- `dirtied` / `written` — pages this query modified / had to write out itself to free buffers (frequent backend writes suggest `shared_buffers` or the background writer cannot keep up)
 - `local hit/read` — temporary table access
 
-A high `read` count on a query that runs frequently is a cache-sizing problem. The rule of thumb: working set should fit in `shared_buffers` (typically 25% of RAM).
+A high `read` count on a query that runs frequently is either a cache-sizing problem or a query reading far more pages than it needs (often a missing index). Rule of thumb: `shared_buffers` is commonly ~25% of RAM, and the OS page cache holds much of the rest of the working set.
 
 ## 2. Sequential Scan vs Index Scan vs Index-Only Scan
 
@@ -102,7 +102,7 @@ The planner chooses a scan strategy based on cost estimates derived from table s
 ### Sequential Scan
 
 ```sql
--- PostgreSQL will likely choose Seq Scan here (high selectivity)
+-- PostgreSQL will likely choose Seq Scan here: the condition matches most rows
 EXPLAIN SELECT COUNT(*) FROM transactions WHERE amount > 0;
 
 -- Output:
@@ -111,14 +111,14 @@ EXPLAIN SELECT COUNT(*) FROM transactions WHERE amount > 0;
 ```
 
 Sequential scan reads every page of the table in order. It wins when:
-- Selectivity is low (returning > ~5–15% of rows)
-- The table fits in shared_buffers
+- The query returns a large fraction of the rows (roughly more than 5–15%; the exact point depends on row size and physical order)
+- The table is small
 - There is no suitable index
 
 ### Index Scan
 
 ```sql
--- High selectivity: index scan wins
+-- Very few rows match: index scan wins
 EXPLAIN SELECT * FROM transactions WHERE id = 'txn_abc123';
 
 -- Output:
@@ -149,7 +149,7 @@ GROUP BY account_id;
 
 Index-only scans skip the heap entirely when:
 1. All projected columns are in the index
-2. The visibility map shows the page is all-visible (no dead tuples to check)
+2. The visibility map shows the page is all-visible (every row on it is visible to all transactions) — this is set by VACUUM, so tables with many recent updates get more heap fetches
 
 **Financial impact**: For account balance summary queries running millions of times per day, index-only scans reduce I/O by orders of magnitude.
 
@@ -200,14 +200,14 @@ Nested Loop  (cost=0.56..9823.45 rows=1250 width=72)
 ```
 Hash Join  (cost=1823.00..12462.00 rows=24800 width=72)
   Hash Cond: (t.account_id = a.id)
-  ->  Seq Scan on transactions t  (build side: 24800 rows)
-  ->  Hash
-        ->  Seq Scan on accounts a  (probe side: 80000 rows)
+  ->  Seq Scan on transactions t  (outer / probe side: 24800 rows)
+  ->  Hash                         (inner / build side: hashed in memory)
+        ->  Seq Scan on accounts a
 ```
 
-**Best when**: joining two large relations without a suitable index. Builds a hash table on the smaller relation, probes with the larger.
+**Best when**: joining two large relations without a suitable index. Builds a hash table on one input (usually the smaller — the child of the `Hash` node), then probes it with each row of the other.
 
-**Cost**: O(N+M) with high memory usage. If the hash table exceeds `work_mem`, it spills to disk (Batches > 1 in EXPLAIN output — a red flag).
+**Cost**: O(N+M) with high memory usage. If the hash table exceeds its memory limit (`work_mem` × `hash_mem_multiplier`, default 2.0 since PostgreSQL 15), it spills to disk (Batches > 1 in EXPLAIN output — a red flag).
 
 ```sql
 -- Tune work_mem per session for a known-expensive report query
@@ -225,7 +225,7 @@ Merge Join  (cost=45678.00..56789.00 rows=24800 width=72)
   ->  Sort on accounts     (id)
 ```
 
-**Best when**: both relations are already sorted on the join key (e.g., both have indexes used for sorting). Rarely seen in practice unless the planner can avoid the sort step.
+**Best when**: both relations are already sorted on the join key (e.g., both have indexes used for sorting), or the result must be sorted on that key anyway. Less common in OLTP workloads than nested loop and hash joins.
 
 ### Forcing Join Strategies for Testing
 
@@ -271,10 +271,11 @@ The `Gather` node collects results from worker processes. `loops=5` means 1 lead
 **Financial use case**: End-of-day reconciliation, fraud batch scoring, regulatory reporting — these benefit enormously from parallel plans.
 
 ```sql
--- Force parallel scan for large batch queries
+-- Let the planner use more workers for scans of this table
+-- (it does not force a parallel plan)
 ALTER TABLE transactions SET (parallel_workers = 8);
 
--- Or set per query
+-- Or for the current session (e.g. a reporting job)
 SET max_parallel_workers_per_gather = 8;
 SET parallel_setup_cost = 100;      -- lower barrier to parallel
 SET parallel_tuple_cost = 0.01;     -- lower cost per parallel tuple
@@ -285,13 +286,13 @@ SET parallel_tuple_cost = 0.01;     -- lower cost per parallel tuple
 `pg_stat_statements` aggregates query execution statistics across all calls. It is the first tool to reach for when investigating production performance.
 
 ```sql
--- Enable the extension
-CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
-
--- postgresql.conf settings:
+-- 1) postgresql.conf (needs a server RESTART):
 -- shared_preload_libraries = 'pg_stat_statements'
 -- pg_stat_statements.track = all
 -- pg_stat_statements.max = 10000
+
+-- 2) then, in the database:
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 ```
 
 ### Finding the Most Expensive Queries
@@ -350,22 +351,23 @@ SELECT pg_stat_statements_reset();
 `pg_stat_statements` shows aggregate statistics but not the actual plan. `auto_explain` logs the full EXPLAIN ANALYZE output for queries exceeding a threshold.
 
 ```sql
--- Load the extension
-LOAD 'auto_explain';
-
--- Configure in postgresql.conf (or ALTER SYSTEM):
+-- Configure in postgresql.conf (or ALTER SYSTEM; preload needs a restart):
 -- shared_preload_libraries = 'auto_explain'
 -- auto_explain.log_min_duration = 1000    -- log queries > 1 second
--- auto_explain.log_analyze = true         -- include actual timing
+-- auto_explain.log_analyze = true         -- include actual rows/timing; adds
+--                                          -- overhead to EVERY sampled query,
+--                                          -- so combine with sample_rate and
+-- auto_explain.log_timing = false         -- (optionally) skip per-node timing
 -- auto_explain.log_buffers = true         -- include buffer stats
 -- auto_explain.log_format = text          -- or json for tooling
 -- auto_explain.log_nested_statements = true
 -- auto_explain.sample_rate = 0.01         -- 1% sample in high-volume systems
 ```
 
-For session-level testing (no restart required):
+For session-level testing (no restart required; `LOAD` needs superuser):
 
 ```sql
+LOAD 'auto_explain';
 SET auto_explain.log_min_duration = 100;  -- 100 ms threshold
 SET auto_explain.log_analyze = true;
 SET auto_explain.log_buffers = true;
@@ -400,7 +402,8 @@ SELECT balance, currency, status, version
 FROM accounts
 WHERE account_number = $1;
 
--- EXPLAIN output (without index on account_number):
+-- EXPLAIN output IF account_number had no index
+-- (here the UNIQUE constraint already creates one):
 -- Seq Scan on accounts  (cost=0.00..1823.00 rows=1 width=36)
 --   Filter: (account_number = $1)
 ```
@@ -425,13 +428,15 @@ WHERE account_number = $1;
 -- Execution Time: 0.058 ms
 ```
 
-For a covering index (index-only scan when version/status are frequently read with balance):
+A covering index can turn this into an index-only scan:
 
 ```sql
 CREATE INDEX idx_accounts_balance_lookup
     ON accounts (account_number)
     INCLUDE (balance, currency, status, version);
 ```
+
+**Be careful on this table.** `balance` and `version` change on every payment. Columns in an index (including `INCLUDE` columns) disable PostgreSQL's cheap HOT updates, so every balance update must also write new index entries — more write I/O and index bloat. And the frequently updated pages are rarely all-visible, so the "index-only" scan still visits the heap. For hot, frequently updated rows, the plain unique index (3 buffer hits, well under a millisecond) is usually the better trade-off.
 
 ### Pattern 2: Transaction History by Date Range
 
@@ -484,7 +489,7 @@ CREATE INDEX idx_transactions_account_date
 --   Heap Fetches: 0
 ```
 
-**Key rule**: Place equality conditions first in the composite index, range conditions last. This allows the B-tree to narrow down to a single account's transactions before scanning the date range.
+**Key rule**: Place equality conditions first in the composite index, range conditions last. This allows the B-tree to narrow down to a single account's transactions before scanning the date range. (The `INCLUDE` list makes the index bigger, and including `status` means a status change can no longer be a HOT update — include only columns the hot query really needs.)
 
 ### Pattern 3: Pending Transaction Count (Fraud Check)
 
@@ -607,11 +612,14 @@ public class TransactionQueryService {
 
     private final JdbcTemplate jdbcTemplate;
     private final MeterRegistry meterRegistry;
+    private final boolean planLoggingEnabled;
 
     public TransactionQueryService(JdbcTemplate jdbcTemplate,
-                                   MeterRegistry meterRegistry) {
+                                   MeterRegistry meterRegistry,
+                                   @Value("${app.plan-logging:false}") boolean planLoggingEnabled) {
         this.jdbcTemplate = jdbcTemplate;
         this.meterRegistry = meterRegistry;
+        this.planLoggingEnabled = planLoggingEnabled;
     }
 
     /**
@@ -645,11 +653,17 @@ public class TransactionQueryService {
 
     /**
      * Log query plan for a specific query in a development/staging context.
-     * Never run EXPLAIN ANALYZE in production hot paths — it disables caching.
+     * Never run EXPLAIN ANALYZE in production hot paths: it really EXECUTES
+     * the query (including any INSERT/UPDATE) and adds timing overhead.
+     * (@Profile only works on beans/@Bean methods, not on an ordinary
+     * method -- so guard with a flag instead.)
      */
-    @Profile("!production")
     public void logQueryPlan(String accountNumber) {
-        String plan = jdbcTemplate.queryForObject(
+        if (!planLoggingEnabled) {          // e.g. @Value("${app.plan-logging:false}")
+            return;
+        }
+        // Text EXPLAIN returns one row per plan line -- collect them all
+        List<String> lines = jdbcTemplate.queryForList(
             """
             EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
             SELECT balance, currency, status, version
@@ -659,12 +673,13 @@ public class TransactionQueryService {
             String.class,
             accountNumber
         );
-        log.info("Query plan for balance_lookup:\n{}", plan);
+        log.info("Query plan for balance_lookup:\n{}", String.join("\n", lines));
     }
 
     /**
      * Transaction history with pagination.
      * Uses keyset pagination instead of OFFSET for large datasets.
+     * Best supported by an index on (account_id, created_at DESC, id DESC).
      */
     public List<TransactionSummary> getTransactionHistory(
             UUID accountId,
@@ -687,7 +702,7 @@ public class TransactionQueryService {
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?
                 """;
-            params = new Object[]{accountId, from, to, limit};
+            params = new Object[]{accountId, Timestamp.from(from), Timestamp.from(to), limit};
         } else {
             // Subsequent pages (keyset — no OFFSET scan)
             sql = """
@@ -699,13 +714,15 @@ public class TransactionQueryService {
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?
                 """;
-            params = new Object[]{accountId, from, to,
-                                  lastSeenDate, lastSeenId, limit};
+            // pgjdbc does not bind java.time.Instant directly -- use Timestamp
+            // (or OffsetDateTime)
+            params = new Object[]{accountId, Timestamp.from(from), Timestamp.from(to),
+                                  Timestamp.from(lastSeenDate), lastSeenId, limit};
         }
 
         return jdbcTemplate.query(sql, (rs, rowNum) ->
             new TransactionSummary(
-                UUID.fromString(rs.getString("id")),
+                rs.getObject("id", UUID.class),
                 rs.getBigDecimal("amount"),
                 rs.getString("currency"),
                 rs.getString("status"),
@@ -729,6 +746,7 @@ Automate plan validation using Testcontainers:
 class QueryPlanRegressionTest {
 
     @Container
+    @ServiceConnection          // Spring Boot 3.1+: points the DataSource at the container
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16")
         .withDatabaseName("fintech_test")
         .withInitScript("schema.sql");
@@ -740,6 +758,7 @@ class QueryPlanRegressionTest {
     void balanceLookupShouldUseIndexScan() {
         // Seed enough data for the planner to prefer an index
         seedAccounts(100_000);
+        jdbcTemplate.execute("ANALYZE accounts");   // fresh statistics for the planner
 
         String plan = jdbcTemplate.queryForObject(
             "EXPLAIN SELECT balance FROM accounts WHERE account_number = 'ACC0001'",
@@ -756,6 +775,7 @@ class QueryPlanRegressionTest {
     void transactionHistoryShouldNotUseOffset() {
         // This test validates keyset pagination is used in service layer
         seedTransactions(500_000);
+        jdbcTemplate.execute("ANALYZE transactions");
 
         String plan = jdbcTemplate.queryForObject(
             """
@@ -787,8 +807,8 @@ class QueryPlanRegressionTest {
             String.class
         );
 
-        // Parse JSON and check Batches == 1 (no spill)
-        assertThat(plan).contains("\"Batches\": 1");
+        // JSON plans name the field "Hash Batches"; 1 means no spill
+        assertThat(plan).contains("\"Hash Batches\": 1");
     }
 }
 ```
@@ -800,6 +820,8 @@ For complex multi-join plans, text output is unwieldy. Use these tools:
 - **explain.depesz.com** — paste text EXPLAIN output, get colour-coded node costs
 - **explain.dalibo.com (pev2)** — interactive tree with per-node timing bars
 - **pgMustard** — automated recommendations from EXPLAIN output
+
+(Plans can reveal table names and literal values — follow your data rules before pasting them into an external service.)
 
 For JSON format (better for tooling):
 
@@ -819,14 +841,14 @@ When a payment query is slow, follow this sequence:
 3. **Check buffer stats**: High `read` count → cache miss → needs index or `shared_buffers` increase
 4. **Identify the expensive node**: The node with the highest `actual time` exclusive cost
 5. **Check join strategy**: Hash join with Batches > 1 → increase `work_mem`
-6. **Check index usage**: Seq scan on a large table with high selectivity → needs an index
+6. **Check index usage**: Seq scan on a large table that returns only a few rows → needs an index
 7. **Check partial filter rows**: Large "Rows Removed by Filter" → consider a partial index
 8. **Verify statistics**: `pg_stat_user_tables` → stale stats → run `ANALYZE`
 9. **Test the fix**: Re-run `EXPLAIN ANALYZE` to verify improvement
 10. **Add a regression test**: Testcontainers plan assertion in CI
 
 > [!WARNING]
-> Never run `EXPLAIN ANALYZE` on production hot paths in automated code. It executes the query and disables caching for that execution. Use `pg_stat_statements` and `auto_explain` for production diagnosis.
+> Never run `EXPLAIN ANALYZE` on production hot paths in automated code. It really executes the query — an `EXPLAIN ANALYZE UPDATE` changes data unless wrapped in a transaction you roll back — and its timing adds overhead. Use `pg_stat_statements` and `auto_explain` for production diagnosis.
 
 <!-- KNOWLEDGE-CHECK
 {
@@ -835,7 +857,7 @@ When a payment query is slow, follow this sequence:
       "text": "An EXPLAIN ANALYZE output shows 'Rows Removed by Filter: 95000' under a Seq Scan node. What does this indicate and what is the appropriate fix?",
       "options": [
         "The query is working correctly; rows removed by filter is normal for WHERE clauses",
-        "The planner estimated 95,000 rows would be removed but only a few remain after filtering, indicating high selectivity — an index on the filtered column would allow an Index Scan instead",
+        "The scan read and discarded 95,000 rows to return only a few — the predicate is selective, so an index on the filtered column would allow an Index Scan instead",
         "The table needs VACUUM to remove dead tuples causing false positives",
         "The work_mem setting is too low, causing disk spills"
       ],
@@ -851,7 +873,7 @@ When a payment query is slow, follow this sequence:
         "Hash Batches: 4 means 4 indexes were used; consider dropping unused indexes"
       ],
       "correct": 1,
-      "explanation": "Hash Batches > 1 means the hash table was too large to fit in work_mem and was written to disk in multiple batches. This dramatically increases I/O. Fix by increasing work_mem (SET work_mem = '256MB') for the session running this query, or globally for reporting workloads."
+      "explanation": "Hash Batches > 1 means the hash table did not fit in its memory limit (work_mem × hash_mem_multiplier) and was written to disk in multiple batches. This greatly increases I/O. Fix by increasing work_mem (SET work_mem = '256MB') for the session running this query, or for a reporting role — not globally, because every hash and sort in every connection may use that much."
     },
     {
       "text": "What is keyset pagination and why is it preferred over OFFSET pagination for large transaction history tables?",

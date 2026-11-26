@@ -15,7 +15,7 @@ prerequisites: []
 # Virtual Threads Performance — Benchmarking Java 21
 
 > [!NOTE]
-> Virtual threads are not faster than platform threads for CPU-bound work — they provide higher throughput for IO-bound workloads by allowing millions of concurrent lightweight threads without the memory overhead of platform threads. For payment processors that spend 90% of request time waiting on IO (database, fraud APIs, payment networks), virtual threads can increase throughput 5–10x with no code changes.
+> Virtual threads are not faster than platform threads for CPU-bound work — they provide higher throughput for IO-bound workloads by allowing millions of concurrent lightweight threads without the memory overhead of platform threads. For payment processors that spend most of each request waiting on IO (database, fraud APIs, payment networks), virtual threads remove the thread-pool ceiling on concurrency with little or no code change — throughput then rises until the next limit (database connections, downstream rate limits, CPU) is reached.
 
 ## What Are Virtual Threads?
 
@@ -26,13 +26,15 @@ Platform Thread Model (before Java 21):
   OS Thread 1 → waiting on DB query (CPU idle, memory consumed)
   OS Thread 2 → waiting on fraud API (CPU idle, memory consumed)
   OS Thread 3 → waiting on payment gateway (CPU idle, memory consumed)
-  ... 300 threads idle-waiting = 300MB memory wasted
+  ... 300 threads idle-waiting = 300 OS threads, each with its own
+      stack (~1MB reserved, part of it committed) and kernel resources
 
 Virtual Thread Model (Java 21):
   Carrier Thread 1 → running VThread A (DB just returned)
   Carrier Thread 2 → running VThread B (fraud API just returned)
   VThread C, D, E, F ... Z all mounted/unmounted as IO completes
-  ... 10,000 virtual threads = ~10MB memory, 8 carrier threads (N_cpu)
+  ... 10,000 parked virtual threads = a few to a few tens of MB of heap
+      (their stacks are small heap objects), 8 carrier threads (N_cpu)
 ```
 
 ---
@@ -43,14 +45,14 @@ Virtual Thread Model (Java 21):
 @BenchmarkMode({Mode.Throughput, Mode.AverageTime})
 @OutputTimeUnit(TimeUnit.SECONDS)
 @State(Scope.Benchmark)
-@Fork(value = 2, jvmArgs = {"-Xms4g", "-Xmx4g", "--enable-preview"})
+@Fork(value = 2, jvmArgs = {"-Xms4g", "-Xmx4g"})   // virtual threads are final in Java 21: no --enable-preview
 @Warmup(iterations = 5, time = 10)
 @Measurement(iterations = 10, time = 10)
 public class VirtualThreadsBenchmark {
 
-    // Simulates a payment authorization: 100ms IO wait + 5ms CPU
+    // Simulates a payment authorization: 100ms IO wait + 1ms CPU
     private static final long IO_WAIT_MILLIS   = 100;
-    private static final long CPU_WORK_MILLIS  = 5;
+    private static final long CPU_WORK_MILLIS  = 1;
     private static final int  CONCURRENT_TASKS = 1000;
 
     private ExecutorService platformPool;
@@ -120,19 +122,19 @@ public class VirtualThreadsBenchmark {
 }
 ```
 
-Benchmark results on 16-core machine (Java 21, `--enable-preview`):
+Illustrative results on a 16-core machine (Java 21). You can predict them with simple arithmetic — which is the point:
 
 ```
-Benchmark                                      Mode  Cnt    Score    Error   Units
-VirtualThreadsBenchmark.platformThreadThroughput  thrpt 20   8.3 ± 0.4   ops/s
-VirtualThreadsBenchmark.virtualThreadThroughput   thrpt 20  48.7 ± 1.9   ops/s
+Benchmark                                         Mode  Cnt    Score    Error   Units
+VirtualThreadsBenchmark.platformThreadThroughput  thrpt  20    1.9 ±  0.1   ops/s
+VirtualThreadsBenchmark.virtualThreadThroughput   thrpt  20    5.8 ±  0.3   ops/s
 
-(1000 concurrent tasks per op; virtual threads 5.9x higher throughput)
-
-Average time per batch of 1000:
-VirtualThreadsBenchmark.platformThreadThroughput  avgt  20  120.4 ± 3.1   ms/op
-VirtualThreadsBenchmark.virtualThreadThroughput   avgt  20   20.5 ± 0.8   ms/op
+Platform pool of 200: 1000 tasks run in 5 "waves" of ~101 ms  -> ~0.51 s per op
+Virtual threads: all 1000 sleep at once (100 ms), then 1000 × 1 ms of CPU
+spread over 16 cores (~63 ms)                                  -> ~0.17 s per op
 ```
+
+Two lessons from the arithmetic: the gain comes from removing the 200-thread limit (a platform pool of 1,000 threads would do about as well here), and as CPU work per request grows, the cores — not the threads — become the limit (with 5 ms of CPU per task, the virtual-thread run already takes ~0.41 s).
 
 ---
 
@@ -141,77 +143,69 @@ VirtualThreadsBenchmark.virtualThreadThroughput   avgt  20   20.5 ± 0.8   ms/op
 ```java
 /**
  * Memory footprint measurement — platform vs virtual threads.
- * Run with: java -Xms256m -Xmx512m -Xss512k ...
+ *
+ * Where the memory lives:
+ *  - Platform thread stacks are NATIVE memory (outside the heap): ~1MB is
+ *    reserved per thread, but only the pages actually used are committed.
+ *    Measure them with Native Memory Tracking:
+ *      java -XX:NativeMemoryTracking=summary ...
+ *      jcmd <pid> VM.native_memory summary     (see the "Thread" section)
+ *  - Virtual thread stacks are small objects ON THE HEAP while parked, so a
+ *    heap measurement does capture them.
+ * (Runtime.totalMemory() - freeMemory() measures only the heap, so it shows
+ *  almost nothing for platform threads -- do not use it to compare.)
  */
 public class ThreadMemoryFootprintDemo {
 
     public static void main(String[] args) throws Exception {
         int threadCount = 10_000;
-        CountDownLatch startLatch = new CountDownLatch(1);
-        CountDownLatch doneLatch  = new CountDownLatch(threadCount);
 
-        // ── Platform Threads ──────────────────────────────────────────────
-        // WARNING: 10,000 platform threads requires ~10GB memory
-        // Don't run this in production; use small counts for measurement only
-        long platformMemoryBefore = Runtime.getRuntime().totalMemory()
-            - Runtime.getRuntime().freeMemory();
-
-        List<Thread> platformThreads = new ArrayList<>();
-        for (int i = 0; i < threadCount; i++) {
-            Thread t = new Thread(() -> {
-                try {
-                    startLatch.await();
-                    Thread.sleep(10_000);  // simulate long IO wait
-                    doneLatch.countDown();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            });
-            platformThreads.add(t);
-            t.start();
-        }
-
-        long platformMemoryAfter = Runtime.getRuntime().totalMemory()
-            - Runtime.getRuntime().freeMemory();
-        System.out.printf("Platform threads (%d): %.1f MB memory%n",
-            threadCount, (platformMemoryAfter - platformMemoryBefore) / 1_048_576.0);
-        // Output: Platform threads (10000): ~9800 MB memory
-
-        // ── Virtual Threads ───────────────────────────────────────────────
-        long virtualMemoryBefore = Runtime.getRuntime().totalMemory()
-            - Runtime.getRuntime().freeMemory();
-
+        // ── Virtual threads: heap usage of 10,000 parked threads ──────────
+        System.gc();
+        long heapBefore = usedHeap();
         List<Thread> virtualThreads = new ArrayList<>();
         for (int i = 0; i < threadCount; i++) {
-            Thread vt = Thread.ofVirtual().start(() -> {
+            virtualThreads.add(Thread.ofVirtual().start(() -> {
                 try {
-                    Thread.sleep(10_000);
+                    Thread.sleep(10_000);   // parked: stack moved to the heap
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-            });
-            virtualThreads.add(vt);
+            }));
         }
+        Thread.sleep(500);                  // let them all reach sleep()
+        System.out.printf("Virtual threads (%d): ~%.1f MB heap%n",
+            threadCount, (usedHeap() - heapBefore) / 1_048_576.0);
+        // Typically a few MB: a few hundred bytes to a few KB per thread,
+        // depending on stack depth
 
-        long virtualMemoryAfter = Runtime.getRuntime().totalMemory()
-            - Runtime.getRuntime().freeMemory();
-        System.out.printf("Virtual threads (%d): %.1f MB memory%n",
-            threadCount, (virtualMemoryAfter - virtualMemoryBefore) / 1_048_576.0);
-        // Output: Virtual threads (10000): ~8 MB memory
-        // 1225x less memory per thread
+        // ── Platform threads: compare with NMT, not with the heap ─────────
+        // Start e.g. 1,000 sleeping platform threads and run:
+        //   jcmd <pid> VM.native_memory summary
+        // "Thread" shows ~1MB RESERVED per thread and a much smaller
+        // COMMITTED amount -- plus one OS thread each in the kernel.
+
+        for (Thread t : virtualThreads) t.join();
+    }
+
+    private static long usedHeap() {
+        Runtime rt = Runtime.getRuntime();
+        return rt.totalMemory() - rt.freeMemory();
     }
 }
 ```
 
 ---
 
-## Carrier Thread Pinning — The Critical Pitfall
+## Carrier Thread Pinning — The Critical Pitfall (Java 21–23)
 
-Virtual threads are **pinned** to their carrier thread when they:
-1. Execute a `synchronized` method or block
-2. Call native code that calls back into Java
+On Java 21–23, a virtual thread is **pinned** to its carrier thread while it:
+1. Runs inside a `synchronized` method or block
+2. Runs native code that calls back into Java
 
-When pinned, the carrier thread cannot serve other virtual threads — defeating the purpose of virtual threads for IO-bound work.
+Pinning only hurts when the virtual thread **blocks** while pinned (IO, `sleep`, waiting for a lock): the carrier thread then blocks too and cannot serve other virtual threads — defeating the purpose of virtual threads for IO-bound work. Short `synchronized` sections that never block are harmless.
+
+**JDK 24 (JEP 491)** reimplemented `synchronized` so that virtual threads can unmount inside it; on JDK 24+ the remaining pinning cases are rare (native frames, class initialisers). If you can run JDK 24+, most of this section becomes a historical note.
 
 ```java
 // PROBLEM: synchronized causes carrier thread pinning
@@ -236,9 +230,11 @@ public class PinnedVirtualThread {
 Detecting pinning at runtime:
 
 ```
-# JVM flag to log pinning events:
+# JDK 21-23 system property to log pinning (removed in JDK 24):
 -Djdk.tracePinnedThreads=full    # log full stack trace
 -Djdk.tracePinnedThreads=short   # log just method name
+# All versions: the JFR event jdk.VirtualThreadPinned (on by default,
+# recorded when a pinned thread blocks for more than 20 ms)
 
 # Output when pinning occurs:
 Thread[#42,ForkJoinPool-1-worker-1,5,CarrierThreads]
@@ -250,7 +246,7 @@ Thread[#42,ForkJoinPool-1-worker-1,5,CarrierThreads]
 
 ## ReentrantLock vs synchronized — Fixing Pinning
 
-Replace `synchronized` with `ReentrantLock` wherever virtual threads are used for IO-bound operations:
+On Java 21–23, replace `synchronized` with `ReentrantLock` where virtual threads block while holding the lock:
 
 ```java
 // SOLUTION: ReentrantLock does NOT pin carrier threads
@@ -260,7 +256,9 @@ public class UnpinnedVirtualThread {
     // Platform thread is released to serve other virtual threads
     private final ReentrantLock lock = new ReentrantLock();
 
-    // GOOD: virtual thread unmounts during IO; carrier serves others
+    // BETTER: virtual thread unmounts during IO; carrier serves others.
+    // (But one global lock around IO still serialises EVERY payment --
+    //  this fixes pinning, not the design. See the next method.)
     public PaymentResult authorizeWithReentrantLock(Payment payment) {
         lock.lock();
         try {
@@ -295,29 +293,26 @@ public class UnpinnedVirtualThread {
 
 ```java
 /**
- * Common pinning sources in payment services to audit:
+ * Common pinning sources in payment services to audit (Java 21–23).
+ * What matters: code that BLOCKS while inside synchronized.
  *
- * 1. JDBC drivers using synchronized:
- *    - MySQL Connector/J 8.x: some synchronized paths
- *    - PostgreSQL JDBC 42.6+: largely updated to avoid pinning
- *    - Solution: use R2DBC or upgrade driver
+ * 1. JDBC drivers:
+ *    - PostgreSQL JDBC 42.6+: replaced synchronized with locks
+ *    - MySQL Connector/J 9.0+: virtual-thread friendly
+ *    - Older drivers: upgrade them
  *
- * 2. Synchronized utility classes:
- *    - java.util.Hashtable (use ConcurrentHashMap)
- *    - java.util.Vector (use ArrayList)
- *    - StringBuffer (use StringBuilder)
+ * 2. Connection pools and HTTP clients that lock around IO:
+ *    - check versions (recent HikariCP, Apache HttpClient 5, OkHttp are fine)
  *
- * 3. Third-party libraries:
- *    - Some Jackson ObjectMapper methods use synchronized
- *    - Some Apache Commons libraries
- *    - Solution: upgrade to virtual-thread-aware versions
+ * 3. Synchronized utility classes (Hashtable, Vector, StringBuffer):
+ *    - harmless unless code blocks while holding their monitor
  *
  * 4. Your own code:
- *    - Singleton caches with synchronized access
- *    - Connection pool implementations
- *    - Solution: replace with ReentrantLock or concurrent data structures
+ *    - synchronized blocks that call a database, HTTP or Thread.sleep
+ *    - Solution: move the IO outside the lock, or use ReentrantLock
+ *
+ * Simplest fix of all: run on JDK 24+ (JEP 491).
  */
-public class PinningAuditChecklist { }
 ```
 
 ---
@@ -332,7 +327,7 @@ public class BeforeVirtualThreadsConfig {
 
     @Bean
     public ExecutorService paymentExecutor() {
-        // 200 platform threads × 1MB stack = 200MB RSS
+        // 200 platform threads, each with its own stack (~1MB reserved)
         // Throughput limited by pool size (Little's Law)
         return Executors.newFixedThreadPool(200);
     }
@@ -363,11 +358,12 @@ public class AfterVirtualThreadsConfig {
     //   - Tomcat request handling
     //   - @Async methods
     //   - @Scheduled tasks
-    //   - Spring Integration message handlers
 }
 
-// Controller code is IDENTICAL — no changes needed
-// But now handles 10x more concurrent requests on the same hardware
+// Controller code is IDENTICAL — no changes needed.
+// It can now hold far more requests in flight on the same hardware --
+// until the next limit (DB connection pool, downstream rate limits) is hit.
+// Keep those limits explicit: they are now the real concurrency control.
 @RestController
 public class PaymentControllerAfter {
 
@@ -407,7 +403,8 @@ public class ContinuationOverheadBenchmark {
 
     /**
      * CPU-bound work with no IO: virtual threads offer NO advantage.
-     * Continuation mounting/unmounting adds ~1-3µs overhead per switch.
+     * (This mostly measures task hand-off: creating/scheduling a virtual
+     *  thread vs reusing a pooled one. The difference is small.)
      */
     @Benchmark
     public long cpuBoundPlatform() throws Exception {
@@ -430,12 +427,16 @@ public class ContinuationOverheadBenchmark {
 ```
 
 ```
-Benchmark                                Mode  Cnt    Score   Error  Units
+Illustrative:
+Benchmark                                       Mode  Cnt    Score   Error  Units
 ContinuationOverheadBenchmark.cpuBoundPlatform  avgt  20  12.3 ± 0.4   µs/op
 ContinuationOverheadBenchmark.cpuBoundVirtual   avgt  20  14.1 ± 0.6   µs/op
 
-Virtual threads add ~15% overhead for pure CPU-bound work.
-Never use virtual threads for CPU-intensive tasks (encryption, ML inference, compression).
+Virtual threads add a little overhead for pure CPU-bound work and bring
+no benefit. Worse: virtual threads are not time-sliced, so long CPU-heavy
+tasks (encryption, ML inference, compression) can occupy all carrier
+threads and delay the IO-bound virtual threads. Run CPU-heavy work on a
+bounded platform-thread pool sized to the cores.
 ```
 
 ---
@@ -461,11 +462,12 @@ Never use virtual threads for CPU-intensive tasks (encryption, ML inference, com
  *   + Drop-in replacement for most platform thread code
  *   + Works with blocking JDBC, synchronous libraries
  *   - Cannot exceed carrier thread count for CPU-bound work
- *   - Pinning pitfalls with synchronized
- *   - Slightly lower throughput than reactive in extreme scenarios
+ *   - Pinning pitfalls with synchronized (Java 21–23)
+ *   - No built-in backpressure: limit concurrency yourself
  *
  * For payment services: virtual threads win on team productivity.
- * The throughput difference (5-15%) is rarely worth the reactive complexity.
+ * The throughput difference is usually small and rarely worth the
+ * reactive complexity.
  * Use reactive only for extremely high-throughput streaming pipelines
  * (e.g., 100K+ events/second real-time risk processing).
  */
@@ -479,17 +481,20 @@ Never use virtual threads for CPU-intensive tasks (encryption, ML inference, com
 /**
  * Migrating a payment service to virtual threads — checklist:
  *
- * Step 1: Upgrade to Java 21
+ * Step 1: Upgrade to Java 21+ (JDK 24+ removes most synchronized pinning)
  * Step 2: Enable virtual threads in Spring Boot:
  *   spring.threads.virtual.enabled=true
  *
  * Step 3: Audit for synchronized blocks in hot paths
- *   - Run with -Djdk.tracePinnedThreads=full during load test
+ *   - JDK 21–23: run with -Djdk.tracePinnedThreads=full during load test,
+ *     or record the JFR event jdk.VirtualThreadPinned
  *   - Check JDBC driver version
  *   - Replace synchronized with ReentrantLock where needed
  *
  * Step 4: Remove explicit thread pool sizing for IO-bound paths
  *   - Delete fixed thread pools used only for IO-bound work
+ *   - ...but keep (or add) explicit limits for scarce resources:
+ *     DB pool size, Semaphores/bulkheads per downstream
  *   - Keep separate pools for CPU-bound work (encryption, compression)
  *
  * Step 5: Load test with realistic payment patterns
@@ -498,8 +503,8 @@ Never use virtual threads for CPU-intensive tasks (encryption, ML inference, com
  *   - Monitor carrier thread CPU utilisation
  *
  * Step 6: Update monitoring
- *   - Virtual thread count: Thread.getAllStackTraces().size() is expensive
- *   - Use JFR events for virtual thread monitoring
+ *   - Thread.getAllStackTraces() does not include virtual threads
+ *   - Use JFR events or Micrometer's VirtualThreadMetrics
  *   - Alert on carrier thread pinning frequency
  */
 ```
@@ -510,38 +515,47 @@ Never use virtual threads for CPU-intensive tasks (encryption, ML inference, com
 
 ```java
 @Component
-public class VirtualThreadMonitor {
+public class VirtualThreadMonitor implements DisposableBean {
 
     /**
      * Use Java Flight Recorder to monitor virtual thread behaviour.
      *
      * JFR command to record virtual thread events:
-     *   jcmd <pid> JFR.start name=payment-vthread \
-     *     settings=default \
-     *     +jdk.VirtualThreadStart#enabled=true \
-     *     +jdk.VirtualThreadEnd#enabled=true \
-     *     +jdk.VirtualThreadPinned#enabled=true
+     *   jcmd <pid> JFR.start name=payment-vthread settings=default \
+     *     jdk.VirtualThreadStart#enabled=true \
+     *     jdk.VirtualThreadEnd#enabled=true
+     *   (jdk.VirtualThreadPinned and jdk.VirtualThreadSubmitFailed are
+     *    enabled by default; Start/End are off because they are frequent)
      *
      * Key events to monitor:
-     *   jdk.VirtualThreadPinned  — carrier thread pinning (bad)
-     *   jdk.VirtualThreadStart   — virtual thread creation rate
-     *   jdk.VirtualThreadEnd     — virtual thread completion rate
-     *   jdk.VirtualThreadSubmitFailed — task queue overflow (bad)
+     *   jdk.VirtualThreadPinned       — pinned thread blocked > 20 ms (bad)
+     *   jdk.VirtualThreadStart / End  — creation / completion rate
+     *   jdk.VirtualThreadSubmitFailed — scheduler could not accept a task (bad)
      */
+    private final RecordingStream stream = new RecordingStream();
+    private final Counter pinned;
 
-    @PostConstruct
-    public void startVirtualThreadMonitoring() {
-        // Log pinning events programmatically
-        System.setProperty("jdk.tracePinnedThreads", "short");
+    public VirtualThreadMonitor(MeterRegistry registry) {
+        this.pinned = Counter.builder("app.virtual_threads.pinned")
+            .description("Pinned virtual threads that blocked (JFR)")
+            .register(registry);
+        // (Setting -Djdk.tracePinnedThreads at runtime via System.setProperty
+        //  has no reliable effect -- it is read at JVM start, and gone in JDK 24.)
+        stream.enable("jdk.VirtualThreadPinned");
+        stream.onEvent("jdk.VirtualThreadPinned", e -> pinned.increment());
+        stream.startAsync();
+    }
+
+    @Override
+    public void destroy() {
+        stream.close();
     }
 
     /**
-     * Metric: ratio of pinned time to total time.
-     * If > 1%, investigate synchronized blocks in hot paths.
-     *
-     * Prometheus query for JFR-exported metrics:
-     *   rate(jvm_virtual_thread_pinned_total[5m]) /
-     *   rate(jvm_virtual_thread_started_total[5m])
+     * Alternatively, Micrometer's VirtualThreadMetrics (micrometer-java21)
+     * publishes jvm.threads.virtual.pinned and
+     * jvm.threads.virtual.submit.failed from the same JFR events.
+     * Investigate when pinning appears regularly in hot paths.
      */
 }
 ```
@@ -585,7 +599,7 @@ Virtual threads are the right default for payment authorization services. They d
         "Pinning is beneficial; it prevents context-switching overhead for high-throughput paths"
       ],
       "correct": 1,
-      "explanation": "If a virtual thread holds a synchronized lock and blocks on I/O, it cannot unmount from its carrier thread (a JVM limitation in Java 21). The carrier thread blocks, reducing the effective carrier pool. Payment services with synchronized blocks in the I/O path lose virtual thread benefits. Fix by replacing synchronized with ReentrantLock or by moving I/O outside synchronized sections."
+      "explanation": "If a virtual thread is inside a synchronized block and blocks on I/O, on Java 21–23 it cannot unmount from its carrier thread. The carrier thread blocks, reducing the effective carrier pool. Payment services with synchronized blocks around I/O lose virtual thread benefits. Fix by moving I/O outside synchronized sections, replacing synchronized with ReentrantLock, or upgrading to JDK 24+, where JEP 491 removed most synchronized pinning."
     },
     {
       "text": "For which payment service workload type should you NOT use virtual threads as the primary concurrency model?",
@@ -596,7 +610,7 @@ Virtual threads are the right default for payment authorization services. They d
         "JDBC database queries using the standard PostgreSQL driver"
       ],
       "correct": 2,
-      "explanation": "Virtual threads excel at I/O-bound work where threads spend most time waiting. CPU-bound work like ML inference keeps the carrier thread busy computing — there is no I/O wait to unmount during. With virtual threads, 1000 concurrent ML scoring requests would require 1000 carrier threads running at 100% CPU, which is worse than a fixed-size platform thread pool sized to CPU core count."
+      "explanation": "Virtual threads excel at I/O-bound work where threads spend most time waiting. CPU-bound work like ML inference keeps the carrier thread busy computing — there is no I/O wait during which to unmount, so there is nothing to gain. Worse, virtual threads are not time-sliced: many CPU-heavy virtual threads can occupy every carrier thread (one per core) and delay the I/O-bound virtual threads, such as authorisations. A bounded platform-thread pool sized to the core count is the better fit."
     }
   ]
 }
@@ -608,10 +622,22 @@ Virtual threads are the right default for payment authorization services. They d
   "difficulty": "advanced",
   "estimatedMinutes": 55,
   "tasks": [
-    {"id": "1", "description": "Write a JMH benchmark comparing throughput and P99 latency for a payment authorization simulation (3 simulated I/O calls: DB lookup 10ms, fraud check 15ms, limit check 5ms) using: platform thread pool (sized at 200), virtual threads (Executors.newVirtualThreadPerTaskExecutor()), and reactive WebFlux."},
-    {"id": "2", "description": "Configure a Spring Boot 3.x payment service to use virtual threads for all request handling and @Async methods, verify that the embedded Tomcat server uses virtual threads."},
-    {"id": "3", "description": "Write a pinning detection test using JFR that starts a recording, runs a payment authorization with a synchronized block containing a simulated DB call, and asserts that no VirtualThreadPinned events were recorded."},
-    {"id": "4", "description": "Measure and document the memory difference between 10,000 virtual threads and 1,000 platform threads under equivalent load, using JFR heap sampling or jcmd VM.native_memory."}
+    {
+      "id": "1",
+      "description": "Write a JMH benchmark comparing throughput and P99 latency for a payment authorization simulation (3 simulated I/O calls: DB lookup 10ms, fraud check 15ms, limit check 5ms) using: platform thread pool (sized at 200), virtual threads (Executors.newVirtualThreadPerTaskExecutor()), and reactive WebFlux."
+    },
+    {
+      "id": "2",
+      "description": "Configure a Spring Boot 3.x payment service to use virtual threads for all request handling and @Async methods, verify that the embedded Tomcat server uses virtual threads."
+    },
+    {
+      "id": "3",
+      "description": "Write a pinning detection test using JFR (RecordingStream on jdk.VirtualThreadPinned): on JDK 21–23, run a payment authorization with a synchronized block around a simulated DB call and assert that VirtualThreadPinned events are recorded; then switch to ReentrantLock (or run on JDK 24+) and assert that none are recorded."
+    },
+    {
+      "id": "4",
+      "description": "Measure and document the memory difference between 10,000 virtual threads and 1,000 platform threads under equivalent load: heap usage for the parked virtual threads, and jcmd VM.native_memory summary (Native Memory Tracking, Thread section: reserved vs committed) for the platform threads."
+    }
   ]
 }
 -->

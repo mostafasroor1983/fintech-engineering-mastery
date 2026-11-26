@@ -43,8 +43,8 @@ Exactly-Once:
 | Guarantee | Loss Risk | Duplicate Risk | Latency | Throughput |
 |-----------|-----------|---------------|---------|------------|
 | At-most-once | High | None | Lowest | Highest |
-| At-least-once | None | High | Medium | Medium |
-| Exactly-once | None | None | +3-5% | -3-5% |
+| At-least-once | None | Possible (on retries/restarts) | Medium | Medium |
+| Exactly-once | None | None (within Kafka) | + up to one commit interval | Some loss (workload-dependent — measure) |
 
 ---
 
@@ -60,8 +60,9 @@ Each producer is assigned a **Producer ID (PID)** and maintains a **sequence num
 Producer (PID=42)
   │── send(msg, seq=0) → Broker receives, stores
   │── TIMEOUT — did broker get it?
-  │── send(msg, seq=0) → Broker rejects (DuplicateSequenceException, internally silent)
-  │── Broker ACKs the first delivery
+  │── retry send(msg, seq=0) → Broker sees seq=0 already written for PID=42
+  │                            → does NOT write it again, returns success
+  │── Producer gets one acknowledgement; the log holds ONE copy
 ```
 
 ### Configuration
@@ -109,8 +110,10 @@ The transactional producer extends idempotence to provide **atomic writes across
 ### Transaction Lifecycle
 
 ```
-initTransactions()          — Register with Transaction Coordinator, get epoch
-beginTransaction()          — Start a transaction fence (epoch++)
+initTransactions()          — Register with Transaction Coordinator; bumps the
+                              epoch for this transactional.id (fences older
+                              instances) and aborts their open transaction
+beginTransaction()          — Start a transaction (local state only)
   send(record1)             — Buffered in transaction
   send(record2)             — Buffered in transaction
   sendOffsetsToTransaction() — Atomically commit consumer offsets with the records
@@ -172,28 +175,31 @@ public class TransactionalPaymentProducer {
     public void processPaymentAtomically(
             ConsumerRecord<String, String> rawRecord,
             String enrichedPayload,
-            String consumerGroupId,
+            ConsumerGroupMetadata groupMetadata,       // = consumer.groupMetadata()
             Map<TopicPartition, OffsetAndMetadata> offsetsToCommit) {
 
         producer.beginTransaction();
         try {
-            // Produce to output topic
+            // Produce to output topic -- partitioned by KEY, not by copying
+            // the input partition number (the output topic may have a
+            // different partition count)
             ProducerRecord<String, String> enriched = new ProducerRecord<>(
                     "payments.enriched",
-                    rawRecord.partition(),  // Same partition for ordering
                     rawRecord.key(),
                     enrichedPayload
             );
             producer.send(enriched);
 
             // Atomically commit the consumed offset as part of the transaction.
-            // If the transaction aborts, the consumer will re-read this record.
-            producer.sendOffsetsToTransaction(offsetsToCommit,
-                    new ConsumerGroupMetadata(consumerGroupId));
+            // Pass the consumer's FULL group metadata (generation, member id):
+            // the broker then fences zombies from an older group generation
+            // (KIP-447). The old groupId-only overload is deprecated.
+            producer.sendOffsetsToTransaction(offsetsToCommit, groupMetadata);
 
             producer.commitTransaction();
 
-        } catch (ProducerFencedException | OutOfOrderSequenceException e) {
+        } catch (ProducerFencedException | OutOfOrderSequenceException
+                 | AuthorizationException e) {
             // Fatal — this producer instance has been fenced.
             // A new producer with the same transactional.id has taken over.
             // Shut down this instance immediately — do not retry.
@@ -202,7 +208,9 @@ public class TransactionalPaymentProducer {
             throw new FatalProducerException("Producer fenced", e);
 
         } catch (KafkaException e) {
-            // Transient error — abort and allow retry
+            // Transient error — abort and allow retry. The CALLER must also
+            // seek the consumer back to the last committed offsets, otherwise
+            // its next poll() continues after the aborted records.
             producer.abortTransaction();
             throw new RetryableProcessingException("Transaction aborted — will retry", e);
         }
@@ -265,20 +273,32 @@ import org.springframework.context.annotation.Configuration;
 public class KafkaTransactionConfig {
 
     @Bean
-    public ProducerFactory<String, String> transactionalProducerFactory() {
+    public ProducerFactory<String, String> transactionalProducerFactory(
+            // ${...} placeholders are only resolved in annotations/properties,
+            // NOT inside Java string literals -- inject the values
+            @Value("${kafka.bootstrap-servers}") String bootstrapServers,
+            @Value("${POD_NAME}") String podName) {
         Map<String, Object> props = new HashMap<>();
-        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "${kafka.bootstrap-servers}");
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
-        props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "payment-svc-${spring.application.name}");
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
 
         DefaultKafkaProducerFactory<String, String> factory =
                 new DefaultKafkaProducerFactory<>(props);
-        factory.setTransactionIdPrefix("payment-svc-");
+        // Do not set transactional.id yourself: the factory derives one per
+        // producer from this prefix. For producer-only transactions the
+        // prefix must be unique per application INSTANCE.
+        factory.setTransactionIdPrefix("payment-svc-" + podName + "-");
         return factory;
+    }
+
+    @Bean
+    public KafkaTemplate<String, String> kafkaTemplate(
+            ProducerFactory<String, String> transactionalProducerFactory) {
+        return new KafkaTemplate<>(transactionalProducerFactory);
     }
 
     @Bean
@@ -329,8 +349,12 @@ public class PaymentStreamsApp {
         props.put(StreamsConfig.APPLICATION_ID_CONFIG, "payment-enrichment-streams");
         props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
 
-        // EOS v2 — uses one epoch per consumer group member (more efficient than v1)
-        // exactly_once_v2 requires Kafka 2.5+ and brokers with >= 3 replicas
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+
+        // EOS v2 — one transactional producer per stream thread (v1: one per task)
+        // Requires brokers 2.5+; the broker's internal transaction log defaults
+        // (replication factor 3, min ISR 2) need at least 3 brokers
         props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG,
                 StreamsConfig.EXACTLY_ONCE_V2);
 
@@ -353,10 +377,10 @@ public class PaymentStreamsApp {
 
 | Property | exactly_once (v1) | exactly_once_v2 |
 |----------|-------------------|-----------------|
-| Kafka version | 0.11+ | 2.5+ |
-| Transactions per task | Per thread | Per task group |
+| Broker version | 0.11+ | 2.5+ |
+| Transactional producers | One per task (input partition) | One per stream thread |
 | Broker load | Higher | Lower |
-| Recommended | No | Yes |
+| Status | Deprecated, removed in Kafka 4.0 | Recommended |
 
 ---
 
@@ -367,32 +391,33 @@ EOS is Kafka-internal. If you consume from Kafka and write to a database, Kafka 
 ```java
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.dao.DuplicateKeyException;
 
 @Service
 public class IdempotentPaymentProcessor {
 
     @Autowired private PaymentRepository paymentRepository;
-    @Autowired private DeduplicationRepository deduplicationRepository;
+    @Autowired private JdbcTemplate jdbcTemplate;
 
     @Transactional
     public void processPayment(String eventId, PaymentEvent event) {
-        // Check deduplication table BEFORE processing
-        if (deduplicationRepository.existsByEventId(eventId)) {
+        // Claim the event FIRST via the primary key. An "exists?" check
+        // followed by a later insert is a race: two deliveries processed
+        // concurrently (e.g. around a rebalance) could both see "not yet".
+        int claimed = jdbcTemplate.update("""
+                INSERT INTO processed_events (event_id, aggregate_id)
+                VALUES (?, ?)
+                ON CONFLICT (event_id) DO NOTHING
+                """, eventId, event.getAggregateId());
+
+        if (claimed == 0) {
             log.info("Duplicate event detected: eventId={} — skipping", eventId);
             return;
         }
 
-        // Process business logic
+        // Process business logic — same DB transaction as the claim, so a
+        // failure rolls both back and the redelivery is processed normally
         Payment payment = Payment.from(event);
         paymentRepository.save(payment);
-
-        // Record event ID as processed — in the same DB transaction
-        deduplicationRepository.save(new ProcessedEvent(
-                eventId,
-                event.getAggregateId(),
-                Instant.now()
-        ));
 
         log.info("Payment processed: paymentId={} eventId={}", event.getPaymentId(), eventId);
     }
@@ -410,7 +435,8 @@ CREATE TABLE processed_events (
 -- Index for cleanup queries
 CREATE INDEX idx_processed_events_at ON processed_events (processed_at);
 
--- Cleanup old records (keep last 7 days for audit)
+-- Cleanup old records: keep them longer than any possible redelivery
+-- (topic retention + replay window), e.g. 7 days
 DELETE FROM processed_events
 WHERE processed_at < NOW() - INTERVAL '7 days';
 ```
@@ -421,9 +447,9 @@ WHERE processed_at < NOW() - INTERVAL '7 days';
 
 ### Pitfall 1: Reusing `transactional.id` Across Multiple Instances
 
-**Problem:** Multiple producer instances share the same `transactional.id`. Instance A is mid-transaction when Instance B calls `initTransactions()`. Instance B fences Instance A, causing B's transaction to succeed but A's data is lost.
+**Problem:** Multiple producer instances share the same `transactional.id`. Instance A is mid-transaction when Instance B calls `initTransactions()`: B's call bumps the epoch, aborts A's open transaction and fences A. When A restarts it fences B in turn — the instances keep killing each other's transactions, throughput collapses and pods crash in a loop.
 
-**Fix:** Ensure each producer instance has a **unique** `transactional.id` incorporating a stable identifier — the pod name, instance index, or a UUID persisted to disk.
+**Fix:** Ensure each producer instance has a **unique** `transactional.id` — e.g. including the pod name. (For read-process-write with Kafka 2.5+ clients and brokers, fencing of zombies is done through the consumer group metadata, so ids need not stay the same across restarts — a StatefulSet's stable pod names are still a simple, safe choice.)
 
 ```java
 // BAD — all instances share the same id
@@ -474,7 +500,7 @@ spring.kafka.consumer.properties.isolation.level=read_committed
 - [ ] `sendOffsetsToTransaction()` used to atomically commit offsets with produced records
 - [ ] Consumer-side deduplication table in place as a cross-system safety net
 - [ ] `processing.guarantee=exactly_once_v2` for Kafka Streams topologies
-- [ ] Transaction timeout set to a value less than the max consumer `session.timeout.ms`
+- [ ] `transaction.timeout.ms` longer than your slowest transaction (processing included) and not above the broker's `transaction.max.timeout.ms` (15 min default)
 - [ ] DLQ configured for messages that repeatedly cause transaction aborts
 
 ---

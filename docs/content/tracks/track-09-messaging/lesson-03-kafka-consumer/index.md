@@ -107,6 +107,8 @@ heartbeat.interval.ms = 3000   (send heartbeat every 3s, must be < session/3)
 max.poll.interval.ms  = 300000 (time your ACTUAL processing must stay within)
 ```
 
+(With the new consumer group protocol of Kafka 4.0 — `group.protocol=consumer`, KIP-848 — session timeout and heartbeat interval are configured on the broker side and assignment is computed by the broker; `max.poll.interval.ms` still applies.)
+
 If your payment processing takes longer than `max.poll.interval.ms`, the consumer is forcibly removed from the group and a rebalance occurs — even if the heartbeat thread is still running. This is the number one cause of unexpected rebalances in systems that perform database writes or external API calls per message.
 
 ---
@@ -120,17 +122,17 @@ props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, true);
 props.put(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG, 5000);
 ```
 
-Auto-commit periodically commits the offset of the last polled record. This creates **at-most-once** processing:
+Auto-commit commits, during `poll()` (and on `close()`), the offsets of the records returned by the previous poll. If you finish processing each batch before calling `poll()` again, that is still at-least-once. But as soon as processing is **not** finished at the next `poll()` — records handed to a worker pool, writes buffered — it becomes **at-most-once**:
 
 ```
-poll() → returns records 0-99
-consumer processes record 50 → consumer crashes
-auto-commit already committed offset 100
+poll() → returns records 0-99 → handed to a worker thread pool
+poll() again → auto-commit commits offset 100 (workers still busy)
+worker is at record 50 → process crashes
 restart → consumer starts at 100
 records 51-99 are LOST FOREVER
 ```
 
-**Never use auto-commit for payment processing.** The only acceptable use is for idempotent read-only analytics where losing a few records is tolerable.
+**Do not use auto-commit for payment processing** — the commit point should be explicit. The only acceptable use is for analytics where losing a few records is tolerable.
 
 ### Strategy 2: Manual commitSync()
 
@@ -263,8 +265,9 @@ public class PaymentEventConsumer {
             processingService.process(event);
             acknowledgment.acknowledge(); // Commit after successful processing
         } catch (RetryableException e) {
-            // Don't acknowledge — record will be redelivered after container restart
-            // Spring Kafka's error handler will manage the retry cycle
+            // Rethrow: the container's DefaultErrorHandler seeks back to this
+            // record and redelivers it with back-off (merely not acknowledging
+            // would NOT cause redelivery -- the next ack would commit past it)
             log.warn("Retryable error on event {}: {}", event.getEventId(), e.getMessage());
             throw e;
         } catch (NonRetryableException e) {
@@ -303,6 +306,8 @@ public class KafkaConsumerConfig {
         factory.setConcurrency(4);
 
         // Error handler with dead-letter publishing
+        // Same partition number in the DLQ: the .dlq topic needs at least
+        // as many partitions as the source topic
         DeadLetterPublishingRecoverer recoverer =
             new DeadLetterPublishingRecoverer(kafkaTemplate,
                 (record, exception) -> new TopicPartition(
@@ -310,14 +315,12 @@ public class KafkaConsumerConfig {
                     record.partition()
                 ));
 
-        DefaultErrorHandler errorHandler = new DefaultErrorHandler(
-            recoverer,
-            new ExponentialBackOffWithMaxRetries(3) {{
-                setInitialInterval(1_000L);
-                setMultiplier(2.0);
-                setMaxInterval(10_000L);
-            }}
-        );
+        ExponentialBackOffWithMaxRetries backOff = new ExponentialBackOffWithMaxRetries(3);
+        backOff.setInitialInterval(1_000L);
+        backOff.setMultiplier(2.0);
+        backOff.setMaxInterval(10_000L);
+
+        DefaultErrorHandler errorHandler = new DefaultErrorHandler(recoverer, backOff);
 
         // Non-retryable exceptions — send straight to DLQ
         errorHandler.addNotRetryableExceptions(
@@ -346,11 +349,14 @@ public void handlePaymentBatch(
 
     log.info("Processing batch of {} payment events", records.size());
 
+    // LinkedHashMap keeps the original (offset) order -- a plain toMap()
+    // returns a HashMap and would scramble per-account ordering
     Map<String, PaymentEvent> eventMap = records.stream()
         .collect(Collectors.toMap(
             r -> r.value().getEventId(),
             ConsumerRecord::value,
-            (a, b) -> b // Last-write wins for duplicates within same batch
+            (a, b) -> b, // duplicates within the same batch: keep one
+            LinkedHashMap::new
         ));
 
     try {
@@ -379,7 +385,7 @@ A consumer group rebalance occurs when:
 
 ### Eager vs Cooperative Rebalancing
 
-**Eager protocol** (default before Kafka 2.4):
+**Eager protocol** (what the default `RangeAssignor` does; still the classic-protocol default today unless you change the assignor):
 ```
 Step 1: ALL consumers stop consuming ("stop-the-world")
 Step 2: ALL consumers release their partition assignments
@@ -415,7 +421,7 @@ spring:
 ```
 
 > [!WARNING]
-> When migrating from eager to cooperative, you must perform a rolling upgrade using the `CooperativeStickyAssignor` with the transition strategy. Direct switch from `RangeAssignor` to `CooperativeStickyAssignor` requires at least two rolling restarts.
+> Migrating a running group from eager to cooperative takes **two rolling restarts**: first deploy with both assignors listed (`CooperativeStickyAssignor,RangeAssignor`), then deploy again with only `CooperativeStickyAssignor`. Switching every instance directly in one step can break the group while old and new members disagree on the protocol. (Kafka 4.0's new consumer protocol, `group.protocol=consumer`, makes all rebalances incremental and broker-driven.)
 
 ### ConsumerRebalanceListener — Handling Partition Revocation
 
@@ -424,6 +430,7 @@ When using manual offset commits, commit offsets before partitions are revoked:
 ```java
 consumer.subscribe(List.of("payment-events"), new ConsumerRebalanceListener() {
 
+    // Filled by the poll loop: last processed offset + 1 per partition
     private final Map<TopicPartition, OffsetAndMetadata> pendingOffsets =
         new ConcurrentHashMap<>();
 
@@ -455,8 +462,10 @@ consumer.subscribe(List.of("payment-events"), new ConsumerRebalanceListener() {
 
     @Override
     public void onPartitionsLost(Collection<TopicPartition> partitions) {
-        // Called only during eager rebalance when partitions are taken immediately
-        log.warn("Partitions lost without revocation (eager rebalance): {}", partitions);
+        // Called when partitions were taken away WITHOUT an orderly
+        // revocation (e.g. this consumer missed its session timeout or was
+        // fenced). Another member may already own them: do NOT commit.
+        log.warn("Partitions lost: {}", partitions);
         // State may be inconsistent — invalidate and rebuild
         stateStore.invalidate(partitions);
     }
@@ -467,7 +476,7 @@ consumer.subscribe(List.of("payment-events"), new ConsumerRebalanceListener() {
 
 ## 6. Consumer Lag Monitoring
 
-Consumer lag is `Log End Offset (LEO) - consumer committed offset`. It is the primary health indicator for Kafka consumers in financial systems.
+Consumer lag is `Log End Offset (LEO) - consumer committed offset` (for `read_committed` consumers, the last stable offset is the more precise end). It is the primary health indicator for Kafka consumers in financial systems.
 
 ### Checking Lag with CLI
 
@@ -492,6 +501,16 @@ public class ConsumerLagMonitor {
 
     private final AdminClient adminClient;
     private final MeterRegistry meterRegistry;
+    // One holder per (group, topic, partition): each gauge is registered once
+    private final Map<String, AtomicLong> lagHolders = new ConcurrentHashMap<>();
+
+    private AtomicLong holder(String name, Tags tags) {
+        return lagHolders.computeIfAbsent(name + tags, k -> {
+            AtomicLong h = new AtomicLong();
+            Gauge.builder(name, h, AtomicLong::get).tags(tags).register(meterRegistry);
+            return h;
+        });
+    }
 
     @Scheduled(fixedDelay = 30_000)
     public void reportConsumerLag() {
@@ -510,8 +529,9 @@ public class ConsumerLagMonitor {
                     .partitionsToOffsetAndMetadata()
                     .get(30, TimeUnit.SECONDS);
 
-            Set<TopicPartition> partitions = committedOffsets.keySet().stream()
-                .filter(tp -> tp.topic().equals(topic))
+            Set<TopicPartition> partitions = committedOffsets.entrySet().stream()
+                .filter(e -> e.getKey().topic().equals(topic) && e.getValue() != null)
+                .map(Map.Entry::getKey)
                 .collect(Collectors.toSet());
 
             // Get the end offsets for all relevant partitions
@@ -529,18 +549,16 @@ public class ConsumerLagMonitor {
                 lagByPartition.put(tp, lag);
                 totalLag += lag;
 
-                meterRegistry.gauge("kafka.consumer.lag",
-                    Tags.of(
+                holder("kafka.consumer.lag", Tags.of(
                         "group_id", groupId,
                         "topic", topic,
-                        "partition", String.valueOf(tp.partition())
-                    ),
-                    lag);
+                        "partition", String.valueOf(tp.partition())))
+                    .set(lag);
             }
 
-            meterRegistry.gauge("kafka.consumer.lag.total",
-                Tags.of("group_id", groupId, "topic", topic),
-                totalLag);
+            holder("kafka.consumer.lag.total",
+                    Tags.of("group_id", groupId, "topic", topic))
+                .set(totalLag);
 
             if (totalLag > 10_000) {
                 log.warn("High consumer lag detected for group {}: {} messages",
@@ -627,33 +645,20 @@ public ConsumerFactory<String, PaymentEvent> consumerFactory() {
 ```
 
 ```java
-// In the listener — check for deserialization errors in headers
+// The listener needs no special code: when ErrorHandlingDeserializer
+// fails, the container does not call the listener with garbage -- it
+// passes a DeserializationException to the DefaultErrorHandler. That
+// exception is not retryable by default, so the DeadLetterPublishingRecoverer
+// immediately publishes the ORIGINAL raw bytes (plus exception headers) to
+// the dead-letter topic and the consumer moves on.
 @KafkaListener(topics = "payment-events")
-public void handlePaymentEvent(
-        ConsumerRecord<String, PaymentEvent> record,
-        Acknowledgment ack) {
-
-    // Check if deserialization failed
-    Header deserializationException = record.headers()
-        .lastHeader(ErrorHandlingDeserializer.VALUE_DESERIALIZER_EXCEPTION_HEADER);
-
-    if (deserializationException != null) {
-        // Raw bytes available — log, alert, publish raw bytes to DLQ
-        log.error("Deserialization failed for record at partition {} offset {}",
-            record.partition(), record.offset());
-        alertingService.sendCriticalAlert("Payment event deserialization failure",
-            record.partition(), record.offset());
-        // Publish raw record to DLQ for manual investigation
-        rawDlqPublisher.publish("payment-events.deserialization-errors",
-            record.key(), record.headers());
-        ack.acknowledge();
-        return;
-    }
-
-    // Normal processing
-    processPaymentEvent(record.value());
+public void handlePaymentEvent(PaymentEvent event, Acknowledgment ack) {
+    processPaymentEvent(event);
     ack.acknowledge();
 }
+
+// Alert on it: count records arriving in the dead-letter topic, or add a
+// retry listener / recoverer wrapper that raises a critical alert.
 ```
 
 ---
@@ -696,26 +701,31 @@ public class BackpressureAwareConsumer {
     private KafkaListenerEndpointRegistry listenerRegistry;
 
     @KafkaListener(topics = "payment-events", id = "payment-consumer")
-    public void handlePaymentEvent(PaymentEvent event, Acknowledgment ack,
-            @Header(KafkaHeaders.RECEIVED_PARTITION) int partition) {
+    public void handlePaymentEvent(PaymentEvent event, Acknowledgment ack) {
+        if (downstreamCircuitBreaker.isOpen()) {
+            pauseConsumer();
+            // THROW, don't just return: the error handler seeks back to this
+            // record, so it is delivered again after resume(). Returning
+            // without an ack would let the following records be processed
+            // and acknowledged -- committing past this one and losing it.
+            throw new DownstreamUnavailableException("circuit open");
+        }
         try {
-            if (downstreamCircuitBreaker.isOpen()) {
-                // Don't acknowledge — pause the container
-                pauseConsumer();
-                return;
-            }
             processingService.process(event);
             ack.acknowledge();
         } catch (DownstreamUnavailableException e) {
             downstreamCircuitBreaker.recordFailure();
             pauseConsumer();
+            throw e;   // same reason: re-seek this record
         }
     }
 
     private void pauseConsumer() {
+        // pause() stops fetching but keeps the consumer in the group
+        // (it keeps polling internally, so no rebalance is triggered)
         MessageListenerContainer container =
             listenerRegistry.getListenerContainer("payment-consumer");
-        if (container != null && !container.isContainerPaused()) {
+        if (container != null && !container.isPauseRequested()) {
             container.pause();
             log.warn("Payment consumer paused — downstream unavailable");
         }
@@ -726,7 +736,7 @@ public class BackpressureAwareConsumer {
         MessageListenerContainer container =
             listenerRegistry.getListenerContainer("payment-consumer");
         if (container != null
-                && container.isContainerPaused()
+                && container.isPauseRequested()
                 && downstreamCircuitBreaker.isClosed()) {
             container.resume();
             log.info("Payment consumer resumed — downstream recovered");
@@ -743,20 +753,29 @@ Since Kafka delivers at-least-once by default, consumers must be idempotent — 
 
 ```java
 @Service
-@Transactional
 public class IdempotentPaymentProcessor {
 
     private final PaymentRepository paymentRepository;
-    private final ProcessedEventRepository processedEventRepository;
+    private final JdbcTemplate jdbcTemplate;
 
+    @Transactional
     public void process(PaymentEvent event) {
-        // Check for duplicate processing using event ID
-        if (processedEventRepository.existsByEventId(event.getEventId())) {
+        // Claim the event FIRST, relying on the primary key. A separate
+        // "exists?" check followed by an insert is a race: two consumers
+        // (e.g. old and new owner around a rebalance) can both see "no".
+        int claimed = jdbcTemplate.update("""
+            INSERT INTO processed_payment_events (event_id, event_type, processed_at)
+            VALUES (?, ?, now())
+            ON CONFLICT (event_id) DO NOTHING
+            """, event.getEventId(), event.getEventType().name());
+
+        if (claimed == 0) {
             log.info("Skipping duplicate event {}", event.getEventId());
             return; // Idempotent no-op
         }
 
-        // Process the payment
+        // Process the payment -- in the SAME transaction as the claim, so a
+        // failure rolls back both and the redelivery can try again
         Payment payment = Payment.builder()
             .paymentId(event.getPaymentId())
             .accountId(event.getAccountId())
@@ -766,13 +785,6 @@ public class IdempotentPaymentProcessor {
             .build();
 
         paymentRepository.save(payment);
-
-        // Record this event as processed within the same transaction
-        processedEventRepository.save(ProcessedEvent.builder()
-            .eventId(event.getEventId())
-            .eventType(event.getEventType().name())
-            .processedAt(Instant.now())
-            .build());
     }
 }
 ```
@@ -788,7 +800,8 @@ CREATE TABLE processed_payment_events (
 -- Index for cleanup queries
 CREATE INDEX idx_ppe_processed_at ON processed_payment_events(processed_at);
 
--- Keep records for at least consumer retention window (e.g., 7 days)
+-- Keep records at least as long as an event could be redelivered: the
+-- topic retention plus any planned replay window (e.g., 7 days)
 -- Run cleanup job daily to remove old records
 DELETE FROM processed_payment_events
 WHERE processed_at < NOW() - INTERVAL '7 days';
@@ -807,7 +820,9 @@ The `auto.offset.reset` configuration controls what happens when a consumer grou
 | `none`     | Throw exception if no committed offset exists | Strict "must have committed offset" |
 
 ```bash
-# Reset consumer group to replay events (disaster recovery)
+# Reset consumer group to replay events (disaster recovery).
+# The group must have NO active members (stop the consumers first);
+# run without --execute (or with --dry-run) to preview the new offsets.
 kafka-consumer-groups.sh \
   --bootstrap-server kafka:9092 \
   --group payment-processor-v1 \
@@ -914,9 +929,9 @@ spring:
   "difficulty": "advanced",
   "estimatedMinutes": 50,
   "tasks": [
-    "Implement a @KafkaListener for a payment-events topic using MANUAL_IMMEDIATE ack mode. After successful processing, commit the specific partition offset using Acknowledgment.acknowledge(). On BusinessException, send the record to a DLQ topic and commit. On TransientException, do not commit — allow redelivery on rebalance.",
+    "Implement a @KafkaListener for a payment-events topic using MANUAL_IMMEDIATE ack mode. After successful processing, commit the offset with Acknowledgment.acknowledge(). Configure a DefaultErrorHandler: BusinessException is not retryable and goes to a DLQ topic at once; TransientException is rethrown and retried with exponential back-off before going to the DLQ.",
     "Configure CooperativeStickyAssignor and implement a ConsumerRebalanceListener that logs which partitions are assigned and revoked, and on revocation calls commitSync() for the current offsets of the revoked partitions to prevent reprocessing.",
-    "Write a test using EmbeddedKafka that produces 20 messages, kills the consumer mid-batch (after 10 messages), starts a new consumer, and verifies that exactly the remaining 10 messages are processed — no duplicates, no gaps.",
+    "Write a test using EmbeddedKafka that produces 20 messages, kills the consumer mid-batch (after 10 acknowledged messages), starts a new consumer, and verifies that every message is processed (no gaps) and that any message delivered twice has no additional effect thanks to the idempotent processor.",
     "Expose consumer lag as a Prometheus metric by querying the KafkaConsumer's currentLag() per partition assignment. Emit an alert annotation in the metric when lag exceeds 1000 for any partition. Write a unit test that verifies the metric is published and the alert threshold triggers correctly."
   ]
 }

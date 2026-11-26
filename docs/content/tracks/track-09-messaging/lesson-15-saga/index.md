@@ -31,10 +31,10 @@ Two-phase commit (2PC) is impractical in a microservices architecture:
 
 | Problem | Impact in Microservices |
 |---|---|
-| Coordinator is a single point of failure | A crashed coordinator leaves all participants locked forever |
+| Coordinator is a single point of failure | A crashed coordinator leaves prepared participants holding their locks until it recovers |
 | Blocking lock duration | All resources are locked from prepare until commit — typically 100ms–1s, unacceptable at payment scale |
-| Cross-database vendor support | A PostgreSQL, MySQL, and MongoDB cluster cannot participate in the same XA transaction |
-| Network partitions cause indefinite lock | CAP theorem: in a distributed system, partition tolerance requires sacrificing consistency |
+| Limited participant support | Not every store can join an XA transaction (MongoDB, Kafka, most HTTP/gRPC APIs cannot) |
+| Network partitions block participants | A participant that has voted "prepared" cannot decide alone; during a partition it must wait (stay blocked) to remain consistent |
 | Operational complexity | XA transactions require all services to implement the XA protocol; most REST/gRPC services do not |
 
 The saga pattern avoids all these issues by using local transactions only. If a step fails, compensating transactions undo the work of completed steps.
@@ -57,6 +57,8 @@ Payment Saga:
 ```
 
 **Key property**: compensating transactions must be **idempotent** because they can be called multiple times on failure/retry.
+
+**Design note on step order:** this classic example is kept simple, but in a real design put the checks that can still say "no" (fraud check) **before** the money moves, and the steps that cannot really be undone (notifications) **last**, after the credit. A sent notification can only be "compensated" with an apology message — so it should only be sent once the outcome is certain.
 
 ---
 
@@ -92,7 +94,11 @@ sequenceDiagram
 ### Choreography Event Handlers
 
 ```java
-// AccountService: starts the saga and handles compensation
+// AccountService: starts the saga and handles compensation.
+// eventPublisher writes to an OUTBOX table in the same DB transaction
+// (Lesson 06) -- publishing straight to Kafka here would be a dual write.
+// The balance check + debit should be one atomic, idempotent update
+// (UPDATE ... SET balance = balance - ? WHERE id = ? AND balance >= ?).
 @KafkaListener(topics = "payment.commands", groupId = "account-service")
 @Transactional
 public void handlePaymentCommand(PaymentInitiateCommand command) {
@@ -125,7 +131,8 @@ public void handlePaymentCommand(PaymentInitiateCommand command) {
 @Transactional
 public void handleFraudCheckResult(FraudCheckEvent event) {
     if (event instanceof FraudCheckFailed failed) {
-        // COMPENSATION: reverse the debit
+        // COMPENSATION: reverse the debit (must be idempotent -- see
+        // "Idempotent Compensation" below; Kafka may deliver this twice)
         Account source = accountRepository.findById(failed.getSourceAccountId())
             .orElseThrow();
         source.credit(failed.getAmount());  // reversal
@@ -200,6 +207,11 @@ public class PaymentSagaOrchestrator {
     private final SagaStateRepository sagaStateRepository;
     private final KafkaTemplate<String, String> commandBus;
 
+    // Note: saving the saga state and sending the command are two writes.
+    // Write the command to an OUTBOX table in the same DB transaction as the
+    // state (Lesson 06), or rely on resume-on-restart + idempotent handlers
+    // to re-send it if the process dies in between.
+    @Transactional
     public UUID initiatePayment(PaymentInitiateCommand command) {
         UUID sagaId = UUID.randomUUID();
 
@@ -303,30 +315,30 @@ public enum SagaStep {
     NOTIFY_BENEFICIARY,    // compensation: SEND_CANCELLATION
     CREDIT_DESTINATION,    // compensation: REVERSE_CREDIT
     COMPLETED,             // no compensation needed (terminal success)
-    COMPENSATING_DEBIT,
-    COMPENSATING_NOTIFICATION,
+    COMPENSATING,
     FAILED                 // terminal failure
 }
 
 public class SagaCompensationService {
 
     public void compensate(SagaState state) {
-        // Execute compensations in reverse order of completed steps
-        SagaStep failedAt = state.getFailedAtStep();
+        // Compensate exactly the steps that COMPLETED, newest first.
+        // (Deriving this from enum ordinals is fragile: states such as
+        //  COMPENSATING have higher ordinals than the business steps and
+        //  would trigger reversals that never had a forward step.)
+        List<SagaStep> done = new ArrayList<>(state.getCompletedSteps());
+        Collections.reverse(done);
 
-        if (failedAt.ordinal() > SagaStep.CREDIT_DESTINATION.ordinal()) {
-            issueCommand(new ReverseDestinationCreditCommand(state));
+        for (SagaStep step : done) {
+            switch (step) {
+                case CREDIT_DESTINATION -> issueCommand(new ReverseDestinationCreditCommand(state));
+                case NOTIFY_BENEFICIARY -> issueCommand(new SendCancellationNotificationCommand(state));
+                case FRAUD_CHECK        -> issueCommand(new ReleaseFraudSlotCommand(state));
+                case DEBIT_SOURCE       -> issueCommand(new ReverseSourceDebitCommand(state));
+                default -> { /* not a business step */ }
+            }
         }
-        if (failedAt.ordinal() > SagaStep.NOTIFY_BENEFICIARY.ordinal()) {
-            issueCommand(new SendCancellationNotificationCommand(state));
-        }
-        if (failedAt.ordinal() > SagaStep.FRAUD_CHECK.ordinal()) {
-            issueCommand(new ReleaseFraudSlotCommand(state));
-        }
-        if (failedAt.ordinal() > SagaStep.DEBIT_SOURCE.ordinal()) {
-            issueCommand(new ReverseSourceDebitCommand(state));
-        }
-        // Step 1 failure: nothing to compensate (debit not yet applied)
+        // Failure at step 1: completedSteps is empty -> nothing to compensate
     }
 }
 ```
@@ -339,11 +351,14 @@ Each compensation command includes the sagaId as the idempotency key:
 @KafkaListener(topics = "account.commands", groupId = "account-command-handler")
 @Transactional
 public void handleReverseDebit(ReverseDebitCommand command) {
-    // Idempotency check: has this reversal already been applied?
-    boolean alreadyApplied = compensationLog.exists(
-        command.getSagaId(), "REVERSE_DEBIT");
+    // Idempotency: CLAIM the (sagaId, step) first -- an INSERT into a table
+    // with PRIMARY KEY (saga_id, step), ON CONFLICT DO NOTHING. A separate
+    // "exists?" check followed by a later insert would race with a duplicate
+    // delivery processed at the same time.
+    boolean firstTime = compensationLog.tryRecord(
+        command.getSagaId(), "REVERSE_DEBIT");   // false = already recorded
 
-    if (alreadyApplied) {
+    if (!firstTime) {
         log.info("Compensation already applied, skipping: sagaId={} step=REVERSE_DEBIT",
                  command.getSagaId());
         return;
@@ -354,10 +369,7 @@ public void handleReverseDebit(ReverseDebitCommand command) {
     source.credit(command.getAmount());  // reverse the debit
     accountRepository.save(source);
 
-    // Record the compensation as applied — same transaction
-    compensationLog.record(command.getSagaId(), "REVERSE_DEBIT");
-
-    // Reply to orchestrator
+    // Reply to orchestrator (via the outbox, same DB transaction)
     replyBus.send("account.replies",
         toJson(new DebitReversedReply(command.getSagaId())));
 }
@@ -396,21 +408,23 @@ CREATE TABLE saga_step_idempotency (
 
 ```java
 // Generic idempotent step executor
-public <T> T executeStep(UUID sagaId, String stepName,
+@Transactional
+public <T> T executeStep(UUID sagaId, String stepName, Class<T> resultType,
                           Supplier<T> stepLogic) {
-    // Check if this step was already executed (e.g., due to retry)
-    return sagaStepIdempotencyRepository
-        .findBySagaIdAndStepName(sagaId, stepName)
-        .map(existing -> {
-            log.info("Step already executed: sagaId={} step={}", sagaId, stepName);
-            return (T) existing.getCachedResult();
-        })
-        .orElseGet(() -> {
-            T result = stepLogic.get();
-            sagaStepIdempotencyRepository.save(
-                new SagaStepRecord(sagaId, stepName, "SUCCESS", toJson(result)));
-            return result;
-        });
+    // Claim the step first (PRIMARY KEY (saga_id, step_name)); if the row
+    // already exists, this step ran before -- return its stored result.
+    boolean claimed = sagaStepIdempotencyRepository.insertIfAbsent(sagaId, stepName);
+    if (!claimed) {
+        log.info("Step already executed: sagaId={} step={}", sagaId, stepName);
+        return fromJson(sagaStepIdempotencyRepository
+            .findResult(sagaId, stepName), resultType);
+    }
+
+    // Same DB transaction as the claim: if the step logic fails, the claim
+    // rolls back too and a retry can run the step again
+    T result = stepLogic.get();
+    sagaStepIdempotencyRepository.saveResult(sagaId, stepName, "SUCCESS", toJson(result));
+    return result;
 }
 ```
 
@@ -457,12 +471,20 @@ public class PaymentSaga {
     @SagaEventHandler(associationProperty = "paymentId")
     public void on(FraudCheckFailedEvent event) {
         if (debitApplied) {
-            // Compensate step 1
+            // Compensate step 1 -- and keep the saga alive until the
+            // reversal is confirmed (ending now would lose track of it)
             commandGateway.send(new ReverseDebitCommand(
                 sourceAccountId, amount, paymentId));
+        } else {
+            SagaLifecycle.end();
         }
-        // Saga ends in failure — Axon manages saga state persistence
-        SagaLifecycle.end();
+    }
+
+    @EndSaga
+    @SagaEventHandler(associationProperty = "paymentId")
+    public void on(DebitReversedEvent event) {
+        // Saga ends in failure, compensation confirmed — Axon persists saga state
+        log.info("Payment saga compensated: paymentId={}", paymentId);
     }
 
     @EndSaga
@@ -478,9 +500,9 @@ public class PaymentSaga {
 
 ## 9. Production Pitfalls
 
-### Pitfall 1 — No Compensation for the First Step
+### Pitfall 1 — First Step Not Idempotent
 
-A team designs a saga where the first step (debit source account) has no compensation. They reason that if the debit fails, nothing has happened. But the saga code does not account for a scenario where the debit SUCCEEDS but the reply is lost (network partition), causing the orchestrator to retry the debit, debiting the account twice.
+A team treats the first step (debit source account) as trivial: if the debit fails, nothing has happened. But they forget the scenario where the debit SUCCEEDS and the reply is lost (network partition): the orchestrator retries the debit and the account is debited twice.
 
 ```java
 // BAD: first step has no idempotency guard
@@ -497,8 +519,9 @@ public void handleDebit(DebitSourceAccountCommand command) {
 @KafkaListener(topics = "account.commands", groupId = "account-service")
 @Transactional
 public void handleDebit(DebitSourceAccountCommand command) {
-    // Check if this saga step was already applied
-    if (sagaStepLog.exists(command.getSagaId(), "DEBIT_SOURCE")) {
+    // Claim the step (INSERT ... ON CONFLICT DO NOTHING on (saga_id, step));
+    // false = this saga step was already applied
+    if (!sagaStepLog.tryRecord(command.getSagaId(), "DEBIT_SOURCE")) {
         log.info("Debit already applied, returning cached reply: sagaId={}",
                  command.getSagaId());
         replyBus.send("account.replies",
@@ -509,7 +532,6 @@ public void handleDebit(DebitSourceAccountCommand command) {
     Account account = accountRepository.findById(command.getSourceAccountId()).orElseThrow();
     account.debit(command.getAmount());
     accountRepository.save(account);
-    sagaStepLog.record(command.getSagaId(), "DEBIT_SOURCE");
 
     replyBus.send("account.replies",
         toJson(new SourceAccountDebitedReply(command.getSagaId())));
@@ -547,8 +569,12 @@ public class PaymentSagaOrchestrator {
             toJson(new DebitSourceAccountCommand(state.getSagaId(), ...)));
     }
 
-    // On startup: find and resume all in-progress sagas from the DB
-    @PostConstruct
+    // On startup: find and resume all in-progress sagas from the DB.
+    // Use ApplicationReadyEvent, not @PostConstruct (Kafka and transactions
+    // may not be ready yet). With several instances, claim each saga first
+    // (e.g. SELECT ... FOR UPDATE SKIP LOCKED) -- duplicate re-sends are
+    // harmless only because every step handler is idempotent.
+    @EventListener(ApplicationReadyEvent.class)
     public void resumeInFlightSagas() {
         List<SagaState> inProgress = sagaStateRepository
             .findByStatus(SagaStatus.IN_PROGRESS);
@@ -577,23 +603,19 @@ public void handleReverseDebit(ReverseDebitCommand command) {
 @KafkaListener(topics = "account.commands", groupId = "account-service")
 @Transactional
 public void handleReverseDebit(ReverseDebitCommand command) {
-    // Check if this compensation was already applied
-    Optional<SagaCompensation> existing = compensationRepository
-        .findBySagaIdAndCompensationType(command.getSagaId(), "REVERSE_DEBIT");
-
-    if (existing.isPresent()) {
+    // Claim the compensation first: INSERT into saga_compensations with
+    // PRIMARY KEY (saga_id, compensation_type), ON CONFLICT DO NOTHING.
+    // (Find-then-save would race with a concurrent duplicate delivery.)
+    if (!compensationRepository.tryInsert(command.getSagaId(), "REVERSE_DEBIT")) {
         log.info("Compensation already applied, skipping: sagaId={}", command.getSagaId());
         return;
     }
 
+    // Same DB transaction as the claim: a failure rolls both back
     Account account = accountRepository.findById(command.getSourceAccountId())
         .orElseThrow();
     account.credit(command.getAmount());
     accountRepository.save(account);
-
-    // Record compensation in same transaction
-    compensationRepository.save(new SagaCompensation(
-        command.getSagaId(), "REVERSE_DEBIT", Instant.now()));
 
     replyBus.send("account.replies",
         toJson(new DebitReversedReply(command.getSagaId())));
@@ -607,9 +629,10 @@ public void handleReverseDebit(ReverseDebitCommand command) {
 - [ ] Every saga step (including the first) is idempotent using `sagaId + stepName` as key
 - [ ] Saga state is persisted to a durable store before any command is sent
 - [ ] Service startup resumes in-progress sagas from the state store
-- [ ] Every compensation is idempotent — guard with a `saga_compensations` table
+- [ ] Every compensation is idempotent — guard with a `saga_compensations` table, claimed by INSERT on a unique key (not check-then-insert)
+- [ ] Commands, replies and events are written via an outbox in the same DB transaction as the state change
 - [ ] Compensation chain covers all steps in reverse order
-- [ ] Failure at step N triggers compensation for steps N-1 down to 1
+- [ ] Failure at step N triggers compensation for the completed steps N-1 down to 1 (tracked explicitly in the saga state)
 - [ ] Choreography: each service has a DLQ for failed event handling
 - [ ] Orchestration: the orchestrator has a timeout per step — alert and compensate on timeout
 - [ ] Saga step timeouts are configured and tested
@@ -625,5 +648,5 @@ public void handleReverseDebit(ReverseDebitCommand command) {
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{"title":"Implement a Payment Saga with Orchestration and Compensation","difficulty":"advanced","estimatedMinutes":75,"tasks":[{"id":"1","description":"Implement a PaymentSagaOrchestrator with a saga_state table in PostgreSQL. The orchestrator must persist SagaState (sagaId, paymentId, sourceAccountId, destAccountId, amount, currentStep, status, failureReason, createdAt, updatedAt) to the database BEFORE sending any command. Implement a @PostConstruct method that queries for all SagaStatus.IN_PROGRESS sagas older than 30 seconds and resumes them by re-sending the command for the current step. Write a unit test that simulates a restart mid-saga and verifies the saga resumes correctly."},{"id":"2","description":"Implement idempotent command handlers in AccountService for DebitSourceAccountCommand and ReverseDebitCommand. Each handler must check a saga_step_idempotency table (saga_id, step_name) before applying any change. If the step was already applied, return the cached reply. Write a test that calls each handler twice with the same sagaId and verifies the account balance changes exactly once."},{"id":"3","description":"Implement the full compensation chain: when FraudCheckFailed is received, the orchestrator must compensate in reverse order: (1) SendCancellationNotification, (2) ReverseSourceDebit. Each compensation step must be idempotent via a saga_compensations table. Write an integration test that simulates FraudCheckFailed at step 2 and verifies: the account balance is fully restored, the compensation log has two entries, and the saga status is FAILED."},{"id":"4","description":"Add saga step timeout monitoring: a @Scheduled task that queries for SagaState where status=IN_PROGRESS and updatedAt < NOW() - 5 minutes. For each timed-out saga, log the sagaId and currentStep, trigger the compensation chain, and set status=TIMED_OUT. Write a test that creates a saga, waits for the timeout threshold, and verifies the timeout monitor picks it up and compensates correctly."}]}
+{"title": "Implement a Payment Saga with Orchestration and Compensation", "difficulty": "advanced", "estimatedMinutes": 75, "tasks": [{"id": "1", "description": "Implement a PaymentSagaOrchestrator with a saga_state table in PostgreSQL. The orchestrator must persist SagaState (sagaId, paymentId, sourceAccountId, destAccountId, amount, currentStep, completedSteps, status, failureReason, createdAt, updatedAt) to the database BEFORE sending any command (ideally with the command in an outbox table, same transaction). Implement an ApplicationReadyEvent listener that finds all SagaStatus.IN_PROGRESS sagas older than 30 seconds and resumes them by re-sending the command for the current step. Write a test that simulates a restart mid-saga and verifies the saga resumes correctly."}, {"id": "2", "description": "Implement idempotent command handlers in AccountService for DebitSourceAccountCommand and ReverseDebitCommand. Each handler must first claim (saga_id, step_name) in a saga_step_idempotency table with INSERT ... ON CONFLICT DO NOTHING, in the same transaction as the balance change. If the step was already applied, return the cached reply. Write a test that calls each handler twice (also concurrently) with the same sagaId and verifies the account balance changes exactly once."}, {"id": "3", "description": "Implement the full compensation chain: when FraudCheckFailed is received, the orchestrator must compensate in reverse order: (1) SendCancellationNotification, (2) ReverseSourceDebit. Each compensation step must be idempotent via a saga_compensations table. Write an integration test that simulates FraudCheckFailed at step 2 and verifies: the account balance is fully restored, the compensation log has two entries, and the saga status is FAILED."}, {"id": "4", "description": "Add saga step timeout monitoring: a @Scheduled task that queries for SagaState where status=IN_PROGRESS and updatedAt < NOW() - 5 minutes. For each timed-out saga, log the sagaId and currentStep, trigger the compensation chain, and set status=TIMED_OUT. Write a test that creates a saga, waits for the timeout threshold, and verifies the timeout monitor picks it up and compensates correctly."}]}
 -->

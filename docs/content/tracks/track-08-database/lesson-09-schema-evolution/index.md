@@ -20,20 +20,21 @@ prerequisites: [track-08-lesson-01]
 ## 1. The Problem with Naive Migrations
 
 ```sql
--- DANGEROUS: This acquires an ACCESS EXCLUSIVE lock on the transactions table
--- All reads AND writes are blocked for the duration
+-- DANGEROUS: each statement takes an ACCESS EXCLUSIVE lock on transactions
 
--- Adding a NOT NULL column without a default blocks indefinitely on large tables
-ALTER TABLE transactions ADD COLUMN processor_id UUID NOT NULL;
+-- NOT NULL column without a default: FAILS on a non-empty table
+-- ("column contains null values"). With a VOLATILE default such as
+-- gen_random_uuid() it succeeds -- by rewriting every row under the lock.
+ALTER TABLE transactions ADD COLUMN processor_id UUID NOT NULL DEFAULT gen_random_uuid();
 
--- Renaming a column breaks all code that references the old name immediately
+-- Renaming a column is instant, but breaks all code that uses the old name
 ALTER TABLE transactions RENAME COLUMN reference TO external_reference;
 
--- Adding a CHECK constraint validates all existing rows synchronously
+-- Adding a CHECK constraint validates all existing rows while holding the lock
 ALTER TABLE transactions ADD CONSTRAINT chk_positive_amount CHECK (amount > 0);
 ```
 
-Each of the above operations acquires an `ACCESS EXCLUSIVE` lock. For a 500M row table, the lock may hold for minutes. Meanwhile, every application waiting for a connection to `transactions` queues up — eventually exhausting connection pools across the fleet.
+Each of the above operations acquires an `ACCESS EXCLUSIVE` lock. For the rewrite and the CHECK validation on a 500M row table, the lock may hold for minutes. Even the instant ones must first *wait* for every running query on the table — and while they wait, every new query queues behind them, eventually exhausting connection pools across the fleet. Always set a short `lock_timeout` for DDL.
 
 ## 2. Flyway vs Liquibase
 
@@ -43,9 +44,9 @@ Both are mature schema migration tools. The choice often comes down to team pref
 |---|---|---|
 | Migration format | SQL (primary), Java | XML, YAML, JSON, SQL |
 | Versioning | Sequential (V1, V2, V3) | Sequential or labeled |
-| Rollback | Commercial (Teams+) | Built-in |
+| Rollback (undo) | Paid editions | Built-in |
 | Spring Boot integration | First-class | First-class |
-| Dry-run | Commercial | Built-in |
+| Dry-run | Paid editions | Built-in (`update-sql`) |
 | Community | Large | Large |
 | Complexity | Simpler | More features |
 
@@ -122,80 +123,71 @@ The expand-contract (also called parallel change) pattern allows schema changes 
 -- Existing application code doesn't know about this column; NULL is fine.
 -- This migration is instant: PostgreSQL adds a nullable column with no table scan.
 
+SET lock_timeout = '3s';   -- give up instead of queueing behind long queries
 ALTER TABLE transactions ADD COLUMN processor_id UUID;
-
--- Add index concurrently (doesn't block reads/writes)
-CREATE INDEX CONCURRENTLY idx_transactions_processor_id
-    ON transactions (processor_id)
-    WHERE processor_id IS NOT NULL;
 
 -- Comment explains the multi-phase migration plan
 COMMENT ON COLUMN transactions.processor_id IS
     'Added 2024-01-10 (Phase 1 of 3). Backfill in progress. NOT NULL constraint added in Phase 3.';
+
+-- V011__index_processor_id.sql  -- a SEPARATE migration:
+-- CREATE INDEX CONCURRENTLY cannot run inside a transaction, and Flyway
+-- runs each migration in one (it refuses to mix transactional and
+-- non-transactional statements in a single file)
+CREATE INDEX CONCURRENTLY idx_transactions_processor_id
+    ON transactions (processor_id)
+    WHERE processor_id IS NOT NULL;
 ```
 
 ### Phase 2: Backfill (Populate Existing Rows)
 
 ```java
-// BackfillProcessorIdJob.java — deployed and run after Phase 1
+// BackfillProcessorIdJob.java — run ONCE after Phase 1, and only after the
+// new application code writes processor_id on every insert (otherwise new
+// NULL rows keep appearing). Run it as a one-off job, not on every
+// instance's startup -- or guard it with an advisory lock.
 @Component
 @Slf4j
-public class BackfillProcessorIdJob implements ApplicationRunner {
+public class BackfillProcessorIdJob {
 
     private final JdbcTemplate jdbcTemplate;
     private final MeterRegistry metrics;
     private static final int BATCH_SIZE = 1_000;
 
     /**
-     * Backfill processor_id in small batches to avoid long-running transactions.
-     * Uses keyset pagination to avoid OFFSET performance degradation.
-     * Runs until all rows are populated.
+     * Backfill processor_id in small batches (one short transaction each).
+     * Keyset pagination on id: every batch continues after the last id, so
+     * rows whose value cannot be derived (still NULL) are never re-read
+     * forever.
      */
-    @Override
-    public void run(ApplicationArguments args) throws Exception {
+    public void run() throws InterruptedException {
         log.info("Starting processor_id backfill");
         long totalUpdated = 0;
         UUID lastId = null;
 
         while (true) {
-            int updated;
-            if (lastId == null) {
-                updated = jdbcTemplate.update(
-                    """
-                    UPDATE transactions
-                    SET processor_id = derive_processor_id(reference)
+            List<UUID> ids = jdbcTemplate.queryForList(
+                """
+                WITH batch AS (
+                    SELECT id FROM transactions
                     WHERE processor_id IS NULL
-                      AND id IN (
-                        SELECT id FROM transactions
-                        WHERE processor_id IS NULL
-                        ORDER BY id
-                        LIMIT ?
-                      )
-                    """,
-                    BATCH_SIZE
-                );
-            } else {
-                updated = jdbcTemplate.update(
-                    """
-                    UPDATE transactions
-                    SET processor_id = derive_processor_id(reference)
-                    WHERE processor_id IS NULL
-                      AND id IN (
-                        SELECT id FROM transactions
-                        WHERE processor_id IS NULL
-                          AND id > ?
-                        ORDER BY id
-                        LIMIT ?
-                      )
-                    """,
-                    lastId, BATCH_SIZE
-                );
-            }
+                      AND (?::uuid IS NULL OR id > ?::uuid)
+                    ORDER BY id
+                    LIMIT ?
+                )
+                UPDATE transactions t
+                SET processor_id = derive_processor_id(t.reference)
+                FROM batch
+                WHERE t.id = batch.id
+                RETURNING t.id
+                """,
+                UUID.class, lastId, lastId, BATCH_SIZE);
 
-            if (updated == 0) break;
+            if (ids.isEmpty()) break;
 
-            totalUpdated += updated;
-            metrics.counter("migration.backfill.rows").increment(updated);
+            lastId = Collections.max(ids);        // continue after this batch
+            totalUpdated += ids.size();
+            metrics.counter("migration.backfill.rows").increment(ids.size());
 
             // Small pause to avoid overwhelming the DB during peak hours
             if (isPeakHours()) {
@@ -209,7 +201,7 @@ public class BackfillProcessorIdJob implements ApplicationRunner {
     }
 
     private boolean isPeakHours() {
-        int hour = LocalTime.now().getHour();
+        int hour = LocalTime.now(ZoneOffset.UTC).getHour();
         return hour >= 8 && hour <= 20;
     }
 }
@@ -222,7 +214,8 @@ public class BackfillProcessorIdJob implements ApplicationRunner {
 -- Run ONLY after backfill is 100% complete and new code writes processor_id on all inserts.
 -- Uses NOT VALID + VALIDATE pattern to avoid a full table scan under lock.
 
--- Step 1: Add constraint without validating existing rows (fast, no lock on data)
+-- Step 1: Add constraint without validating existing rows
+-- (brief ACCESS EXCLUSIVE lock, no scan)
 ALTER TABLE transactions
     ADD CONSTRAINT chk_processor_id_not_null
     CHECK (processor_id IS NOT NULL)
@@ -231,7 +224,8 @@ ALTER TABLE transactions
 -- Step 2: Validate separately (uses SHARE UPDATE EXCLUSIVE — allows reads/writes!)
 ALTER TABLE transactions VALIDATE CONSTRAINT chk_processor_id_not_null;
 
--- Now safe to convert to NOT NULL (uses existing validated constraint)
+-- Now SET NOT NULL skips the full scan (PostgreSQL 12+ uses the validated
+-- CHECK constraint); it still takes a brief ACCESS EXCLUSIVE lock
 ALTER TABLE transactions ALTER COLUMN processor_id SET NOT NULL;
 
 -- Drop the CHECK constraint (redundant now that column is NOT NULL)
@@ -249,6 +243,8 @@ ALTER TABLE transactions DROP CONSTRAINT chk_processor_id_not_null;
 ALTER TABLE transactions ADD COLUMN external_reference VARCHAR(100);
 -- Application code updated to write BOTH columns simultaneously
 -- New code reads external_reference, falls back to reference if NULL
+-- (Alternative while old and new code run side by side: a trigger that
+--  copies reference -> external_reference on every insert/update)
 
 -- Step 2: Backfill (populate new column from old)
 -- V016__backfill_external_reference.sql
@@ -282,21 +278,22 @@ SELECT phase, blocks_done, blocks_total, tuples_done, tuples_total,
 FROM pg_stat_progress_create_index
 WHERE relid = 'transactions'::regclass;
 
--- If CONCURRENTLY fails mid-way (connection lost, etc.), it leaves a INVALID index
--- Check for invalid indexes:
-SELECT indexname, indexdef
-FROM pg_indexes
-WHERE tablename = 'transactions'
-  AND NOT indisvalid;  -- WARNING: this syntax may differ by version
+-- If CONCURRENTLY fails mid-way (connection lost, etc.), it leaves an INVALID index
+-- Check for invalid indexes (validity lives in pg_index, not pg_indexes):
+SELECT c.relname AS indexname, pg_get_indexdef(i.indexrelid) AS indexdef
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+WHERE i.indrelid = 'transactions'::regclass
+  AND NOT i.indisvalid;
 
 -- Drop and retry the failed index:
 DROP INDEX CONCURRENTLY idx_transactions_external_ref;
 CREATE INDEX CONCURRENTLY idx_transactions_external_ref ON transactions (...);
 ```
 
-## 6. Large Table Migrations with pg_repack
+## 6. Removing Bloat After Big Migrations with pg_repack
 
-For migrations that require rewriting table data (e.g., changing column type, filling gaps in values), `pg_repack` rebuilds the table online without blocking.
+Large backfills and updates leave a lot of dead space behind. `pg_repack` rebuilds a table online to remove that bloat (or to re-order it by an index) with only brief locks at the start and end. It does **not** change column types or data — for type changes, use the expand-contract pattern (new column, dual write, backfill, switch, drop).
 
 ```bash
 # Install pg_repack
@@ -366,52 +363,55 @@ Flyway Community does not support automatic rollback. The recommended approach i
 ```sql
 -- V020__add_settlement_account_id.sql  (forward migration)
 ALTER TABLE transactions ADD COLUMN settlement_account_id UUID;
+
+-- V021__index_settlement_account_id.sql  (separate: CONCURRENTLY)
 CREATE INDEX CONCURRENTLY idx_transactions_settlement_account
     ON transactions (settlement_account_id)
     WHERE settlement_account_id IS NOT NULL;
 
--- U020__add_settlement_account_id.sql  (undo migration — Flyway Teams / manual)
-DROP INDEX CONCURRENTLY IF EXISTS idx_transactions_settlement_account;
-ALTER TABLE transactions DROP COLUMN IF EXISTS settlement_account_id;
+-- Rollback scripts (Flyway paid "undo" files, or kept manually):
+-- U021: DROP INDEX CONCURRENTLY IF EXISTS idx_transactions_settlement_account;
+-- U020: ALTER TABLE transactions DROP COLUMN IF EXISTS settlement_account_id;
 ```
 
 For Community edition, maintain manual rollback scripts and test them in staging:
 
 ```java
-@Component
-@Profile("staging")
-public class MigrationRollbackTester {
+// A CI test (not a runtime @Component): apply the migration, run the
+// rollback script, and check the schema is back to its previous state
+@SpringBootTest
+@Testcontainers
+class MigrationRollbackTest {
 
-    private final JdbcTemplate jdbcTemplate;
-    private final Flyway flyway;
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16");
 
-    /**
-     * Test that the rollback script works before promoting to production.
-     * Run this in staging CI after each migration.
-     */
+    @Autowired private JdbcTemplate jdbcTemplate;
+    @Autowired private DataSource dataSource;
+
     @Test
-    public void verifyRollbackScript() throws Exception {
-        // Record pre-migration state
-        int rowCountBefore = jdbcTemplate.queryForObject(
-            "SELECT COUNT(*) FROM transactions", Integer.class);
+    void rollbackScriptRestoresPreviousSchema() throws Exception {
+        // Flyway has applied all migrations at startup
+        assertThat(columnExists("settlement_account_id")).isTrue();
 
-        // Apply migration
-        flyway.migrate();
+        // Run the rollback scripts; try-with-resources returns the connection
+        try (Connection con = dataSource.getConnection()) {
+            ScriptUtils.executeSqlScript(con,
+                new ClassPathResource("db/rollback/U021__drop_index.sql"));
+            ScriptUtils.executeSqlScript(con,
+                new ClassPathResource("db/rollback/U020__drop_column.sql"));
+        }
 
-        // Verify migration succeeded
-        // ... validate new column exists, indexes are present
+        assertThat(columnExists("settlement_account_id")).isFalse();
+    }
 
-        // Run rollback script
-        Resource rollbackScript = new ClassPathResource("db/rollback/U020__rollback.sql");
-        ScriptUtils.executeSqlScript(
-            jdbcTemplate.getDataSource().getConnection(),
-            rollbackScript
-        );
-
-        // Verify rollback succeeded
-        int rowCountAfter = jdbcTemplate.queryForObject(
-            "SELECT COUNT(*) FROM transactions", Integer.class);
-        assertThat(rowCountAfter).isEqualTo(rowCountBefore);
+    private boolean columnExists(String column) {
+        Integer n = jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM information_schema.columns
+            WHERE table_name = 'transactions' AND column_name = ?
+            """, Integer.class, column);
+        return n != null && n > 0;
     }
 }
 ```
@@ -463,14 +463,13 @@ class FlywayMigrationTest {
     void latestMigrationShouldHaveCorrectSchema() {
         // Verify the schema is as expected after all migrations
         // This catches typos, missing columns, wrong types
-        ResultSet rs = jdbcTemplate.getDataSource()
-            .getConnection()
-            .getMetaData()
-            .getColumns(null, "public", "transactions", null);
-
         Map<String, String> columns = new HashMap<>();
-        while (rs.next()) {
-            columns.put(rs.getString("COLUMN_NAME"), rs.getString("TYPE_NAME"));
+        try (Connection con = jdbcTemplate.getDataSource().getConnection();
+             ResultSet rs = con.getMetaData()
+                 .getColumns(null, "public", "transactions", null)) {
+            while (rs.next()) {
+                columns.put(rs.getString("COLUMN_NAME"), rs.getString("TYPE_NAME"));
+            }
         }
 
         assertThat(columns).containsEntry("id", "uuid");
@@ -501,9 +500,11 @@ class FlywayMigrationTest {
         flyway.migrate();
         flyway.migrate();
 
-        // Verify no duplicate entries in schema history
+        // Verify no duplicate entries in schema history (versioned migrations
+        // only: repeatable R__ migrations have a NULL version)
         int historyRows = jdbcTemplate.queryForObject(
-            "SELECT COUNT(*) FROM flyway_schema_history", Integer.class);
+            "SELECT COUNT(*) FROM flyway_schema_history WHERE version IS NOT NULL",
+            Integer.class);
 
         int uniqueVersionRows = jdbcTemplate.queryForObject(
             "SELECT COUNT(DISTINCT version) FROM flyway_schema_history", Integer.class);
@@ -546,15 +547,15 @@ Post-deployment:
 {
   "questions": [
     {
-      "text": "You need to add a NOT NULL column `processor_id UUID NOT NULL` to a 500M row transactions table in production. If you run this as a single ALTER TABLE statement, what happens?",
+      "text": "You need to add a column `processor_id UUID NOT NULL DEFAULT gen_random_uuid()` to a 500M row transactions table in production. If you run this as a single ALTER TABLE statement, what happens?",
       "options": [
         "PostgreSQL adds the column instantly using metadata only, with no lock",
-        "PostgreSQL acquires an ACCESS EXCLUSIVE lock and scans all 500M rows to validate the NOT NULL constraint, blocking all reads and writes for minutes",
+        "PostgreSQL acquires an ACCESS EXCLUSIVE lock and rewrites all 500M rows (the default is volatile, so every row needs its own value), blocking all reads and writes for the whole rewrite",
         "PostgreSQL rejects the statement because NOT NULL columns cannot be added to existing tables",
         "PostgreSQL adds the column with NULL values for existing rows and enforces NOT NULL only for new inserts"
       ],
       "correct": 1,
-      "explanation": "ALTER TABLE ... ADD COLUMN ... NOT NULL acquires an ACCESS EXCLUSIVE lock (blocks all reads and writes) and must validate the NOT NULL constraint against every existing row. For a 500M row table, this lock could last several minutes, causing a production outage. The expand-contract pattern avoids this: add as nullable (Phase 1, instant), backfill (Phase 2, no lock), then add CHECK NOT VALID + VALIDATE separately (Phase 3, SHARE UPDATE EXCLUSIVE lock — allows reads/writes)."
+      "explanation": "ALTER TABLE ... ADD COLUMN takes an ACCESS EXCLUSIVE lock (blocks all reads and writes). With a volatile default such as gen_random_uuid(), PostgreSQL must rewrite every row to store its own value — minutes of outage on a 500M row table. (Without any default the statement simply fails on a non-empty table; with a constant default, PostgreSQL 11+ adds it instantly via the catalog.) The expand-contract pattern avoids the long lock: add the column as nullable (Phase 1, instant), backfill in batches (Phase 2), then add CHECK ... NOT VALID + VALIDATE and SET NOT NULL (Phase 3, only brief locks)."
     },
     {
       "text": "You are renaming column `transactions.reference` to `transactions.external_reference`. What is the minimum number of deployments required to do this with zero downtime?",
@@ -571,12 +572,12 @@ Post-deployment:
       "text": "During a CREATE INDEX CONCURRENTLY operation on the transactions table, the database connection drops. What is the correct recovery procedure?",
       "options": [
         "Re-run the same CREATE INDEX CONCURRENTLY command — it will resume from where it left off",
-        "Run REINDEX CONCURRENTLY to fix the partially built index",
+        "Run VACUUM ANALYZE transactions so the planner marks the index valid",
         "Drop the INVALID index with DROP INDEX CONCURRENTLY, then re-run the CREATE INDEX CONCURRENTLY",
         "Run VACUUM FULL transactions to clean up the broken index"
       ],
       "correct": 2,
-      "explanation": "When CREATE INDEX CONCURRENTLY fails mid-way, it leaves behind an index marked as INVALID in pg_indexes. This index is not usable for queries but still incurs maintenance overhead on every write. The correct procedure is: (1) find the invalid index with SELECT indexname FROM pg_indexes WHERE NOT indisvalid, (2) DROP INDEX CONCURRENTLY idx_name, (3) retry the CREATE INDEX CONCURRENTLY. REINDEX CONCURRENTLY would work for a valid but bloated index, but cannot fix an INVALID index from a failed CREATE."
+      "explanation": "When CREATE INDEX CONCURRENTLY fails mid-way, it leaves behind an index marked INVALID (pg_index.indisvalid = false). It is not used by queries but is still updated on every write. The recommended procedure: (1) find it with a query on pg_index WHERE NOT indisvalid, (2) DROP INDEX CONCURRENTLY idx_name, (3) retry CREATE INDEX CONCURRENTLY. (Rebuilding it with REINDEX INDEX CONCURRENTLY is also possible.) VACUUM does not make an invalid index valid."
     }
   ]
 }

@@ -42,14 +42,14 @@ graph TB
     
     subgraph Node1 ["Worker Node 1"]
         kubelet1[kubelet]
-        kube-proxy1[kube-proxy]
+        kubeproxy1[kube-proxy]
         P1[payment-api\nPod]
         P2[payment-api\nPod]
     end
     
     subgraph Node2 ["Worker Node 2"]
         kubelet2[kubelet]
-        kube-proxy2[kube-proxy]
+        kubeproxy2[kube-proxy]
         P3[fraud-service\nPod]
         P4[settlement-worker\nPod]
     end
@@ -67,7 +67,7 @@ graph TB
 
 **etcd** stores all cluster state — deployments, services, secrets, configmaps. For financial K8s clusters, etcd encryption at rest is mandatory.
 
-**API Server** is the single entry point for all cluster operations. All changes go through it, providing a complete audit trail in the K8s audit log.
+**API Server** is the single entry point for all cluster operations. All changes go through it, so with API server audit logging enabled (an audit policy must be configured; managed clusters expose it as a setting) you get a complete audit trail of who changed what.
 
 **Scheduler** places pods on nodes based on resource requests, affinity rules, and taints.
 
@@ -75,7 +75,7 @@ graph TB
 
 ## Pods — The Deployment Unit
 
-A **pod** is the smallest deployable unit in Kubernetes. It encapsulates one or more containers that share network and storage.
+A **pod** is the smallest deployable unit in Kubernetes. It encapsulates one or more containers that share network and storage. In practice you never create bare pods — a Deployment (next section) creates them from its template; the full spec below shows what each pod contains.
 
 ```yaml
 # payment-api pod specification
@@ -116,11 +116,19 @@ spec:
         cpu: "1000m"
         
     # Health checks
+    # startupProbe covers JVM start-up (up to 30 x 5s = 150s); liveness and
+    # readiness only start after it succeeds -- no guessed initialDelaySeconds
+    startupProbe:
+      httpGet:
+        path: /actuator/health/liveness
+        port: 8081
+      periodSeconds: 5
+      failureThreshold: 30
+
     livenessProbe:
       httpGet:
         path: /actuator/health/liveness
         port: 8081
-      initialDelaySeconds: 30
       periodSeconds: 10
       failureThreshold: 3
       
@@ -128,11 +136,12 @@ spec:
       httpGet:
         path: /actuator/health/readiness
         port: 8081
-      initialDelaySeconds: 10
       periodSeconds: 5
       failureThreshold: 3
       
-    # Secrets from Vault via External Secrets Operator — never hardcoded
+    # Secret synced from Vault by External Secrets Operator — never hardcoded.
+    # (An env var is read once at start-up: a rotated password reaches the
+    # pod only after a restart -- or mount the secret as a file and reload)
     env:
     - name: DB_PASSWORD
       valueFrom:
@@ -182,33 +191,40 @@ spec:
         app: payment-api
         version: "2.4.1"
     spec:
-      # Anti-affinity: spread pods across nodes and availability zones
-      affinity:
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-          - labelSelector:
-              matchLabels:
-                app: payment-api
-            topologyKey: "kubernetes.io/hostname"   # no two pods on same node
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              labelSelector:
-                matchLabels:
-                  app: payment-api
-              topologyKey: "topology.kubernetes.io/zone"  # prefer different AZs
-              
+      # Spread pods across availability zones and nodes.
+      # (A REQUIRED hostname anti-affinity would need one node per pod:
+      # with maxSurge=2 and an HPA max of 24, pods would stay Pending
+      # whenever there are fewer nodes than pods. Spread constraints
+      # spread evenly without that hard limit.)
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule      # zones must stay balanced
+        labelSelector:
+          matchLabels:
+            app: payment-api
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway     # prefer different nodes
+        labelSelector:
+          matchLabels:
+            app: payment-api
+
       # Graceful shutdown — give in-flight requests 30 seconds to complete
       terminationGracePeriodSeconds: 30
       
       containers:
       - name: payment-api
         image: bank-registry.internal/payment-api:2.4.1
+        # resources, probes, env and securityContext as in the pod spec above
         lifecycle:
           preStop:
-            exec:
-              # Give load balancer time to stop routing traffic before pod terminates
-              command: ["/bin/sh", "-c", "sleep 5"]
+            # Give the load balancer time to stop routing traffic before the
+            # pod terminates. Native sleep action (Kubernetes 1.30+) -- works
+            # in distroless images that have no /bin/sh. On older clusters:
+            # exec: {command: ["sleep", "5"]}
+            sleep:
+              seconds: 5
 ```
 
 ---
@@ -258,7 +274,7 @@ spec:
   - to:
     - namespaceSelector:
         matchLabels:
-          name: database
+          kubernetes.io/metadata.name: database   # label set automatically on every namespace
     ports:
     - protocol: TCP
       port: 5432  # PostgreSQL
@@ -266,23 +282,32 @@ spec:
   - to:
     - namespaceSelector:
         matchLabels:
-          name: kafka
+          kubernetes.io/metadata.name: kafka
     ports:
     - protocol: TCP
       port: 9092
-  # Allow DNS
+  # Allow DNS (cluster DNS only -- UDP and TCP)
   - to:
-    - namespaceSelector: {}
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
     ports:
     - protocol: UDP
       port: 53
+    - protocol: TCP
+      port: 53
 ```
+
+NetworkPolicies are only enforced if the cluster's network plugin (CNI) supports them — e.g. Calico or Cilium; check before relying on them.
 
 ---
 
 ## Horizontal Pod Autoscaler — Scaling for Payment Peaks
 
-Financial systems experience predictable peaks: salary payment days, bill payment windows, end of month. The HPA scales pods based on observed metrics.
+Financial systems experience predictable peaks: salary payment days, bill payment windows, end of month. The HPA scales pods based on observed metrics — it reacts *after* load rises, and new JVM pods need time to warm up. For known peaks, also scale ahead of time (e.g. raise `minReplicas` on a schedule, or a KEDA cron trigger).
 
 ```yaml
 apiVersion: autoscaling/v2
@@ -308,7 +333,9 @@ spec:
         type: Utilization
         averageUtilization: 60   # scale up when average CPU > 60%
         
-  # Scale on custom metric — payment queue depth (via KEDA/Prometheus)
+  # Scale on custom metric — payment queue depth (served through the custom
+  # metrics API, e.g. by Prometheus Adapter. KEDA is an alternative that
+  # creates and manages its own HPA -- don't combine both on one Deployment)
   - type: Pods
     pods:
       metric:
@@ -355,9 +382,12 @@ data:
 ```
 
 ```yaml
-# External Secrets Operator: sync secrets from HashiCorp Vault
-# Never store sensitive values in K8s Secrets (base64 is not encryption)
-apiVersion: external-secrets.io/v1beta1
+# External Secrets Operator: sync secrets from HashiCorp Vault.
+# Vault stays the source of truth (rotation, access policy, audit). ESO
+# still writes a normal K8s Secret -- base64 is not encryption -- so also
+# enable etcd encryption at rest (KMS) and restrict RBAC on Secrets.
+# Never put secret values in ConfigMaps or in Git.
+apiVersion: external-secrets.io/v1      # v1beta1 in older ESO releases
 kind: ExternalSecret
 metadata:
   name: payment-api-db-secret
@@ -384,13 +414,13 @@ spec:
 Before deploying a financial service to production Kubernetes:
 
 - [ ] **Resource requests and limits** set on all containers — no unbounded resource consumption
-- [ ] **Pod anti-affinity** configured — no two replicas on the same node
+- [ ] **Topology spread** (or preferred anti-affinity) configured — replicas spread across zones and nodes
 - [ ] **Non-root security context** — `runAsNonRoot: true`, `readOnlyRootFilesystem: true`
-- [ ] **External secrets** via Vault ESO — no plaintext secrets in configmaps or env vars
+- [ ] **External secrets** via Vault ESO — no secret values in configmaps or Git; etcd encryption at rest and tight RBAC on Secrets
 - [ ] **Network policy** restricts egress to known destinations only
-- [ ] **Health probes** on separate actuator port — not the application port
+- [ ] **Health probes** — startup, liveness and readiness. If actuator runs on a separate management port, remember the probes then don't exercise the main server port (Spring Boot can also expose them on the main port: `management.endpoint.health.probes.add-additional-paths=true` → `/livez`, `/readyz`)
 - [ ] **Graceful shutdown** with `preStop` sleep + `terminationGracePeriodSeconds`
-- [ ] **HPA configured** with both CPU and business metrics
+- [ ] **HPA configured** with both CPU and business metrics, plus pre-scaling for known peaks
 - [ ] **Resource quotas** applied to namespace
 - [ ] **K8s audit logging** enabled — all API server interactions recorded
 
@@ -419,7 +449,7 @@ Before deploying a financial service to production Kubernetes:
         "Kubernetes Secrets expire after 90 days"
       ],
       "correct": 1,
-      "explanation": "Base64 is encoding, not encryption. Without etcd encryption at rest AND strict RBAC, K8s Secrets are effectively plaintext. For financial services, secrets must be: encrypted at rest (Vault), access-controlled with least-privilege ACLs, audited (every read is logged), and rotatable without pod restarts. External Secrets Operator + Vault provides all of this."
+      "explanation": "Base64 is encoding, not encryption. Without etcd encryption at rest AND strict RBAC, K8s Secrets are effectively plaintext to anyone with access to the namespace or to etcd. For financial services the source of truth should be a secrets manager such as Vault: encrypted at rest, access-controlled with least-privilege policies, every read audited, and rotation managed centrally. External Secrets Operator syncs the value into the cluster — the resulting K8s Secret still needs etcd encryption and tight RBAC, and the application must re-read it (restart, or a mounted file that is reloaded) to pick up a rotation."
     },
     {
       "id": "q3",
@@ -438,12 +468,12 @@ Before deploying a financial service to production Kubernetes:
       "text": "A NetworkPolicy denies all ingress to the payments-prod namespace except from the api-gateway namespace. A new compliance service in the compliance-prod namespace needs to query the payment API. What must you do?",
       "options": [
         "Delete the NetworkPolicy — it's too restrictive",
-        "Add an ingress rule to the payments-prod NetworkPolicy allowing traffic from pods with namespace label 'name: compliance-prod'",
+        "Add an ingress rule to the payments-prod NetworkPolicy allowing traffic from the compliance-prod namespace (namespaceSelector on kubernetes.io/metadata.name: compliance-prod), ideally only from the compliance service's pods",
         "Move the compliance service into the payments-prod namespace",
         "Use an Ingress resource to bypass the NetworkPolicy"
       ],
       "correct": 1,
-      "explanation": "NetworkPolicies are additive — you add an allow rule rather than removing the deny-all. The correct fix is adding an ingress rule to the existing payments-prod NetworkPolicy that permits traffic from namespaceSelector matching 'name: compliance-prod'. This maintains the principle of least privilege while enabling the specific access needed."
+      "explanation": "NetworkPolicies are additive allow-lists — you add an allow rule rather than removing the deny-all. The correct fix is an ingress rule in payments-prod that permits traffic from the compliance-prod namespace (the kubernetes.io/metadata.name label is set automatically on every namespace), narrowed with a podSelector to the compliance service and to the API port. This keeps least privilege while enabling exactly the access needed."
     }
   ]
 }
@@ -451,25 +481,25 @@ Before deploying a financial service to production Kubernetes:
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "Kubernetes for Financial Services \u2014 Architecture and Workloads \u2014 Production Implementation",
+  "title": "Production-Ready Kubernetes Manifests for a Payment API",
   "difficulty": "advanced",
   "estimatedMinutes": 90,
   "tasks": [
     {
       "id": "1",
-      "description": "Write the Deployment manifest"
+      "description": "Write the Deployment manifest for payment-api: 6 replicas, rolling update with maxUnavailable=1 and maxSurge=2, topology spread across zones and nodes, startup/liveness/readiness probes, resource requests and limits, a non-root read-only security context, and a preStop delay with a matching terminationGracePeriodSeconds."
     },
     {
       "id": "2",
-      "description": "Write the HPA manifest"
+      "description": "Write the HPA manifest: minReplicas 6, maxReplicas 24, scale on CPU (60%) and on a custom payment_queue_depth metric, fast scale-up and slow scale-down. Explain how you would pre-scale before a known salary-day peak."
     },
     {
       "id": "3",
-      "description": "Write the NetworkPolicy"
+      "description": "Write the NetworkPolicy set for payments-prod: default deny for ingress and egress, ingress only from the api-gateway namespace on port 8080, egress only to PostgreSQL (5432), Kafka (9092) and cluster DNS (UDP and TCP 53). Test it with a debug pod from an unrelated namespace."
     },
     {
       "id": "4",
-      "description": "Write the ExternalSecret manifest"
+      "description": "Write the ExternalSecret manifest that syncs the database password from Vault into payment-api-db-secret, and describe how a rotated password reaches the running pods (restart via a rollout, or a mounted file that the application reloads)."
     }
   ]
 }

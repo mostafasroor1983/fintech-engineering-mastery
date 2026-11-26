@@ -20,8 +20,8 @@ prerequisites: [track-08-lesson-01]
 ## 1. Why PostgreSQL Connections Are Expensive
 
 Each PostgreSQL connection is a separate backend process (not a thread):
-- Consumes ~5–10 MB of RAM per connection
-- Has a startup cost (~1ms) for each new connection
+- Consumes several MB of private RAM per connection (more with large `work_mem` use or big catalog caches)
+- Has a startup cost (process fork + authentication, typically a few milliseconds; more with TLS and SCRAM)
 - Holds a slot in `pg_stat_activity` even when idle
 - Requires authentication and session setup overhead
 
@@ -65,11 +65,11 @@ PostgreSQL (100 actual backend processes)
 
 ### PgBouncer Modes
 
-**Session mode**: One server connection held per client for the entire session. Equivalent to no pooling — only saves connection startup time.
+**Session mode**: One server connection held per client for the entire session. Server connections are reused after a client disconnects, but there is no multiplexing: N connected clients still need N server connections.
 
 **Transaction mode**: Server connection checked out at transaction start, returned at commit/rollback. This is the correct mode for microservices — most of the time, connections are idle between transactions.
 
-**Statement mode**: Server connection returned after each statement. Breaks prepared statements and multi-statement transactions. Generally not recommended.
+**Statement mode**: Server connection returned after each statement. Multi-statement transactions are not allowed at all. Generally not recommended.
 
 ### PgBouncer Configuration
 
@@ -107,9 +107,12 @@ client_idle_timeout = 300    # close idle client connections after 5 min
 query_timeout = 30           # kill queries > 30s (payment processing SLA)
 query_wait_timeout = 5       # client wait for available connection: 5s
 
-# Performance
-max_prepared_statements = 0  # REQUIRED: disable in transaction mode
-                              # (see Section 4 for why)
+# Prepared statements in transaction mode (PgBouncer 1.21+):
+# > 0 makes PgBouncer track protocol-level prepared statements (the kind
+# the JDBC driver uses) and re-prepare them on whichever server connection
+# runs the transaction. 0 (the default on older setups) means no support --
+# then turn server-side prepares off in the driver (see Section 4).
+max_prepared_statements = 200
 
 # Logging
 log_connections = 0          # don't log every connection (too noisy)
@@ -140,8 +143,8 @@ SHOW POOLS;
 -- database | user | cl_active | cl_waiting | sv_active | sv_idle | sv_used | maxwait
 -- payments | app  | 45        | 0          | 48        | 2       | 0       | 0
 
--- cl_waiting > 0 means clients are waiting for connections -- alert immediately
--- maxwait > 1000ms means severe pool exhaustion
+-- cl_waiting > 0 sustained means clients are queueing for server connections -- alert
+-- maxwait (seconds; maxwait_us adds the microseconds) >= 1 means severe pool exhaustion
 
 -- Show connection stats
 SHOW STATS;
@@ -154,27 +157,29 @@ SHOW SERVERS;
 
 ## 3. HikariCP — Application-Side Connection Pooling
 
-HikariCP is the fastest JDBC connection pool available and Spring Boot's default.
+HikariCP is a very fast, lightweight JDBC connection pool and Spring Boot's default.
 
 ### The Pool Sizing Formula
 
-The classic formula from HikariCP's author:
+The classic starting point (from the PostgreSQL wiki, popularised by HikariCP's "About Pool Sizing" page):
 
 ```
-pool_size = (core_count * 2) + effective_spindle_count
+connections = (core_count * 2) + effective_spindle_count
 
-For a payment service with:
-  - 4 vCPU application server
-  - Connecting to PostgreSQL on NVMe SSD (effectively 1 "spindle")
-  - pool_size = (4 * 2) + 1 = 9 connections
+core_count = cores of the DATABASE server (not the application server)
+The result is the number of ACTIVE connections the database can usefully
+work on at once -- in TOTAL, across all clients.
 
 For a PostgreSQL server with:
   - 16 cores
-  - 2 NVMe SSDs
-  - Maximum useful pool = (16 * 2) + 2 = 34 connections
+  - NVMe SSD (count it as ~1 "spindle"; the formula predates SSDs)
+  - Useful active connections = (16 * 2) + 1 = 33
+
+Spread over 10 application instances (no PgBouncer):
+  - ~33 / 10 = 3-4 active connections per instance
 ```
 
-**Important**: This is the pool size per application instance. If you have 10 instances, the total PostgreSQL connections = 10 * 9 = 90.
+**Important**: the formula is a starting point for the *database-wide* total, to be confirmed by load testing. Each application pool is a share of that total; with 10 instances, per-instance pools of 20 would allow 200 connections — far beyond what the server can execute concurrently. With PgBouncer in transaction mode, application pools can be larger, because PgBouncer funnels them into a server pool close to the formula's number. A quick per-instance check comes from Little's law (see Section 6).
 
 ### HikariCP Configuration
 
@@ -184,7 +189,7 @@ public class DatabaseConfig {
 
     @Bean
     @Primary
-    public DataSource primaryDataSource() {
+    public DataSource primaryDataSource(MeterRegistry meterRegistry) {
         HikariConfig config = new HikariConfig();
 
         config.setJdbcUrl("jdbc:postgresql://pgbouncer:6432/payments");
@@ -204,8 +209,8 @@ public class DatabaseConfig {
         config.setMaxLifetime(1_800_000);    // recycle connections every 30 min
         config.setKeepaliveTime(60_000);     // keepalive probes every 60s
 
-        // Validation
-        config.setConnectionTestQuery("SELECT 1");  // validate connection health
+        // Validation: do NOT set connectionTestQuery with a JDBC4 driver --
+        // HikariCP then uses Connection.isValid(), which is cheaper
 
         // PostgreSQL-specific settings
         config.addDataSourceProperty("socketTimeout", "30");        // 30s socket timeout
@@ -215,15 +220,16 @@ public class DatabaseConfig {
         config.addDataSourceProperty("preparedStatementCacheQueries", "250");
         config.addDataSourceProperty("preparedStatementCacheSizeMiB", "5");
 
-        // Note: When connecting via PgBouncer in transaction mode,
-        // disable server-side prepared statements (PgBouncer can't route them)
-        // This is handled by PgBouncer's max_prepared_statements=0 setting.
-        // The JDBC driver's client-side prepared statements still work.
+        // Via PgBouncer in transaction mode, server-side prepared statements
+        // need PgBouncer 1.21+ with max_prepared_statements > 0. On older
+        // PgBouncer, add prepareThreshold=0 so the driver never creates
+        // named server-side statements (Section 4).
 
         // Pool name for metrics
         config.setPoolName("payments-primary");
 
-        // Register metrics with Micrometer (requires micrometer-core)
+        // Register metrics with Micrometer (Spring Boot does this automatically
+        // for pools it creates; needed here because we build the pool ourselves)
         config.setMetricRegistry(meterRegistry);
 
         return new HikariDataSource(config);
@@ -262,7 +268,6 @@ spring:
       idle-timeout: 600000
       max-lifetime: 1800000
       keepalive-time: 60000
-      connection-test-query: SELECT 1
       data-source-properties:
         socketTimeout: 30
         tcpKeepAlive: true
@@ -272,7 +277,7 @@ spring:
 
 ## 4. Prepared Statements in PgBouncer Transaction Mode
 
-PgBouncer in transaction mode cannot route server-side prepared statements because the prepared statement is tied to a specific backend connection, but transaction mode may assign different backends on consecutive transactions.
+A server-side prepared statement lives in one backend connection, but transaction mode may assign a different backend to each transaction. Without help from PgBouncer, a statement prepared in one transaction is missing in the next. (The PostgreSQL JDBC driver switches to named server-side prepared statements after `prepareThreshold` = 5 executions of the same `PreparedStatement`, so this hits Java apps too.)
 
 ```sql
 -- This fails in PgBouncer transaction mode:
@@ -285,29 +290,31 @@ EXECUTE balance_lookup('ACC001');
 
 ### Solutions
 
-**Option 1: Disable server-side prepared statements (simplest)**
+**Option 1: Let PgBouncer track prepared statements (PgBouncer 1.21+, recommended)**
 
 ```
 # pgbouncer.ini
-max_prepared_statements = 0
+max_prepared_statements = 200
 ```
 
-The PostgreSQL JDBC driver will use client-side prepared statements (sent as full text after a threshold number of executions, with parameter substitution done client-side). This is slightly less efficient but works correctly.
+PgBouncer remembers protocol-level prepared statements (what the JDBC driver sends) and prepares them on whichever server connection the transaction gets. SQL-level `PREPARE`/`EXECUTE` statements, as in the example above, are still not supported.
 
 **Option 2: Session mode for specific use cases requiring prepared statements**
 
 ```ini
-# pgbouncer.ini — route specific users to session mode
+# pgbouncer.ini — per-database pool mode
 [databases]
 payments_transactions = host=postgres port=5432 dbname=payments pool_mode=transaction
 payments_reporting = host=postgres port=5432 dbname=payments pool_mode=session
 ```
 
-**Option 3: JDBC driver protocol_version = 3 with disable_prepared_statement**
+**Option 3: Turn off named server-side prepares in the driver (older PgBouncer)**
 
 ```java
-config.addDataSourceProperty("prepareThreshold", "0");  // never use server-side prepared
-// All queries sent as simple text protocol — works with PgBouncer transaction mode
+config.addDataSourceProperty("prepareThreshold", "0");  // never create named server-side statements
+// The driver still uses the extended protocol with bind parameters (no SQL
+// injection risk), but with unnamed statements that live only for one
+// execution -- safe with PgBouncer transaction mode, at a small parsing cost
 ```
 
 ## 5. Pool Exhaustion — Symptoms and Solutions
@@ -315,40 +322,43 @@ config.addDataSourceProperty("prepareThreshold", "0");  // never use server-side
 ### Detecting Pool Exhaustion
 
 ```java
+// HikariCP already publishes hikaricp_connections_active / _idle / _pending
+// / _timeout_total through Micrometer -- alert on those. This class only
+// adds log lines; it reads the pool on each run and registers nothing.
 @Component
 @Slf4j
 public class ConnectionPoolMonitor {
 
     private final HikariDataSource dataSource;
-    private final MeterRegistry metrics;
+
+    public ConnectionPoolMonitor(HikariDataSource dataSource) {
+        this.dataSource = dataSource;
+    }
 
     @Scheduled(fixedRate = 10_000)
-    public void reportPoolMetrics() {
+    public void logPoolState() {
         HikariPoolMXBean pool = dataSource.getHikariPoolMXBean();
+        if (pool == null) return;                 // pool not started yet
 
-        int active = pool.getActiveConnections();
-        int idle   = pool.getIdleConnections();
-        int total  = pool.getTotalConnections();
+        int active  = pool.getActiveConnections();
+        int idle    = pool.getIdleConnections();
+        int total   = pool.getTotalConnections();
         int waiting = pool.getThreadsAwaitingConnection();
 
-        // Alert conditions
-        double utilization = (double) active / total;
+        int max = dataSource.getMaximumPoolSize();
+        double utilization = max == 0 ? 0 : (double) active / max;
         if (utilization > 0.80) {
-            log.warn("Connection pool high utilization: {}/{} ({:.0f}%)",
-                active, total, utilization * 100);
+            log.warn("Connection pool high utilization: {}/{} ({}%)",
+                active, max, Math.round(utilization * 100));
         }
 
         if (waiting > 0) {
             log.error("Connection pool EXHAUSTED: {} threads waiting for connection. " +
                 "Current: active={}, idle={}, total={}",
                 waiting, active, idle, total);
-            // This should fire a PagerDuty alert
+            // Page from the metric (hikaricp_connections_pending > 0 for 1m),
+            // not from this log line
         }
-
-        metrics.gauge("db.pool.active", active);
-        metrics.gauge("db.pool.idle", idle);
-        metrics.gauge("db.pool.waiting", waiting);
-        metrics.gauge("db.pool.utilization", utilization);
     }
 }
 ```
@@ -359,30 +369,32 @@ public class ConnectionPoolMonitor {
 |---|---|---|
 | Threads waiting for connection | Pool too small | Increase maximumPoolSize |
 | Pool fills during batch jobs | Batch not using separate pool | Dedicated batch DataSource |
-| Connections held too long | Missing transaction boundary | Add @Transactional, check for missing commit |
-| `idle in transaction` accumulating | Transaction not closed | Set statement_timeout, fix code |
-| PgBouncer cl_waiting > 0 | PgBouncer server pool full | Increase PgBouncer pool_size |
+| Connections held too long | Slow external calls (HTTP, Kafka) inside a transaction | Move external calls outside @Transactional |
+| `idle in transaction` accumulating | Transaction not closed | Set idle_in_transaction_session_timeout, fix code |
+| PgBouncer cl_waiting > 0 | PgBouncer server pool full | Find slow queries first; then raise default_pool_size (within max_db_connections) |
 
 ```sql
--- Find long-running "idle in transaction" connections (they hold locks)
+-- Find long-running "idle in transaction" connections (they hold locks
+-- and hold back VACUUM). state_change = when it went idle.
 SELECT
     pid,
     usename,
     application_name,
     state,
-    query_start,
-    EXTRACT(EPOCH FROM (NOW() - query_start))::INT AS seconds_in_state,
+    xact_start,
+    EXTRACT(EPOCH FROM (NOW() - state_change))::INT AS seconds_in_state,
     LEFT(query, 100) AS last_query
 FROM pg_stat_activity
 WHERE state = 'idle in transaction'
-  AND query_start < NOW() - INTERVAL '30 seconds'
+  AND state_change < NOW() - INTERVAL '30 seconds'
 ORDER BY seconds_in_state DESC;
 
--- Kill runaway idle-in-transaction connections
+-- Kill runaway idle-in-transaction connections (their work is rolled back)
 SELECT pg_terminate_backend(pid)
 FROM pg_stat_activity
 WHERE state = 'idle in transaction'
-  AND query_start < NOW() - INTERVAL '5 minutes';
+  AND datname = 'payments'
+  AND state_change < NOW() - INTERVAL '5 minutes';
 ```
 
 ## 6. Right-Sizing Connection Pools for Payment Services
@@ -402,13 +414,19 @@ Calculation:
   - Long operations (30%): 30 req/s * 100ms = 3.0 connections occupied at any time
   - Total steady-state: ~3.7 connections per instance
   - With 2x headroom: ~8 connections
-  - Formula check: (4 cores * 2) + 1 = 9. Close agreement.
   - Set maximumPoolSize = 10 per instance
+
+Database-side check (formula from Section 3, DB server with 8 cores):
+  - (8 * 2) + 1 = 17 useful active connections
+  - Fleet steady state: 10 * 3.7 = ~37 busy connections at peak -- more
+    than 17, so either queries must get faster or the DB needs more cores;
+    load-test to find the real knee
 
 PgBouncer configuration:
   - 10 instances * 10 connections = 100 potential application connections
-  - PgBouncer pool_size: 25 (transaction mode multiplexes 100:25)
-  - PostgreSQL max_connections: 50 (25 from app + 10 for ops/admin/monitoring)
+  - PgBouncer default_pool_size: 25 (transaction mode multiplexes 100:25)
+  - PostgreSQL max_connections: 50 (25 from PgBouncer + ~10 for
+    ops/admin/monitoring, plus headroom)
 ```
 
 ### Configuration for Batch Processing
@@ -429,12 +447,14 @@ public class BatchDataSourceConfig {
         config.setUsername("payments_batch");
         config.setPassword(resolveSecret("db.batch.password"));
 
-        // Batch jobs use more connections but for shorter periods
-        config.setMaximumPoolSize(5);      // limited: don't starve real-time
+        // Small pool: batch work is throughput-oriented and must not take
+        // database capacity away from real-time payments
+        config.setMaximumPoolSize(5);
         config.setMinimumIdle(1);
         config.setConnectionTimeout(10_000); // batch can wait longer
 
-        // Batch-specific settings
+        // Batch-specific settings (fetch size only streams rows when
+        // autocommit is off, i.e. inside a transaction)
         config.addDataSourceProperty("defaultFetchSize", "1000");
         config.addDataSourceProperty("reWriteBatchedInserts", "true");
 
@@ -456,66 +476,69 @@ Application (HikariCP pool)         PgBouncer           PostgreSQL
 ```
 
 ```java
-@SpringBootTest
+@SpringBootTest(properties = {
+    "spring.datasource.hikari.maximum-pool-size=20",
+    "spring.datasource.hikari.connection-timeout=2000"
+})
 @Testcontainers
 class ConnectionPoolIntegrationTest {
 
     @Container
+    @ServiceConnection
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16")
-        .withCommand("-c", "max_connections=50");
+        .withCommand("postgres", "-c", "max_connections=50");
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
 
     @Test
-    void poolShouldNotExhaustUnderLoad() throws Exception {
-        int concurrentThreads = 25;  // more than pool size
-        CountDownLatch latch = new CountDownLatch(concurrentThreads);
+    void poolShouldQueueRatherThanFailUnderLoad() throws Exception {
+        int concurrentThreads = 25;  // more than the pool size (20)
         AtomicInteger successCount = new AtomicInteger(0);
         AtomicInteger timeoutCount = new AtomicInteger(0);
 
-        ExecutorService executor = Executors.newFixedThreadPool(concurrentThreads);
-
-        for (int i = 0; i < concurrentThreads; i++) {
-            executor.submit(() -> {
-                try {
-                    jdbcTemplate.queryForObject("SELECT pg_sleep(0.1), 1", Integer.class);
-                    successCount.incrementAndGet();
-                } catch (DataAccessResourceFailureException e) {
-                    if (e.getMessage().contains("timeout")) {
-                        timeoutCount.incrementAndGet();
+        try (ExecutorService executor = Executors.newFixedThreadPool(concurrentThreads)) {
+            for (int i = 0; i < concurrentThreads; i++) {
+                executor.submit(() -> {
+                    try {
+                        // holds a connection for ~100 ms
+                        jdbcTemplate.queryForObject(
+                            "SELECT 1 FROM pg_sleep(0.1)", Integer.class);
+                        successCount.incrementAndGet();
+                    } catch (CannotGetJdbcConnectionException e) {
+                        timeoutCount.incrementAndGet();   // waited > 2 s
                     }
-                } finally {
-                    latch.countDown();
-                }
-            });
-        }
+                });
+            }
+        } // close() waits for all tasks (Java 19+)
 
-        latch.await(10, TimeUnit.SECONDS);
-
-        // Pool should handle at least maximumPoolSize (20) concurrent requests
-        assertThat(successCount.get()).isGreaterThanOrEqualTo(20);
-        // Remaining 5 may timeout or succeed (pool recycles)
+        // The 5 extra requests wait ~100 ms for a free connection -- far less
+        // than the 2 s connection timeout -- so every request succeeds
+        assertThat(successCount.get()).isEqualTo(concurrentThreads);
+        assertThat(timeoutCount.get()).isZero();
     }
 }
 ```
 
 > [!WARNING]
-> The most common production incident caused by connection pooling is `idle in transaction` connections. These hold database locks (sometimes table-level) while doing nothing. A single stuck connection can block an entire payment processing flow. Set `idle_in_transaction_session_timeout` in PostgreSQL to automatically kill connections stuck in a transaction for too long: `ALTER DATABASE payments SET idle_in_transaction_session_timeout = '30s';`
+> One of the most common production incidents around connection pooling is `idle in transaction` connections. These hold database locks (sometimes table-level) and hold back VACUUM while doing nothing. A single stuck connection can block an entire payment processing flow. Set `idle_in_transaction_session_timeout` in PostgreSQL to automatically kill connections stuck in a transaction for too long: `ALTER DATABASE payments SET idle_in_transaction_session_timeout = '30s';`
 
 <!-- KNOWLEDGE-CHECK
 {
   "questions": [
     {
-      "text": "A payment service has 10 instances, each with a 4 vCPU application server connecting to a PostgreSQL server with 16 cores and NVMe storage. Using the HikariCP formula, what is the recommended pool size per application instance?",
+      "text": "A payment service runs 10 instances (4 vCPU each) connecting directly — without PgBouncer — to a PostgreSQL server with 16 cores and NVMe storage. Using the classic formula connections = (core_count * 2) + effective_spindle_count as a starting point, what pool size per application instance is reasonable?",
       "options": [
         "4 connections — one per application vCPU",
-        "9 connections — (4 * 2) + 1 (application vCPUs * 2 + effective spindles)",
-        "33 connections — based on the PostgreSQL server's (16 * 2) + 1",
-        "20 connections — the HikariCP default maximum"
+        "About 3–4 connections — the formula applies to the DATABASE server, (16 * 2) + 1 ≈ 33 active connections in total, shared by 10 instances",
+        "33 connections per instance — (16 * 2) + 1",
+        "10 connections — the HikariCP default maximumPoolSize"
       ],
       "correct": 1,
-      "explanation": "The HikariCP formula is pool_size = (core_count * 2) + effective_spindle_count, applied to the APPLICATION server's vCPUs (not the database server). With 4 application vCPUs and NVMe SSD (1 effective spindle): (4 * 2) + 1 = 9. The total connections to PostgreSQL = 10 instances * 9 = 90, which is manageable. The database server's core count is irrelevant for sizing the application pool — it's the application's ability to generate concurrent database requests that matters."
+      "explanation": "The formula estimates how many connections the DATABASE server can usefully run at once, using the database server's cores: (16 * 2) + 1 ≈ 33. That is a total for all clients, so 10 instances get about 3–4 each (confirm with a load test). Giving each instance 33 would allow 330 connections that mostly wait on each other. With PgBouncer in transaction mode the application pools can be larger, because PgBouncer funnels them into a server pool near the formula's number."
     },
     {
-      "text": "PgBouncer is configured in transaction mode with max_prepared_statements = 0. A Spring JPA service using Hibernate's server-side prepared statement caching begins throwing errors: 'prepared statement does not exist'. What is the root cause?",
+      "text": "PgBouncer (older than 1.21, or with max_prepared_statements = 0) runs in transaction mode. A Spring service using the PostgreSQL JDBC driver — which switches to named server-side prepared statements after 5 executions — starts throwing errors: 'prepared statement \"S_1\" does not exist'. What is the root cause?",
       "options": [
         "Hibernate prepared statement cache is too small and needs to be increased",
         "In transaction mode, PgBouncer routes each transaction to potentially a different backend server connection; server-side prepared statements are tied to a specific backend connection and become invalid when PgBouncer routes to a different one",
@@ -523,7 +546,7 @@ class ConnectionPoolIntegrationTest {
         "PostgreSQL max_prepared_transactions is set to 0 and needs to be increased"
       ],
       "correct": 1,
-      "explanation": "Server-side prepared statements in PostgreSQL are tied to a specific backend connection. In PgBouncer transaction mode, connections are reused across clients — a PREPARE in one transaction may land on backend-1, but the subsequent EXECUTE lands on backend-2 (which has no knowledge of that prepared statement). Setting max_prepared_statements = 0 in PgBouncer disables server-side prepared statements. The JDBC driver then uses client-side prepared statement emulation (substituting parameters client-side before sending full SQL), which works correctly with connection multiplexing."
+      "explanation": "Server-side prepared statements live in one backend connection. In transaction mode, PgBouncer may give each transaction a different backend, so a statement prepared on backend-1 is unknown on backend-2. Fixes: upgrade to PgBouncer 1.21+ and set max_prepared_statements > 0 (PgBouncer then tracks protocol-level prepared statements and re-prepares them where needed), or set prepareThreshold=0 in the JDBC driver so it never creates named server-side statements."
     },
     {
       "text": "pg_stat_activity shows 15 connections in state 'idle in transaction' for over 5 minutes on the payments database. What is the most likely business impact and the fastest mitigation?",
@@ -534,7 +557,7 @@ class ConnectionPoolIntegrationTest {
         "These connections indicate a client timeout misconfiguration; increase connectionTimeout in HikariCP"
       ],
       "correct": 1,
-      "explanation": "Connections in 'idle in transaction' state have an open transaction but are not currently executing any statement. This means they hold any locks acquired during that transaction — potentially blocking rows, pages, or the entire table from being modified or vacuumed. In a payment system, a single idle-in-transaction connection holding a row lock on a hot account can cascade into a queue of blocked payment transactions. Immediate mitigation: SELECT pg_terminate_backend(pid) for all such connections. Prevention: ALTER DATABASE payments SET idle_in_transaction_session_timeout = '30s'."
+      "explanation": "Connections in 'idle in transaction' state have an open transaction but are not executing anything. They keep every lock taken in that transaction — possibly blocking rows or a whole table — and hold back VACUUM. In a payment system, one such connection holding a row lock on a hot account can queue up many blocked payment transactions. Immediate mitigation: SELECT pg_terminate_backend(pid) for those connections (their work rolls back). Prevention: ALTER DATABASE payments SET idle_in_transaction_session_timeout = '30s', and fix the code path that leaves transactions open."
     }
   ]
 }
@@ -546,10 +569,22 @@ class ConnectionPoolIntegrationTest {
   "difficulty": "advanced",
   "estimatedMinutes": 50,
   "tasks": [
-    {"id": "1", "description": "Using the HikariCP sizing formula, calculate the correct pool size for a payment service with the following profile: 15 instances, 2 vCPU each, connecting via PgBouncer to a PostgreSQL server with 8 cores and NVMe. Configure both the HikariCP application pool and PgBouncer server pool sizes. Show your calculation and explain the relationship between application pool size, PgBouncer pool size, and PostgreSQL max_connections."},
-    {"id": "2", "description": "Build a Testcontainers integration test that deliberately exhausts the connection pool: configure a pool with maximumPoolSize=5 and connectionTimeout=1000ms, then submit 20 concurrent database operations each holding a connection for 500ms. Assert that the first 5 succeed within 500ms, the remaining 15 either succeed within 1500ms (queued) or fail with ConnectionTimeout. Add HikariCP metrics to verify the pool never exceeds maximumPoolSize."},
-    {"id": "3", "description": "Write a runbook for diagnosing a production connection pool exhaustion incident. Include the specific SQL queries to run against pg_stat_activity to identify: total connections by state, 'idle in transaction' culprits with their last query and duration, connections by application and IP, and long-running active queries. Provide kill commands with appropriate safety checks."},
-    {"id": "4", "description": "Implement a separate HikariCP pool for batch processing jobs with maximumPoolSize=3 and a routing DataSource that sends @Transactional(readOnly=true) operations to a read-replica pool. Write tests verifying that batch operations never starve real-time payment processing, and that read-only transactions actually route to the replica pool."}
+    {
+      "id": "1",
+      "description": "Size the pools for a payment service with this profile: 15 instances, 2 vCPU each, connecting via PgBouncer to a PostgreSQL server with 8 cores and NVMe. Use the (core_count * 2) + spindles formula on the DATABASE server for the PgBouncer server pool, and Little's law (throughput × time a connection is held) for each HikariCP application pool. Show your calculation and explain the relationship between application pool size, PgBouncer pool size, and PostgreSQL max_connections."
+    },
+    {
+      "id": "2",
+      "description": "Build a Testcontainers integration test that deliberately exhausts the connection pool: configure a pool with maximumPoolSize=5 and connectionTimeout=1000ms, then submit 20 concurrent database operations each holding a connection for 500ms. Assert that the first 5 succeed within 500ms, the remaining 15 either succeed within 1500ms (queued) or fail with ConnectionTimeout. Add HikariCP metrics to verify the pool never exceeds maximumPoolSize."
+    },
+    {
+      "id": "3",
+      "description": "Write a runbook for diagnosing a production connection pool exhaustion incident. Include the specific SQL queries to run against pg_stat_activity to identify: total connections by state, 'idle in transaction' culprits with their last query and duration, connections by application and IP, and long-running active queries. Provide kill commands with appropriate safety checks."
+    },
+    {
+      "id": "4",
+      "description": "Implement a separate HikariCP pool for batch processing jobs with maximumPoolSize=3 and a routing DataSource that sends @Transactional(readOnly=true) operations to a read-replica pool. Write tests verifying that batch operations never starve real-time payment processing, and that read-only transactions actually route to the replica pool."
+    }
   ]
 }
 -->

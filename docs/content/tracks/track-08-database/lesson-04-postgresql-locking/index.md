@@ -30,9 +30,9 @@ PostgreSQL defines eight table-level lock modes, ordered from least to most rest
 | ROW EXCLUSIVE | INSERT, UPDATE, DELETE | SHARE, SHARE ROW EXCLUSIVE, EXCLUSIVE, ACCESS EXCLUSIVE |
 | SHARE UPDATE EXCLUSIVE | VACUUM, ANALYZE, CREATE INDEX CONCURRENTLY | SHARE UPDATE EXCLUSIVE, SHARE, SHARE ROW EXCLUSIVE, EXCLUSIVE, ACCESS EXCLUSIVE |
 | SHARE | CREATE INDEX | ROW EXCLUSIVE, SHARE UPDATE EXCLUSIVE, SHARE ROW EXCLUSIVE, EXCLUSIVE, ACCESS EXCLUSIVE |
-| SHARE ROW EXCLUSIVE | CREATE TRIGGER, ALTER TABLE | ROW EXCLUSIVE, SHARE UPDATE EXCLUSIVE, SHARE, SHARE ROW EXCLUSIVE, EXCLUSIVE, ACCESS EXCLUSIVE |
-| EXCLUSIVE | (rarely acquired directly) | All except ACCESS SHARE |
-| ACCESS EXCLUSIVE | ALTER TABLE, DROP TABLE, VACUUM FULL, TRUNCATE | All lock modes |
+| SHARE ROW EXCLUSIVE | CREATE TRIGGER, ADD FOREIGN KEY, some ALTER TABLE forms | ROW EXCLUSIVE, SHARE UPDATE EXCLUSIVE, SHARE, SHARE ROW EXCLUSIVE, EXCLUSIVE, ACCESS EXCLUSIVE |
+| EXCLUSIVE | REFRESH MATERIALIZED VIEW CONCURRENTLY | All except ACCESS SHARE |
+| ACCESS EXCLUSIVE | most ALTER TABLE forms, DROP TABLE, TRUNCATE, VACUUM FULL, REINDEX, CLUSTER | All lock modes |
 
 The most practically important distinction for financial systems:
 - **Normal reads and writes** (SELECT, INSERT, UPDATE, DELETE) coexist without table-level conflicts
@@ -113,6 +113,8 @@ FOR NO KEY UPDATE;
 -- DOES block SELECT FOR UPDATE and SELECT FOR SHARE
 ```
 
+An ordinary `UPDATE` that does not change key columns takes this lock automatically — which is why inserting child rows (an FK check takes FOR KEY SHARE on the parent) does not block updates of the parent's balance.
+
 ### 2.4 SELECT FOR KEY SHARE
 
 The weakest row lock. Prevents the row from being deleted or key columns from being updated, but allows non-key column updates. Used internally by PostgreSQL for foreign key enforcement.
@@ -144,7 +146,7 @@ WHERE status = 'pending';
 ```
 
 ```sql
--- Worker: atomically claim a pending payment (no duplicates, no skipping busy items)
+-- Worker: atomically claim a pending payment (no duplicates; items locked by other workers are skipped)
 BEGIN;
 
 SELECT queue_id, payment_id, amount, from_account, to_account
@@ -163,6 +165,10 @@ WHERE queue_id = :claimed_queue_id;
 
 COMMIT;
 ```
+
+The claim commits quickly; the payment itself is processed afterwards. Two things are then essential:
+- **Stuck items:** if a worker dies after claiming, the row stays `processing` forever. Store a `claimed_at` (lease) timestamp and let a sweeper return items whose lease expired to `pending`.
+- **Idempotent processing:** a reclaimed item may already have been partly processed, so the processing step must be safe to repeat (idempotency key towards the gateway, unique constraints on ledger entries).
 
 ### 3.2 Java Implementation of Queue Worker
 
@@ -255,8 +261,12 @@ SELECT pg_advisory_unlock(12345);
 
 -- Lock using bigint to represent a business entity
 -- Hash account_id to get a stable integer lock key
+-- (hashtext returns a 32-bit value: different accounts can collide and
+--  then share a lock -- harmless for correctness, but it adds contention)
 SELECT pg_try_advisory_lock(hashtext('ACC-1001'));
 ```
+
+**Careful with connection pools:** a session-level lock belongs to the database connection, not to your thread. If code returns the connection to the pool without unlocking (an exception path), the lock stays held by an idle pooled connection. Behind PgBouncer in transaction mode, consecutive statements may even run on different server connections, so session-level advisory locks do not work at all. Prefer transaction-level locks.
 
 ### 4.2 Transaction-Level Advisory Locks
 
@@ -290,7 +300,9 @@ public class DistributedAccountLockService {
      */
     @Transactional
     public boolean tryLockAccount(String accountId) {
-        long lockKey = accountId.hashCode();  // Or use a hash function
+        // String.hashCode() is 32-bit and may collide: two accounts would then
+        // share a lock (safe, just more contention)
+        long lockKey = accountId.hashCode();
         Boolean acquired = jdbcTemplate.queryForObject(
             "SELECT pg_try_advisory_xact_lock(?)",
             Boolean.class, lockKey);
@@ -327,6 +339,11 @@ public class ReconciliationJobLock {
 
     private static final long RECONCILIATION_LOCK_ID = 9876543210L;
 
+    // NOTE: the xact lock lives as long as THIS transaction, so the whole
+    // reconciliation runs inside one transaction. For a job that runs for
+    // many minutes, that long transaction holds back VACUUM -- use a
+    // session-level lock on a dedicated connection instead (and always
+    // unlock in finally).
     @Transactional
     public boolean tryRunReconciliation(Runnable reconciliationLogic) {
         // Only one node in the cluster runs reconciliation at a time
@@ -355,9 +372,9 @@ PostgreSQL runs a deadlock detection algorithm when a lock wait exceeds `deadloc
 
 ```
 ERROR 40P01: deadlock detected
-DETAIL: Process 1234 waits for ShareLock on transaction 5678;
+DETAIL: Process 1234 waits for ShareLock on transaction 90211;
         blocked by process 5678.
-        Process 5678 waits for ShareLock on transaction 1234;
+        Process 5678 waits for ShareLock on transaction 90207;
         blocked by process 1234.
 ```
 
@@ -463,6 +480,20 @@ SHOW log_lock_waits;
 
 ### 6.1 Viewing Active Locks
 
+The quickest way to see who blocks whom (PostgreSQL 9.6+):
+
+```sql
+SELECT pid,
+       pg_blocking_pids(pid) AS blocked_by,
+       wait_event_type,
+       now() - xact_start AS xact_age,
+       left(query, 80) AS query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+```
+
+The detailed join over `pg_locks` shows the lock modes involved:
+
 ```sql
 -- Full view of current locks with blocking relationship
 SELECT
@@ -533,12 +564,14 @@ The added danger: blocked queries queue up. When the DDL completes, all queued q
 ### 7.2 Safe DDL Patterns
 
 ```sql
--- SAFE: Adding a nullable column is instant in modern PostgreSQL
--- PostgreSQL 11+: no rewrite needed for nullable columns with no default
+-- FAST: Adding a nullable column needs no table rewrite.
+-- It still takes ACCESS EXCLUSIVE briefly -- and waits behind any running
+-- query on the table while blocking everyone queued after it, so always
+-- combine DDL with a short lock_timeout (section 7.3)
 ALTER TABLE accounts ADD COLUMN kyc_tier SMALLINT;
 
--- SAFE: Adding a column with a constant default (PostgreSQL 11+)
--- PostgreSQL 11+ stores the default in catalog without rewriting rows
+-- FAST: Adding a column with a constant (non-volatile) default (PostgreSQL 11+)
+-- PostgreSQL 11+ stores the default in the catalog without rewriting rows
 ALTER TABLE accounts ADD COLUMN kyc_verified BOOLEAN DEFAULT FALSE;
 -- Pre-PostgreSQL 11: this rewrote the entire table! On PG11+ it is instant.
 
@@ -565,20 +598,31 @@ COMMIT;
 -- Application can retry at a quieter time
 ```
 
-### 7.4 pg_repack for Online Table Rewrites
+### 7.4 Heavy Schema Changes in Steps
 
-When schema changes require a table rewrite (adding a NOT NULL column with a non-trivial default pre-PG11, changing column type, etc.), use `pg_repack`:
+Some schema changes rewrite or scan the whole table under ACCESS EXCLUSIVE (`SET NOT NULL` scans the table; most column type changes rewrite it). Break them into online steps:
 
 ```bash
-# Add a NOT NULL column with default safely (PostgreSQL 10 and earlier style)
-# Step 1: Add nullable column (instant)
+# Add a NOT NULL column without a long lock
+# Step 1: Add nullable column (fast)
 psql -c "ALTER TABLE transactions ADD COLUMN payment_channel VARCHAR(20)"
 
-# Step 2: Backfill with a background UPDATE (batch to avoid lock storms)
-# Step 3: Add NOT NULL constraint with VALIDATE (uses ShareUpdateExclusiveLock)
-psql -c "ALTER TABLE transactions ALTER COLUMN payment_channel SET NOT NULL"
+# Step 2: Backfill in small batches (short transactions, no lock storms)
 
-# For true table rewrites (changing column types):
+# Step 3: Prove NOT NULL with a CHECK constraint, validated online
+psql -c "ALTER TABLE transactions ADD CONSTRAINT payment_channel_nn
+         CHECK (payment_channel IS NOT NULL) NOT VALID"        # brief lock
+psql -c "ALTER TABLE transactions VALIDATE CONSTRAINT payment_channel_nn"
+                                          # scans, but only SHARE UPDATE EXCLUSIVE
+
+# Step 4: SET NOT NULL now skips the scan (PostgreSQL 12+ uses the valid
+#         CHECK constraint), then drop the helper constraint
+psql -c "ALTER TABLE transactions ALTER COLUMN payment_channel SET NOT NULL"
+psql -c "ALTER TABLE transactions DROP CONSTRAINT payment_channel_nn"
+
+# Changing a column TYPE: pg_repack cannot do this. Use expand/contract:
+# add a new column, write both, backfill, switch reads, drop the old column
+# (lesson 9). pg_repack is for removing bloat online:
 pg_repack -d payments_db -t transactions --no-kill-backend
 ```
 
@@ -594,8 +638,10 @@ pg_repack -d payments_db -t transactions --no-kill-backend
 | `CREATE INDEX CONCURRENTLY` | SHARE UPDATE EXCLUSIVE | Minimal — allows DML |
 | `VACUUM` | SHARE UPDATE EXCLUSIVE | Minimal — allows DML |
 | `ANALYZE` | SHARE UPDATE EXCLUSIVE | Minimal — allows DML |
-| `ALTER TABLE ADD COLUMN` (nullable, PG11+) | ACCESS EXCLUSIVE | ALL |
-| `ALTER TABLE ADD CONSTRAINT` | ACCESS EXCLUSIVE | ALL |
+| `ALTER TABLE ADD COLUMN` (nullable, PG11+) | ACCESS EXCLUSIVE (brief, no rewrite) | ALL |
+| `ALTER TABLE ADD CONSTRAINT ... CHECK` | ACCESS EXCLUSIVE (brief with NOT VALID) | ALL |
+| `ALTER TABLE ADD FOREIGN KEY` | SHARE ROW EXCLUSIVE on both tables | Writes (use NOT VALID + VALIDATE) |
+| `ALTER TABLE VALIDATE CONSTRAINT` | SHARE UPDATE EXCLUSIVE | Minimal — allows DML |
 | `TRUNCATE` | ACCESS EXCLUSIVE | ALL |
 | `DROP TABLE` | ACCESS EXCLUSIVE | ALL |
 
@@ -618,7 +664,10 @@ public class FinancialTransactionService {
             .sorted()
             .collect(Collectors.toList());
 
-        // Lock all accounts in one query (more efficient than N separate queries)
+        // Lock all accounts in one query. The query MUST contain
+        // ORDER BY id: "WHERE id IN (...) FOR UPDATE" locks rows in the order
+        // the scan finds them, not in the order of the list you pass
+        //   SELECT ... WHERE id IN (:ids) ORDER BY id FOR UPDATE
         List<Account> accounts = accountRepository
             .findAllByIdInWithLock(accountIds);
 
@@ -669,7 +718,7 @@ PostgreSQL's locking system gives you precision control over concurrency in fina
 - **SKIP LOCKED** enables high-throughput concurrent queue processing without coordination overhead
 - **Advisory locks** provide distributed coordination primitives for singleton job execution and cross-service serialisation
 - **Deadlock prevention** requires consistent lock ordering — always lock multiple rows in a deterministic sequence
-- **DDL changes** in production require care — use `CREATE INDEX CONCURRENTLY`, set `lock_timeout`, and use `pg_repack` for table rewrites
+- **DDL changes** in production require care — use `CREATE INDEX CONCURRENTLY`, set `lock_timeout`, and break heavy changes into online steps
 - **Monitor pg_locks** proactively — lock contention is a leading indicator of correctness bugs and performance degradation
 
 <!-- KNOWLEDGE-CHECK

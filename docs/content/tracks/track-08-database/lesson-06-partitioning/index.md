@@ -45,11 +45,11 @@ A digital payments platform processing 10 million transactions per day accumulat
 
 Three operational problems emerge at this scale without partitioning:
 
-**1. VACUUM can never catch up.** PostgreSQL VACUUM must scan every page looking for dead tuples. On a 500GB monolithic table with continuous write traffic, autovacuum may run indefinitely, never finishing before new dead tuples accumulate.
+**1. VACUUM struggles to keep up.** VACUUM skips pages already marked all-visible, but each run must still scan every changed page and every index of the table. On a 500GB monolithic table with continuous write traffic, a single autovacuum run can take hours, and new dead tuples accumulate faster than it finishes; anti-wraparound freezing must eventually scan the whole table.
 
-**2. Index bloat becomes unmanageable.** B-tree indexes on a 10-billion-row table reach tens of GB. REINDEX requires an ACCESS SHARE lock on the full table (PostgreSQL 12+ has REINDEX CONCURRENTLY, but it still takes hours and doubles temporary disk usage).
+**2. Index bloat becomes unmanageable.** B-tree indexes on a 10-billion-row table reach hundreds of GB. A plain REINDEX blocks writes to the table for its whole duration (PostgreSQL 12+ has REINDEX CONCURRENTLY, but on such an index it still takes hours and needs as much extra disk space as the index).
 
-**3. Time-range queries hit the wrong data.** A query for "last 30 days" must navigate a B-tree index across 10 years of data, reading many more index pages than necessary.
+**3. Time-range queries compete with old data.** A query for "last 30 days" uses indexes that also cover 10 years of history; those huge indexes are harder to keep in memory, and every large scan, report or index rebuild has to deal with the full dataset.
 
 Partitioning solves all three:
 - VACUUM runs per-partition; a 2GB monthly partition vacuums in seconds
@@ -68,8 +68,8 @@ Partitioning solves all three:
 ├─────────────────┼────────────────────┼──────────────────────────────┤
 │ Date/timestamp  │ ID columns         │ Enum values                  │
 │ Time-ordered    │ Even distribution  │ Region/currency              │
-│ queries         │ No natural order   │ Data residency               │
-│ Archival        │ Parallel write     │ Jurisdiction split           │
+│ queries         │ No natural order   │ Per-region operations        │
+│ Archival        │ Parallel write     │ Jurisdiction retention rules │
 ├─────────────────┼────────────────────┼──────────────────────────────┤
 │ transactions    │ accounts           │ payment_methods by currency  │
 │ audit_logs      │ customers          │ orders by country            │
@@ -133,11 +133,16 @@ CREATE TABLE transactions_2024_12
     PARTITION OF transactions
     FOR VALUES FROM ('2024-12-01') TO ('2025-01-01');
 
--- Always create a default partition to catch out-of-range inserts
--- Without this, inserts outside defined ranges raise an error
+-- Default partition: catches out-of-range inserts (without it they fail).
+-- Trade-offs: creating a new partition must check the default (and FAILS
+-- if it already holds rows for that range), and DETACH ... CONCURRENTLY is
+-- not allowed while a default exists. If you use pg_partman, let it create
+-- the default -- don't add a second one by hand.
 CREATE TABLE transactions_default
     PARTITION OF transactions DEFAULT;
 ```
+
+**Time zones:** `created_at` is a `TIMESTAMPTZ`, so a bound written as `'2024-01-01'` is interpreted in the *session's* `TimeZone`. Write bounds with an explicit offset (`'2024-01-01 00:00:00+00'`) or make sure the session that creates partitions runs in UTC — otherwise partition boundaries shift by hours.
 
 ### 3.3 Create Indexes on the Parent (Propagate to All Partitions)
 
@@ -182,21 +187,20 @@ SELECT transaction_id, amount, currency, status
 FROM transactions
 WHERE created_at >= '2024-01-01'
   AND created_at <  '2024-02-01'
-  AND account_id = 'acct-001';
+  AND account_id = '5f0c7e2a-6f1d-4b8e-9c55-2b8f2a7d9e01';
 ```
 
-Expected plan output:
+Expected plan output (illustrative; index names are generated per partition):
 ```
-Append  (cost=0.00..8.50 rows=10 width=52) (actual time=0.030..0.045 rows=3 loops=1)
-  Subplans Removed: 11
-  ->  Index Scan using idx_transactions_account_date_2024_01 on transactions_2024_01
-        Index Cond: ((account_id = 'acct-001') AND (created_at >= '2024-01-01') AND (created_at < '2024-02-01'))
-        Buffers: shared hit=4
+Index Scan using transactions_2024_01_account_id_created_at_idx on transactions_2024_01
+  Index Cond: ((account_id = '5f0c7e2a-...') AND (created_at >= '2024-01-01 ...')
+               AND (created_at < '2024-02-01 ...'))
+  Buffers: shared hit=4
 Planning Time: 1.2 ms
 Execution Time: 0.08 ms
 ```
 
-"Subplans Removed: 11" means 11 partitions were eliminated before execution.
+Only January's partition appears: the other 11 were pruned **at plan time**, so they are not in the plan at all. When the values are only known at run time (bind parameters in a generic prepared plan, or values from a subquery), pruning happens during execution and the plan shows `Subplans Removed: N` under an `Append` node instead.
 
 ### 4.2 Incorrect Predicate — Pruning Disabled
 
@@ -289,16 +293,18 @@ pg_partman is the production standard for maintaining date-based partitions. It 
 ### 6.1 Install and Configure
 
 ```sql
--- Install extension (requires superuser)
-CREATE EXTENSION pg_partman;
+-- Install extensions (requires superuser; pg_cron must also be listed in
+-- shared_preload_libraries)
+CREATE SCHEMA IF NOT EXISTS partman;
+CREATE EXTENSION pg_partman SCHEMA partman;
 CREATE EXTENSION pg_cron;  -- For scheduling maintenance
 
--- Register the transactions table with pg_partman
+-- Register the transactions table with pg_partman (5.x syntax)
 SELECT partman.create_parent(
     p_parent_table   => 'public.transactions',
     p_control        => 'created_at',
     p_type           => 'range',
-    p_interval       => 'monthly',
+    p_interval       => '1 month',
     p_premake        => 3,         -- Pre-create 3 future partitions
     p_start_partition => '2024-01-01'
 );
@@ -333,15 +339,19 @@ SELECT
     control,
     partition_interval,
     premake,
-    retention,
-    last_partition_created
+    retention
 FROM partman.part_config
 WHERE parent_table = 'public.transactions';
+
+-- List the child partitions pg_partman manages
+SELECT * FROM partman.show_partitions('public.transactions');
 ```
 
 ---
 
 ## 7. Java Partition Maintenance Job
+
+If you are not using pg_partman, a small scheduled job can do the same. Use **one** mechanism — pg_partman *or* this job — never both on the same table.
 
 ```java
 @Component
@@ -354,11 +364,13 @@ public class PartitionMaintenanceJob {
     /**
      * Creates monthly partitions for the next {@code monthsAhead} months.
      * Safe to run multiple times (idempotent via IF NOT EXISTS logic).
+     * Month boundaries are computed in UTC and written with an explicit
+     * offset, so they do not depend on the session time zone.
      */
     @Scheduled(cron = "0 0 2 * * *")  // Daily at 02:00
     public void ensureFuturePartitions() {
         int monthsAhead = 3;
-        YearMonth current = YearMonth.now();
+        YearMonth current = YearMonth.now(ZoneOffset.UTC);
 
         for (int i = 0; i <= monthsAhead; i++) {
             YearMonth month = current.plusMonths(i);
@@ -392,10 +404,12 @@ public class PartitionMaintenanceJob {
             """;
 
         try {
+            // Values are generated by code (never user input), and format()
+            // with %I / %L quotes them safely inside the DO block
             jdbc.execute(sql
                 .replace(":partitionName", "'" + partitionName + "'")
-                .replace(":start", "'" + start + "'")
-                .replace(":end",   "'" + end + "'")
+                .replace(":start", "'" + start + " 00:00:00+00'")
+                .replace(":end",   "'" + end + " 00:00:00+00'")
             );
             log.info("Partition ensured: {}", partitionName);
         } catch (DataAccessException e) {
@@ -412,7 +426,7 @@ public class PartitionMaintenanceJob {
     @Scheduled(cron = "0 30 2 * * *")  // 02:30 daily, after ensureFuturePartitions
     public void archiveOldPartitions() {
         int retentionMonths = 24;
-        YearMonth cutoff = YearMonth.now().minusMonths(retentionMonths);
+        YearMonth cutoff = YearMonth.now(ZoneOffset.UTC).minusMonths(retentionMonths);
 
         List<String> candidates = jdbc.queryForList(
             """
@@ -453,8 +467,10 @@ public class PartitionMaintenanceJob {
             long rowCount = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM " + partition, Long.class
             );
-            // DETACH PARTITION CONCURRENTLY requires PostgreSQL 14+
-            // Uses a weaker lock than DETACH PARTITION (no ACCESS EXCLUSIVE)
+            // DETACH PARTITION CONCURRENTLY requires PostgreSQL 14+, must run
+            // outside a transaction block (auto-commit), and is NOT allowed
+            // while the table has a default partition. It avoids the
+            // ACCESS EXCLUSIVE lock of a plain DETACH.
             jdbc.execute("ALTER TABLE transactions DETACH PARTITION " + partition + " CONCURRENTLY");
             log.info("Detached partition {} ({} rows). Ready for archival.", partition, rowCount);
             // After detaching, the table is standalone.
@@ -471,12 +487,21 @@ public class PartitionMaintenanceJob {
 
 ## 8. ATTACH PARTITION — Migrating Existing Data
 
-Migrating from an unpartitioned table to a partitioned one without downtime:
+Migrating a large live table to a partitioned one. The lowest-risk approach is usually to **keep the existing table as one big "history" partition** and only create new monthly partitions for future data:
+
+1. Add a `CHECK (created_at < '<cutover>')` constraint to the old table `NOT VALID`, then `VALIDATE` it (online).
+2. Create the new partitioned parent and its future monthly partitions.
+3. In a short transaction: rename the old table, attach it as the partition `FOR VALUES FROM (MINVALUE) TO ('<cutover>')` (the validated CHECK lets PostgreSQL skip the scan), and rename the new parent to `transactions`.
+4. Old data can later be split into monthly partitions, or simply age out.
+
+The step-by-step copy below works for smaller tables. Note that copying with `INSERT ... SELECT` while the application keeps writing misses later rows: you need a short write freeze, or a trigger/CDC that copies new writes until the switch.
 
 ```sql
 -- Step 1: Create the new partitioned table (different name to avoid conflicts)
+-- INCLUDING ALL also copies the old primary key; a PK on a partitioned
+-- table must contain created_at, so define keys explicitly if this fails
 CREATE TABLE transactions_partitioned (
-    LIKE transactions INCLUDING ALL
+    LIKE transactions INCLUDING DEFAULTS INCLUDING CONSTRAINTS
 ) PARTITION BY RANGE (created_at);
 
 -- Step 2: Create partitions for all existing data ranges
@@ -506,8 +531,11 @@ ALTER TABLE transactions_partitioned
 ATTACH PARTITION transactions_migrate_2024_01
 FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
 
--- Step 7: Atomically swap the tables (requires brief ACCESS EXCLUSIVE lock)
+-- Step 7: Atomically swap the tables (requires brief ACCESS EXCLUSIVE lock;
+-- set a short lock_timeout). Check sequences, views, foreign keys and
+-- grants that still point at the old table.
 BEGIN;
+SET LOCAL lock_timeout = '2s';
 ALTER TABLE transactions RENAME TO transactions_old;
 ALTER TABLE transactions_partitioned RENAME TO transactions;
 COMMIT;
@@ -536,7 +564,7 @@ SELECT
     last_autoanalyze,
     pg_size_pretty(pg_relation_size(c.oid)) AS size
 FROM pg_stat_user_tables t
-JOIN pg_class c ON c.relname = t.relname
+JOIN pg_class c ON c.oid = t.relid
 WHERE c.relname LIKE 'transactions_%'
 ORDER BY c.relname;
 ```
@@ -615,7 +643,7 @@ WHERE created_at >= '2024-01-01'
 -- rather than wrapping dates in functions
 ```
 
-### Pitfall 2: Missing Future Partition Causes Silent Data Loss
+### Pitfall 2: Missing Future Partition — Failed Inserts or Stuck Default Rows
 
 ```sql
 -- If a partition for February 2025 does not exist and there is no DEFAULT partition,
@@ -672,11 +700,11 @@ CREATE TABLE transaction_dedup (
 - Range partition transaction/audit tables by month or week depending on write volume
 - Hash partition account/customer tables with 16 or 32 partitions (power of 2)
 - Always include partition key in unique constraints; use a dedup table for global uniqueness
-- Run EXPLAIN and confirm "Subplans Removed" before deploying to production
+- Run EXPLAIN and confirm only the expected partitions appear (or "Subplans Removed" for run-time pruning) before deploying to production
 - Never wrap the partition key in a function in WHERE clauses
 - Configure pg_partman with p_premake = 3 to maintain future partitions
 - Alert when future partition count drops below 2
-- Use DETACH PARTITION CONCURRENTLY (PostgreSQL 14+) for zero-impact archival
+- Use DETACH PARTITION CONCURRENTLY (PostgreSQL 14+; not possible while a default partition exists) for low-impact archival
 - Add NOT VALID CHECK constraints before ATTACH PARTITION to skip full table scans
 - Monitor per-partition row counts for hash partition skew (should be within 10% of ideal)
 - Run VACUUM FREEZE on archived (read-only) partitions to avoid transaction ID wraparound
@@ -711,13 +739,13 @@ CREATE TABLE transaction_dedup (
     {
       "text": "The team is using ATTACH PARTITION to migrate data from a staging table into a partitioned parent. Without adding a CHECK constraint first, what performance problem occurs and what is the solution?",
       "options": [
-        "ATTACH PARTITION acquires an ACCESS EXCLUSIVE lock on the entire partitioned table and scans every row in the staging table to verify all rows fall within the partition bounds; add NOT VALID CHECK constraint then VALIDATE CONSTRAINT separately before attaching",
+        "ATTACH PARTITION must scan every row of the table being attached to verify the partition bounds, while holding a strong lock on that table (the parent only needs SHARE UPDATE EXCLUSIVE since PostgreSQL 12); add a NOT VALID CHECK constraint, then VALIDATE CONSTRAINT separately, before attaching",
         "ATTACH PARTITION copies all data from the staging table into the partition, doubling storage temporarily",
         "ATTACH PARTITION is blocked by any active read transactions on the parent table",
         "ATTACH PARTITION reindexes the staging table using ACCESS SHARE lock, causing index bloat"
       ],
       "correct": 0,
-      "explanation": "Without a CHECK constraint, PostgreSQL must scan every row in the staging table to verify all rows satisfy the partition bounds. This can take many minutes on a large table while holding an ACCESS EXCLUSIVE lock. The workaround: (1) ALTER TABLE staging_table ADD CONSTRAINT chk_date CHECK (created_at >= '...' AND created_at < '...') NOT VALID — this skips scanning existing rows; (2) ALTER TABLE staging_table VALIDATE CONSTRAINT chk_date — this validates using a weaker SHARE UPDATE EXCLUSIVE lock; (3) ATTACH PARTITION — now PostgreSQL trusts the constraint and skips the full scan. The ATTACH step itself is near-instantaneous."
+      "explanation": "Without a matching CHECK constraint, PostgreSQL must scan every row in the table being attached to verify that all rows satisfy the partition bounds — on a large table this takes minutes while that table is locked (and, before PostgreSQL 12, the whole partitioned parent too). The workaround: (1) ADD CONSTRAINT ... CHECK (created_at >= '...' AND created_at < '...') NOT VALID — skips scanning existing rows; (2) VALIDATE CONSTRAINT — scans with only a SHARE UPDATE EXCLUSIVE lock, so reads and writes continue; (3) ATTACH PARTITION — PostgreSQL uses the validated constraint and skips the scan, so the attach itself is near-instant."
     }
   ]
 }
@@ -731,7 +759,7 @@ CREATE TABLE transaction_dedup (
   "tasks": [
     {
       "id": "1",
-      "description": "Create a monthly RANGE-partitioned transactions table covering the current year (12 partitions plus a default partition). Create a composite index on (account_id, created_at DESC) INCLUDE (amount, currency, status) on the parent table and verify via pg_class that it propagated to all child partitions. Run EXPLAIN (ANALYZE, BUFFERS) for a single-month query and confirm 'Subplans Removed: 11' appears in the output. Then run the same query with DATE_TRUNC and document the difference in the plan."
+      "description": "Create a monthly RANGE-partitioned transactions table covering the current year (12 partitions plus a default partition). Create a composite index on (account_id, created_at DESC) INCLUDE (amount, currency, status) on the parent table and verify via pg_class that it propagated to all child partitions. Run EXPLAIN (ANALYZE, BUFFERS) for a single-month query with literal dates and confirm only that month's partition appears in the plan; then run it as a prepared statement with parameters and look for 'Subplans Removed'. Finally run the query with DATE_TRUNC and document the difference."
     },
     {
       "id": "2",
@@ -739,7 +767,7 @@ CREATE TABLE transaction_dedup (
     },
     {
       "id": "3",
-      "description": "Create a HASH-partitioned accounts table with 16 partitions. Insert 160,000 test accounts using generate_series. Write a SQL query that reports the row count and percentage of total rows for each partition. Verify that no partition deviates more than 15% from the ideal 10,000 rows. Document why UUID v4 produces good hash distribution but sequential integer IDs with HASH partitioning can cause skew."
+      "description": "Create a HASH-partitioned accounts table with 16 partitions. Insert 160,000 test accounts using generate_series. Write a SQL query that reports the row count and percentage of total rows for each partition. Verify that no partition deviates more than 15% from the ideal 10,000 rows. Explain why both UUIDs and sequential integer IDs distribute evenly with PostgreSQL's hash function, and when skew can still happen (few distinct key values, a handful of very hot keys)."
     },
     {
       "id": "4",

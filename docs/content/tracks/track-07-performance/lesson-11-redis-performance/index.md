@@ -15,7 +15,7 @@ prerequisites: [track-07-lesson-10]
 # Redis Performance — Pipelining, Scripting, and Data Structures
 
 > [!NOTE]
-> Redis is single-threaded for command execution, which means its performance profile is entirely dominated by network round-trip time, not compute. Every architectural decision — pipelining, scripting, data structure selection — is about minimizing round trips and maximizing the work done per command.
+> Redis executes commands on a single thread (newer versions can use extra threads only for network I/O). Most commands take microseconds, so for typical workloads the client's experience is dominated by network round-trip time, not compute. Every architectural decision — pipelining, scripting, data structure selection — is about minimizing round trips and maximizing the work done per command.
 
 ## 1. Redis Pipelining — Batching Commands to Reduce Round Trips
 
@@ -40,27 +40,34 @@ Client <- [RESPONSE_1, RESPONSE_2, RESPONSE_3] <- Server
 @Service
 public class RedisPipelineService {
 
-    private final RedisTemplate<String, String> redisTemplate;
-    private final StringRedisTemplate stringRedisTemplate;
+    private final StringRedisTemplate redis;   // String keys and values
+
+    public RedisPipelineService(StringRedisTemplate redis) {
+        this.redis = redis;
+    }
 
     /**
-     * Load multiple account metadata fields in one round trip.
+     * Load multiple account metadata hashes in one round trip.
      * Without pipelining: N round trips for N accounts.
      * With pipelining: 1 round trip for all N accounts.
      */
+    @SuppressWarnings("unchecked")
     public Map<String, AccountMetadata> loadAccountsBatch(List<String> accountIds) {
-        List<Object> results = redisTemplate.executePipelined(
+        List<Object> results = redis.executePipelined(
             (RedisCallback<Object>) connection -> {
                 accountIds.forEach(id ->
-                    connection.hGetAll(("account:" + id).getBytes())
+                    connection.hashCommands().hGetAll(
+                        ("account:" + id).getBytes(StandardCharsets.UTF_8))
                 );
-                return null; // return value is ignored; results collected separately
+                return null; // must return null; results come back as a list
             }
         );
 
+        // executePipelined deserialises results with the template's
+        // serializers, so each hash arrives as Map<String, String>
         Map<String, AccountMetadata> output = new HashMap<>();
         for (int i = 0; i < accountIds.size(); i++) {
-            Map<byte[], byte[]> fields = (Map<byte[], byte[]>) results.get(i);
+            Map<String, String> fields = (Map<String, String>) results.get(i);
             if (fields != null && !fields.isEmpty()) {
                 output.put(accountIds.get(i), deserializeAccountMetadata(fields));
             }
@@ -70,37 +77,35 @@ public class RedisPipelineService {
 
     /**
      * Record multiple velocity counters in one round trip.
-     * Used in fraud detection: increment daily/hourly transaction counts per account.
+     * Used in fraud detection: increment hourly/daily/monthly counts per account.
      */
     public void recordVelocityCounters(UUID accountId, BigDecimal amount) {
         String prefix = "velocity:" + accountId;
         Instant now = Instant.now();
+        LocalDate todayUtc = LocalDate.ofInstant(now, ZoneOffset.UTC);
         String hourKey  = prefix + ":hour:"  + now.truncatedTo(ChronoUnit.HOURS).getEpochSecond();
-        String dayKey   = prefix + ":day:"   + LocalDate.now();
-        String monthKey = prefix + ":month:" + YearMonth.now();
+        String dayKey   = prefix + ":day:"   + todayUtc;
+        String monthKey = prefix + ":month:" + YearMonth.from(todayUtc);
 
-        redisTemplate.executePipelined((RedisCallback<Object>) conn -> {
-            byte[] amountBytes = amount.toPlainString().getBytes();
+        // Sums are kept in MINOR units (cents) as integers: exact, and
+        // INCRBY only accepts integers. (amount.longValue() would drop the cents.)
+        long minorUnits = amount.movePointRight(2).longValueExact();
 
-            // Increment count
-            conn.incr(hourKey.getBytes());
-            conn.incr(dayKey.getBytes());
-            conn.incr(monthKey.getBytes());
-
-            // Add to sum (using INCRBYFLOAT on a separate key)
-            conn.incrBy((hourKey  + ":sum").getBytes(), amount.longValue());
-            conn.incrBy((dayKey   + ":sum").getBytes(), amount.longValue());
-            conn.incrBy((monthKey + ":sum").getBytes(), amount.longValue());
-
-            // Set TTL (expire at end of period)
-            conn.expire(hourKey.getBytes(), 3600L);
-            conn.expire(dayKey.getBytes(), 86400L);
-            conn.expire(monthKey.getBytes(), 2678400L);  // 31 days
-
-            conn.expire((hourKey  + ":sum").getBytes(), 3600L);
-            conn.expire((dayKey   + ":sum").getBytes(), 86400L);
-            conn.expire((monthKey + ":sum").getBytes(), 2678400L);
-
+        redis.executePipelined((RedisCallback<Object>) conn -> {
+            Map<String, Long> ttls = Map.of(
+                hourKey, 3_600L, dayKey, 86_400L, monthKey, 2_678_400L);  // 31 days
+            for (Map.Entry<String, Long> e : ttls.entrySet()) {
+                String k = e.getKey();
+                long ttl = e.getValue();
+                byte[] count = k.getBytes(StandardCharsets.UTF_8);
+                byte[] sum = (k + ":sum").getBytes(StandardCharsets.UTF_8);
+                conn.stringCommands().incr(count);
+                conn.stringCommands().incrBy(sum, minorUnits);
+                // The key name already contains the period, so a TTL of one
+                // period after the last write is enough to clean it up
+                conn.keyCommands().expire(count, ttl);
+                conn.keyCommands().expire(sum, ttl);
+            }
             return null;
         });
     }
@@ -110,6 +115,7 @@ public class RedisPipelineService {
 ### Pipeline Throughput Benchmarks
 
 ```
+Illustrative, one connection, 0.5 ms network round trip:
 Single command (no pipeline):  RTT = 0.5ms  -> 2,000 ops/sec
 Pipeline 10 commands:          RTT = 0.6ms  -> 16,667 ops/sec (8x)
 Pipeline 100 commands:         RTT = 1.5ms  -> 66,667 ops/sec (33x)
@@ -120,7 +126,7 @@ Pipeline 1000 commands:        RTT = 10ms   -> 100,000 ops/sec (50x)
 
 ## 2. Lua Scripting for Atomic Operations
 
-Lua scripts execute atomically on the Redis server — no other command can interleave during script execution. This is essential for operations that must be atomic but require multiple commands.
+Lua scripts execute atomically on the Redis server — no other command can interleave during script execution. This is essential for operations that must be atomic but require multiple commands. (Atomic means "not interleaved", not "all-or-nothing": if a script fails halfway, the writes it already made stay.)
 
 ### Rate Limiting Script
 
@@ -128,15 +134,19 @@ Lua scripts execute atomically on the Redis server — no other command can inte
 @Component
 public class RedisRateLimiter {
 
-    private final RedisTemplate<String, String> redisTemplate;
+    private final StringRedisTemplate redis;
 
     // Lua script: sliding window rate limiter
-    // Returns: [allowed (1/0), current_count, ttl_ms]
+    // Returns: [allowed (1/0), current_count, ttl_or_retry_ms]
     private static final String RATE_LIMIT_SCRIPT = """
         local key = KEYS[1]
         local limit = tonumber(ARGV[1])
         local window_ms = tonumber(ARGV[2])
-        local now = tonumber(ARGV[3])
+        local request_id = ARGV[3]
+
+        -- Use the Redis server clock: app servers' clocks can disagree
+        local t = redis.call('TIME')
+        local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
         local window_start = now - window_ms
 
         -- Remove expired entries from sorted set
@@ -146,9 +156,8 @@ public class RedisRateLimiter {
         local count = redis.call('ZCARD', key)
 
         if count < limit then
-            -- Add current request with timestamp as score
-            redis.call('ZADD', key, now, now .. '-' .. math.random())
-            -- Set TTL to window size
+            -- Unique member per request (a caller-supplied id, not math.random)
+            redis.call('ZADD', key, now, request_id)
             redis.call('PEXPIRE', key, window_ms)
             return {1, count + 1, window_ms}
         else
@@ -158,11 +167,12 @@ public class RedisRateLimiter {
         end
         """;
 
-    private final RedisScript<List<Long>> rateLimitScript;
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static final RedisScript<List<Long>> RATE_LIMIT =
+        (RedisScript<List<Long>>) (RedisScript) RedisScript.of(RATE_LIMIT_SCRIPT, List.class);
 
-    @PostConstruct
-    public void initScript() {
-        rateLimitScript = RedisScript.of(RATE_LIMIT_SCRIPT, List.class);
+    public RedisRateLimiter(StringRedisTemplate redis) {
+        this.redis = redis;
     }
 
     /**
@@ -173,15 +183,14 @@ public class RedisRateLimiter {
      * @return RateLimitResult with allowed flag and retry-after
      */
     public RateLimitResult checkRateLimit(String accountId, int limit, long windowMillis) {
-        String key = "ratelimit:" + accountId;
-        long now = System.currentTimeMillis();
+        String key = "ratelimit:{" + accountId + "}";   // hash tag: cluster-safe
 
-        List<Long> result = redisTemplate.execute(
-            rateLimitScript,
-            Collections.singletonList(key),
+        List<Long> result = redis.execute(
+            RATE_LIMIT,
+            List.of(key),
             String.valueOf(limit),
             String.valueOf(windowMillis),
-            String.valueOf(now)
+            UUID.randomUUID().toString()
         );
 
         boolean allowed = result.get(0) == 1L;
@@ -221,6 +230,11 @@ public class IdempotencyService {
      * Atomic get-or-set for idempotency with response storage.
      * If key exists, return existing response.
      * If key does not exist, reserve it (caller will process and store result).
+     * (Redis 7+ can do the same in one command: SET key value NX GET EX ttl.)
+     *
+     * Redis is a fast FIRST check only. Redis is not durable by default and
+     * failover can lose recent writes, so the payment's source of truth must
+     * still be a UNIQUE constraint on the idempotency key in the database.
      */
     private static final String IDEM_GETORSET_SCRIPT = """
         local key = KEYS[1]
@@ -256,15 +270,20 @@ public class IdempotencyService {
 }
 ```
 
-### Account Balance Lock Script
+### Distributed Lock Script
 
 ```java
 @Component
 public class DistributedLockService {
 
     /**
-     * Redlock-compatible SET NX EX for distributed locking.
-     * Returns the lock token if acquired, null otherwise.
+     * Single-instance lock with SET NX EX (this is NOT Redlock, which uses
+     * several independent Redis nodes). Returns the lock token if acquired.
+     *
+     * Use such locks only to avoid duplicate WORK (efficiency). They do not
+     * guarantee mutual exclusion for CORRECTNESS: a GC pause or network delay
+     * can let the TTL expire while the holder still runs. Money movements must
+     * be protected by the database (row locks, version checks, fencing tokens).
      */
     public Optional<String> tryAcquireLock(String resource, Duration ttl) {
         String token = UUID.randomUUID().toString();
@@ -339,7 +358,7 @@ public class TransactionVelocityService {
     public long countTransactionsInWindow(UUID accountId, Duration window) {
         String key = "velocity:txn:" + accountId;
         double minScore = System.currentTimeMillis() - window.toMillis();
-        double maxScore = Double.MAX_VALUE;
+        double maxScore = Double.POSITIVE_INFINITY;
 
         return redisTemplate.opsForZSet().count(key, minScore, maxScore);
     }
@@ -351,7 +370,8 @@ public class TransactionVelocityService {
     public void pruneOldEntries(UUID accountId, Duration retentionWindow) {
         String key = "velocity:txn:" + accountId;
         double cutoff = System.currentTimeMillis() - retentionWindow.toMillis();
-        redisTemplate.opsForZSet().removeRangeByScore(key, Double.MIN_VALUE, cutoff);
+        // Double.MIN_VALUE is the smallest POSITIVE double -- use -infinity
+        redisTemplate.opsForZSet().removeRangeByScore(key, Double.NEGATIVE_INFINITY, cutoff);
     }
 }
 ```
@@ -385,12 +405,13 @@ public class AccountSessionCache {
     }
 
     /**
-     * Partial update: only update changed fields without touching others.
+     * Partial update: change one field without touching the others.
+     * Careful: if the key has already expired, HSET creates a NEW hash with
+     * only "status" and NO TTL. For a cache, invalidating is usually safer:
+     * the next read reloads the full, current row from the database.
      */
-    public void updateAccountStatus(UUID accountId, String newStatus) {
-        String key = "account:" + accountId;
-        redisTemplate.opsForHash().put(key, "status", newStatus);
-        // No need to reload/reserialize the entire account object
+    public void onAccountStatusChanged(UUID accountId) {
+        redisTemplate.delete("account:" + accountId);
     }
 
     /**
@@ -473,46 +494,55 @@ public class PaymentEventStream {
 @Slf4j
 public class RedisLatencyMonitor {
 
-    private final RedisConnectionFactory connectionFactory;
-    private final MeterRegistry metrics;
+    private final StringRedisTemplate redis;
+    private final AtomicLong newSlowEntries = new AtomicLong();
+    private long lastSeenId = -1;
+
+    public RedisLatencyMonitor(StringRedisTemplate redis, MeterRegistry metrics) {
+        this.redis = redis;
+        // Register ONCE; the scheduled job only updates the holder
+        metrics.gauge("redis.slowlog.new_entries", Tags.of("instance", "primary"), newSlowEntries);
+    }
 
     /**
-     * Query Redis SLOWLOG for commands exceeding the threshold.
-     * Default threshold: 10ms (slowlog-log-slower-than 10000 microseconds).
+     * Read Redis SLOWLOG for commands exceeding the threshold
+     * (slowlog-log-slower-than; default 10000 microseconds = 10 ms).
+     * The slowlog keeps old entries, so count only entries with a new id.
      */
     @Scheduled(fixedRate = 60_000)
+    @SuppressWarnings("unchecked")
     public void reportSlowLog() {
-        try (RedisConnection conn = connectionFactory.getConnection()) {
-            List<Object> slowlog = conn.serverCommands().slowlogGet(10);
+        List<Object> entries = redis.execute((RedisCallback<List<Object>>) conn ->
+            (List<Object>) conn.execute("SLOWLOG", "GET".getBytes(), "128".getBytes()));
+        if (entries == null) return;
 
-            if (slowlog != null && !slowlog.isEmpty()) {
-                log.warn("Redis slowlog has {} entries in last 60s", slowlog.size());
-                // Parse and emit as metrics
-                metrics.gauge("redis.slowlog.count",
-                    Tags.of("instance", "primary"),
-                    slowlog.size());
-            }
+        long fresh = 0, maxId = lastSeenId;
+        for (Object e : entries) {
+            long id = (Long) ((List<Object>) e).get(0);   // entry = [id, time, micros, args...]
+            if (id > lastSeenId) fresh++;
+            maxId = Math.max(maxId, id);
+        }
+        lastSeenId = maxId;
+        newSlowEntries.set(fresh);
+        if (fresh > 0) {
+            log.warn("Redis slowlog: {} new slow commands in the last minute", fresh);
         }
     }
 
     /**
-     * Monitor Redis latency events via LATENCY HISTORY.
-     * Redis tracks event latency for: command, fast-command, net
+     * Per-command latency percentiles from INFO latencystats (Redis 7+).
      */
     @Scheduled(fixedRate = 30_000)
-    public void reportLatencyHistory() {
-        try (RedisConnection conn = connectionFactory.getConnection()) {
-            // Get latest latency sample
-            Properties info = conn.serverCommands().info("latencystats");
-            if (info != null) {
-                info.forEach((key, value) -> {
-                    if (key.toString().startsWith("latency_percentiles_usec_")) {
-                        String cmd = key.toString()
-                            .replace("latency_percentiles_usec_", "");
-                        log.debug("Redis command {} latency: {}", cmd, value);
-                    }
-                });
-            }
+    public void reportLatencyStats() {
+        Properties info = redis.execute((RedisCallback<Properties>) conn ->
+            conn.serverCommands().info("latencystats"));
+        if (info != null) {
+            info.forEach((key, value) -> {
+                if (key.toString().startsWith("latency_percentiles_usec_")) {
+                    String cmd = key.toString().replace("latency_percentiles_usec_", "");
+                    log.debug("Redis command {} latency: {}", cmd, value);
+                }
+            });
         }
     }
 }
@@ -525,7 +555,7 @@ public class RedisLatencyMonitor {
 slowlog-log-slower-than 5000    # log commands > 5ms (5000 microseconds)
 slowlog-max-len 256             # keep last 256 entries
 
-# In application.yml via Spring
+# In application.yml via Spring (pooling also needs commons-pool2 on the classpath)
 spring:
   data:
     redis:
@@ -555,34 +585,37 @@ list-max-listpack-size -2       # list uses listpack up to 8KB
 @Service
 public class RedisMemoryOptimizer {
 
-    /**
-     * Use compact keys to reduce memory overhead.
-     * Redis stores key names in memory — verbose keys waste RAM.
-     */
-    private static final String ACCT_KEY_PREFIX    = "a:";  // not "account:"
-    private static final String VELOCITY_KEY_PREFIX = "v:"; // not "velocity:"
-    private static final String RATELIMIT_KEY_PREFIX = "r:"; // not "ratelimit:"
+    private final StringRedisTemplate redis;
 
-    /**
-     * Check object encoding to verify compact encoding is used.
-     */
-    public void checkEncoding(String key) {
-        String encoding = redisTemplate.execute(
-            (RedisCallback<String>) conn ->
-                new String(conn.keyCommands().dump(key.getBytes()))
-        );
-        // If encoding shows "hashtable" instead of "listpack" for small maps,
-        // reduce hash-max-listpack-entries in redis.conf
+    public RedisMemoryOptimizer(StringRedisTemplate redis) {
+        this.redis = redis;
     }
 
     /**
-     * Monitor memory usage per key pattern using MEMORY USAGE command.
+     * Short key prefixes save a few bytes per key. That only matters with
+     * hundreds of millions of keys -- otherwise readable names win.
      */
-    public long getKeyMemoryBytes(String key) {
-        return redisTemplate.execute(
-            (RedisCallback<Long>) conn ->
-                conn.serverCommands().memoryUsage(key.getBytes())
-        );
+    private static final String ACCT_KEY_PREFIX     = "a:";  // vs "account:"
+    private static final String VELOCITY_KEY_PREFIX = "v:";  // vs "velocity:"
+
+    /**
+     * Check the encoding (OBJECT ENCODING) to verify a compact encoding is used.
+     */
+    public RedisValueEncoding checkEncoding(String key) {
+        RedisValueEncoding encoding = redis.execute((RedisCallback<RedisValueEncoding>) conn ->
+            conn.keyCommands().encodingOf(key.getBytes(StandardCharsets.UTF_8)));
+        // "hashtable" for a hash you expected to be small means it passed a
+        // threshold: too many fields, or a value longer than
+        // hash-max-listpack-value. Raise the threshold or shorten values.
+        return encoding;
+    }
+
+    /**
+     * Memory used by one key (MEMORY USAGE), including overhead.
+     */
+    public Long getKeyMemoryBytes(String key) {
+        return redis.execute((RedisCallback<Long>) conn ->
+            conn.serverCommands().memoryUsage(key.getBytes(StandardCharsets.UTF_8)));
     }
 }
 ```
@@ -643,17 +676,17 @@ public class RedissonConfig {
             .setConnectionPoolSize(20)
             .setConnectTimeout(1000)
             .setTimeout(500)
+            // Retries resend commands after a timeout: a non-idempotent
+            // command such as INCR may then run twice
             .setRetryAttempts(3)
             .setRetryInterval(100);
 
         return Redisson.create(config);
     }
 
-    // Distributed lock via Redisson
-    @Bean
-    public RLock accountLock(RedissonClient redisson) {
-        return redisson.getFairLock("account-processing-lock");
-    }
+    // Distributed lock via Redisson -- usually obtained per resource
+    // (redisson.getLock("lock:account:" + id)), not as one global bean.
+    // Same caveat as above: efficiency, not correctness, for money movement.
 }
 ```
 
@@ -666,9 +699,9 @@ In Redis Cluster, keys are distributed across shards using CRC16 of the key. Key
 public class ClusterAwareService {
 
     /**
-     * Without hash tags, these keys may land on different shards.
-     * Multi-key commands (MGET, pipeline across keys, Lua) will fail
-     * if keys span multiple shards.
+     * Without hash tags, these keys may land on different slots/shards.
+     * Multi-key commands (MGET, MSET) and Lua scripts touching them fail
+     * with a CROSSSLOT error.
      */
     // WRONG: may be on different shards
     private String badKey(UUID accountId, String type) {
@@ -688,19 +721,21 @@ public class ClusterAwareService {
      * Example: rate limit and velocity keys for the same account
      * must be on the same shard to allow Lua scripts to access both.
      */
+    // Reads all three keys in one atomic server-side step
+    private static final RedisScript<List> SESSION_SNAPSHOT_SCRIPT = RedisScript.of(
+        "return {redis.call('GET', KEYS[1]), redis.call('GET', KEYS[2]), "
+      + "redis.call('HGETALL', KEYS[3])}", List.class);
+
     public void processWithCluster(UUID accountId) {
         String rateLimitKey = "ratelimit:{" + accountId + "}";
         String velocityKey  = "velocity:{" + accountId + "}";
         String sessionKey   = "session:{" + accountId + "}";
 
-        // These are guaranteed to be on the same shard
-        // so a Lua script can safely access all three
-        redisTemplate.executePipelined((RedisCallback<Object>) conn -> {
-            conn.get(rateLimitKey.getBytes());
-            conn.get(velocityKey.getBytes());
-            conn.hGetAll(sessionKey.getBytes());
-            return null;
-        });
+        // Same hash tag -> same slot, so ONE Lua script may use all three keys
+        // (Note: Spring Data Redis's executePipelined is not supported on a
+        //  cluster connection; use a script or Lettuce's async API instead.)
+        redisTemplate.execute(SESSION_SNAPSHOT_SCRIPT,
+            List.of(rateLimitKey, velocityKey, sessionKey));
     }
 }
 ```
@@ -714,10 +749,11 @@ spring:
     redis:
       lettuce:
         pool:
-          # Formula: max-active = (threads per service instance) * 0.5
-          # Rationale: Redis commands are fast (sub-ms), so threads don't hold
-          # connections for long. 50% of threads holding connections at peak
-          # is a safe upper bound.
+          # Lettuce connections are thread-safe: ONE shared connection
+          # multiplexes all ordinary commands, and that is often the fastest
+          # setup. A pool is needed only for blocking commands (BLPOP, XREAD
+          # BLOCK) and MULTI/EXEC transactions. If you pool, size it from
+          # load tests -- a small pool is usually enough.
           max-active: 20
           max-idle: 10
           min-idle: 5
@@ -733,29 +769,27 @@ spring:
 ```
 
 ```java
-@Component
-@Slf4j
-public class RedisConnectionPoolMonitor {
+@Configuration
+public class RedisMetricsConfig {
 
-    private final GenericObjectPoolConfig<?> poolConfig;
-    private final MeterRegistry metrics;
-
-    @Scheduled(fixedRate = 15_000)
-    public void reportPoolStats() {
-        // If using Lettuce with connection pooling, monitor via JMX or
-        // Spring Actuator's redis health endpoint
-        metrics.gauge("redis.pool.active_connections",
-            Tags.of("instance", "primary"),
-            getActiveConnections());
-
-        metrics.gauge("redis.pool.idle_connections",
-            Tags.of("instance", "primary"),
-            getIdleConnections());
+    // Spring Boot already records Lettuce command latency
+    // (lettuce.command.completion / lettuce.command.firstresponse timers).
+    // For pool usage, register gauges ONCE with functions that read the pool:
+    @Bean
+    public MeterBinder redisPoolMetrics(PoolStatsSource pool) {   // your adapter
+        return registry -> {
+            Gauge.builder("redis.pool.active_connections", pool, PoolStatsSource::active)
+                .tag("instance", "primary").register(registry);
+            Gauge.builder("redis.pool.idle_connections", pool, PoolStatsSource::idle)
+                .tag("instance", "primary").register(registry);
+        };
     }
 }
 ```
 
 ## 9. Performance Benchmarks for Common Payment Operations
+
+Illustrative latencies within one data centre (network round trip included):
 
 | Operation | Data Structure | Complexity | Typical Latency |
 |---|---|---|---|
@@ -775,13 +809,14 @@ public class RedisConnectionPoolMonitor {
 // On a 1M key instance, KEYS * takes seconds and freezes all other commands
 redisTemplate.keys("account:*");  // NEVER in production
 
-// CORRECT: Use SCAN with cursor
+// CORRECT: Use SCAN with cursor -- and CLOSE the cursor, which also
+// releases the connection it holds
 ScanOptions options = ScanOptions.scanOptions().match("account:*").count(100).build();
-Cursor<byte[]> cursor = redisTemplate.getConnectionFactory()
-    .getConnection().keyCommands().scan(options);
-while (cursor.hasNext()) {
-    byte[] key = cursor.next();
-    // process
+try (Cursor<String> cursor = redisTemplate.scan(options)) {
+    while (cursor.hasNext()) {
+        String key = cursor.next();
+        // process
+    }
 }
 
 // ANTI-PATTERN 2: Storing large objects in a single string
@@ -790,7 +825,7 @@ redisTemplate.opsForValue().set("account:" + id, serialize(bigAccountObject));
 
 // CORRECT: Use Hash and only fetch needed fields
 redisTemplate.opsForHash().multiGet("account:" + id,
-    List.of("balance", "currency", "status"));
+    List.of("currency", "status", "type"));   // (never cache balances -- lesson 10)
 
 // ANTI-PATTERN 3: No TTL on keys
 redisTemplate.opsForValue().set("temp-data:" + id, value);
@@ -800,7 +835,9 @@ redisTemplate.opsForValue().set("temp-data:" + id, value);
 redisTemplate.opsForValue().set("temp-data:" + id, value, Duration.ofMinutes(30));
 
 // ANTI-PATTERN 4: Using Redis as a primary transaction store
-// Redis is not durable by default (AOF must be enabled and fsync configured)
+// Redis is not durable by default (only periodic RDB snapshots; AOF is off).
+// Even with AOF and fsync, replication is asynchronous, so a failover can
+// lose acknowledged writes.
 // Never use Redis as the primary store for financial transactions
 // Use it as a cache/auxiliary store only
 ```
@@ -854,10 +891,22 @@ redisTemplate.opsForValue().set("temp-data:" + id, value, Duration.ofMinutes(30)
   "difficulty": "advanced",
   "estimatedMinutes": 55,
   "tasks": [
-    {"id": "1", "description": "Implement a sliding window rate limiter using a Redis Sorted Set and Lua script that limits payment submissions to N per time window per account, using hash-tagged keys for Redis Cluster compatibility."},
-    {"id": "2", "description": "Implement an idempotency key store using Redis SET NX EX that: stores payment result for 24 hours, returns the stored result on duplicate submission, and uses pipelining to check idempotency and store result atomically."},
-    {"id": "3", "description": "Write a RedisConnectionPoolMonitor Spring component that reports pool active/idle connections and latency percentiles via Micrometer, and fires an alert when pool utilization exceeds 80%."},
-    {"id": "4", "description": "Write integration tests using an embedded Redis (Testcontainers with redis:7-alpine) that verify: rate limit enforcement, idempotency key behavior on duplicate submissions, and Lua script atomicity under concurrent requests."}
+    {
+      "id": "1",
+      "description": "Implement a sliding window rate limiter using a Redis Sorted Set and Lua script that limits payment submissions to N per time window per account, using hash-tagged keys for Redis Cluster compatibility."
+    },
+    {
+      "id": "2",
+      "description": "Implement an idempotency key store using Redis SET NX EX that: reserves the key atomically on first submission, stores the payment result for 24 hours, and returns the stored result on duplicate submission. Explain why a pipeline is not atomic (use one command or a Lua script) and why the database must still enforce a UNIQUE idempotency key."
+    },
+    {
+      "id": "3",
+      "description": "Write Spring configuration that reports Redis pool active/idle connections and command latency via Micrometer (gauges registered once), and an alert rule that fires when pool utilisation exceeds 80%."
+    },
+    {
+      "id": "4",
+      "description": "Write integration tests using an embedded Redis (Testcontainers with redis:7-alpine) that verify: rate limit enforcement, idempotency key behavior on duplicate submissions, and Lua script atomicity under concurrent requests."
+    }
   ]
 }
 -->

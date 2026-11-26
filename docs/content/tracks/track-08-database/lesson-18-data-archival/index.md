@@ -15,22 +15,24 @@ prerequisites: [track-08-lesson-06]
 # Data Archival — Cold Storage and Tiered Data Management
 
 > [!NOTE]
-> The Bank Secrecy Act (BSA) requires retention of transaction records for at least 5 years; anti-money laundering regulations commonly require 7 years. Storing 7 years of transactions in a single hot PostgreSQL table is prohibitively expensive. Tiered archival moves old data to progressively cheaper storage while maintaining the ability to query it for compliance.
+> The US Bank Secrecy Act (BSA) requires retention of transaction records for at least 5 years; other regimes and internal policies often set 5–10 years (7 is a common policy choice). Keeping 7 years of transactions in a single hot PostgreSQL table is expensive and operationally heavy. Tiered archival moves old data to progressively cheaper storage while maintaining the ability to query it for compliance.
 
 ## 1. Regulatory Retention Requirements
 
 ```
-Financial data retention schedule (US, common framework):
-  - Transaction records (AML/BSA): 5-7 years
-  - Customer identification (KYC): 5 years after account closure
-  - Suspicious Activity Reports (SARs): 5 years
+Financial data retention schedule (US, simplified -- always confirm
+the exact rules with your legal/compliance team):
+  - Transaction records (BSA/AML): 5 years (many firms keep 7 by policy)
+  - Customer identification (CIP/KYC): 5 years after account closure
+  - Suspicious Activity Reports (SARs) and supporting documents: 5 years
   - Wire transfer records: 5 years
-  - Customer agreements: 7 years
+  - Customer agreements: often 7 years (firm policy / contract law)
 
 GDPR (EU) consideration:
-  - Financial data processed under "legal obligation" basis is exempt from
-    the right to erasure during the mandatory retention period
-  - After retention period expires: deletion is REQUIRED (not optional)
+  - Data kept because of a "legal obligation" is exempt from the right to
+    erasure during the mandatory retention period (Art. 17(3)(b))
+  - After the retention period expires: delete or anonymise it, unless
+    another lawful basis applies (storage limitation principle)
   - Implement automated deletion at the end of the retention period
 ```
 
@@ -44,8 +46,8 @@ WARM     PostgreSQL RDS   $0.115         <10ms           6-24 months
          (smaller instance, read-only replica)
 COLD     S3 Standard      $0.023         1-5 seconds     2-7 years
          (pg_dump files, Parquet on Athena)
-FROZEN   S3 Glacier       $0.004         3-5 hours       >7 years
-         (compliance only, pre-deletion)
+FROZEN   S3 Glacier       ~$0.004        minutes-hours   legal hold only
+         (data past retention that must be kept for a dispute/investigation)
 ```
 
 For a system with 10M transactions/month at ~1KB each:
@@ -53,7 +55,7 @@ For a system with 10M transactions/month at ~1KB each:
 - Hot tier (6 months): 60M rows = 60GB on RDS = $6.90/month
 - Cold tier (remaining 6.5 years): 780M rows = 780GB on S3 = $17.94/month
 - vs keeping everything hot: $96.60/month
-- **Savings: ~80% by tiering data properly**
+- **Storage savings: ~75% by tiering** (illustrative list prices; storage only — the bigger wins are often smaller instances, faster backups/restores and lighter maintenance)
 
 ## 3. Partition-Based Archival Pipeline
 
@@ -72,7 +74,9 @@ The partition-based archival workflow:
 
 ```sql
 -- Detach the January 2023 partition (safe: no new data written there)
--- CONCURRENTLY: non-blocking in PostgreSQL 14+
+-- CONCURRENTLY (PostgreSQL 14+): avoids blocking queries on the parent.
+-- Limits: cannot run inside a transaction block (so not inside a
+-- function/procedure), and not allowed while the table has a DEFAULT partition.
 ALTER TABLE transactions
     DETACH PARTITION transactions_2023_01 CONCURRENTLY;
 
@@ -86,79 +90,85 @@ ALTER TABLE transactions
 ```bash
 #!/bin/bash
 # archive_partition.sh
+set -euo pipefail
 
 PARTITION_NAME="transactions_2023_01"
-S3_BUCKET="s3://company-financial-archive"
-S3_PATH="${S3_BUCKET}/transactions/year=2023/month=01/"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BUCKET="company-financial-archive"
+KEY="transactions/year=2023/month=01/${PARTITION_NAME}.csv.gz"
 
-# Export as compressed CSV (simple, universally readable)
-psql -h ${DB_HOST} -U ${DB_USER} -d payments \
+# Record the source row count -- the verification step compares against it
+ROWS=$(psql -h "${DB_HOST}" -U "${DB_USER}" -d payments -XAtq \
+  -c "SELECT count(*) FROM ${PARTITION_NAME}")
+
+# Stream straight to S3: no unencrypted copy of customer data on local disk
+psql -h "${DB_HOST}" -U "${DB_USER}" -d payments \
   -c "\COPY ${PARTITION_NAME} TO STDOUT CSV HEADER" \
-  | gzip > "/tmp/${PARTITION_NAME}_${TIMESTAMP}.csv.gz"
+  | gzip \
+  | aws s3 cp - "s3://${BUCKET}/${KEY}" \
+      --sse aws:kms --sse-kms-key-id "${KMS_KEY_ARN}" \
+      --metadata "row-count=${ROWS}"
 
-# Upload to S3
-aws s3 cp "/tmp/${PARTITION_NAME}_${TIMESTAMP}.csv.gz" \
-  "${S3_PATH}${PARTITION_NAME}_${TIMESTAMP}.csv.gz" \
-  --server-side-encryption aws:kms \
-  --sse-kms-key-id "${KMS_KEY_ARN}" \
-  --storage-class STANDARD_IA
+# Verify the object exists and carries the expected row count
+aws s3api head-object --bucket "${BUCKET}" --key "${KEY}" \
+  --query 'Metadata."row-count"' --output text | grep -qx "${ROWS}"
 
-# Verify upload
-aws s3api head-object \
-  --bucket "company-financial-archive" \
-  --key "transactions/year=2023/month=01/${PARTITION_NAME}_${TIMESTAMP}.csv.gz"
-
-echo "Archive complete: ${PARTITION_NAME} -> S3"
+echo "Archive complete: ${PARTITION_NAME} (${ROWS} rows) -> s3://${BUCKET}/${KEY}"
+# Next: record PENDING in archival_log; a separate check (e.g. Athena
+# COUNT(*)) sets it to VERIFIED before the partition may be dropped
 ```
 
 ### Step 3: Export as Parquet (for Athena Query Performance)
 
 ```python
 # convert_to_parquet.py
+import os
 import psycopg2
+from psycopg2 import sql
 import pyarrow as pa
 import pyarrow.parquet as pq
-import boto3
-import pandas as pd
+from pyarrow import fs
 
-def export_partition_to_parquet(partition_name: str, s3_path: str):
+def export_partition_to_parquet(partition_name: str, year: str, month: str) -> int:
     conn = psycopg2.connect(
         host=os.environ['DB_HOST'],
         dbname='payments',
         user=os.environ['DB_USER'],
-        password=os.environ['DB_PASSWORD']
+        password=os.environ['DB_PASSWORD'],
     )
+    s3 = fs.S3FileSystem()   # credentials from the environment / IAM role
+    # Same year=/month= layout as the Athena table below
+    path = (f"company-financial-archive/transactions/"
+            f"year={year}/month={month}/{partition_name}.parquet")
 
-    # Read in chunks to avoid memory exhaustion
     chunk_size = 100_000
-    chunks = []
+    total_rows = 0
+    writer = None
+    try:
+        # A NAMED cursor is a server-side cursor: rows arrive in chunks.
+        # (A normal cursor would load the whole partition into memory.)
+        with conn.cursor(name='archive_cursor') as cur:
+            cur.itersize = chunk_size
+            # Identifier quoting instead of an f-string: no SQL injection
+            cur.execute(sql.SQL("SELECT * FROM {}").format(
+                sql.Identifier(partition_name)))
+            while True:
+                rows = cur.fetchmany(chunk_size)
+                if not rows:
+                    break
+                columns = [d[0] for d in cur.description]
+                batch = pa.Table.from_pylist([dict(zip(columns, r)) for r in rows])
+                if writer is None:
+                    writer = pq.ParquetWriter(path, batch.schema,
+                                              filesystem=s3, compression='snappy')
+                writer.write_table(batch)      # stream chunk by chunk
+                total_rows += batch.num_rows
+    finally:
+        if writer is not None:
+            writer.close()
+        conn.close()
 
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT COUNT(*) FROM {partition_name}")
-        total_rows = cur.fetchone()[0]
-        print(f"Exporting {total_rows} rows from {partition_name}")
-
-        cur.execute(f"SELECT * FROM {partition_name}")
-
-        while True:
-            rows = cur.fetchmany(chunk_size)
-            if not rows:
-                break
-            df = pd.DataFrame(rows, columns=[desc[0] for desc in cur.description])
-            chunks.append(pa.Table.from_pandas(df))
-
-    # Write partitioned Parquet files
-    combined = pa.concat_tables(chunks)
-    pq.write_to_dataset(
-        combined,
-        root_path=s3_path,
-        partition_cols=['currency'],  # partition by currency for efficient Athena queries
-        compression='snappy',
-        use_dictionary=True
-    )
-
-    print(f"Exported {total_rows} rows to {s3_path}")
+    print(f"Exported {total_rows} rows to s3://{path}")
+    return total_rows
 ```
 
 ### Step 4: Drop the Local Partition
@@ -206,12 +216,14 @@ For archived financial data, S3 Intelligent-Tiering automatically moves objects 
 }
 ```
 
-Intelligent-Tiering tiers:
+Intelligent-Tiering tiers (approximate savings vs Frequent Access):
 - **Frequent Access**: objects accessed recently
-- **Infrequent Access**: objects not accessed for 30 days (45% lower cost)
-- **Archive Instant Access**: 90 days (68% lower cost, millisecond retrieval)
-- **Archive Access**: 90-180 days (71% lower cost, 3-5 minute retrieval)
-- **Deep Archive**: >180 days (95% lower cost, 12 hour retrieval)
+- **Infrequent Access**: not accessed for 30 days (~40% lower cost)
+- **Archive Instant Access**: not accessed for 90 days (~68% lower cost, millisecond retrieval)
+- **Archive Access** (opt-in): after 90+ days (retrieval in hours)
+- **Deep Archive Access** (opt-in): after 180+ days (~95% lower cost, retrieval within ~12 hours)
+
+Athena can only read objects in the first three tiers; objects in the opt-in archive tiers must be restored first. For WORM protection against deletion or tampering, also enable **S3 Object Lock** (compliance mode) on the archive bucket.
 
 ## 5. Querying Archived Data — AWS Athena
 
@@ -250,7 +262,9 @@ SELECT
 FROM transactions_archive
 WHERE year = '2022'
   AND account_id IN (
-    SELECT id FROM accounts WHERE customer_id = 'cust-001'
+    -- accounts live in PostgreSQL, not in Athena: query a reference copy
+    -- exported to S3 (accounts_reference)
+    SELECT CAST(id AS VARCHAR) FROM accounts_reference WHERE customer_id = 'cust-001'
   )
 ORDER BY created_at;
 -- Cost: Athena charges $5/TB scanned. With partitioning + Parquet, typical query
@@ -264,37 +278,42 @@ ORDER BY created_at;
 @Slf4j
 public class ComplianceDataService {
 
-    private final AmazonAthena athenaClient;
+    private static final DateTimeFormatter ATHENA_TS =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS").withZone(ZoneOffset.UTC);
+
+    private final AthenaClient athenaClient;          // AWS SDK v2
     private final JdbcTemplate jdbcTemplate;
+    private final ArchivalBoundaryService archivalBoundary;
 
     /**
-     * Regulatory query: retrieve all transactions for a subject access request (SAR).
-     * May span both hot (PostgreSQL) and cold (Athena/S3) data.
+     * Regulatory or data-subject-access request: all transactions of a
+     * customer in [from, to). May span hot (PostgreSQL) and cold (Athena/S3).
      */
     public List<TransactionRecord> getTransactionsForCompliance(
-            UUID customerId,
-            Instant from,
-            Instant to) {
+            UUID customerId, Instant from, Instant to) {
+
+        // The real boundary: start of the oldest month still attached in
+        // PostgreSQL (read from archival_log) -- NOT a fixed "now - 2 years",
+        // which would drift away from what was actually archived
+        Instant hotCutoff = archivalBoundary.oldestHotMonthStart();
 
         List<TransactionRecord> results = new ArrayList<>();
 
-        // Hot tier: PostgreSQL (last 2 years)
-        Instant hotCutoff = Instant.now().minus(Duration.ofDays(730));
-
+        // Hot tier: [max(from, cutoff), to)
         if (to.isAfter(hotCutoff)) {
             Instant hotFrom = from.isAfter(hotCutoff) ? from : hotCutoff;
             results.addAll(queryHotTier(customerId, hotFrom, to));
         }
 
-        // Cold tier: Athena/S3 (data older than 2 years)
+        // Cold tier: [from, min(to, cutoff)) -- half-open ranges on both
+        // sides, so a row exactly at the cutoff is returned once, not twice
         if (from.isBefore(hotCutoff)) {
             Instant coldTo = to.isBefore(hotCutoff) ? to : hotCutoff;
             results.addAll(queryColdTier(customerId, from, coldTo));
         }
 
-        return results.stream()
-            .sorted(Comparator.comparing(TransactionRecord::getCreatedAt))
-            .collect(Collectors.toList());
+        results.sort(Comparator.comparing(TransactionRecord::getCreatedAt));
+        return results;
     }
 
     private List<TransactionRecord> queryHotTier(
@@ -305,52 +324,58 @@ public class ComplianceDataService {
             FROM transactions t
             JOIN accounts a ON t.account_id = a.id
             WHERE a.customer_id = ?
-              AND t.created_at BETWEEN ? AND ?
+              AND t.created_at >= ? AND t.created_at < ?
             ORDER BY t.created_at
             """,
             this::mapRow,
-            customerId, from, to
-        );
+            customerId, Timestamp.from(from), Timestamp.from(to));
     }
 
     private List<TransactionRecord> queryColdTier(
             UUID customerId, Instant from, Instant to) {
-        // Build Athena query with partition predicates for cost efficiency
-        String years = getYearRange(from, to);
-        String athenaQuery = String.format(
-            """
+        // Parameterised Athena query (executionParameters) -- no string
+        // concatenation of values into SQL. The year predicate keeps the
+        // scan (and the bill) to the needed partitions.
+        String athenaQuery = """
             SELECT id, amount, currency, status, created_at
             FROM transactions_archive
-            WHERE year IN (%s)
+            WHERE year BETWEEN ? AND ?
               AND account_id IN (
                 SELECT CAST(id AS VARCHAR) FROM accounts_reference
-                WHERE customer_id = '%s'
+                WHERE customer_id = ?
               )
-              AND created_at BETWEEN TIMESTAMP '%s' AND TIMESTAMP '%s'
+              AND created_at >= CAST(? AS TIMESTAMP)
+              AND created_at <  CAST(? AS TIMESTAMP)
             ORDER BY created_at
-            """,
-            years, customerId, from, to
-        );
+            """;
+        List<String> params = List.of(
+            quote(String.valueOf(from.atZone(ZoneOffset.UTC).getYear())),
+            quote(String.valueOf(to.atZone(ZoneOffset.UTC).getYear())),
+            quote(customerId.toString()),
+            quote(ATHENA_TS.format(from)),
+            quote(ATHENA_TS.format(to)));
 
-        return executeAthenaQuery(athenaQuery);
+        return executeAthenaQuery(athenaQuery, params);
     }
 
-    private List<TransactionRecord> executeAthenaQuery(String sql) {
+    private static String quote(String value) {     // Athena parameters are SQL literals
+        return "'" + value.replace("'", "''") + "'";
+    }
+
+    private List<TransactionRecord> executeAthenaQuery(String sql, List<String> params) {
         StartQueryExecutionRequest request = StartQueryExecutionRequest.builder()
             .queryString(sql)
+            .executionParameters(params)
             .queryExecutionContext(QueryExecutionContext.builder()
                 .database("financial_archive")
                 .build())
-            .resultConfiguration(ResultConfiguration.builder()
-                .outputLocation("s3://company-athena-results/compliance-queries/")
-                .build())
-            .workGroup("compliance-queries")
+            .workGroup("compliance-queries")   // output location set on the workgroup
             .build();
 
         String executionId = athenaClient.startQueryExecution(request)
             .queryExecutionId();
 
-        return pollForResults(executionId);
+        return pollForResults(executionId);    // GetQueryExecution until SUCCEEDED
     }
 }
 ```
@@ -358,55 +383,61 @@ public class ComplianceDataService {
 ## 7. Archival Pipeline Automation with pg_cron
 
 ```sql
--- Install pg_cron
+-- Install pg_cron (needs shared_preload_libraries = 'pg_cron'; jobs run in
+-- the database named by cron.database_name -- use cron.schedule_in_database
+-- to run them elsewhere)
 CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+CREATE TABLE IF NOT EXISTS archival_log (
+    partition_name TEXT        NOT NULL,
+    status         TEXT        NOT NULL,   -- PENDING / VERIFIED / FAILED / DROPPED_LOCAL
+    row_count      BIGINT,
+    s3_path        TEXT,
+    completed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- Create the archival procedure
 CREATE OR REPLACE PROCEDURE archive_old_partition(
     months_ago INT DEFAULT 13
 ) LANGUAGE plpgsql AS $$
 DECLARE
-    target_date DATE;
-    partition_name TEXT;
-    archive_status TEXT;
+    v_target_date    DATE;
+    v_partition      TEXT;   -- "v_" prefix: a variable named like a column
+                             -- (partition_name) makes queries ambiguous
 BEGIN
-    target_date := DATE_TRUNC('month', NOW() - (months_ago || ' months')::INTERVAL);
-    partition_name := 'transactions_' || TO_CHAR(target_date, 'YYYY_MM');
+    v_target_date := DATE_TRUNC('month', NOW() - make_interval(months => months_ago));
+    v_partition   := 'transactions_' || TO_CHAR(v_target_date, 'YYYY_MM');
 
     -- Check if partition exists
+    IF to_regclass('public.' || v_partition) IS NULL THEN
+        RAISE NOTICE 'Partition % does not exist, skipping', v_partition;
+        RETURN;
+    END IF;
+
+    -- Step 1: only proceed if the archive was VERIFIED independently
+    -- (row count compared via Athena by the export job)
     IF NOT EXISTS (
-        SELECT 1 FROM pg_class WHERE relname = partition_name
+        SELECT 1 FROM archival_log
+        WHERE partition_name = v_partition AND status = 'VERIFIED'
     ) THEN
-        RAISE NOTICE 'Partition % does not exist, skipping', partition_name;
+        RAISE WARNING 'Partition % not verified in S3, skipping drop', v_partition;
         RETURN;
     END IF;
 
-    -- Step 1: Verify archive exists in S3 (call external validation)
-    -- This is a placeholder: in practice, call an external service or check a table
-    SELECT status INTO archive_status
-    FROM archival_log
-    WHERE partition_name = partition_name
-      AND status = 'ARCHIVED';
-
-    IF archive_status IS NULL THEN
-        RAISE WARNING 'Partition % not yet archived to S3, skipping drop', partition_name;
-        RETURN;
-    END IF;
-
-    -- Step 2: Detach partition
-    EXECUTE FORMAT(
-        'ALTER TABLE transactions DETACH PARTITION %I CONCURRENTLY',
-        partition_name
-    );
-    RAISE NOTICE 'Detached partition: %', partition_name;
+    -- Step 2: Detach partition. DETACH ... CONCURRENTLY is not allowed here
+    -- (a procedure body runs inside a transaction), so use a plain DETACH
+    -- with a short lock_timeout; the job retries next run if it cannot lock
+    SET LOCAL lock_timeout = '5s';
+    EXECUTE format('ALTER TABLE transactions DETACH PARTITION %I', v_partition);
+    RAISE NOTICE 'Detached partition: %', v_partition;
 
     -- Step 3: Drop the partition
-    EXECUTE FORMAT('DROP TABLE %I', partition_name);
-    RAISE NOTICE 'Dropped partition: %', partition_name;
+    EXECUTE format('DROP TABLE %I', v_partition);
+    RAISE NOTICE 'Dropped partition: %', v_partition;
 
     -- Step 4: Log the archival
-    INSERT INTO archival_log (partition_name, action, completed_at)
-    VALUES (partition_name, 'DROPPED_LOCAL', NOW());
+    INSERT INTO archival_log (partition_name, status)
+    VALUES (v_partition, 'DROPPED_LOCAL');
 END;
 $$;
 
@@ -445,7 +476,7 @@ Option B: Tiered archival (hot 1 year + cold 6 years)
 
   Athena queries (compliance, ~10/month): negligible ($0.05/month)
   Total: $18.82/month = $225.84/year
-  Savings vs Option A: 80.5%
+  Savings vs Option A: 80.5% (storage only, illustrative list prices)
 
 Option C: Partitioned PostgreSQL (hot, no cold tier)
   Same RDS cost as Option A: $96.60/month
@@ -458,39 +489,45 @@ Option C: Partitioned PostgreSQL (hot, no cold tier)
 
 ```sql
 -- Regulatory request: need all transactions from Q1 2021 immediately
--- Step 1: Create staging table
+-- (Often simpler: query them in Athena, or restore into a separate
+--  "restore" schema without attaching to the live table.)
+-- Step 1: Create staging tables
 CREATE TABLE transactions_2021_01_restored (LIKE transactions INCLUDING ALL);
 CREATE TABLE transactions_2021_02_restored (LIKE transactions INCLUDING ALL);
 CREATE TABLE transactions_2021_03_restored (LIKE transactions INCLUDING ALL);
 ```
 
 ```bash
-# Step 2: Download from S3 and restore
+# Step 2: Stream from S3 and load (no decompressed copy on disk)
+set -euo pipefail
 for month in 01 02 03; do
-  aws s3 cp \
-    "s3://company-financial-archive/transactions/year=2021/month=${month}/" \
-    "/tmp/restore_2021_${month}/" \
-    --recursive
-
-  # Decompress and load
-  gunzip /tmp/restore_2021_${month}/*.csv.gz
-
-  psql -h ${DB_HOST} -U ${DB_USER} -d payments \
-    -c "\COPY transactions_2021_${month}_restored FROM '/tmp/restore_2021_${month}/transactions.csv' CSV HEADER"
-
+  for key in $(aws s3api list-objects-v2 \
+                 --bucket company-financial-archive \
+                 --prefix "transactions/year=2021/month=${month}/" \
+                 --query 'Contents[?ends_with(Key, `.csv.gz`)].Key' --output text); do
+    aws s3 cp "s3://company-financial-archive/${key}" - \
+      | gunzip \
+      | psql -h "${DB_HOST}" -U "${DB_USER}" -d payments \
+          -c "\COPY transactions_2021_${month}_restored FROM STDIN CSV HEADER"
+  done
   echo "Restored 2021-${month}"
 done
 ```
 
 ```sql
--- Step 3: Attach to parent table for transparent querying
+-- Step 3: Attach to parent table for transparent querying.
+-- A matching CHECK constraint first lets ATTACH skip its full validation
+-- scan (which would run under a lock on the new partition)
+ALTER TABLE transactions_2021_01_restored
+    ADD CONSTRAINT chk_range CHECK (created_at >= '2021-01-01' AND created_at < '2021-02-01');
 ALTER TABLE transactions
     ATTACH PARTITION transactions_2021_01_restored
     FOR VALUES FROM ('2021-01-01') TO ('2021-02-01');
+-- (same for 02 and 03)
 
 -- Now compliance query works transparently
 SELECT * FROM transactions
-WHERE account_id = 'acct-001'
+WHERE account_id = :account_id
   AND created_at >= '2021-01-01'
   AND created_at < '2021-04-01';
 
@@ -536,12 +573,12 @@ Compliance validation:
       "text": "A payment system stores 7 years of transaction data as required by BSA regulations. All data is kept in a single hot PostgreSQL table (no partitioning). What are the two most critical operational problems this causes?",
       "options": [
         "Slower application startup and increased JAR file size",
-        "VACUUM becomes increasingly slow as the table grows (autovacuum must scan more pages to find dead tuples), and query performance degrades because even date-filtered queries cannot prune rows without an index scan over the full table",
+        "Removing expired data needs huge DELETEs (massive WAL, bloat, long VACUUMs) instead of simply dropping a partition, and every maintenance task — VACUUM and anti-wraparound freezing, index rebuilds, restores — has to process the whole multi-year table",
         "PostgreSQL cannot handle tables larger than 32TB so the system will eventually fail",
         "Backups take longer because pg_basebackup copies the entire database"
       ],
       "correct": 1,
-      "explanation": "Without partitioning, VACUUM must scan the entire table to find dead tuples, even if only recent partitions have activity. This becomes prohibitively slow for multi-hundred-GB tables. Additionally, queries filtering by date must still access the full table's index pages. With time-based partitioning, VACUUM operates per-partition (only the active partition has dead tuples), and date-range queries benefit from partition pruning (the planner eliminates irrelevant partitions from the execution plan). These are the core operational reasons to partition time-series financial data."
+      "explanation": "With one huge table, retention is enforced by DELETE: billions of rows deleted produce huge WAL volumes, leave bloat behind and trigger very long VACUUMs. Maintenance also scales with the whole table: anti-wraparound freezing, index rebuilds and restores all handle 7 years of data at once. With time-based partitioning, expired months are removed with DETACH + DROP (almost instant), maintenance works per partition, and date-range queries benefit from partition pruning. These are the core operational reasons to partition time-series financial data."
     },
     {
       "text": "Before dropping a PostgreSQL partition that has been archived to S3, what verification steps are required and why?",
@@ -558,12 +595,12 @@ Compliance validation:
       "text": "A compliance team needs to query all transactions for a specific customer from January 2020 (data is archived in S3). The hot PostgreSQL tier only holds the last 24 months. What is the latency characteristics of an Athena query against this archived data compared to a PostgreSQL query?",
       "options": [
         "Athena queries are as fast as PostgreSQL queries because both use the same underlying storage",
-        "Athena queries take 1-5 seconds for a typical compliance query (S3 read + distributed processing), compared to milliseconds in PostgreSQL — acceptable for infrequent compliance queries but not for real-time customer-facing features",
+        "Athena queries typically take a few seconds (sometimes tens of seconds) for a compliance query (S3 reads + distributed processing), compared to milliseconds in PostgreSQL — acceptable for infrequent compliance queries but not for real-time customer-facing features",
         "Athena queries always take more than 10 minutes due to Glacier cold storage retrieval",
         "Athena queries cannot filter by customer_id because S3 does not support indexed lookups"
       ],
       "correct": 1,
-      "explanation": "Athena reads directly from S3 Standard (or Intelligent-Tiering Frequent/Infrequent tier) with latencies in the 1-5 second range for well-partitioned Parquet data. With proper S3 partitioning by year/month and Parquet columnar format, a compliance query scanning one year of data for one customer might scan only 10-100MB instead of 100GB (the full year), costing ~$0.0005 per query. This is acceptable for compliance queries that occur tens of times per month, not tens of times per second. For real-time customer-facing features, only the hot PostgreSQL tier should be used."
+      "explanation": "Athena reads directly from S3 (Standard, or the Intelligent-Tiering Frequent / Infrequent / Archive Instant tiers) with latencies of a few seconds for well-partitioned Parquet data. With year/month partitioning and columnar Parquet, a compliance query for one customer may scan only 10–100MB instead of the whole year, costing a fraction of a cent. That is fine for compliance queries that run tens of times per month, not tens of times per second. Real-time customer-facing features should only use the hot PostgreSQL tier."
     }
   ]
 }
@@ -575,10 +612,22 @@ Compliance validation:
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
-    {"id": "1", "description": "Implement the full 4-step archival pipeline for a monthly transactions partition: (1) DETACH PARTITION CONCURRENTLY, (2) export to S3 as Parquet using the Python script template from this lesson, (3) register in AWS Glue catalog, (4) verify row counts match before DROP TABLE. Wrap this in a pg_cron scheduled procedure with error handling — if any step fails, the procedure must log the failure and halt without proceeding to DROP TABLE."},
-    {"id": "2", "description": "Build a cross-tier compliance query service in Java that transparently queries both the hot PostgreSQL tier (last 24 months) and the cold S3/Athena tier (older data) based on the requested date range. The service should merge and sort results from both tiers. Write an integration test using Testcontainers for PostgreSQL and LocalStack for S3/Athena that verifies a 3-year query spanning both tiers returns all records in correct chronological order."},
-    {"id": "3", "description": "Design and implement the archival log table that tracks every archival operation: partition name, row count before and after, S3 path, archive timestamp, verification status (PENDING / VERIFIED / FAILED), and the operator who approved the DROP. Write the SQL to query this table for the current archival status of all partitions, showing which are in PostgreSQL, which are verified in S3, and which are pending verification."},
-    {"id": "4", "description": "Implement the GDPR right-to-erasure workflow for archived data. When a customer requests deletion, their transaction data must be deleted from both the hot PostgreSQL tier AND redacted in archived S3 files. Design the redaction strategy (you cannot modify Parquet files in place — what are the options?), implement a tracking mechanism for pending erasure requests in archived partitions, and write the procedure that creates a new redacted Parquet file and replaces the original in S3."}
+    {
+      "id": "1",
+      "description": "Implement the full 4-step archival pipeline for a monthly transactions partition: (1) export to S3 as Parquet using the Python script template from this lesson, (2) register in the AWS Glue catalog and verify the row count via Athena (mark VERIFIED in archival_log), (3) DETACH the partition (CONCURRENTLY from an external job, or a plain DETACH with lock_timeout inside a procedure), (4) DROP TABLE only for VERIFIED partitions. Wrap the database side in a pg_cron scheduled procedure with error handling — if any step fails, it must log the failure and halt without proceeding to DROP TABLE."
+    },
+    {
+      "id": "2",
+      "description": "Build a cross-tier compliance query service in Java that transparently queries both the hot PostgreSQL tier (last 24 months) and the cold S3/Athena tier (older data) based on the requested date range. The service should merge and sort results from both tiers. Write an integration test using Testcontainers for PostgreSQL and LocalStack for S3 (Athena emulation needs LocalStack's paid edition — otherwise stub the Athena client) that verifies a 3-year query spanning both tiers returns all records in correct chronological order."
+    },
+    {
+      "id": "3",
+      "description": "Design and implement the archival log table that tracks every archival operation: partition name, row count before and after, S3 path, archive timestamp, verification status (PENDING / VERIFIED / FAILED), and the operator who approved the DROP. Write the SQL to query this table for the current archival status of all partitions, showing which are in PostgreSQL, which are verified in S3, and which are pending verification."
+    },
+    {
+      "id": "4",
+      "description": "Implement the GDPR right-to-erasure workflow for archived data. When a customer requests deletion, their transaction data must be deleted from both the hot PostgreSQL tier AND redacted in archived S3 files. Design the redaction strategy (you cannot modify Parquet files in place — what are the options?), implement a tracking mechanism for pending erasure requests in archived partitions, and write the procedure that creates a new redacted Parquet file and replaces the original in S3."
+    }
   ]
 }
 -->

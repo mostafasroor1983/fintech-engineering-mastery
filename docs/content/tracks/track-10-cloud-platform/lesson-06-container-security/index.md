@@ -59,7 +59,10 @@ jobs:
         docker build -t payment-processor:${{ github.sha }} .
 
     - name: Run Trivy vulnerability scanner
-      uses: aquasecurity/trivy-action@master
+      # Pin third-party actions to a release -- better, to its full commit
+      # SHA. A moving ref like @master runs whatever is pushed there, and
+      # compromised popular actions have leaked CI secrets before.
+      uses: aquasecurity/trivy-action@0.28.0
       with:
         image-ref: payment-processor:${{ github.sha }}
         format: sarif
@@ -79,7 +82,7 @@ jobs:
         sarif_file: trivy-results.sarif
 
     - name: Run Trivy for SBOM generation
-      uses: aquasecurity/trivy-action@master
+      uses: aquasecurity/trivy-action@0.28.0
       with:
         image-ref: payment-processor:${{ github.sha }}
         format: spdx-json
@@ -93,17 +96,18 @@ jobs:
         retention-days: 365   # retain for compliance audit trail
 ```
 
-### Trivy in Kubernetes Admission (Trivy Operator)
+### Trivy in the Cluster (Trivy Operator)
 
-```yaml
+The Trivy Operator is not an admission controller: it continuously re-scans the images of running workloads, so CVEs published *after* deployment are found too.
+
+```bash
 # Trivy Operator continuously scans all running images
 helm upgrade --install trivy-operator aquasecurity/trivy-operator \
   --namespace trivy-system \
   --create-namespace \
   --set="trivy.ignoreUnfixed=true" \
   --set="trivy.severity=CRITICAL\,HIGH" \
-  --set="operator.scanJobTimeout=10m" \
-  --set="operator.vulnerabilityReportsPlugin=Trivy"
+  --set="operator.scanJobTimeout=10m"
 
 # Check scan results
 kubectl get vulnerabilityreports -n payments -o wide
@@ -118,18 +122,22 @@ kubectl get vulnerabilityreports -n payments \
 ```dockerfile
 # Secure Dockerfile for payment processor
 # Multi-stage build: builder is large, runtime image is minimal
-FROM eclipse-temurin:17-jdk-jammy AS builder
+FROM eclipse-temurin:21-jdk-jammy AS builder
 
 WORKDIR /build
-COPY pom.xml .
+# The Maven wrapper must be copied too, or ./mvnw does not exist
+COPY mvnw pom.xml ./
+COPY .mvn .mvn
+RUN ./mvnw -q dependency:go-offline     # cached layer while pom.xml is unchanged
 COPY src ./src
 
 # Build without running tests (tests run separately in CI)
 RUN ./mvnw package -DskipTests -q
 
 # ---- Runtime stage ----
-# Use distroless: no shell, no package manager, minimal attack surface
-FROM gcr.io/distroless/java17-debian12:nonroot
+# Use distroless: no shell, no package manager, minimal attack surface.
+# Pin by digest in production (FROM ...@sha256:...) for reproducible builds.
+FROM gcr.io/distroless/java21-debian12:nonroot
 
 # Non-root user — 'nonroot' UID 65532 in distroless
 # No USER instruction needed; distroless/nonroot runs as 65532 by default
@@ -137,20 +145,17 @@ FROM gcr.io/distroless/java17-debian12:nonroot
 # Copy only the JAR, not build artifacts
 COPY --from=builder /build/target/payment-processor-*.jar /app/app.jar
 
-# Set JAR file permissions
-# (distroless handles this correctly)
-
 # Expose only the application port
 EXPOSE 8080
 
 # No HEALTHCHECK instruction — Kubernetes probes handle this
 
+# (Container support is on by default since JDK 10, and the old
+#  -Djava.security.egd=file:/dev/./urandom trick is not needed on modern JDKs)
 ENTRYPOINT ["java", \
-  "-XX:+UseContainerSupport", \
   "-XX:MaxRAMPercentage=75.0", \
   "-XX:+UseG1GC", \
   "-XX:MaxGCPauseMillis=100", \
-  "-Djava.security.egd=file:/dev/./urandom", \
   "-jar", "/app/app.jar"]
 ```
 
@@ -161,7 +166,7 @@ ENTRYPOINT ["java", \
 
 ## 2. Pod Security Standards
 
-Kubernetes 1.25+ replaces the deprecated PodSecurityPolicy with Pod Security Standards (PSS), enforced via the `pod-security.kubernetes.io` namespace labels.
+Kubernetes 1.25 removed PodSecurityPolicy; its replacement is the built-in Pod Security Admission controller, which enforces the Pod Security Standards (PSS) via the `pod-security.kubernetes.io` namespace labels.
 
 ### Three PSS Levels
 
@@ -169,7 +174,7 @@ Kubernetes 1.25+ replaces the deprecated PodSecurityPolicy with Pod Security Sta
 |---|---|---|
 | Privileged | No restrictions | System components only |
 | Baseline | Prevents known privilege escalations | General workloads |
-| Restricted | Hardened; requires non-root, no privilege escalation | Financial services |
+| Restricted | Hardened; requires non-root, no privilege escalation, all capabilities dropped, a seccomp profile | Financial services |
 
 ### Namespace-Level Enforcement
 
@@ -182,7 +187,7 @@ metadata:
   labels:
     # enforce: pod creation fails if spec violates Restricted
     pod-security.kubernetes.io/enforce: restricted
-    pod-security.kubernetes.io/enforce-version: v1.28
+    pod-security.kubernetes.io/enforce-version: v1.28   # pin, or "latest"
     # audit: log violations without blocking (for monitoring legacy namespaces)
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/audit-version: v1.28
@@ -223,8 +228,9 @@ spec:
         image: payments-registry.internal/payment-processor:v2.4.1
         securityContext:
           allowPrivilegeEscalation: false   # required for Restricted
-          readOnlyRootFilesystem: true      # required for Restricted
-          runAsNonRoot: true                # required for Restricted
+          readOnlyRootFilesystem: true      # NOT part of Restricted -- our own
+                                            # hardening rule (enforced by Kyverno)
+          runAsNonRoot: true                # required for Restricted (pod or container)
           capabilities:
             drop: ["ALL"]                  # required for Restricted
             # Do not add any capabilities back for payment services
@@ -257,7 +263,7 @@ Seccomp (Secure Computing Mode) restricts which Linux system calls a container p
 
 ### RuntimeDefault Profile
 
-The `RuntimeDefault` seccomp profile (provided by containerd/CRI-O) blocks ~40% of syscalls that typical application containers never use. This is the minimum for production financial workloads.
+The `RuntimeDefault` seccomp profile (provided by containerd/CRI-O) blocks several dozen dangerous syscalls that typical application containers never use — e.g. `kexec_load`, `reboot`, `mount`, `ptrace` on older kernels, `bpf`. This is the minimum for production financial workloads.
 
 ```yaml
 # Apply RuntimeDefault seccomp at the namespace level via Kyverno policy
@@ -266,6 +272,8 @@ kind: ClusterPolicy
 metadata:
   name: require-seccomp-profile
 spec:
+  # Kyverno 1.13+ prefers a per-rule validate.failureAction; the policy-level
+  # validationFailureAction used in these examples is deprecated but works
   validationFailureAction: Enforce
   background: true
   rules:
@@ -289,7 +297,10 @@ spec:
 
 ### Custom Seccomp Profile for Payment Service
 
-For maximum restriction, create a custom profile that allows only the syscalls your Java application actually uses:
+For maximum restriction, create a custom profile that allows only the syscalls your Java application actually uses.
+
+> [!WARNING]
+> The list below is a shortened illustration — a real JVM needs more (e.g. `rt_sigreturn`, `sigaltstack`, `madvise`, `prctl`, `gettid`, `newfstatat`/`statx`, `pread64`, `clock_nanosleep`), and the exact set depends on JDK version, GC and libraries. Do not write the list by hand: **record** it (Security Profiles Operator, or `strace -f -c` under a full test load), review it, and test every code path — a missing syscall crashes the service in production. Each kubelet node also needs the profile file.
 
 ```json
 // /var/lib/kubelet/seccomp/profiles/payment-processor.json
@@ -371,7 +382,7 @@ profile payment-processor flags=(attach_disconnected,mediate_deleted) {
   deny @{PROC}/** w,
   deny /sys/** w,
 
-  # Allow network: TCP only (no raw sockets)
+  # Allow network: TCP and UDP (DNS) only, no raw sockets
   network tcp,
   network udp,
   deny network raw,
@@ -431,23 +442,29 @@ Image signing creates a verifiable chain of custody from CI pipeline to producti
 ```bash
 # In GitHub Actions CI pipeline:
 
+# Sign the image DIGEST, not a tag: a tag can later be moved to other content
+IMAGE=payments-registry.internal/payment-processor@sha256:3f1c...   # from the build/push step
+
 # Generate a keyless signature using OIDC (sigstore keyless signing)
-# No private key to manage — uses ephemeral keys tied to GitHub Actions OIDC token
+# No private key to manage — uses ephemeral keys tied to GitHub Actions OIDC token.
+# Note: keyless signing records an entry in the PUBLIC Rekor transparency log
+# (image name, workflow identity). For internal images, consider a private
+# Sigstore deployment or KMS keys.
 cosign sign \
   --yes \
-  payments-registry.internal/payment-processor:v2.4.1
+  "$IMAGE"
 
 # Or with a managed key stored in AWS KMS:
 cosign sign \
   --key awskms:///arn:aws:kms:us-east-1:123456789:key/abc-def-123 \
-  payments-registry.internal/payment-processor:v2.4.1
+  "$IMAGE"
 
 # Attach SBOM to image
 cosign attest \
   --yes \
   --predicate sbom.spdx.json \
   --type spdxjson \
-  payments-registry.internal/payment-processor:v2.4.1
+  "$IMAGE"
 ```
 
 ### Admission Policy with Kyverno: Only Signed Images
@@ -517,6 +534,7 @@ spec:
           kinds: [Pod]
           namespaces: [payments, fraud, risk]
     validate:
+      # (covers spec.containers; add the same check for initContainers)
       message: "Resource limits are required for all containers in regulated namespaces"
       pattern:
         spec:
@@ -542,11 +560,13 @@ spec:
           kinds: [Pod]
           namespaces: [payments, fraud, risk]
     validate:
-      message: "Using 'latest' tag is not allowed in production namespaces"
+      message: "An explicit image tag other than 'latest' is required"
       pattern:
         spec:
           containers:
-          - image: "!*:latest"
+          # "*:*" requires a tag at all (an image without a tag IS latest);
+          # "!*:latest" rejects the explicit latest tag
+          - image: "*:* & !*:latest"
 
 ---
 # Policy 3: Require read-only root filesystem
@@ -585,6 +605,10 @@ spec:
       any:
       - resources:
           kinds: [Pod]
+    exclude:                       # don't break system add-ons (CNI, CSI...)
+      any:
+      - resources:
+          namespaces: [kube-system]
     validate:
       message: "Privilege escalation is not allowed"
       pattern:
@@ -627,7 +651,8 @@ spec:
 - [ ] `allowPrivilegeEscalation: false` on all containers
 - [ ] `capabilities.drop: [ALL]` — no capabilities re-added
 - [ ] RuntimeDefault seccomp profile applied (at minimum)
-- [ ] Image signing with Cosign in CI; Kyverno verifies signatures in admission
+- [ ] Image signing with Cosign in CI (by digest); Kyverno verifies signatures in admission
+- [ ] CI actions and base images pinned (commit SHA / digest)
 - [ ] SBOM generated and stored for every production image
 - [ ] Kyverno policy: no `latest` tags in production
 - [ ] Kyverno policy: resource limits required
@@ -637,7 +662,7 @@ spec:
 
 ## Summary
 
-Container security in a financial platform is not a single control — it is a stack. Trivy catches known CVEs in the supply chain before images reach production. The Restricted Pod Security Standard, combined with Kyverno admission policies, ensures every pod runs with minimal privilege at the Kubernetes layer. Seccomp and AppArmor profiles restrict kernel-level interactions, dramatically reducing what a successful container exploit can do. Image signing with Cosign closes the supply chain: even if an attacker compromises a dependency, an unsigned image cannot be admitted to the production cluster. Each layer is independently valuable; together they satisfy the container security requirements of PCI-DSS, SOC 2 Type II, and ISO 27001.
+Container security in a financial platform is not a single control — it is a stack. Trivy catches known CVEs in the supply chain before images reach production. The Restricted Pod Security Standard, combined with Kyverno admission policies, ensures every pod runs with minimal privilege at the Kubernetes layer. Seccomp and AppArmor profiles restrict kernel-level interactions, dramatically reducing what a successful container exploit can do. Image signing with Cosign closes the supply chain: even if an attacker compromises a dependency, an unsigned image cannot be admitted to the production cluster. Each layer is independently valuable; together they cover the container-related controls that PCI-DSS, SOC 2 Type II, and ISO 27001 audits look for.
 
 <!--KNOWLEDGE-CHECK
 {
@@ -662,7 +687,7 @@ Container security in a financial platform is not a single control — it is a s
         "The pod runs normally — Kyverno ClusterPolicies only apply to new namespaces, not existing deployments"
       ],
       "correct": 1,
-      "explanation": "Kyverno admission policies with action: Deny block non-compliant resources at the API server admission stage — the pod is never created. The developer must add readOnlyRootFilesystem: true to the container's securityContext. Applications that write temporary files (logs, PID files, etc.) need emptyDir or configMap volumes mounted at the specific write paths. The pod specification must be corrected before it will be admitted. Kyverno can also be configured to mutate (auto-add) the field, but validation/denial is the enforcement mode."
+      "explanation": "A Kyverno validation policy in Enforce mode (validationFailureAction: Enforce, or failureAction: Enforce per rule) blocks non-compliant resources at the API server admission stage — the pod is never created. The developer must add readOnlyRootFilesystem: true to the container's securityContext. Applications that write temporary files (logs, PID files, etc.) need emptyDir volumes mounted at the specific write paths. Kyverno can also be configured to mutate (auto-add) the field, but validation in Enforce mode is what blocks the pod here. (In Audit mode the pod would be admitted and only a policy report written.)"
     },
     {
       "text": "An image is built and signed with Cosign using keyless OIDC signing (sigstore). A Kyverno policy verifies the signature using the OIDC issuer and subject. If an attacker rebuilds the same image from the same Dockerfile without going through the CI pipeline, what prevents the attacker's image from being deployed?",
@@ -673,7 +698,7 @@ Container security in a financial platform is not a single control — it is a s
         "The image tag 'latest' cannot be used without CI pipeline promotion, blocking the attacker's push"
       ],
       "correct": 1,
-      "explanation": "Cosign keyless signing ties the signature to the OIDC identity that performed the signing — typically the GitHub Actions workflow or the CI runner's service account. The signature is specific to that digest AND that identity. Even if an attacker builds an identical image (same layers, same digest), they cannot create a valid signature for the expected OIDC issuer (e.g., https://token.actions.githubusercontent.com) and subject (e.g., the specific repository and workflow). Kyverno's image verification checks that the signature exists AND was produced by the trusted identity, rejecting the attacker's unsigned image."
+      "explanation": "Cosign keyless signing ties the signature to the image digest AND to the OIDC identity that signed it — typically the GitHub Actions workflow of the release pipeline. A rebuild outside CI almost never produces the same digest (timestamps and build metadata differ; bit-for-bit reproducible builds take deliberate effort), so the attacker's image has no signature, and the attacker cannot obtain one for the expected issuer (https://token.actions.githubusercontent.com) and subject (the specific repository and workflow). Kyverno therefore rejects it. And if a rebuild WERE byte-identical, the existing signature would apply — but then it is exactly the approved content, so nothing untrusted runs."
     }
   ]
 }
@@ -687,7 +712,7 @@ Container security in a financial platform is not a single control — it is a s
   "tasks": [
     "Write a secure multi-stage Dockerfile for a Spring Boot payment-api: stage 1 uses eclipse-temurin:21-jdk as the builder, stage 2 uses gcr.io/distroless/java21-debian12 as the runtime, runs as a non-root user (UID 10001), and excludes all build tools and test dependencies. Run Trivy against the resulting image and verify zero CRITICAL or HIGH CVEs. Document any CVEs found and whether they have available fixes.",
     "Create a Kyverno ClusterPolicy named payment-pod-security that validates: containers have CPU and memory limits set, readOnlyRootFilesystem is true, allowPrivilegeEscalation is false, and the image tag is not 'latest'. Set the policy to Enforce mode. Attempt to deploy a non-compliant pod and capture the admission rejection message. Then fix the pod spec and confirm it is admitted.",
-    "Implement a seccomp profile for the payment-api that allows only the syscalls needed for a JVM process: read, write, openat, close, mmap, mprotect, brk, futex, clone, execve, exit_group, sigaltstack, rt_sigaction, rt_sigprocmask, and common network syscalls. Apply it via pod spec securityContext.seccompProfile.type=Localhost referencing the profile file. Run the payment-api and verify it starts successfully, then try to call a blocked syscall (e.g., via strace) and confirm it is blocked.",
+    "Build a seccomp profile for the payment-api by RECORDING the syscalls it uses (Security Profiles Operator, or strace -f under a full test load), then review and tighten it. Apply it via pod spec securityContext.seccompProfile.type=Localhost referencing the profile file. Run the payment-api through its full test suite and verify it works, then verify that a syscall outside the profile is blocked (e.g. a small test binary in the pod calling mount or unshare fails with EPERM).",
     "Set up Cosign keyless image signing in a GitHub Actions workflow: use the GitHub OIDC token to sign the payment-api image after the Trivy scan passes. Install a Kyverno ClusterPolicy that verifies the image signature using the GitHub OIDC issuer (https://token.actions.githubusercontent.com) and the specific repository subject. Deploy an unsigned image directly and verify Kyverno rejects it. Deploy the CI-signed image and verify it is admitted."
   ]
 }

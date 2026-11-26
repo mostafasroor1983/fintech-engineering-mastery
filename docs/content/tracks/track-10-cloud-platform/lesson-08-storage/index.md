@@ -97,10 +97,8 @@ spec:
   resources:
     requests:
       storage: 500Gi
-  # Optional: label selector to bind to a specific pre-provisioned PV
-  selector:
-    matchLabels:
-      app: postgres
+  # (A PVC with a label selector can only bind to an EXISTING PV -- it is
+  #  never dynamically provisioned. Leave the selector out for dynamic PVs.)
 ```
 
 ### 1.3 StorageClass
@@ -114,6 +112,10 @@ kind: StorageClass
 metadata:
   name: gp3-encrypted
   annotations:
+    # Default class: every PVC without a class gets Retain volumes -- deleted
+    # test PVCs then leave orphaned (billed) EBS volumes behind. Some teams
+    # make a Delete class the default and require Retain classes explicitly
+    # for regulated data.
     storageclass.kubernetes.io/is-default-class: "true"
 provisioner: ebs.csi.aws.com
 parameters:
@@ -134,7 +136,7 @@ metadata:
 provisioner: ebs.csi.aws.com
 parameters:
   type: io2
-  iops: "16000"       # up to 64000 IOPS for critical transactional DB
+  iops: "16000"       # io2 Block Express scales far higher (up to 256,000 IOPS)
   encrypted: "true"
   kmsKeyId: "arn:aws:kms:us-east-1:123456789:key/abc123"
 reclaimPolicy: Retain
@@ -182,24 +184,26 @@ Storage class selection for fintech workloads:
 | PostgreSQL (dev/staging)   | gp3-encrypted | 3,000    | Adequate for lower concurrency      |
 | Redis snapshots (AOF)      | gp3-encrypted | 3,000    | Periodic sequential writes           |
 
-**gp3 vs io2 cost comparison** (us-east-1 as of 2024):
+**gp3 vs io2 cost comparison** (us-east-1 list prices at the time of writing — check current pricing):
 - gp3: $0.08/GB/month + $0.005/provisioned IOPS above 3000
-- io2: $0.125/GB/month + $0.065/provisioned IOPS
-- For 500GB PostgreSQL at 16,000 IOPS: gp3 = $105/mo, io2 = $1,088/mo
-- Use io2 only for critical primary databases; gp3 for replicas and dev
+- io2: $0.125/GB/month + $0.065/provisioned IOPS (up to 32,000; cheaper tiers above)
+- For 500GB PostgreSQL at 16,000 IOPS: gp3 ≈ $105/mo, io2 ≈ $1,100/mo
+- gp3 can deliver 16,000 IOPS too; what io2 adds is higher durability (99.999%) and more consistent sub-millisecond latency. Use io2 for critical primary databases where that matters; gp3 for replicas, Kafka and dev
 
 ---
 
 ## 4. StatefulSet for Kafka and PostgreSQL
 
-StatefulSets provide three guarantees that Deployments cannot:
+StatefulSets provide four guarantees that Deployments cannot:
 
 1. **Stable network identity**: Each pod gets a predictable DNS name: `kafka-0.kafka.payments.svc.cluster.local`
 2. **Ordered startup**: Pods start sequentially (kafka-0 → kafka-1 → kafka-2)
-3. **Ordered shutdown**: Pods terminate in reverse order (kafka-2 → kafka-1 → kafka-0)
+3. **Ordered shutdown**: Pods terminate in reverse order on scale-down (kafka-2 → kafka-1 → kafka-0)
 4. **Dedicated PVC per pod**: Each pod binds to its own PVC that survives pod restarts
 
 ### 4.1 Kafka StatefulSet
+
+The example shows what a hand-written Kafka StatefulSet involves. In production, most teams run Kafka on Kubernetes through an operator such as **Strimzi** (or use a managed service), which handles KRaft quorum setup, certificates, rolling restarts and rebalancing.
 
 ```yaml
 apiVersion: apps/v1
@@ -233,19 +237,24 @@ spec:
               topologyKey: topology.kubernetes.io/zone   # spread across AZs
       containers:
         - name: kafka
-          image: confluentinc/cp-kafka:7.5.0
+          image: apache/kafka:4.0.0     # KRaft only -- ZooKeeper was removed in Kafka 4.0
           ports:
             - name: kafka
               containerPort: 9092
-            - name: kafka-internal
+            - name: controller
               containerPort: 9093
           env:
-            - name: KAFKA_BROKER_ID
+            # Numeric node id from the pod's ordinal (label set by Kubernetes
+            # 1.28+). The pod NAME ("kafka-0") is not a valid numeric id.
+            - name: KAFKA_NODE_ID
               valueFrom:
                 fieldRef:
-                  fieldPath: metadata.annotations['statefulset.kubernetes.io/pod-name']
-            - name: KAFKA_ZOOKEEPER_CONNECT
-              value: "zookeeper-0.zookeeper:2181,zookeeper-1.zookeeper:2181"
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "0@kafka-0.kafka:9093,1@kafka-1.kafka:9093,2@kafka-2.kafka:9093"
+            # (plus listeners, advertised listeners, TLS/SASL settings ...)
             - name: KAFKA_LOG_DIRS
               value: "/data/kafka"
           volumeMounts:
@@ -258,11 +267,11 @@ spec:
             limits:
               cpu: "4"
               memory: 16Gi
+          # Cheap TCP check: starting a JVM CLI tool every 30s per broker
+          # costs CPU and can time out under load
           livenessProbe:
-            exec:
-              command:
-                - kafka-broker-api-versions.sh
-                - --bootstrap-server=localhost:9092
+            tcpSocket:
+              port: 9092
             initialDelaySeconds: 60
             periodSeconds: 30
   volumeClaimTemplates:
@@ -355,7 +364,7 @@ spec:
             storage: 500Gi
 ```
 
-The pod `postgres-0` becomes the primary at DNS `postgres-0.postgres.data.svc.cluster.local`. Replicas connect to this address for WAL streaming replication.
+The pod `postgres-0` gets the stable DNS name `postgres-0.postgres.data.svc.cluster.local`. Note what this manifest does **not** do: the plain `postgres` image does not set up replication — both pods start as independent primaries. Streaming replication, automatic failover, backups and safe upgrades need an operator such as **CloudNativePG**, Zalando Postgres Operator or Crunchy PGO — or a managed database (RDS/Aurora), which is what most payment teams choose.
 
 ---
 
@@ -367,7 +376,7 @@ The pod `postgres-0` becomes the primary at DNS `postgres-0.postgres.data.svc.cl
 | Delete  | PV and underlying volume are deleted   | Ephemeral test data   |
 | Recycle | PV data is scrubbed; PV made available | Deprecated; don't use |
 
-**Golden rule for fintech**: All production StorageClasses must use `Retain`. With `Delete`, a developer accidentally running `kubectl delete pvc` would permanently destroy payment transaction data.
+**Golden rule for fintech**: All production StorageClasses must use `Retain`. With `Delete`, a developer accidentally running `kubectl delete pvc` would permanently destroy payment transaction data. (Retain protects against deleting the *volume* — not against `DROP TABLE` or corruption; that is what backups are for.)
 
 ---
 
@@ -380,9 +389,9 @@ Velero backs up Kubernetes resources and persistent volume data. For a fintech c
 ```mermaid
 graph TD
     velero_ctrl[Velero Backup Controller] -->|reads resources| kube_api[Kubernetes API]
-    velero_ctrl -->|trigger snapshot| ebs[EBS Volume Snapshot]
-    velero_ctrl -->|upload manifest| s3[S3 Backup Bucket]
-    ebs -->|copy snapshot| s3_snap[S3 Snapshot Copy]
+    velero_ctrl -->|trigger snapshot| ebs[EBS Volume Snapshot - same region]
+    velero_ctrl -->|upload manifests| s3[S3 Backup Bucket]
+    velero_ctrl -->|optional data mover: copy volume data| s3
     s3 -->|encrypt at rest| kms[AWS KMS]
 ```
 
@@ -419,10 +428,9 @@ spec:
     storageLocation: default  # BackupStorageLocation referencing S3
     volumeSnapshotLocations:
       - default
-    # Label selector — only back up resources with this label
-    labelSelector:
-      matchLabels:
-        backup: "true"
+    # Careful with filters: combined with the allowlist above, a label
+    # selector would silently skip every resource that lacks the label.
+    # Prefer whole namespaces without a selector for regulated data.
 ```
 
 ### 6.3 BackupStorageLocation — S3 Configuration
@@ -446,7 +454,10 @@ spec:
     name: velero-credentials
     key: cloud
 ---
-# Second region BSL for DR
+# Second region BSL for DR. Note: EBS snapshots stay in the source region.
+# For a usable cross-region copy, either copy the snapshots (AWS Backup /
+# DLM) or use Velero's data mover, which uploads volume DATA to the bucket.
+# A schedule must also be pointed at this location (storageLocation).
 apiVersion: velero.io/v1
 kind: BackupStorageLocation
 metadata:
@@ -461,6 +472,9 @@ spec:
     region: us-west-2        # DR region
     kmsKeyId: "arn:aws:kms:us-west-2:123456789:key/backup-key-dr"
     serverSideEncryption: aws:kms
+  credential:
+    name: velero-credentials
+    key: cloud
 ```
 
 ### 6.4 Restore Procedure
@@ -492,16 +506,17 @@ kubectl patch pvc postgres-data-postgres-0 -n data \
   --type='merge' \
   -p '{"spec":{"resources":{"requests":{"storage":"1000Gi"}}}}'
 
-# Step 2: Watch for the resize to complete
-kubectl get pvc postgres-data-postgres-0 -n data -w
-# STATUS transitions: Bound → FileSystemResizePending → Bound
+# Step 2: Watch for the resize to complete (STATUS stays Bound; the
+# conditions show Resizing, then FileSystemResizePending, then disappear)
+kubectl describe pvc postgres-data-postgres-0 -n data
 
-# Step 3: Verify filesystem was expanded (may require pod restart for ext4)
+# Step 3: Verify the filesystem was expanded (the EBS CSI driver and kubelet
+# grow ext4/xfs online while the pod runs)
 kubectl exec -n data postgres-0 -- df -h /var/lib/postgresql/data
 # Expected: 1000G total capacity
 ```
 
-If the PVC status is stuck in `FileSystemResizePending`, the pod must be restarted to trigger the in-pod filesystem resize via kubelet.
+`FileSystemResizePending` normally clears on its own once the kubelet resizes the filesystem of the mounted volume. Only with drivers or setups that do not support online expansion does the pod need a restart. Also note that an EBS volume can be modified only once every 6 hours — size generously.
 
 ---
 
@@ -538,11 +553,13 @@ allowVolumeExpansion: true
 volumeBindingMode: WaitForFirstConsumer
 ```
 
-Additionally, protect PVCs with a finalizer annotation to require deliberate confirmation before deletion:
+Additionally, make PVC deletion hard. Note that the common `helm.sh/resource-policy=keep` annotation only stops **Helm** from deleting the PVC on uninstall/upgrade — it does nothing against `kubectl delete pvc`. Use RBAC (no `delete` on PVCs for humans in production) and/or an admission policy:
 ```bash
-# Add deletion protection to critical PVC
+# Keep Helm from deleting the PVC when the release is removed
 kubectl annotate pvc postgres-data-postgres-0 -n data \
   "helm.sh/resource-policy=keep"
+# And: remove "delete" on persistentvolumeclaims from production RBAC roles;
+# optionally a Kyverno policy that blocks DELETE of PVCs labelled pci-scope=true
 ```
 
 ---
@@ -600,7 +617,7 @@ spec:
       - secrets           # DO NOT exclude secrets from production backup
 ```
 
-**Correct approach**: Include Secrets in backup but ensure the S3 backup bucket is encrypted with KMS, access-controlled with IAM policies, and versioned.
+**Correct approach**: Include Secrets in backup but ensure the S3 backup bucket is encrypted with KMS, access-controlled with IAM policies, and versioned. (If Secrets are generated by External Secrets Operator, the ExternalSecret resources and a reachable Vault are what must be restorable — ESO then re-creates the Secrets.)
 
 ```yaml
 spec:
@@ -627,8 +644,8 @@ spec:
 
 Verify that Secrets are included in a test backup:
 ```bash
-velero backup describe daily-backup-20241101020000 --details | grep Secret
-# Expected: secrets: included
+velero backup describe daily-backup-20241101020000 --details | grep -A5 'v1/Secret'
+# Expected: the resource list contains v1/Secret entries for the namespaces
 ```
 
 ---
@@ -647,6 +664,7 @@ velero backup describe daily-backup-20241101020000 --details | grep Secret
 ### StatefulSet Configuration
 - [ ] `podAntiAffinity` with `topologyKey: topology.kubernetes.io/zone` on all StatefulSets
 - [ ] `podManagementPolicy: OrderedReady` for databases (not Parallel)
+- [ ] Databases run by an operator (CloudNativePG, Strimzi, ...) or a managed service — not hand-written StatefulSets
 - [ ] `terminationGracePeriodSeconds` ≥ 60 seconds for all stateful workloads
 - [ ] `volumeClaimTemplates` using the correct StorageClass per workload
 - [ ] Headless Service (`clusterIP: None`) created for each StatefulSet
@@ -660,7 +678,7 @@ velero backup describe daily-backup-20241101020000 --details | grep Secret
 - [ ] `velero restore create` procedure tested and documented in runbook
 
 ### Operational
-- [ ] PVC deletion protection (`helm.sh/resource-policy=keep`) on all production PVCs
+- [ ] PVC deletion restricted (RBAC / admission policy; `helm.sh/resource-policy=keep` against Helm deletes)
 - [ ] PVC capacity monitoring alert at 80% usage (triggers resize process)
 - [ ] StorageClass reclaim policy reviewed in infrastructure code review checklist
 - [ ] All StatefulSet PVs are in the same AZ as their nodes (verified with label inspection)
@@ -668,9 +686,9 @@ velero backup describe daily-backup-20241101020000 --details | grep Secret
 ---
 
 <!-- KNOWLEDGE-CHECK
-{"questions":[{"text":"A Kafka StatefulSet pod fails to start with error 'volume is not available in the node's AZ'. What is the root cause and fix?","options":["a) The EBS volume type is gp3 but Kafka requires io2 — change the StorageClass type parameter","b) The StorageClass uses volumeBindingMode: Immediate, which created the EBS volume in a different AZ than where the pod was scheduled — change to WaitForFirstConsumer","c) The StatefulSet replicas field is set higher than the number of available nodes","d) The podAntiAffinity rule is preventing the pod from being scheduled in any AZ"],"correct":1,"explanation":"EBS volumes are AZ-scoped. With Immediate binding mode, the volume is provisioned before a pod is scheduled, potentially in a different AZ. WaitForFirstConsumer delays provisioning until after the pod's node is selected, ensuring the volume is created in the correct AZ."},{"text":"What is the risk of using reclaimPolicy: Delete on a production StorageClass in a fintech cluster?","options":["a) Pods cannot be restarted without manually re-provisioning the volume","b) The StorageClass cannot be used with StatefulSets","c) Deleting a PVC (accidentally or intentionally) immediately and permanently destroys the underlying EBS volume and all data, with no recovery path","d) StatefulSet pods will not respect ordered startup when Delete policy is active"],"correct":2,"explanation":"The Delete reclaim policy causes the PersistentVolume and the underlying cloud storage to be permanently deleted when the PVC is deleted. In a production financial system, this means a single accidental kubectl delete pvc command causes irreversible data loss. The Retain policy is mandatory for production databases."},{"text":"A team runs velero restore after a cluster disaster but payment-service fails to authenticate to PostgreSQL. What was likely missing from the Velero backup?","options":["a) The PostgreSQL StatefulSet was excluded from the backup namespace list","b) Secrets were explicitly excluded from the backup, so the postgres-credentials Secret was not restored","c) Velero does not support backing up StatefulSets","d) The PersistentVolumeClaim snapshots were not included in the VolumeSnapshotLocation"],"correct":1,"explanation":"Secrets are sometimes excluded from Velero backups to avoid storing credentials in backup storage. Without the postgres-credentials Secret, payment-service cannot authenticate to the database after restore. Secrets must be included in backup (with the backup bucket properly encrypted with KMS) to enable a complete namespace restore."}]}
+{"questions": [{"text": "A Kafka StatefulSet pod fails to start with error 'volume is not available in the node's AZ'. What is the root cause and fix?", "options": ["a) The EBS volume type is gp3 but Kafka requires io2 — change the StorageClass type parameter", "b) The StorageClass uses volumeBindingMode: Immediate, which created the EBS volume in a different AZ than where the pod was scheduled — change to WaitForFirstConsumer", "c) The StatefulSet replicas field is set higher than the number of available nodes", "d) The podAntiAffinity rule is preventing the pod from being scheduled in any AZ"], "correct": 1, "explanation": "EBS volumes are AZ-scoped. With Immediate binding mode, the volume is provisioned before a pod is scheduled, potentially in a different AZ. WaitForFirstConsumer delays provisioning until after the pod's node is selected, ensuring the volume is created in the correct AZ."}, {"text": "What is the risk of using reclaimPolicy: Delete on a production StorageClass in a fintech cluster?", "options": ["a) Pods cannot be restarted without manually re-provisioning the volume", "b) The StorageClass cannot be used with StatefulSets", "c) Deleting a PVC (accidentally or intentionally) immediately and permanently destroys the underlying EBS volume and all data — recoverable only from snapshots or backups, if they exist", "d) StatefulSet pods will not respect ordered startup when Delete policy is active"], "correct": 2, "explanation": "The Delete reclaim policy causes the PersistentVolume and the underlying cloud storage to be permanently deleted when the PVC is deleted. In a production financial system, this means a single accidental kubectl delete pvc command destroys the volume; only an existing snapshot or backup can bring the data back. The Retain policy is mandatory for production databases."}, {"text": "A team runs velero restore after a cluster disaster but payment-service fails to authenticate to PostgreSQL. What was likely missing from the Velero backup?", "options": ["a) The PostgreSQL StatefulSet was excluded from the backup namespace list", "b) Secrets were explicitly excluded from the backup, so the postgres-credentials Secret was not restored", "c) Velero does not support backing up StatefulSets", "d) The PersistentVolumeClaim snapshots were not included in the VolumeSnapshotLocation"], "correct": 1, "explanation": "Secrets are sometimes excluded from Velero backups to avoid storing credentials in backup storage. Without the postgres-credentials Secret, payment-service cannot authenticate to the database after restore. Secrets must be included in backup (with the backup bucket properly encrypted with KMS) to enable a complete namespace restore."}]}
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{"title":"Production-Grade Stateful Storage for Fintech PostgreSQL and Kafka","difficulty":"advanced","estimatedMinutes":90,"tasks":[{"id":"1","description":"Create two StorageClasses: 'gp3-encrypted' (for Kafka, with WaitForFirstConsumer and Retain policy) and 'io2-encrypted' (for PostgreSQL, 16000 IOPS). Deploy a 3-replica Kafka StatefulSet using volumeClaimTemplates with gp3-encrypted. Verify that three separate PVCs are created (kafka-data-kafka-0, kafka-data-kafka-1, kafka-data-kafka-2)."},{"id":"2","description":"Deploy a 2-replica PostgreSQL StatefulSet (primary + replica) using io2-encrypted StorageClass. Configure podAntiAffinity to spread replicas across AZs. Verify that each pod gets its own PVC and that PVCs use the io2 StorageClass. Test that deleting pod postgres-0 and letting it restart reconnects to the same PVC."},{"id":"3","description":"Install Velero with an S3 backend (use MinIO locally as S3-compatible). Create a Schedule to run every minute (for testing) backing up the data namespace including Secrets. Trigger a manual backup, verify it completes, then simulate data loss by deleting the namespace. Restore from the backup and verify PostgreSQL and Kafka resume normally."},{"id":"4","description":"Test PVC online resize: expand the postgres-data-postgres-0 PVC from its initial size to 2x. Watch the PVC status transition. If it enters FileSystemResizePending, restart the pod and verify the filesystem expands. Document the exact kubectl commands, any downtime observed, and whether the resize was truly online."}]}
+{"title": "Production-Grade Stateful Storage for Fintech PostgreSQL and Kafka", "difficulty": "advanced", "estimatedMinutes": 90, "tasks": [{"id": "1", "description": "Create two StorageClasses: 'gp3-encrypted' (for Kafka, with WaitForFirstConsumer and Retain policy) and 'io2-encrypted' (for PostgreSQL, 16000 IOPS). Deploy a 3-replica Kafka StatefulSet using volumeClaimTemplates with gp3-encrypted. Verify that three separate PVCs are created (kafka-data-kafka-0, kafka-data-kafka-1, kafka-data-kafka-2)."}, {"id": "2", "description": "Deploy a 2-instance PostgreSQL cluster (primary + streaming replica) with an operator such as CloudNativePG, using the io2-encrypted StorageClass and spreading the instances across AZs. Verify that each instance gets its own PVC with the io2 StorageClass. Delete the primary pod and verify that the operator fails over to the replica and the old primary rejoins with its own PVC."}, {"id": "3", "description": "Install Velero with an S3 backend (use MinIO locally as S3-compatible). Create a Schedule to run every minute (for testing) backing up the data namespace including Secrets. Trigger a manual backup, verify it completes, then simulate data loss by deleting the namespace. Restore from the backup and verify PostgreSQL and Kafka resume normally."}, {"id": "4", "description": "Test PVC online resize: expand the PostgreSQL data PVC from its initial size to 2x. Watch the PVC conditions (Resizing, FileSystemResizePending) and verify with df inside the running pod that the filesystem grew without a restart. Document the exact kubectl commands, any downtime observed, and the EBS limit of one modification per 6 hours."}]}
 -->

@@ -167,7 +167,8 @@ Multi-region active-active is expensive. The decision requires quantifying the c
  * - Data synchronisation: latency overhead, consistency trade-offs
  *
  * BENEFITS:
- * - Regional outage tolerance (AWS us-east-1 has ~2-3 regional incidents/year)
+ * - Regional outage tolerance (large cloud regions have had notable regional
+ *   incidents roughly once or twice a year — use your provider's own history)
  * - Latency improvement for geographically distributed customers
  * - Regulatory: some jurisdictions require data residency in-country
  *
@@ -209,11 +210,14 @@ Multi-region active-active is expensive. The decision requires quantifying the c
  * RTO (Recovery Time Objective) and RPO (Recovery Point Objective)
  * set the investment level for DR:
  *
- * TIER        RTO     RPO    Investment  Technology
- * Active-Active < 1min 0 sec   Very High   Multi-region, global load balancer
- * Hot Standby   < 15min 0 sec  High        Warm secondary region, synchronous replication
- * Warm Standby  < 1h   < 15min Medium      Cold secondary, daily backups restored hourly
- * Cold Backup   < 24h  < 24h   Low         Daily backup restore, manual runbook
+ * TIER          RTO      RPO          Investment  Technology
+ * Active-Active < 1min   ~0           Very High   Multi-region, global load balancer
+ * Hot Standby   < 15min  ~0 / seconds High        Full-capacity standby; sync replication
+ *                                                 in-region, near-sync to the DR region
+ * Warm Standby  < 1h     seconds-min  Medium      Scaled-down secondary kept current by
+ *                                                 async replication; scale up on failover
+ * Cold Backup   < 24h    < 24h        Low         Restore from backup + WAL archive,
+ *                                                 manual runbook
  *
  * Cost calculator:
  * DR Investment ≈ Annual Outage Cost × Fraction eliminated by DR
@@ -286,27 +290,32 @@ Multi-region active-active is expensive. The decision requires quantifying the c
  * Compliance Implications of Downtime — Key Facts for Principal Engineers
  *
  * 1. REGULATORY NOTIFICATION
- *    EBA ICT Incident Classification:
- *    Major incident requiring notification if:
- *    - > 10% of customers affected OR > 5,000 absolute customers
- *    - Duration > 1 hour for payment systems
- *    - Reputational damage or media attention
- *    - Data breach alongside outage
- *    → System design must track: affected customers, duration in real-time
- *    → Notification system must function even during outage (separate stack)
+ *    EU — DORA: an incident is classified as "major" using criteria set in
+ *    regulatory technical standards: clients and counterparts affected,
+ *    duration and service downtime, geographical spread, data losses,
+ *    criticality of the services affected, economic impact, reputational
+ *    impact. Compliance maps them to concrete thresholds; a major incident
+ *    must be notified within 4 hours of classification (max 24h after detection).
+ *    → System design must MEASURE the inputs in real time: affected customers,
+ *      transaction count and value, duration
+ *    → Notification tooling must work even during the outage (separate stack)
  *
  * 2. SLA vs SLO
  *    SLO (internal): 99.9% availability target
  *    SLA (contractual): may be 99.5% with financial penalty below
  *    Principal engineer must know both.
- *    Setting SLO < SLA leaves no buffer for investigation before breach.
- *    Set SLO > SLA: SLO=99.9% when SLA=99.5% gives 3.5 hours buffer.
+ *    Setting SLO <= SLA leaves no buffer for investigation before breach.
+ *    Set SLO > SLA: with SLO=99.9% (~44 min/month) and SLA=99.5%
+ *    (~3.65 h/month) the team has about 2.9 hours of buffer.
  *
  * 3. SETTLEMENT CYCLES
- *    Payment systems have hard settlement deadlines:
- *    - ACH: 5:30 PM ET cut-off
- *    - SWIFT: 17:00 CET cut-off
- *    - CHAPS: 15:00 GMT cut-off
+ *    Payment systems have hard settlement deadlines. Examples (always check
+ *    the current scheme rules AND your bank's earlier internal cut-offs):
+ *    - Fed same-day ACH: final submission window in the afternoon ET
+ *    - TARGET (T2) euro customer payments: 17:00 CET cut-off
+ *    - CHAPS: customer payments until late afternoon UK time
+ *    (SWIFT itself is a messaging network: cut-offs belong to the currency's
+ *     settlement system and the correspondent bank.)
  *    Downtime during these windows has amplified impact.
  *    SLO targets should be tighter during settlement windows.
  *    Change freeze: typically no deployments 2 hours before cut-offs.
@@ -399,11 +408,11 @@ A principal engineer who reviews and approves an architecture without circuit br
 | No timeout on external API calls | Thread starvation, full outage | Set timeout = 2x p99 latency |
 | Retry without idempotency | Duplicate payments, double charges | Idempotency key on all payment mutations |
 | Circuit breaker with no fallback | Visible error instead of degraded service | Always define a fallback |
-| SLO higher than SLA | No buffer before contract breach | SLO should be significantly above SLA |
+| SLO equal to (or below) the SLA | No buffer before contract breach | SLO should be significantly above SLA |
 | Load test at unrealistic traffic patterns | Misses real failure modes | Base tests on production traffic profiles |
 | DR never tested | Unknown actual RTO/RPO | Annual DR exercise with real failover |
 | Reliability owned by one team | Siloed; not embedded in feature teams | Each team owns reliability for their service |
-| Alert threshold = SLO threshold | No time to respond before breach | Alert at 50% error budget burn rate |
+| Alert threshold = SLO threshold | No time to respond before breach | Alert on error-budget burn rate (multi-window), before the SLO is breached |
 
 ---
 
@@ -416,19 +425,34 @@ The principal engineer's reliability decision framework starts with business-inf
   "questions": [
     {
       "text": "A payment authorisation service has an SLA of 99.5% availability. What should its internal SLO be set to?",
-      "options": ["Exactly 99.5% — matching the SLA gives maximum feature velocity", "Below 99.5% to maximize error budget for feature work", "Significantly above 99.5%, such as 99.9%, to provide buffer before SLA breach", "100% — payment systems should never have downtime"],
+      "options": [
+        "Exactly 99.5% — matching the SLA gives maximum feature velocity",
+        "Below 99.5% to maximize error budget for feature work",
+        "Significantly above 99.5%, such as 99.9%, to provide buffer before SLA breach",
+        "100% — payment systems should never have downtime"
+      ],
       "correct": 2,
-      "explanation": "The SLO should be set meaningfully above the SLA to provide an internal warning buffer. If the SLO is 99.9% and the SLA is 99.5%, the team has 3.5 hours of monthly downtime before breaching the contractual SLA. Setting the SLO equal to the SLA means any SLO breach is simultaneously an SLA breach with no time to investigate and resolve."
+      "explanation": "The SLO should be set meaningfully above the SLA to provide an internal warning buffer. With an SLO of 99.9% (about 44 minutes of downtime a month) and an SLA of 99.5% (about 3.65 hours a month), the team has roughly 2.9 hours of buffer before breaching the contractual SLA. Setting the SLO equal to the SLA means any SLO breach is simultaneously an SLA breach, with no time to investigate and resolve."
     },
     {
       "text": "A team is debating whether to invest in multi-region active-active for their payment service. How should a principal engineer frame this decision?",
-      "options": ["Multi-region is always necessary for financial services", "Quantify the annual cost of single-region outages vs the annual cost of multi-region, then justify if outage cost exceeds infrastructure cost", "Multi-region is too complex for most teams — avoid it", "The decision should be driven by latency requirements, not cost"],
+      "options": [
+        "Multi-region is always necessary for financial services",
+        "Quantify the annual cost of single-region outages vs the annual cost of multi-region, then justify if outage cost exceeds infrastructure cost",
+        "Multi-region is too complex for most teams — avoid it",
+        "The decision should be driven by latency requirements, not cost"
+      ],
       "correct": 1,
       "explanation": "Multi-region is a significant investment (2-3x infrastructure cost, 6-18 months engineering). The correct approach is to quantify: annual probability of regional outage × duration × revenue/hour = expected annual outage cost. If this exceeds the annual multi-region cost, it is justified. The lesson shows this calculation explicitly with a $2M outage cost vs $1.1M multi-region cost example."
     },
     {
       "text": "An engineering team has spent its entire error budget for the month but still has three weeks of features planned. What should the principal engineer recommend?",
-      "options": ["Continue with feature work — error budgets are guidelines, not rules", "Freeze new feature deployments and invest engineering time in reliability improvements to restore the error budget", "Reduce the SLO target to give more error budget headroom", "Deploy features during off-peak hours to reduce risk"],
+      "options": [
+        "Continue with feature work — error budgets are guidelines, not rules",
+        "Freeze new feature deployments and invest engineering time in reliability improvements to restore the error budget",
+        "Reduce the SLO target to give more error budget headroom",
+        "Deploy features during off-peak hours to reduce risk"
+      ],
       "correct": 1,
       "explanation": "Error budgets are the mechanism that makes the reliability vs velocity trade-off explicit and non-negotiable. When the error budget is exhausted, the correct response is to freeze new feature deployments and invest in reliability. This is not a guideline — it is the purpose of error budgets. Reducing the SLO target to get more budget is gaming the system; the SLO should reflect actual business requirements."
     }

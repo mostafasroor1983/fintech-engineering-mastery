@@ -27,18 +27,28 @@ The single most important rule in performance engineering:
 // BAD: "I think HashMap is faster than LinkedHashMap here"
 Map<String, BigDecimal> balances = new LinkedHashMap<>();
 // ... change to HashMap because "obviously faster"
+// (and silently lose the iteration order some code may rely on)
 
-// GOOD: Measure first
+// GOOD: Measure the real access pattern first
 @Benchmark
-public Map<String, BigDecimal> linkedHashMapOperations(BenchmarkState state) {
-    return state.linkedHashMap; // measure the actual access pattern
+public BigDecimal linkedHashMapAggregation(BenchmarkState state) {
+    Map<String, BigDecimal> m = new LinkedHashMap<>();
+    for (Posting p : state.postings) {
+        m.merge(p.accountId(), p.amount(), BigDecimal::add);
+    }
+    return m.get(state.lookupAccount);       // return a result: no dead code
 }
 
 @Benchmark
-public Map<String, BigDecimal> hashMapOperations(BenchmarkState state) {
-    return state.hashMap;
+public BigDecimal hashMapAggregation(BenchmarkState state) {
+    Map<String, BigDecimal> m = new HashMap<>();
+    for (Posting p : state.postings) {
+        m.merge(p.accountId(), p.amount(), BigDecimal::add);
+    }
+    return m.get(state.lookupAccount);
 }
-// Result: 2.1% difference — not worth the code complexity change
+// Illustrative result: ~2% difference — not worth changing behaviour for
+// (Returning a pre-built map from the state would measure nothing at all.)
 ```
 
 ### The Measurement Hierarchy
@@ -62,11 +72,13 @@ For every resource in your payment system, check:
 ```
 Resource: CPU
   Utilization: top/htop/Prometheus (node_cpu_seconds_total)
-  Saturation: load average > CPU count (run queue length)
+  Saturation: run queue longer than the CPU count (vmstat "r"; on Linux
+              the load average also counts threads blocked on disk I/O)
   Errors: CPU errors (rare — ECC memory errors, thermal throttling)
 
 Resource: Memory
-  Utilization: used / total (node_memory_MemUsed_bytes)
+  Utilization: 1 - MemAvailable / MemTotal
+               (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
   Saturation: swap usage, page faults (sar -B)
   Errors: OOM killer events (/var/log/kern.log)
 
@@ -95,27 +107,33 @@ Resource: Thread Pool
 @Component
 public class UseMethodDashboard {
 
-    private final MeterRegistry metrics;
-    private final HikariDataSource dataSource;
+    // Gauges are registered ONCE with functions that read the live objects.
+    // (Calling metrics.gauge(name, someDouble) every 10s would register a
+    //  boxed number once and never update it.)
+    public UseMethodDashboard(MeterRegistry metrics,
+                              HikariDataSource dataSource,
+                              @Qualifier("paymentExecutor") ThreadPoolExecutor executor) {
 
-    @Scheduled(fixedRate = 10_000)
-    public void collectUseMetrics() {
         // DB Connection Pool — USE
-        HikariPoolMXBean poolStats = dataSource.getHikariPoolMXBean();
-
-        metrics.gauge("pool.utilization",
-            (double) poolStats.getActiveConnections() / poolStats.getTotalConnections());
-
-        metrics.gauge("pool.saturation",   // saturation = pending / max
-            (double) poolStats.getThreadsAwaitingConnection() /
-                dataSource.getMaximumPoolSize());
+        HikariPoolMXBean pool = dataSource.getHikariPoolMXBean();
+        Gauge.builder("pool.utilization", pool,
+                p -> (double) p.getActiveConnections() / dataSource.getMaximumPoolSize())
+            .register(metrics);
+        Gauge.builder("pool.saturation", pool,           // threads waiting per pool slot
+                p -> (double) p.getThreadsAwaitingConnection() / dataSource.getMaximumPoolSize())
+            .register(metrics);
 
         // JVM Thread Pool — USE
-        ThreadPoolExecutor executor = getPaymentExecutor();
-        metrics.gauge("executor.utilization",
-            (double) executor.getActiveCount() / executor.getMaximumPoolSize());
-        metrics.gauge("executor.saturation",
-            (double) executor.getQueue().size() / executor.getQueue().remainingCapacity());
+        Gauge.builder("executor.utilization", executor,
+                e -> (double) e.getActiveCount() / e.getMaximumPoolSize())
+            .register(metrics);
+        Gauge.builder("executor.saturation", executor,   // how full the queue is (0..1)
+                e -> {
+                    int used = e.getQueue().size();
+                    int capacity = used + e.getQueue().remainingCapacity();
+                    return capacity == 0 ? 0.0 : (double) used / capacity;
+                })
+            .register(metrics);
     }
 }
 ```
@@ -140,7 +158,8 @@ Step 2: Is DB connection pool saturation > 0 (threads waiting for connections)?
     - Check pg_stat_activity: are queries slow or just many?
     - If queries are slow: query optimization, indexes (Track 07, Lessons 8-9)
     - If connections are exhausted: pool sizing, read replicas, caching
-    - Fix: increase pool size, optimize queries, add read replica
+    - Fix: optimize queries first; grow the pool only if the database has
+      headroom (lesson 7); add a read replica for read-heavy paths
 
   NO -> Continue to Step 3
 
@@ -255,14 +274,16 @@ slo:
 
 ```java
 // Enforce SLOs in CI via load tests
+// (PaymentAuthSimulation / SimulationReport are thin in-house wrappers around
+//  a Gatling run -- in practice Gatling's own assertions, lesson 16, do this)
 class SloValidationTest {
 
     @Test
     @Tag("slo-validation")
     void paymentAuthorizationMeetsSlo() {
-        GatlingSimulation simulation = new PaymentAuthSimulation(
-            targetUsers: 500,
-            duration: Duration.ofMinutes(5)
+        PaymentAuthSimulation simulation = new PaymentAuthSimulation(
+            500,                        // target users per second
+            Duration.ofMinutes(5)       // duration
         );
 
         SimulationReport report = simulation.run();
@@ -280,7 +301,7 @@ class SloValidationTest {
 Before starting any performance project, calculate expected ROI.
 
 ```
-ROI Framework:
+ROI Framework (illustrative numbers):
 
 1. Measure current state
    - p99 latency: 800ms
@@ -307,7 +328,7 @@ ROI Framework:
 ```
 
 ```java
-// Document performance work with before/after measurements
+// Document performance work with before/after measurements (illustrative)
 /**
  * Performance optimization: Composite index on transactions(account_id, created_at)
  *
@@ -327,7 +348,7 @@ ROI Framework:
  *   - Customer support tickets for "slow balance": expected -60%
  *   - Infrastructure: deferred $4,000/month read replica for 6 months
  */
-CREATE INDEX idx_transactions_account_history
+CREATE INDEX CONCURRENTLY idx_transactions_account_history   -- no write lock (lesson 9)
     ON transactions (account_id, created_at DESC)
     INCLUDE (amount, currency, status);
 ```
@@ -380,10 +401,11 @@ class BenchmarkRegressionCheck {
 
 ```yaml
 # GitHub Actions: performance regression gate
+# Run on a DEDICATED, quiet runner: shared CI machines vary by more than 20%
 - name: Run performance benchmarks
   run: |
-    mvn test -Dtest="*Benchmark*" -Ptesting
-    mvn jmh:benchmark
+    mvn -q package -DskipTests
+    java -jar target/benchmarks.jar -rf json -rff target/jmh-result.json
 
 - name: Check for regressions
   run: |
@@ -397,7 +419,10 @@ class BenchmarkRegressionCheck {
   run: |
     cp target/jmh-result.json .performance-baselines/main.json
     git commit -am "Update performance baseline [skip ci]"
+    git push   # needs a token with write permission
 ```
+
+(Many teams store the baseline as a build artifact or in a metrics store instead of committing it, and compare against the median of several recent runs to absorb noise.)
 
 ## 7. Performance vs Maintainability Tradeoffs
 
@@ -444,19 +469,22 @@ public ValidationResult validate(PaymentRequest request) {
 /**
  * Performance optimization decision: idempotency key lookup
  *
- * We use a Redis hash index instead of the elegant repository pattern
- * because HGET on a Redis hash is 0.1ms vs 2ms DB index scan.
+ * We add a Redis check IN FRONT OF the database lookup, because HGET on
+ * a Redis hash is ~0.1ms vs ~2ms for the DB index scan (illustrative).
  *
- * At 5,000 TPS, this saves 9.5 seconds of cumulative latency per second
- * (effectively reducing the idempotency check from 2% to 0.01% of request time).
+ * At 5,000 TPS, this saves ~9.5 seconds of cumulative latency per second
+ * (the idempotency check drops from ~2% to ~0.1% of request time).
  *
  * Trade-off accepted:
- *   - Performance gain: 95% reduction in idempotency check latency
- *   - Complexity added: Redis dependency for idempotency (previously DB-only)
+ *   - Performance gain: ~95% reduction in idempotency check latency
+ *   - Complexity added: Redis dependency on the hot path
+ *   - Correctness unchanged: the UNIQUE constraint on the idempotency key
+ *     in the database stays the source of truth (Redis is not durable and
+ *     can lose recent writes on failover -- lesson 11)
  *   - Reviewed by: Principal Engineer on 2024-01-15
  *   - Review date: 2025-01-15 (annual review)
  *
- * If Redis availability drops below 99.95%, we fall back to DB check.
+ * If Redis is slow or unavailable, we skip it and use the DB check only.
  */
 @Service
 public class IdempotencyService {
@@ -506,9 +534,9 @@ public String formatAccountNumber(String raw) {
     return sb.toString();
 }
 
-// This method is called once per API response — the optimization saves 50ns
-// but adds 15 lines of code. The readability cost far exceeds the benefit.
-// String.format() or simple "+" concatenation is fine here.
+// This method is called once per API response — the "optimization" saves
+// nanoseconds but makes simple code harder to read. Simple "+"
+// concatenation is fine here (the compiler optimizes it anyway).
 ```
 
 ### Anti-Pattern 2: Ignoring the Real Bottleneck
@@ -529,8 +557,9 @@ public String formatAccountNumber(String raw) {
 public BigDecimal getRate(String base, String quote) {
     return rateRepository.findLatest(base, quote);
 }
-// When the rate provider updates rates, this cache serves stale data forever
-// (until service restart). In a forex trading context: catastrophic.
+// If the cache has no TTL configured (the default for a plain cache
+// manager), it serves stale rates until restart or eviction.
+// In a forex trading context: catastrophic.
 ```
 
 ### Anti-Pattern 4: N+1 Queries from ORM
@@ -575,7 +604,7 @@ A principal engineer's performance responsibilities:
         "Ask for a load test at 10,000 TPS to see if the change is measurable at scale"
       ],
       "correct": 1,
-      "explanation": "The core principle is: measure first, always. Without a benchmark, the team cannot know whether the performance delta is meaningful. At the method call frequency described, a 2% improvement at 10,000 TPS saves 50 ns × 10,000 = 500 µs/second of CPU — negligible. The readability cost of switching from LinkedHashMap (deterministic iteration order) to HashMap exceeds any benefit. A JMH benchmark would reveal this immediately. The principal engineer's role is to challenge optimisations that add complexity for marginal gains."
+      "explanation": "The core principle is: measure first, always. Without a benchmark, the team cannot know whether the performance delta is meaningful. At the call frequency described, a 2% improvement at 10,000 TPS saves about 50 ns × 10,000 = 500 µs of CPU per second — negligible. The change is also not free: LinkedHashMap keeps insertion order and code (or tests, or report output) may depend on it. A JMH benchmark of the real access pattern would show the tiny gain immediately. The principal engineer's role is to challenge optimisations that add risk or complexity for marginal gains."
     },
     {
       "text": "A payment service's p99 latency is 800 ms. CPU utilization is 15%. DB connection pool saturation shows threads awaiting connections. What is the correct next step in the bottleneck identification framework?",
@@ -589,15 +618,15 @@ A principal engineer's performance responsibilities:
       "explanation": "The bottleneck identification framework works stepwise. CPU < 80% → not CPU-bound. Pool saturation > 0 → DB bottleneck. The next question is WHY connections are exhausted: slow queries (need indexes, query optimisation) or too many queries (need pool sizing, replicas, or caching). pg_stat_activity shows active query durations. EXPLAIN ANALYZE reveals query plans. Blindly increasing pool size without diagnosing query performance is the 'ignoring the real bottleneck' anti-pattern — it delays exhaustion but doesn't fix the root cause."
     },
     {
-      "text": "A team accepts technical debt by switching idempotency key lookup from a database query (2 ms) to Redis HGET (0.1 ms). What documentation is required, and when should this decision be reviewed?",
+      "text": "A team adds a Redis HGET check (0.1 ms) in front of the database idempotency lookup (2 ms) on the payment hot path. What documentation is required, and when should this decision be reviewed?",
       "options": [
         "No documentation is needed — Redis is widely understood and the performance benefit is obvious",
-        "Document the performance gain (95% latency reduction), the complexity added (Redis dependency for idempotency, previously DB-only), the reviewed-by principal engineer and date, the annual review date, and the fallback behaviour when Redis availability drops below 99.95%",
+        "Document the performance gain (~95% lower check latency), the complexity added (Redis dependency on the hot path), that the database UNIQUE constraint stays the source of truth, who reviewed it and when, the annual review date, and the fallback when Redis is slow or unavailable",
         "Create a Jira ticket describing the change and close it when the deployment is complete",
         "Document in the README that Redis is used for idempotency — no further justification required"
       ],
       "correct": 1,
-      "explanation": "When accepting technical debt for performance, the decision must be explicit and time-bounded. Required documentation: the measured before/after performance numbers that justify the trade-off, the specific complexity added, who reviewed it and when, an annual review date to verify the trade-off still holds, and the fallback behaviour when the dependency degrades. This creates an audit trail for future engineers who encounter the Redis dependency and need to understand why it exists and what happens if it fails."
+      "explanation": "When accepting technical debt for performance, the decision must be explicit and time-bounded. Required documentation: the measured before/after numbers that justify the trade-off, the specific complexity added, why correctness does not depend on the new component (here: the database UNIQUE constraint still blocks duplicate payments, because Redis can lose writes), who reviewed it and when, a review date to check the trade-off still holds, and the fallback behaviour when the dependency degrades. This creates an audit trail for future engineers who need to understand why the dependency exists and what happens if it fails."
     }
   ]
 }
@@ -609,10 +638,22 @@ A principal engineer's performance responsibilities:
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Implement UseMethodDashboard as a Spring @Component that collects USE metrics every 10 seconds for HikariCP connection pool (utilization = active/total, saturation = threads_awaiting/max_pool_size), the payment executor thread pool (utilization = active/max, saturation = queue_size/remaining_capacity), and JVM GC (utilization = gc_time_percent over 10s window). Expose all metrics as Micrometer Gauges. Define alert thresholds: pool saturation > 0.1 → P2, pool saturation > 0.5 → P1."},
-    {"id": "2", "description": "Write a JMH benchmark class PaymentValidationBenchmark that measures two implementations of payment validation: (a) the current ValidationChain pattern with four validator objects, (b) a hand-inlined version. Use @BenchmarkMode(Mode.AverageTime) and @OutputTimeUnit(TimeUnit.NANOSECONDS). Run with 5 warmup iterations and 10 measurement iterations. Document the ROI calculation: at 10,000 TPS, if the inlined version saves 300 ns per call, calculate total CPU savings per second and determine whether the maintainability cost is justified."},
-    {"id": "3", "description": "Implement a CI performance regression gate using a GitHub Actions workflow that runs JMH benchmarks on every PR, compares results against a baseline stored in .performance-baselines/main.json, and fails the build if any benchmark regresses by more than 20%. The workflow must update the baseline file when a PR is merged to main. Write the Python script check_perf_regression.py that reads JMH JSON output, finds the matching baseline score, and exits with code 1 and a descriptive message if the regression threshold is exceeded."},
-    {"id": "4", "description": "Complete a performance trade-off decision record for adding a Redis cache to the exchange rate lookup in a multi-currency payment service. Include: current measured p99 (320 ms with DB query), target p99 after caching, the cache invalidation strategy (TTL + event-driven invalidation on rate update), the fallback when Redis is unavailable (fall back to DB, circuit breaker with 5-second open state), the operational dependency added, and the annual review date. Document this as a code comment using the template from Section 7 of this lesson."}
+    {
+      "id": "1",
+      "description": "Implement UseMethodDashboard as a Spring @Component that registers USE gauges ONCE (with functions reading live values) for the HikariCP connection pool (utilization = active/max_pool_size, saturation = threads_awaiting/max_pool_size), the payment executor thread pool (utilization = active/max, saturation = queue_size/queue_capacity), and JVM GC (utilization = gc_time_percent over a 10s window). Define alert thresholds: pool saturation > 0.1 → P2, pool saturation > 0.5 → P1."
+    },
+    {
+      "id": "2",
+      "description": "Write a JMH benchmark class PaymentValidationBenchmark that measures two implementations of payment validation: (a) the current ValidationChain pattern with four validator objects, (b) a hand-inlined version. Use @BenchmarkMode(Mode.AverageTime) and @OutputTimeUnit(TimeUnit.NANOSECONDS). Run with 5 warmup iterations and 10 measurement iterations. Document the ROI calculation: at 10,000 TPS, if the inlined version saves 300 ns per call, calculate total CPU savings per second and determine whether the maintainability cost is justified."
+    },
+    {
+      "id": "3",
+      "description": "Implement a CI performance regression gate using a GitHub Actions workflow that runs JMH benchmarks on every PR, compares results against a baseline stored in .performance-baselines/main.json, and fails the build if any benchmark regresses by more than 20%. The workflow must update the baseline file when a PR is merged to main. Write the Python script check_perf_regression.py that reads JMH JSON output, finds the matching baseline score, and exits with code 1 and a descriptive message if the regression threshold is exceeded."
+    },
+    {
+      "id": "4",
+      "description": "Complete a performance trade-off decision record for adding a Redis cache to the exchange rate lookup in a multi-currency payment service. Include: current measured p99 (320 ms with DB query), target p99 after caching, the cache invalidation strategy (TTL + event-driven invalidation on rate update), the fallback when Redis is unavailable (fall back to DB, circuit breaker with 5-second open state), the operational dependency added, and the annual review date. Document this as a code comment using the template from Section 7 of this lesson."
+    }
   ]
 }
 -->
