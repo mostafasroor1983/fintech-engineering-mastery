@@ -4411,7 +4411,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "CI/CD Pipelines — Secure Delivery for Financial Services A CI/CD pipeline in a financial services company is not just an automation convenience — it is a PCI-DSS control. Requirement 6 mandates that all system components and software are protected from known vulnerabilities, and that security is integrated into the development lifecycle. This lesson builds a complete, PCI-DSS-mapped pipeline from code commit to production deployment. Pipeline Architecture Overview PCI-DSS Requirement 6 Mapping |"
+      "body": "--- id: track-10-lesson-13 title: \"خطوط CI/CD — التسليم الآمن للخدمات المالية\" slug: cicd-secure-delivery track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 13 difficulty: advanced estimatedMinutes: 80 status: published tags: - CI-CD - GitHub-Actions - ArgoCD - GitOps - SAST - container-signing - supply-chain --- خطوط CI/CD — تسليم آمن للخدمات المالية خط CI/CD في شركة خدمات مالية ليس مجرد راحة أتمتة — بل ضابط من ضوابط PCI-DSS. فالمتطلب 6 يفرض حماية كل مكونات النظام وال"
     },
     {
       "id": "track-10-lesson-14",

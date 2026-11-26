@@ -2,7 +2,9 @@ name: Deploy to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    # The repository's working branch is v1 (there is no main branch);
+    # main is kept in case the branch is renamed later
+    branches: [v1, main]
   workflow_dispatch:
 
 permissions:
@@ -25,7 +27,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Pages
+        # Requires Settings -> Pages -> Source = "GitHub Actions" (one-time
+        # setup; the default GITHUB_TOKEN cannot enable Pages by itself)
         uses: actions/configure-pages@v5
+
+      - name: Validate content before publishing
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 tools/validate_content.py
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

@@ -32,28 +32,30 @@ graph LR
     ci --> build[Build JAR]
     build --> unit[Unit Tests]
     unit --> sast[SAST - SonarQube]
-    sast --> scan[Container Scan - Trivy]
-    scan --> integration[Integration Tests]
-    integration --> sign[Sign Image - Cosign]
-    sign --> sbom[Generate SBOM - Syft]
-    sbom --> publish[Push to ECR]
-    publish --> cd[CD - ArgoCD]
+    sast --> integration[Integration Tests]
+    integration --> publish[Build and push image to ECR - once]
+    publish --> scan[Scan pushed digest - Trivy]
+    scan --> sign[Sign digest - Cosign]
+    sign --> sbom[SBOM attestation - Syft]
+    sbom --> cd[CD - ArgoCD]
     cd --> dev_env[dev namespace]
     dev_env --> staging[staging namespace]
     staging --> approval[Manual Approval Gate]
     approval --> prod[production namespace]
 ```
 
-### PCI-DSS Requirement 6 Mapping
+### PCI-DSS Requirement Mapping (v4.0 numbering)
 
-| Pipeline Stage         | PCI-DSS Requirement | Control Description                               |
+| Pipeline Stage         | PCI-DSS v4.0 Requirement | Control Description                               |
 |------------------------|---------------------|---------------------------------------------------|
-| SAST (SonarQube)       | Req 6.3.2           | Detect security vulnerabilities before deployment |
-| Gitleaks secret scan   | Req 6.4.3           | Prevent secrets in code                          |
-| Trivy container scan   | Req 6.3.3           | Known vulnerability scanning of images           |
-| Code review gate       | Req 6.4.4           | Manual review before merge to main               |
-| Cosign image signing   | Req 6.4.2           | Verify integrity of deployed artifacts           |
-| Approval gate (prod)   | Req 6.5.6           | Change management for production deployments     |
+| SAST (SonarQube)       | 6.2.3, 6.2.4        | Custom code reviewed for vulnerabilities before release; secure coding techniques |
+| Gitleaks secret scan   | 8.6.2 (and 6.2.4)   | No hard-coded passwords for system/application accounts in code or config |
+| Trivy container scan   | 6.3.1, 6.3.3        | Identify known vulnerabilities; install critical patches promptly |
+| Code review gate       | 6.2.3.1             | Code changes reviewed by someone other than the author before release |
+| Cosign image signing   | supports 6.5.1      | Proves the deployed artifact is the approved, tested build |
+| Approval gate (prod)   | 6.5.1               | Changes to production follow documented change control (approval, testing, rollback) |
+
+The mapping shows which control each stage provides evidence for; your QSA decides what counts as sufficient evidence.
 
 ---
 
@@ -120,7 +122,7 @@ jobs:
 
   # ─────────────────────────────────────────────────
   # Stage 2: SAST — SonarQube Analysis
-  # PCI-DSS Req 6.3.2: Automated security review
+  # PCI-DSS 6.2.3 / 6.2.4: automated security review of custom code
   # ─────────────────────────────────────────────────
   sast:
     name: SAST Analysis (SonarQube)
@@ -143,8 +145,10 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        # "verify" runs the tests so the JaCoCo report exists -- the build
+        # job's reports are not available in this job's fresh workspace
         run: |
-          mvn --batch-mode sonar:sonar \
+          mvn --batch-mode verify sonar:sonar \
             -Dsonar.projectKey=payment-service \
             -Dsonar.qualitygate.wait=true \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
@@ -155,23 +159,66 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
         # Fails the pipeline if any secrets are found in Git history
-        # PCI-DSS Req 6.4.3: prevent secrets in source code
+        # PCI-DSS 8.6.2: no hard-coded credentials in source code
 
   # ─────────────────────────────────────────────────
-  # Stage 3: Container Build and Vulnerability Scan
-  # PCI-DSS Req 6.3.3: Known vulnerability scanning
+  # Stage 3: Integration Tests (before any image is published)
   # ─────────────────────────────────────────────────
-  container-scan:
-    name: Build and Scan Container
+  integration-test:
+    name: Integration Tests
     runs-on: ubuntu-latest
     needs: sast
     permissions:
       contents: read
-      id-token: write     # required for Cosign keyless signing
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: payments_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+      # "verify" compiles, packages and runs unit + integration tests.
+      # (Calling failsafe:integration-test directly on a fresh checkout
+      #  would find no compiled classes.)
+      - name: Run integration tests
+        run: mvn --batch-mode verify
+        env:
+          DB_URL: jdbc:postgresql://localhost:5432/payments_test
+          DB_USER: test
+          DB_PASSWORD: test
+
+  # ─────────────────────────────────────────────────
+  # Stage 4: Build ONCE, push, scan the pushed digest
+  # PCI-DSS 6.3.1 / 6.3.3: known vulnerability scanning
+  # Building twice (once to scan, once to push) can produce a different
+  # image than the one scanned -- and signing the digest of a local build
+  # signs something that was never pushed.
+  # ─────────────────────────────────────────────────
+  container-scan:
+    name: Build, Push and Scan Container
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.event_name != 'pull_request'   # PRs: build/test only
+    permissions:
+      contents: read
+      id-token: write     # OIDC for AWS
       security-events: write
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
-      image-tag: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
 
@@ -191,7 +238,6 @@ jobs:
           aws-region: us-east-1
 
       - name: Login to Amazon ECR
-        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Extract image metadata
@@ -201,32 +247,33 @@ jobs:
           images: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=sha,prefix=sha-
-            type=ref,event=branch
             type=semver,pattern={{version}}
 
-      - name: Build container image
+      - name: Build and push image (once)
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: false
-          load: true
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: true      # generate SLSA provenance
-          sbom: true            # generate SBOM in image metadata
+          provenance: mode=max  # SLSA provenance attestation
+          sbom: true            # SBOM attestation in the registry
 
+      # Scan exactly the pushed digest. A failure stops the pipeline before
+      # signing -- and the admission policy only runs SIGNED images, so an
+      # unscanned/failed image can never reach production.
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0   # pin (better: commit SHA)
         with:
-          image-ref: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          image-ref: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           format: sarif
           output: trivy-results.sarif
           exit-code: 1          # FAIL pipeline on CRITICAL or HIGH CVEs
           severity: CRITICAL,HIGH
           vuln-type: os,library
-          ignore-unfixed: true  # ignore CVEs with no available fix
+          ignore-unfixed: true  # only fixable CVEs block; track the rest separately
 
       - name: Upload Trivy results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
@@ -234,68 +281,27 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
 
-      - name: Push image to ECR
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
-
   # ─────────────────────────────────────────────────
-  # Stage 4: Integration Tests
-  # ─────────────────────────────────────────────────
-  integration-test:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-    needs: container-scan
-    services:
-      postgres:
-        image: postgres:15.4
-        env:
-          POSTGRES_DB: payments_test
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
-      - name: Run integration tests
-        run: mvn --batch-mode failsafe:integration-test failsafe:verify
-        env:
-          DB_URL: jdbc:postgresql://localhost:5432/payments_test
-          DB_USER: test
-          DB_PASSWORD: test
-
-  # ─────────────────────────────────────────────────
-  # Stage 5: Sign Image and Generate SBOM
-  # PCI-DSS Req 6.4.2: Artifact integrity
+  # Stage 5: Sign Image and Attach SBOM
+  # Supports PCI-DSS 6.5.1: deployed artifact = approved build
   # ─────────────────────────────────────────────────
   sign-and-publish:
-    name: Sign Image and Generate SBOM
+    name: Sign Image and Attest SBOM
     runs-on: ubuntu-latest
-    needs: integration-test
+    needs: container-scan
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
       id-token: write     # required for keyless Cosign signing
-      packages: write
     steps:
-      - uses: actions/checkout@v4
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::123456789:role/GitHubActionsECRRole
           aws-region: us-east-1
+
+      - name: Login to Amazon ECR       # cosign pushes signatures to ECR
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
@@ -303,13 +309,11 @@ jobs:
       - name: Install Syft (SBOM generator)
         uses: anchore/sbom-action/download-syft@v0
 
+      # Keyless signing records an entry in the PUBLIC Rekor log (image
+      # name, workflow identity) -- consider a private Sigstore or KMS keys
       - name: Sign image with Cosign (keyless OIDC)
-        env:
-          COSIGN_EXPERIMENTAL: "1"
         run: |
-          cosign sign \
-            --yes \
-            --rekor-url https://rekor.sigstore.dev \
+          cosign sign --yes \
             ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.container-scan.outputs.image-digest }}
 
       - name: Generate SBOM with Syft
@@ -319,11 +323,12 @@ jobs:
             --output spdx-json=sbom.spdx.json \
             --output cyclonedx-json=sbom.cdx.json
 
-      - name: Attach SBOM to image
+      # A signed attestation instead of the deprecated "cosign attach sbom"
+      - name: Attest SBOM
         run: |
-          cosign attach sbom \
-            --sbom sbom.spdx.json \
-            --type spdx \
+          cosign attest --yes \
+            --type spdxjson \
+            --predicate sbom.spdx.json \
             ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.container-scan.outputs.image-digest }}
 
       - name: Upload SBOM artifacts
@@ -372,8 +377,9 @@ spec:
     namespace: payments
 
   syncPolicy:
-    # In production: manual sync only (no auto-sync without approval)
-    # automated: {}  <-- DO NOT enable in production without approval gate
+    # Production here: manual sync by the prod-deployer role. (Auto-sync is
+    # also acceptable IF the GitOps repo enforces reviewed PRs -- then the
+    # approved merge is the change approval. See Pitfall 2.)
     syncOptions:
       - CreateNamespace=false
       - PrunePropagationPolicy=foreground
@@ -404,6 +410,7 @@ metadata:
   name: payments-platform
   namespace: argocd
 spec:
+  project: payments-prod       # never leave the default (unrestricted) project
   source:
     repoURL: https://github.com/fintech/k8s-manifests.git
     targetRevision: HEAD
@@ -445,6 +452,7 @@ replicaCount: 1
 image:
   repository: 123456789.dkr.ecr.us-east-1.amazonaws.com/payment-service
   tag: sha-abc123def456    # same SHA — promoted from staging
+  # stricter: pin the digest (sha256:...), which cannot be re-pointed
 replicaCount: 3
 resources:
   requests:
@@ -468,13 +476,15 @@ cosign verify \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   123456789.dkr.ecr.us-east-1.amazonaws.com/payment-service@sha256:abc123...
 
-# Inspect the SBOM attached to the image
-cosign download sbom \
+# Verify the SBOM attestation and list its packages
+cosign verify-attestation --type spdxjson \
+  --certificate-identity "https://github.com/fintech/payment-service/.github/workflows/ci.yml@refs/heads/main" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   123456789.dkr.ecr.us-east-1.amazonaws.com/payment-service@sha256:abc123... \
-  | jq '.packages[].name' | head -20
+  | jq -r '.payload | @base64d | fromjson | .predicate.packages[].name' | head -20
 ```
 
-Enforce signature verification at admission using Cosign's `policy-controller`:
+Enforce signature verification at admission using Sigstore's `policy-controller` (it only checks namespaces labelled `policy.sigstore.dev/include=true`):
 
 ```yaml
 # ClusterImagePolicy — only signed images from our CI pipeline are admitted
@@ -507,7 +517,7 @@ spec:
 # This is NOT a valid Trivy flag but represents a common conceptual mistake:
 # Running trivy on the JAR only (not the container image)
 - name: Scan JAR only (WRONG)
-  run: trivy fs --security-checks vuln target/payment-service.jar
+  run: trivy fs --scanners vuln target/payment-service.jar
   # Misses: OS CVEs, transitive native deps, base image issues
 ```
 
@@ -516,21 +526,21 @@ spec:
 - name: Scan full container image (CORRECT)
   uses: aquasecurity/trivy-action@master
   with:
-    image-ref: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+    image-ref: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
     format: sarif
     output: trivy-results.sarif
     exit-code: 1
     severity: CRITICAL,HIGH
     vuln-type: os,library    # scan BOTH OS packages AND application libraries
-    ignore-unfixed: false    # include unfixed to track technical debt
+    ignore-unfixed: true     # block on fixable CVEs; report unfixed ones in
+                             # a separate, non-blocking scan to track the debt
 ```
 
 Additionally, use a minimal base image to reduce attack surface:
 ```dockerfile
-# Dockerfile — use distroless for minimal attack surface
-FROM eclipse-temurin:21-jre-jammy AS runtime
-# Better: use distroless
-FROM gcr.io/distroless/java21-debian12 AS runtime
+# Dockerfile — runtime stage on distroless for minimal attack surface
+# (instead of a full OS image such as eclipse-temurin:21-jre-jammy)
+FROM gcr.io/distroless/java21-debian12:nonroot AS runtime
 COPY --from=build /app/target/payment-service.jar /app/payment-service.jar
 ENTRYPOINT ["java", "-jar", "/app/payment-service.jar"]
 ```
@@ -539,9 +549,11 @@ ENTRYPOINT ["java", "-jar", "/app/payment-service.jar"]
 
 ### Pitfall 2: ArgoCD Auto-Sync Enabled in Production Without Approval
 
-**Problem**: When ArgoCD `automated.selfHeal: true` is set in the production Application, any push to the GitOps repo — including an accidental one — immediately applies to production. In a PCI-DSS environment, this violates change management requirements.
+**Problem**: When ArgoCD automated sync is enabled for the production Application **and the GitOps repository accepts unreviewed commits** (direct pushes, no branch protection), any push — including an accidental one — immediately applies to production. That bypasses change control (PCI-DSS 6.5.1).
 
-**Dangerous production ArgoCD Application**:
+There are two valid fixes: (a) keep auto-sync but make the reviewed, approved PR the change approval — branch protection with required reviews, no direct pushes, no admin bypass (the model used in the Helm/GitOps lesson); or (b) disable auto-sync for production so a named role must trigger each sync. Many banks use (a) for speed and add (b) during change freezes.
+
+**Dangerous** when the repo has no enforced reviews:
 ```yaml
 syncPolicy:
   automated:
@@ -551,7 +563,7 @@ syncPolicy:
     - CreateNamespace=true
 ```
 
-**Correct production configuration**:
+**Manual-sync production configuration** (option b):
 ```yaml
 syncPolicy:
   # NO automated section in production — human approval required
@@ -631,7 +643,7 @@ jobs:
           FLYWAY_PASSWORD: ${{ secrets.DB_MIGRATION_PASSWORD }}
         run: |
           flyway -url=${{ vars.DB_URL }} migrate
-          unset FLYWAY_PASSWORD  # clear immediately after use
+        # the variable exists only in this step's process environment
 ```
 
 Enforce secret scanning in the repository settings and add Gitleaks to the pipeline as shown in Stage 2.
@@ -654,27 +666,28 @@ Enforce secret scanning in the repository settings and add Gitleaks to the pipel
 - [ ] SBOM generated (Syft) and attached to image on every release
 - [ ] `ClusterImagePolicy` enforces that only signed images are admitted to production
 - [ ] Image digest (SHA256) used in deployment manifests (not floating tags like `latest`)
-- [ ] SLSA provenance level 2+ achieved (via `provenance: true` in docker/build-push-action)
+- [ ] SLSA provenance attestation generated (`provenance: mode=max`); higher SLSA build levels need a hardened, isolated builder (e.g. the SLSA GitHub generator)
+- [ ] Image built once; the scanned digest is the signed and deployed digest
 
 ### CD and GitOps
-- [ ] ArgoCD production Applications have NO `automated:` sync policy
+- [ ] Production sync is controlled: either no `automated:` policy, or auto-sync behind a GitOps repo with enforced PR reviews and no direct pushes
 - [ ] ArgoCD `AppProject` restricts sync permissions to named role
 - [ ] Environment promotion requires a Git PR with at least one approval
 - [ ] Production deployments linked to change management ticket in annotation
 - [ ] ArgoCD diff review conducted before every production sync
 - [ ] `revisionHistoryLimit` set to retain at least 10 versions for rollback
 
-### Compliance (PCI-DSS Requirement 6)
-- [ ] SAST results retained as PCI-DSS Req 6.3.2 evidence
-- [ ] Container scan results retained as PCI-DSS Req 6.3.3 evidence
-- [ ] Image signatures retained as PCI-DSS Req 6.4.2 evidence
+### Compliance (PCI-DSS Requirements 6 and 8)
+- [ ] SAST results retained as PCI-DSS 6.2.3 / 6.2.4 evidence
+- [ ] Container scan results retained as PCI-DSS 6.3.1 / 6.3.3 evidence
+- [ ] Image signatures and approvals retained as PCI-DSS 6.5.1 change-control evidence
 - [ ] Pipeline code reviewed and approved by security team annually
 - [ ] All pipeline failures trigger PagerDuty alert (no silent failures)
 
 ---
 
 <!-- KNOWLEDGE-CHECK
-{"questions":[{"text":"A Trivy scan passes with zero findings but a production incident reveals a critical glibc vulnerability in the container. What was the most likely misconfiguration?","options":["a) Trivy was not configured to fail the pipeline on CRITICAL severity","b) The scan was run against the JAR file or application layer only, not the full container image including the OS base layer","c) The base image was distroless which Trivy does not support","d) Trivy was running in a GitHub Actions environment without Docker socket access"],"correct":1,"explanation":"Trivy must scan the full container image (vuln-type: os,library) to detect CVEs in both the OS base layer (glibc, openssl, etc.) and application dependencies. Scanning only the JAR or application files misses the majority of real-world CVEs which originate in OS packages of the base image."},{"text":"Why is enabling ArgoCD automated sync with selfHeal: true dangerous in a production PCI-DSS environment?","options":["a) selfHeal causes ArgoCD to delete all resources and recreate them from scratch on every sync","b) Any Git commit to the GitOps repository immediately deploys to production without human approval, violating change management requirements in PCI-DSS Requirement 6.5.6","c) selfHeal mode prevents ArgoCD from respecting Helm chart values overrides","d) Automated sync bypasses Kubernetes admission controllers including OPA Gatekeeper"],"correct":1,"explanation":"PCI-DSS Requirement 6.5.6 requires change management procedures for production deployments. With automated selfHeal enabled, any push to the GitOps repository — including accidental changes — immediately applies to production without approval. Production ArgoCD Applications must have no automated sync policy, requiring human initiation for every deployment."},{"text":"What is the security advantage of using Cosign keyless signing with OIDC over traditional key-based signing?","options":["a) Keyless signing produces smaller image manifests, reducing ECR storage costs","b) OIDC-based signing ties the signature to the CI workflow identity rather than a long-lived signing key that must be managed, rotated, and secured as a secret","c) Keyless signing allows images to be deployed without a ClusterImagePolicy","d) Keyless signing only works with public images and cannot be used in private ECR registries"],"correct":1,"explanation":"Traditional signing requires a long-lived private key stored as a CI secret — a secret that must be rotated, can be leaked, and represents a persistent risk. Cosign keyless signing uses the OIDC token from GitHub Actions to get a short-lived certificate from Fulcio, binding the signature to the specific workflow and commit. There is no long-lived key to manage or compromise."}]}
+{"questions": [{"text": "A Trivy scan passes with zero findings but a production incident reveals a critical glibc vulnerability in the container. What was the most likely misconfiguration?", "options": ["a) Trivy was not configured to fail the pipeline on CRITICAL severity", "b) The scan was run against the JAR file or application layer only, not the full container image including the OS base layer", "c) The base image was distroless which Trivy does not support", "d) Trivy was running in a GitHub Actions environment without Docker socket access"], "correct": 1, "explanation": "Trivy must scan the full container image (vuln-type: os,library) to detect CVEs in both the OS base layer (glibc, openssl, etc.) and application dependencies. Scanning only the JAR or application files misses the majority of real-world CVEs which originate in OS packages of the base image."}, {"text": "Why can enabling ArgoCD automated sync with selfHeal: true be dangerous in a production PCI-DSS environment?", "options": ["a) selfHeal causes ArgoCD to delete all resources and recreate them from scratch on every sync", "b) If the GitOps repository accepts unreviewed commits, any commit immediately deploys to production without human approval, bypassing change control (PCI-DSS 6.5.1) — auto-sync is only safe behind enforced PR reviews, otherwise use manual sync", "c) selfHeal mode prevents ArgoCD from respecting Helm chart values overrides", "d) Automated sync bypasses Kubernetes admission controllers including OPA Gatekeeper"], "correct": 1, "explanation": "PCI-DSS 6.5.1 requires that changes to production follow documented change control, including approval. With automated sync, the GitOps repository becomes the deployment trigger: if direct or unreviewed pushes are possible, an accidental change goes straight to production. Either make the reviewed, approved pull request the change approval (branch protection, required reviews, no direct pushes or admin bypass), or disable auto-sync for production so a named role must trigger each sync."}, {"text": "What is the security advantage of using Cosign keyless signing with OIDC over traditional key-based signing?", "options": ["a) Keyless signing produces smaller image manifests, reducing ECR storage costs", "b) OIDC-based signing ties the signature to the CI workflow identity rather than a long-lived signing key that must be managed, rotated, and secured as a secret", "c) Keyless signing allows images to be deployed without a ClusterImagePolicy", "d) Keyless signing only works with public images and cannot be used in private ECR registries"], "correct": 1, "explanation": "Traditional signing requires a long-lived private key stored as a CI secret — a secret that must be rotated, can be leaked, and represents a persistent risk. Cosign keyless signing uses the OIDC token from GitHub Actions to get a short-lived certificate from Fulcio, binding the signature to the specific workflow and commit. There is no long-lived key to manage or compromise."}]}
 -->
 
 <!-- PRACTICAL-CHALLENGE
