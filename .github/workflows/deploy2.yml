@@ -1,0 +1,48 @@
+name: Deploy to GitHub Pages
+
+# The site is published with Settings -> Pages -> "Deploy from a branch"
+# (branch v1, folder /docs), which needs no workflow. This workflow is only
+# for the alternative setup "Source: GitHub Actions"; it runs manually so the
+# two methods don't compete. To switch: set Source = GitHub Actions and add
+#   push:
+#     branches: [v1]
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        # Requires Settings -> Pages -> Source = "GitHub Actions" (one-time
+        # setup; the default GITHUB_TOKEN cannot enable Pages by itself)
+        uses: actions/configure-pages@v5
+
+      - name: Validate content before publishing
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 tools/validate_content.py
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
