@@ -373,5 +373,27 @@
       "senior"
     ],
     "mainPathHours": 1.6
+  },
+  {
+    "id": "track-17",
+    "sequence": 17,
+    "title": "التحضير النهائي للمقابلات",
+    "shortTitle": "التحضير النهائي للمقابلات",
+    "slug": "final-prep",
+    "color": "#d946ef",
+    "colorMuted": "rgba(217, 70, 239, 0.15)",
+    "description": "سباق نهائي في 12 ساعة لمقابلات المستوى الأول وStaff في التقنية المالية: 500 سؤال وجواب تقني ومعماري، و10 تحديات برمجية مختبرة، و100 سؤال اختيار من متعدد قائم على سيناريوهات، و300 نصيحة عالية الأثر للمقابلات.",
+    "difficulty": "senior",
+    "estimatedHours": 12.0,
+    "lessonCount": 18,
+    "status": "published",
+    "priority": "critical",
+    "tags": [
+      "interview",
+      "final-prep",
+      "senior",
+      "staff"
+    ],
+    "mainPathHours": 12.0
   }
 ]

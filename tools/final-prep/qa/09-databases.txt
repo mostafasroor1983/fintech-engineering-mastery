@@ -1,0 +1,156 @@
+## PostgreSQL internals
+Q: How does MVCC work in PostgreSQL?
+A: Each row version carries the creating (`xmin`) and deleting (`xmax`) transaction ids; an UPDATE writes a new version and marks the old one dead. Each transaction sees versions visible to its snapshot, so readers never block writers. Dead versions stay until VACUUM removes them, which is why long-running transactions (holding old snapshots) cause bloat.
+
+Q: What does VACUUM do, and what happens if autovacuum falls behind?
+A: It removes dead row versions so space can be reused, updates the visibility map (enabling index-only scans) and freezes old transaction ids. If it falls behind: table and index bloat, slower queries, and ultimately transaction-id wraparound protection, which forces aggressive vacuuming or even stops writes. Tune autovacuum per hot table and kill idle-in-transaction sessions.
+
+Q: What is transaction id wraparound, and why is it an outage risk?
+A: PostgreSQL uses 32-bit transaction ids. If old rows aren't frozen by VACUUM before about 2 billion transactions pass, the database refuses new writes to avoid data appearing to be "in the future". Monitor `age(datfrozenxid)`, keep autovacuum healthy, and never let a replication slot or long transaction pin the oldest xmin for days.
+
+Q: What locks does `ALTER TABLE ... ADD COLUMN` take, and why can a quick migration cause an outage?
+A: It needs an `ACCESS EXCLUSIVE` lock (briefly, for a nullable column without a volatile default, since PostgreSQL 11 doesn't rewrite the table). If a long transaction holds a conflicting lock, the ALTER waits, and every new query on that table queues behind it, so traffic stops. Set `lock_timeout` (a few seconds) and retry, and run migrations off-peak.
+
+Q: `SELECT ... FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`: when do you use each?
+A: `FOR UPDATE` locks rows for modification or deletion, blocking other lockers and writers. `FOR NO KEY UPDATE` is weaker (the default lock taken by UPDATE when no key changes) and doesn't block foreign-key checks from child inserts. `FOR SHARE` lets others read-lock but blocks writes (useful to ensure a referenced row doesn't change). Add `NOWAIT` or `SKIP LOCKED` to avoid waiting.
+
+Q: How does `SKIP LOCKED` enable job queues in PostgreSQL?
+A: Workers run `SELECT ... WHERE status = 'PENDING' ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED`, so each takes rows nobody else has locked and skips the rest, then updates their status in the same transaction. Multiple workers process the queue concurrently without duplicates or blocking. It doesn't guarantee strict order across workers.
+
+Q: What are advisory locks, and when are they useful?
+A: Application-defined locks on a number (`pg_advisory_xact_lock(hashtext(key))`), held for the transaction or session, not tied to any row. Useful to serialise work per key that has no row yet (creating an account for a customer once) or to ensure a single runner for a maintenance job. Transaction-level advisory locks release automatically on commit, which avoids leaks with pooling.
+
+## Indexing and query plans
+Q: How do you read an `EXPLAIN (ANALYZE, BUFFERS)` plan?
+A: Read bottom-up: each node shows estimated vs actual rows, loops, time and buffers (shared hit vs read from disk). Look for large mismatches between estimated and actual rows (stale statistics), sequential scans on big tables with selective filters (missing index), nested loops with many iterations, sorts or hashes spilling to disk, and high buffer reads.
+
+Q: How do you design a composite index for `WHERE account_id = ? AND created_at > ? ORDER BY created_at DESC`?
+A: `(account_id, created_at DESC)`: equality columns first, then the range/sort column, so PostgreSQL seeks to the account and reads rows already in order, with no sort. Add `INCLUDE (amount, status)` for an index-only scan if those are the only other columns needed. Column order matters: `(created_at, account_id)` would be far worse.
+
+Q: What is a covering index, and what is an index-only scan?
+A: An index that contains all columns a query needs (key columns plus `INCLUDE` columns), so PostgreSQL can answer from the index without visiting the table heap, if the visibility map shows the pages as all-visible (kept up to date by VACUUM). It greatly reduces I/O for hot read paths such as account history.
+
+Q: When does PostgreSQL ignore your index?
+A: When it estimates that a large fraction of rows match (a sequential scan is cheaper), when the query wraps the column in a function or cast (`WHERE lower(email) = ?` needs an expression index), on type mismatches, with leading wildcards in `LIKE '%x'`, with OR conditions across columns, or because statistics are stale (run ANALYZE). Check with EXPLAIN rather than guessing.
+
+Q: What is a partial index, and give a fintech example.
+A: An index over a subset of rows defined by a WHERE clause. Example: `CREATE INDEX ON payments (created_at) WHERE status = 'PENDING'` keeps a small, hot index for the reconciliation or retry job, instead of indexing millions of settled payments. A unique partial index can enforce "only one active card per account".
+
+Q: How do indexes slow down writes, and how do you decide which to keep?
+A: Every insert or update must update every index (and non-HOT updates create new index entries), increasing write latency, WAL volume and vacuum work. Keep indexes that serve real queries (check `pg_stat_user_indexes` for unused ones), avoid redundant prefixes, and drop unused indexes after verifying across all workloads, including monthly jobs.
+
+Q: What are GIN indexes and when would you use JSONB?
+A: GIN indexes support containment and existence queries on JSONB, arrays and full-text search (`metadata @> '{"rail":"SEPA"}'`). JSONB suits semi-structured data such as provider-specific payment metadata or raw messages, kept alongside typed columns. Keep money, keys and anything you filter or constrain on in typed columns with constraints.
+
+## Schema design for money
+Q: How do you design a payments table for correctness?
+A: Typed columns: `id` (UUIDv7 or bigint), `amount_minor BIGINT CHECK (amount_minor > 0)`, `currency CHAR(3) CHECK (currency ~ '^[A-Z]{3}$')`, `status` with a CHECK or enum, `idempotency_key` unique per client, foreign keys, `created_at timestamptz`, `version` for optimistic locking. Let the database enforce invariants; application checks are not enough under concurrency.
+
+Q: Natural keys vs surrogate keys for financial entities?
+A: Surrogate keys (generated ids) for primary keys: stable, compact, never change. Enforce natural business keys with unique constraints (IBAN per account, end-to-end id per payment, idempotency key per client). External identifiers can change format or be reused, so don't make them primary keys, but always make them unique where they must be.
+
+Q: How do you store and query an account's balance history efficiently?
+A: Keep postings append-only, partitioned by time, indexed by `(account_id, created_at)`; store periodic balance snapshots (end of day or month) so a historical balance is snapshot + postings since, rather than a sum from inception. For statements, generate and store issued documents immutably.
+
+Q: What is the risk of `ON DELETE CASCADE` in financial schemas?
+A: A single delete can silently remove large amounts of related history (postings, audit rows), violating retention and audit requirements. In financial systems, prefer `RESTRICT` (deletes fail if referenced) and soft-deletion or status changes, with archival processes that move data deliberately.
+
+## Partitioning, scaling and HA
+Q: When and how do you partition a large PostgreSQL table?
+A: When a table is too large for efficient maintenance (vacuum, index builds) or retention (dropping old data), typically time-based declarative range partitioning (monthly partitions for postings). Benefits: partition pruning in queries that filter on the key, cheap retention by detaching partitions. Costs: unique constraints must include the partition key, and queries without the key scan all partitions.
+
+Q: How do you scale reads on PostgreSQL, and what are the consistency risks?
+A: Streaming read replicas for reporting and read-heavy APIs, routed with a read-only data source (`@Transactional(readOnly = true)` plus routing), and a pooler (PgBouncer). Risks: replication lag (stale reads, read-your-writes violations); keep balance checks and post-write reads on the primary, and monitor lag.
+
+Q: How does PostgreSQL failover work, and what can go wrong?
+A: An HA manager (Patroni with etcd, or a managed service) detects primary failure and promotes a standby, updating the endpoint. Risks: split-brain without proper fencing, data loss with asynchronous replicas, clients holding stale connections (configure pool validation and DNS TTLs), and in-flight transactions failing with unknown outcomes that applications must retry idempotently.
+
+Q: What are RPO and RTO, and how do backups and replication relate to them?
+A: RPO is how much data you can lose; RTO is how long recovery takes. Synchronous replication gives near-zero RPO for node failures; backups with WAL archiving (point-in-time recovery with pgBackRest, for example) protect against logical errors such as a bad migration or accidental delete, which replication copies instantly. Test restores regularly and time them.
+
+Q: What is PgBouncer, and what breaks in transaction pooling mode?
+A: A lightweight connection pooler that multiplexes many client connections onto few server connections. In transaction mode, a server connection is assigned per transaction, so session state doesn't survive: session-level prepared statements (older versions), `SET` without `LOCAL`, session advisory locks, `LISTEN/NOTIFY` and temporary tables break. Use transaction-scoped settings and locks.
+
+Q: How do you run a large data backfill without hurting production?
+A: Batch by key ranges (a few thousand rows per transaction), commit between batches, throttle with sleeps or a rate limit, run off-peak, make it resumable (track the last processed key) and idempotent, monitor replication lag and locks, and test on a production-size copy. Never one giant UPDATE: it holds locks for a long time, bloats the table and floods replicas with WAL.
+
+## Choosing data stores
+Q: When would you choose a distributed SQL database (CockroachDB, Spanner, YugabyteDB) over sharded PostgreSQL?
+A: When you need horizontal write scaling with cross-shard ACID transactions and multi-region resilience, and the team prefers buying consistency over building sagas and sharding logic. Costs: higher write latency (consensus), different performance characteristics and SQL compatibility gaps, licensing and cost, and less operational familiarity. Benchmark your actual workload.
+
+Q: When is a NoSQL store like Cassandra or DynamoDB a good fit in fintech?
+A: For high-volume, key-based access with predictable queries and simple consistency needs: event and audit logs, device fingerprints, session data, idempotency key stores at huge scale, time-series telemetry. Not for ledgers needing multi-row atomic transactions and constraints. Design tables around queries (no ad hoc joins), and understand their consistency settings.
+
+Q: How do you feed analytics and regulatory reporting without loading the production database?
+A: Stream changes out with CDC (Debezium to Kafka) into a data lake or warehouse (Iceberg tables, Snowflake, BigQuery), or use read replicas for lighter needs. Model curated, versioned datasets for reports, reconcile warehouse totals with the ledger, and govern access to personal data.
+
+Q: What's the difference between OLTP and OLAP workloads, and why separate them?
+A: OLTP: many small, concurrent read/write transactions with strict latency (payments). OLAP: large scans and aggregations over history (reports, analytics). Running heavy analytical queries on the OLTP primary competes for I/O, CPU and buffers, and long queries hold snapshots that block vacuum. Separate them with replicas or a warehouse.
+
+Q: What is event sourcing's storage model, and what are its operational costs?
+A: Each aggregate's state is the fold of its event stream, stored append-only with a per-aggregate version and an optimistic concurrency check on append. Current state comes from snapshots plus later events; queries come from projections. Costs: schema evolution of old events (upcasting), rebuilding projections, more complex debugging and GDPR erasure (crypto-shredding).
+
+## Database correctness under concurrency
+Q: What is write skew, and which isolation level prevents it?
+A: Two transactions read overlapping data, make decisions, and write different rows, together violating an invariant (two doctors both go off call; two withdrawals from accounts with a shared limit). REPEATABLE READ (snapshot isolation) doesn't prevent it; SERIALIZABLE (SSI in PostgreSQL) does, or you materialise the conflict with a lock on a shared row or a constraint.
+
+Q: How do database constraints act as your last line of defence?
+A: UNIQUE stops duplicates (idempotency keys, one active card), CHECK enforces ranges (`balance >= 0`, positive amounts), foreign keys prevent orphans, exclusion constraints prevent overlapping ranges, and deferred triggers enforce multi-row invariants (balanced journal entries). They hold no matter which code path, script or concurrent race writes the data.
+
+Q: Why should you avoid long-running transactions?
+A: They hold locks (blocking writers and migrations), keep old snapshots (preventing vacuum, causing bloat), hold connections (exhausting pools), and increase deadlock and serialization-failure risk. Keep transactions short: no remote calls or user think-time inside them, and set `idle_in_transaction_session_timeout` and `statement_timeout`.
+
+Q: How do you detect and fix lock contention in PostgreSQL?
+A: Query `pg_stat_activity` with `pg_blocking_pids(pid)` to see who blocks whom, check `pg_locks`, and log lock waits (`log_lock_waits = on` with `deadlock_timeout`). Fixes: shorten transactions, lock rows in a consistent order, use `SKIP LOCKED` for queues, split hot rows, and set `lock_timeout` so waiters fail fast instead of piling up.
+
+Q: What's the difference between `DELETE`, `TRUNCATE` and dropping a partition for retention?
+A: `DELETE` removes rows one by one, generating WAL and dead tuples that need vacuum. `TRUNCATE` empties the whole table instantly (taking an exclusive lock). Detaching and dropping a time partition removes old data instantly with minimal impact. For financial retention, archive the partition (export to immutable storage) before dropping it.
+
+Q: How do you implement soft deletes without causing bugs?
+A: A `deleted_at` column plus partial unique indexes that ignore deleted rows (`UNIQUE (email) WHERE deleted_at IS NULL`), views or default filters so queries don't accidentally include deleted rows, and an archival job for real removal when retention ends. Watch for foreign keys pointing at soft-deleted rows.
+
+Q: How do you make a schema migration reversible, and why might you choose not to?
+A: Write down-migrations or forward-fixes, and keep schema changes backward compatible with the previous application version (expand/contract), so you can roll back the application without rolling back the schema. Destructive steps (dropping columns) come last, after the new code is proven. Many teams prefer forward-only migrations plus compatibility, because a data-changing rollback is itself risky.
+
+Q: How do you store audit history of changes to a table?
+A: Trigger-based history tables (old and new values, actor from a session setting, timestamp), CDC into an append-only audit store, or temporal tables. Capture the actor reliably (pass the user via `SET LOCAL app.user_id` in the transaction), protect the history from modification (separate privileges), and index for typical audit queries.
+
+Q: Why might `COUNT(*)` on a large PostgreSQL table be slow, and what do you do?
+A: MVCC means PostgreSQL must check row visibility, so it scans the table or an index (index-only scans help only if the visibility map is up to date). For dashboards, use an estimate (`pg_class.reltuples`), maintain counters incrementally, or precompute in a summary table updated by events or batch jobs.
+
+Q: How do you choose between UUIDs and sequential ids as primary keys?
+A: Sequential bigint ids are compact and index-friendly but reveal volume and need central generation. Random UUIDv4 spread inserts across the index (page splits, cache misses). UUIDv7 gives global uniqueness with time ordering, so inserts stay local. For public APIs, avoid exposing guessable sequential ids.
+
+Q: How do you protect sensitive columns (PAN, national id) in a database?
+A: Don't store them if a token will do; otherwise encrypt at the application level with keys in a KMS (envelope encryption), store a keyed hash (HMAC) for lookups, restrict column access with roles, mask in non-production copies, and keep them out of logs, backups without encryption, and analytics extracts.
+
+Q: How do you test database performance before a release?
+A: Run migrations and key queries against a production-sized, anonymised dataset; capture plans with EXPLAIN ANALYZE and compare with the previous version; load test the critical paths; check `pg_stat_statements` for regressions after deployment; and watch locks and replication lag during migrations.
+
+Q: What are the most useful PostgreSQL views for production troubleshooting?
+A: `pg_stat_activity` (what's running, waiting and idle in transaction), `pg_stat_statements` (top queries by total time), `pg_locks` with `pg_blocking_pids`, `pg_stat_user_tables` (seq scans, dead tuples, last vacuum), `pg_stat_user_indexes` (unused indexes), `pg_stat_replication` and `pg_replication_slots` (lag and retained WAL).
+
+Q: What is the HOT update optimisation, and how do you get more of it?
+A: A heap-only tuple update avoids creating new index entries when no indexed column changes and the new row version fits on the same page. It reduces index bloat and write amplification. Encourage it by not indexing frequently updated columns (status timestamps) unnecessarily and leaving free space on pages (`fillfactor` 80–90 on update-heavy tables).
+
+Q: How do you handle time zones correctly in PostgreSQL?
+A: Use `timestamptz` for instants (stored as UTC, converted for the session's time zone), `date` for business dates, and avoid `timestamp without time zone` for events. Set the application's session time zone explicitly (UTC) and compute business dates in the application with the right calendar, not with implicit server settings.
+
+## More database questions
+Q: What is a phantom read, and does it matter for a limit check?
+A: A query re-run in the same transaction returns new rows that another transaction inserted (rows matching a predicate appear). For "total of today's payouts must stay under the daily limit", two transactions can each count existing payouts, both pass, and both insert: a write skew via phantoms. Use SERIALIZABLE, or lock a per-account limit row (`SELECT ... FOR UPDATE`) that every payout must update.
+
+Q: When are materialised views useful, and what's the catch?
+A: They store a query's result for fast reads (daily totals per merchant, dashboards). The catch: they're stale until refreshed, `REFRESH MATERIALIZED VIEW` locks out readers unless you use `CONCURRENTLY` (which needs a unique index), and refreshes of big views are expensive. For near-real-time aggregates, maintain summary tables incrementally from events.
+
+Q: Database per service or a shared database: what are the trade-offs?
+A: Per service: independent schema evolution and deployment, clear ownership, isolation of load and failures, but no cross-service joins or transactions (you need events, APIs and sagas). Shared: easy joins and transactions, but tight coupling, risky migrations and unclear ownership. A common middle ground: one database server, separate schemas and credentials per service.
+
+Q: How does MySQL InnoDB storage differ from PostgreSQL's, and why does it matter for primary keys?
+A: InnoDB stores rows in a clustered index ordered by the primary key, and secondary indexes point to the primary key, so random primary keys (UUIDv4) cause page splits and large secondary indexes. PostgreSQL stores rows in an unordered heap, and all indexes point to physical row locations. Sequential or time-ordered keys help both, but matter more for InnoDB.
+
+Q: What is `PREPARE TRANSACTION` in PostgreSQL, and why is it usually disabled?
+A: It's the database side of two-phase commit: a transaction is prepared (durable, holding its locks) and later committed or rolled back by an external coordinator. If the coordinator disappears, prepared transactions keep their locks and block vacuum indefinitely. It's off by default (`max_prepared_transactions = 0`); enable it only with an XA coordinator and monitoring of `pg_prepared_xacts`.
+
+Q: Physical vs logical replication in PostgreSQL: when do you use each?
+A: Physical (streaming) replication copies WAL byte for byte: whole-cluster standbys for high availability and read scaling, same major version. Logical replication publishes row changes per table: selective replication, cross-version upgrades with minimal downtime, feeding other systems (and CDC). Logical replication doesn't copy DDL or sequences automatically.

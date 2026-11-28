@@ -373,5 +373,27 @@
       "senior"
     ],
     "mainPathHours": 1.6
+  },
+  {
+    "id": "track-17",
+    "sequence": 17,
+    "title": "Final Interview Prep",
+    "shortTitle": "Final Interview Prep",
+    "slug": "final-prep",
+    "color": "#d946ef",
+    "colorMuted": "rgba(217, 70, 239, 0.15)",
+    "description": "A 12-hour final sprint for senior and staff FinTech interviews: 500 technical and architectural Q&As, 10 tested coding challenges, 100 scenario-based self-test questions and 300 high-impact interview tips.",
+    "difficulty": "senior",
+    "estimatedHours": 12.0,
+    "lessonCount": 18,
+    "status": "published",
+    "priority": "critical",
+    "tags": [
+      "interview",
+      "final-prep",
+      "senior",
+      "staff"
+    ],
+    "mainPathHours": 12.0
   }
 ]

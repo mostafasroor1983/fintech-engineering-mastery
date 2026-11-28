@@ -27,6 +27,7 @@
         <module>capstone-4-reconciliation</module>
         <module>capstone-5-instant-p2p</module>
         <module>track-13-web</module>
+        <module>track-17-coding</module>
     </modules>
 
     <properties>

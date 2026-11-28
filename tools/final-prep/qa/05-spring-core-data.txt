@@ -1,0 +1,158 @@
+## Dependency injection and the container
+Q: Why prefer constructor injection over field injection?
+A: Dependencies are explicit and final, the object can't exist half-initialised, it's testable with plain `new` (no reflection), and too many constructor parameters make a class's excess responsibilities visible. Field injection hides dependencies and needs a container or reflection in tests. A single constructor needs no `@Autowired`.
+
+Q: What happens when you inject a prototype-scoped bean into a singleton?
+A: The prototype is created once, when the singleton is created, so the singleton keeps the same instance forever, which defeats the prototype scope. Use `ObjectProvider<T>.getObject()` (or a lookup method) to get a fresh instance each time.
+
+Q: How does a Spring Boot auto-configuration decide whether to create a bean?
+A: Auto-configuration classes listed in `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` are applied when their conditions pass: `@ConditionalOnClass`, `@ConditionalOnMissingBean` (your bean wins), `@ConditionalOnProperty` and so on. Debug with `--debug` or the `/actuator/conditions` endpoint, which lists positive and negative matches with reasons.
+
+Q: How do you create typed, validated configuration?
+A: `@ConfigurationProperties(prefix = "payments.psp")` on a record with `@Validated` and Bean Validation constraints (`@NotNull`, `@DurationMin`), enabled via `@ConfigurationPropertiesScan`. Invalid configuration fails at start-up, not at the first request. Scattered `@Value` annotations have no validation and no single source of truth.
+
+Q: What is the bean lifecycle, and where do you put initialisation logic?
+A: Instantiate, inject dependencies, `Aware` callbacks, `BeanPostProcessor` before-init, `@PostConstruct`/`afterPropertiesSet`, post-processors after-init (where proxies are created), then use; `@PreDestroy` on shutdown. Avoid heavy work or remote calls in `@PostConstruct` (proxies such as `@Transactional` may not apply yet); use `ApplicationReadyEvent` or `SmartLifecycle` for start-up work.
+
+Q: How do profiles and property sources interact in Spring Boot?
+A: Properties come from many sources with a defined precedence: command-line arguments and environment variables override `application-{profile}.yml`, which overrides `application.yml`. Profiles activate profile-specific files and `@Profile` beans. In Kubernetes prefer environment variables and mounted config files; keep secrets in a secret store, not in profile files.
+
+## Proxies and AOP
+Q: Why does `@Transactional` sometimes not work?
+A: It's applied by a proxy, so it only intercepts calls coming through the proxy: self-invocation (`this.method()`), private methods, final classes or methods (with CGLIB) and objects created with `new` bypass it. Also, by default it rolls back only on unchecked exceptions, and a caught exception means nothing is rolled back. The same applies to `@Async`, `@Cacheable`, `@Retryable` and `@PreAuthorize`.
+
+Q: JDK dynamic proxies vs CGLIB proxies: what's the difference in Spring?
+A: JDK proxies implement the bean's interfaces; CGLIB generates a subclass. Spring Boot uses CGLIB by default (`proxyTargetClass=true`), which can't proxy final classes or methods. With JDK proxies, injecting by the concrete class fails because the proxy only implements the interfaces.
+
+Q: How would you implement an audit annotation with AOP, and what are the risks?
+A: A `@Around` advice on `@Audited` methods records actor, arguments (redacted), result and timing. Risks: self-invocation isn't intercepted, ordering with `@Transactional` matters (should the audit write join the transaction or use `REQUIRES_NEW`?), and logging sensitive arguments. For financial audit, write the audit record in the same transaction as the change, so neither exists without the other.
+
+## Transactions
+Q: Explain `REQUIRED` vs `REQUIRES_NEW` vs `NESTED` propagation.
+A: `REQUIRED` joins the current transaction or starts one. `REQUIRES_NEW` suspends the current one and runs an independent transaction that commits on its own, using a second connection. `NESTED` uses a savepoint inside the same transaction (JDBC only), so inner work can roll back alone. `REQUIRES_NEW` under load can exhaust the pool because each request holds two connections.
+
+Q: What does `readOnly = true` on `@Transactional` do?
+A: It's a hint: Hibernate skips dirty checking and flushing (less CPU and memory), the JDBC connection may be set read-only, and routing data sources can send the query to a replica. It doesn't by itself stop writes in all databases. Use it on query methods for performance and clarity.
+
+Q: Why must you never call a remote service inside a database transaction?
+A: The transaction holds a database connection and row locks for the whole remote call. A slow or hanging dependency then exhausts the connection pool and blocks other transactions on those locks, and a rollback can't undo the remote side effect. Pattern: transaction 1 records intent, remote call outside any transaction, transaction 2 records the result; or the outbox.
+
+Q: What isolation level does PostgreSQL use by default, and what anomalies does it allow?
+A: READ COMMITTED: each statement sees data committed before it began. It allows non-repeatable reads and lost updates through read-modify-write in application code. REPEATABLE READ (snapshot) prevents those but can fail with serialization errors that you must retry; SERIALIZABLE (SSI) prevents write skew too, with more aborts. MySQL InnoDB defaults to REPEATABLE READ, with different locking semantics.
+
+Q: How do you handle serialization failures or deadlocks when using higher isolation levels?
+A: Treat SQLSTATE 40001 (serialization failure) and 40P01 (deadlock) as retryable: retry the whole transaction with backoff and a bounded number of attempts, and keep transactions short so conflicts are rare. Spring Retry's `@Retryable` around the transactional method (outside the transaction boundary), or Spring Framework 7's resilience annotations, does this cleanly.
+
+Q: What does `@TransactionalEventListener` do, and when would you use it?
+A: It delivers an application event only at a transaction phase, by default after commit. Use it for side effects that must only happen if the transaction committed (send a notification). But it's not durable: if the process crashes after commit and before the listener runs, the event is lost. For guaranteed delivery, use a transactional outbox.
+
+Q: How do you test that a transaction really rolls back?
+A: An integration test against a real database (Testcontainers): call the service so it fails midway, then assert in a new transaction that no partial rows exist. Beware that `@Transactional` on the test method wraps everything in one transaction that's rolled back at the end, which can hide bugs such as missing flushes or `REQUIRES_NEW` behaviour.
+
+## Spring Data and JPA
+Q: What is the N+1 problem in JPA, and how do you fix it?
+A: Loading N entities then touching a lazy association on each triggers N extra queries. Fix with a fetch join (`JOIN FETCH`), `@EntityGraph`, `@BatchSize`, or a DTO projection query that fetches exactly what's needed. Don't switch to `FetchType.EAGER` everywhere: it loads too much on every path and can still produce N+1.
+
+Q: Optimistic vs pessimistic locking in JPA: how do they work?
+A: Optimistic: a `@Version` column is checked and incremented on update (`WHERE version = ?`); a conflict throws `OptimisticLockException` at flush and you retry. Pessimistic: `@Lock(PESSIMISTIC_WRITE)` issues `SELECT … FOR UPDATE`, blocking other writers until commit. Optimistic suits low contention; pessimistic suits hot rows. Always add a lock timeout for pessimistic locks.
+
+Q: Why should `spring.jpa.open-in-view` be false for APIs?
+A: Open-in-view keeps the persistence context (and potentially a connection) open until the response is rendered, so lazy loading happens during serialization: hidden N+1 queries, connections held longer, and surprising behaviour. Spring Boot enables it by default and logs a warning. Turn it off and fetch what you need explicitly.
+
+Q: Why can't a Java record be a JPA entity, and where do records fit with Spring Data?
+A: Entities need a no-argument constructor, mutable state for dirty checking, and must be non-final for lazy-loading proxies; records are final and immutable. Use records as `@Embeddable` value objects (supported since Hibernate 6.2), as DTO/projection results (`SELECT new com.x.PaymentView(...)` or interface/record projections), and as API types.
+
+Q: What is the difference between `save`, `persist` and `merge`, and the trap with `save` on a new entity with an assigned id?
+A: `persist` makes a new instance managed; `merge` copies state onto a managed instance and returns it. Spring Data's `save` calls `persist` if the entity is new, else `merge`. With assigned (non-generated) ids, Spring can't tell it's new, so it calls `merge`, which issues an extra SELECT first. Implement `Persistable.isNew()` or use a version field to fix it.
+
+Q: How do you page through 10 million rows efficiently?
+A: Avoid OFFSET pagination: the database still reads and discards all skipped rows, so deep pages get slower. Use keyset (seek) pagination: `WHERE (created_at, id) > (:lastCreatedAt, :lastId) ORDER BY created_at, id LIMIT 500` on a matching index. For batch processing, stream with a fetch size or use Spring Batch with a keyset-based reader.
+
+Q: What does the first-level cache do, and how can it cause memory problems in batch jobs?
+A: The persistence context keeps every loaded or persisted entity for the transaction (identity map plus dirty checking). In a batch inserting a million rows, it grows until OOM and dirty checking gets slower. Flush and clear every N rows, use JDBC batching (`hibernate.jdbc.batch_size`), or use a stateless session or plain JDBC for bulk work.
+
+Q: Why does Hibernate disable JDBC batching for `IDENTITY` ids, and what do you use instead?
+A: With `IDENTITY` the id is known only after each INSERT executes, so Hibernate must insert immediately, one row at a time. Use a `SEQUENCE` with a pooled optimizer (`allocationSize` 50) so ids are allocated in blocks and inserts can be batched. For PostgreSQL also set `reWriteBatchedInserts=true` on the JDBC URL.
+
+Q: How do you map a money value object in JPA?
+A: An `@Embeddable` record or class with `amount_minor` (BIGINT) and `currency` (CHAR(3)) columns, or an `AttributeConverter` for single-column cases. Never a `double` column; use `NUMERIC(19,4)` or BIGINT minor units, with a CHECK constraint on currency format. Keep arithmetic in the value object, not in entities.
+
+Q: What does `Specification.unrestricted()` replace in Spring Data 4?
+A: `Specification.where(null)`, which was deprecated: build dynamic queries starting from `Specification.unrestricted()` and combine with `and`/`or`. It's part of Spring Data 2025.x (Spring Boot 4) clean-ups along with nullability annotations from JSpecify.
+
+## Web and APIs
+Q: How do you return errors from a Spring REST API?
+A: RFC 9457 problem details (`ProblemDetail`, `application/problem+json`) from a `@RestControllerAdvice`, with a stable `type` URI, a `title`, the HTTP status, a safe `detail`, and extension fields such as an error code or the correlation id. Never leak stack traces or SQL. Enable `spring.mvc.problemdetails.enabled` for Spring's own exceptions.
+
+Q: How do you implement idempotent POST endpoints in Spring?
+A: Read the `Idempotency-Key` header, hash the request body, and in one transaction insert the key (unique per client) together with the business change and the stored response. A duplicate key replays the stored status and body; the same key with a different hash returns 422; a key still in progress returns 409. A filter or interceptor can make this reusable.
+
+Q: How do you implement optimistic concurrency over HTTP?
+A: Return an `ETag` (the entity version) on GET; require `If-Match` on PUT/PATCH/DELETE; compare it with the current version and return 412 Precondition Failed on mismatch (and 428 if the header is missing). It prevents lost updates between two clients or operators editing the same resource.
+
+Q: What does Spring Framework 7 add for API versioning?
+A: Built-in API versioning: configure how the version is resolved (path segment, header, query parameter or media type), then map handlers with `@GetMapping(version = "1.1")`; deprecated versions can emit deprecation headers. It also has client-side support for sending the version, removing a lot of hand-rolled routing.
+
+Q: `RestTemplate`, `RestClient`, `WebClient` or HTTP interface clients?
+A: `RestClient` (Spring 6.1+) is the modern synchronous fluent client and pairs well with virtual threads. `WebClient` is reactive and non-blocking. HTTP interface clients (`@HttpExchange` interfaces, with Boot 4's HTTP service groups) give declarative clients on top of either. `RestTemplate` is in maintenance mode. Always configure connect and read timeouts.
+
+Q: How do you validate request bodies, and what's a common gap?
+A: Bean Validation annotations on a record DTO plus `@Valid` on the `@RequestBody` parameter, producing 400 problem responses. Common gaps: forgetting `@Valid` on nested objects or collection elements, validating only format and not business rules (currency supported, amount within limits), and trusting client-supplied ids instead of the authenticated principal.
+
+Q: How do you stop a client from reading or changing another customer's account (BOLA)?
+A: Every lookup is scoped to the authenticated principal: `findByIdAndOwnerId(id, principal.customerId())`, never `findById(id)` followed by nothing. Return 404 rather than 403 to avoid revealing existence. Test it with two users. This is OWASP API Security risk #1 and the most common API breach.
+
+## Configuration, Actuator and operations
+Q: What Actuator endpoints matter in production, and how do you secure them?
+A: `health` (with liveness and readiness groups for Kubernetes), `info`, `prometheus` or `metrics`. Expose only those publicly or on a separate management port reachable from the cluster only, with authentication. Never expose `env`, `heapdump`, `threaddump`, `configprops` or `loggers` publicly: they leak secrets and internals.
+
+Q: Liveness vs readiness probes in Spring Boot: what should each check?
+A: Liveness: is the process able to make progress (restart if not); don't include external dependencies, or a database outage restarts every pod and makes things worse. Readiness: can it serve traffic now (warm-up done, required dependencies reachable); failing it removes the pod from the load balancer without restarting it.
+
+Q: How does graceful shutdown work in Spring Boot, and why does it matter for payments?
+A: With graceful shutdown (default since Boot 3.4), on SIGTERM the server stops accepting new requests, readiness goes down, and in-flight requests get up to `spring.lifecycle.timeout-per-shutdown-phase` to finish. That must be shorter than the pod's `terminationGracePeriodSeconds`. Kafka consumers must stop polling and commit offsets. Without it, deploys cut payments mid-flight.
+
+Q: How do you manage secrets in a Spring Boot service?
+A: Never in Git or images. Load them at runtime from a secret manager (Vault, AWS Secrets Manager, Kubernetes secrets with encryption at rest) via Spring Cloud Vault or config import (`spring.config.import=vault://`), prefer short-lived dynamic credentials (Vault database secrets), and rotate them. Mask them in logs and in Actuator output.
+
+## Testing
+Q: Slice tests vs `@SpringBootTest`: when do you use each?
+A: Slices (`@WebMvcTest`, `@DataJpaTest`, `@JsonTest`) load only one layer: fast, focused tests for controllers, repositories and JSON contracts. `@SpringBootTest` loads the full context for integration paths. Each different context configuration starts a new context, so many `@MockitoBean` variations slow the suite: standardise test configurations.
+
+Q: Why test against a real database with Testcontainers instead of H2?
+A: H2 in "PostgreSQL mode" differs in SQL dialect, locking, isolation, constraint behaviour, JSONB and functions, so tests pass on H2 and fail in production (or the reverse). Testcontainers with `@ServiceConnection` starts real PostgreSQL, Kafka or Redis and wires the connection details automatically. Reuse containers across tests to keep the suite fast.
+
+Q: What replaced `@MockBean` in Spring Boot 4?
+A: `@MockitoBean` and `@MockitoSpyBean` from Spring Framework's test module (available since 6.2); Boot's `@MockBean`/`@SpyBean` were deprecated in 3.4 and removed in 4.0. They work on test class fields and in `@Nested` classes, and you can't use them in `@Configuration` classes.
+
+## Spring Boot 4 essentials
+Q: What are the headline changes in Spring Boot 4 that affect a service team?
+A: Java 17 minimum (21+ recommended), Spring Framework 7 and Jakarta EE 11 (Servlet 6.1), modular starters and auto-configuration (`spring-boot-starter-webmvc` instead of `-web`, separate test starters), Jackson 3 by default, JSpecify null-safety annotations, built-in API versioning, HTTP service client groups, resilience annotations (`@Retryable`, `@ConcurrencyLimit`) in core Spring, and removals of long-deprecated APIs (Undertow support, `@MockBean`).
+
+Q: How do you migrate a service from Spring Boot 3.5 to 4.0 safely?
+A: First get clean on 3.5 with no deprecation warnings; upgrade Java if needed; then upgrade the parent, switch to the modular starters, fix removed APIs, migrate Jackson 2 customisations to Jackson 3 (`tools.jackson` packages, `JsonMapperBuilderCustomizer`), and update Spring Security configuration to the 7.x DSL. Use OpenRewrite recipes where available. Pin API contracts with tests (JSON property order and null handling can change) and roll out with canaries.
+
+Q: What does Spring Framework 7's built-in resilience support give you?
+A: `@Retryable` (with backoff, jitter and exception filters) and `@ConcurrencyLimit` (a bulkhead limiting concurrent invocations) in `spring-core`, enabled with `@EnableResilientMethods`, plus a programmatic `RetryTemplate`. For circuit breakers, rate limiters and time limiters you still use Resilience4j (or Spring Cloud Circuit Breaker).
+
+Q: How do you add a database migration safely with Flyway in a running system?
+A: Expand/contract: add nullable columns or new tables first, deploy code that writes both shapes, backfill in batches, switch reads, then drop old columns in a later release. Build indexes with `CREATE INDEX CONCURRENTLY` in their own non-transactional migration. Set `lock_timeout` so a migration blocked by a long transaction fails fast instead of queuing all traffic behind it.
+
+Q: How do you make sure an endpoint is both secure and observable before go-live in Spring?
+A: Security: authentication on every endpoint, authorisation by scope and ownership, input validation, no sensitive data in logs. Observability: RED metrics via Micrometer (`http.server.requests`), traces propagated with OpenTelemetry, structured logs with correlation ids, dashboards and alerts on SLOs. Then a production readiness review: runbook, rollback plan, load test results.
+
+## More production pitfalls
+Q: What are the pitfalls of `@Cacheable` in a financial service?
+A: It's proxy-based (self-invocation skips the cache), keys default to all parameters (watch mutable or large objects), there's no TTL unless the cache provider sets one, and caching data used for money decisions (balances, limits) serves stale values. Cache reference data (currencies, BIN tables, FX metadata) with explicit TTLs and size limits; evict on change events.
+
+Q: How do you size the HikariCP connection pool?
+A: Start small: the database executes only about as many queries in parallel as it has cores and disk capacity, so a pool around 10–20 per instance is typical; then measure pending-connection time under load. Remember the database's total (`max_connections`) across all instances and services; put PgBouncer in transaction mode in front when instances scale out. Set `connectionTimeout` low (a few seconds) so exhaustion fails fast.
+
+Q: What goes wrong with `@Scheduled` when you scale to several instances?
+A: Every instance runs the job, so work is done N times (duplicate payouts, duplicate emails). Fix: claim work units with `FOR UPDATE SKIP LOCKED`, use ShedLock or a leader-elected scheduler for run-once jobs, or move the schedule to an external trigger (a Kubernetes CronJob). Make jobs idempotent regardless.
+
+Q: How do Spring application events work, and when are they the wrong tool?
+A: `ApplicationEventPublisher.publishEvent` calls listeners synchronously in the same thread (and transaction) by default, or asynchronously with `@Async`. They're good for in-process decoupling. They're wrong for cross-service integration or anything that must survive a crash: events are in memory and lost on restart. Use the outbox and a broker for those.
+
+Q: Where should `@Transactional` go: on the class, the interface, or the method?
+A: On concrete classes or public methods of the service layer that define a business operation; not on interfaces (it only works with interface-based proxies) and not on repositories plus services in a way that splits one business operation into several transactions. Keep the transaction boundary at the use-case level and as short as possible.

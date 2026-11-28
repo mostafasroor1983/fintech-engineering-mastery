@@ -1,0 +1,158 @@
+## Idempotency in depth
+Q: Walk through the database design of an idempotency table for a payments API.
+A: `idempotency_key(client_id, key, request_hash, status IN_PROGRESS|COMPLETED, response_status, response_body, resource_id, created_at, expires_at)`, primary key `(client_id, key)`. Insert it first, in the same transaction as the payment intent; the unique key decides the winner. Store the response on completion. Purge after the retention you promise clients (24 hours to 7 days), via time partitions.
+
+Q: What should happen when a retry arrives while the original request is still being processed?
+A: The retry finds the key IN_PROGRESS. Options: return 409 Conflict with `Retry-After` (simple and honest), or wait briefly for completion and then replay the stored response. Never start a second execution. If IN_PROGRESS rows can be orphaned by crashes, a recovery job resolves them by checking the downstream state.
+
+Q: Why is "check if exists, then insert" an unsafe idempotency implementation?
+A: Two concurrent retries both see "not exists" and both proceed (check-then-act race), producing two payments. The database must arbitrate: insert-first under a unique constraint (catching the duplicate-key error or using `ON CONFLICT DO NOTHING RETURNING`), so exactly one request wins regardless of timing.
+
+Q: How do you make a downstream PSP call idempotent if the PSP supports idempotency keys?
+A: Derive a deterministic key for each attempt from your payment id (for example `payment-123:capture:1`) and send it on every retry of that attempt, so the PSP returns the original result instead of charging again. A new attempt after a definite failure gets a new attempt number. Store the PSP reference you get back for reconciliation.
+
+Q: How long should you keep idempotency keys, and what happens after expiry?
+A: At least as long as clients can retry (their maximum retry window plus margin); common choices are 24 hours to 7 days, documented in the API contract. After expiry, a reused key is treated as new, so business-level duplicate checks (same order id already paid) remain a second line of defence.
+
+Q: What makes a consumer idempotent when events have no unique id?
+A: Derive a natural key from the business content (transfer id + event type + version), or make the effect itself idempotent: absolute updates (`SET status = 'SETTLED' WHERE id = ? AND status = 'PENDING'`) instead of relative ones (`balance = balance + x`), or upserts keyed by the business id. Push producers to add event ids; it's the most reliable option.
+
+## Outbox and CDC in practice
+Q: How does a polling outbox relay work, and how do you run several relay instances?
+A: The relay selects unpublished rows in order with `FOR UPDATE SKIP LOCKED LIMIT n`, publishes them to Kafka, waits for acknowledgements, marks them published (or deletes them), and commits. `SKIP LOCKED` lets several instances work in parallel without double-publishing the same row. Clean up published rows, index the unpublished state, and monitor the backlog age.
+
+Q: Does a polling outbox preserve event order, and how do you keep per-account order?
+A: Not globally with parallel relays: two instances can publish rows out of order. Keep per-aggregate order by including the aggregate id as the Kafka key, publishing rows for one aggregate in sequence (single relay, or partition the relay by aggregate hash), and adding a per-aggregate version so consumers can detect reordering.
+
+Q: What operational problems does Debezium-based CDC introduce?
+A: A PostgreSQL logical replication slot retains WAL until the connector confirms it, so a stopped connector fills the disk (monitor slot lag and set `max_slot_wal_keep_size`). Schema changes need care, initial snapshots of big tables take time, failovers need slot handling (failover slots in newer PostgreSQL), and Kafka Connect becomes infrastructure you must run and monitor.
+
+Q: Debezium's outbox event router: what does it do?
+A: A single message transform that reads rows from an outbox table and routes them to Kafka topics based on a column (aggregate type), using the aggregate id as the message key and the payload column as the value, with the event id in headers. You can delete outbox rows right after insert (Debezium reads the INSERT from the WAL), so the table stays small.
+
+Q: Outbox vs listen-to-yourself vs event sourcing: how do they differ?
+A: Outbox: write state and event in one transaction, then publish. Listen-to-yourself: publish the event first and update your own state from it (the event log is the commit point), which adds latency and complicates reads-after-writes. Event sourcing: events are the state itself, stored in an append-only event store, with projections for reads. Outbox is the least invasive for an existing CRUD service.
+
+## Sagas in practice
+Q: How would you implement a saga orchestrator for a cross-service transfer?
+A: A persisted state machine per transfer (states, step results, attempt counts) in the orchestrator's database. Each step sends a command with an idempotency key (via the outbox) and handles the reply event. Timeouts trigger retries or compensation. Recovery on restart resumes in-flight sagas from their stored state. Temporal or Camunda provide this durable execution if you don't want to build it.
+
+Q: What happens if a compensation itself fails?
+A: Retry it with backoff (compensations must be idempotent); after bounded retries, park the saga in a `COMPENSATION_FAILED` state, alert, and route it to manual handling with full context. Money is left in a visible clearing or suspense account, so reconciliation catches it. Never silently drop a failed compensation.
+
+Q: How do you order the steps of a payment saga to minimise compensation pain?
+A: Put steps that are easy to undo first (reserve funds with a hold, which can be released) and irreversible steps last (sending an instant payment, notifying the customer). Do validation and fraud checks before any money moves. Pivot transactions (the point of no return) should be followed only by steps that are retryable until they succeed.
+
+Q: How do you observe and debug long-running sagas?
+A: Saga id as a correlation id in every log, event and trace; the persisted state with step history queryable by support tools; metrics for sagas per state and age (stuck sagas alert); and a dashboard of compensations. Tracing helps for single runs; the persisted state machine is the source of truth over hours or days.
+
+## Delivery semantics and ordering
+Q: A consumer must call an external API for each event exactly once. How do you design it?
+A: You can't guarantee exactly-once on an external call, but you can approach it: record the intent and an idempotency key in the database (processed-event table) before calling, pass the key to the external API if it supports one, record the result after, and on redelivery check the stored state or query the external system before calling again. Reconcile with the external party's reports.
+
+Q: How do you handle a slow consumer without losing messages or blocking the partition?
+A: Measure first (lag, processing time). Options: scale consumers up to the partition count, increase partitions (careful with key remapping), process records in parallel while keeping per-key order (Confluent parallel consumer), move slow side effects to a separate topic, or batch database writes. Don't commit offsets for unprocessed records.
+
+Q: Where can duplicates come from in a Kafka pipeline even with idempotent producers?
+A: Consumer crashes after processing but before committing the offset (redelivery), rebalances, producer retries in applications without idempotence or with timeouts at the application level (the app resends a new record), outbox relays republishing after a crash, DLT replays, and upstream systems resending. Design every consumer for duplicates.
+
+Q: When is ordering actually required, and when is it an expensive illusion?
+A: It's required per aggregate (one account's debits and credits, one payment's state transitions), not globally. Global ordering forces a single partition and kills throughput. Prefer per-key ordering plus version checks, and design state transitions so that late or duplicate events are detected and ignored.
+
+## Backpressure and load management
+Q: What is backpressure, and how do you apply it in a request/response service?
+A: Signalling producers to slow down when consumers can't keep up, instead of buffering without limit. In synchronous services: bounded thread pools and queues, concurrency limits per dependency, and returning 429/503 with `Retry-After` when full (load shedding). In streams: bounded buffers and demand signalling (Reactive Streams `request(n)`), or Kafka's pull model, where consumers fetch at their own pace.
+
+Q: What is load shedding, and how do you decide what to shed?
+A: Rejecting some work early when overloaded, so the work you accept finishes within its deadline. Prioritise: shed low-value traffic first (analytics, retries, bulk exports) and protect critical paths (payment authorisation). Use cheap signals (queue length, concurrency, latency) and reject at the edge before work starts. A fast rejection beats a slow timeout.
+
+Q: What is a retry storm, and how do you prevent it?
+A: When a service slows down, every client retries, multiplying load and turning a brief slowdown into an outage; with retries at several layers it multiplies further (3 layers × 3 retries = 27 calls). Prevent it with retry budgets (cap retries to a percentage of traffic), exponential backoff with jitter, retrying at one layer only, circuit breakers, and honouring `Retry-After`.
+
+Q: What are deadlines (timeout budgets), and how do you propagate them?
+A: The caller gives a request an absolute deadline; each hop subtracts elapsed time and passes the remaining budget downstream (gRPC deadlines, or a header), and work stops when the budget is gone. It prevents downstream services from doing work whose result nobody is waiting for any more, and keeps timeouts consistent across layers.
+
+Q: What is the thundering herd problem, and where does it hit?
+A: Many clients act at once on the same trigger: cache entries expiring together, all clients reconnecting after an outage, scheduled jobs at the top of the hour, many pods restarting simultaneously. Mitigate with jittered TTLs and schedules, request coalescing (one load per key), exponential backoff with jitter on reconnect, and staggered rollouts.
+
+## Resilience patterns
+Q: How do you choose timeout values for a dependency?
+A: From measurements: set the read timeout slightly above the dependency's p99.9 latency under normal load, within the caller's overall budget, and much lower than the caller's own SLO. Separate connect timeouts (short) from read timeouts. Review them when latency changes, and alert on timeout rates. Defaults of "none" or "30 seconds" are rarely right.
+
+Q: What is a bulkhead, and how do you size it?
+A: Isolation of resources per dependency (separate thread pools or semaphores), so one slow dependency can't use up resources needed by others. Size it with Little's Law: expected throughput to that dependency × its latency at p99, plus headroom; reject (fail fast) when full rather than queueing indefinitely.
+
+Q: What is graceful degradation in a payment product? Give examples.
+A: Keep the core working with reduced features when non-critical parts fail: hide recommendations when that service is down, show cached FX rates marked as indicative (but don't execute trades on stale rates), queue statement generation for later, approve low-risk payments with a stand-in policy when fraud scoring is down. Decide degradations in advance with product and risk teams.
+
+Q: What is the hedged-request pattern, and when is it dangerous?
+A: Send a duplicate request to another replica if the first hasn't answered within, say, the p95 latency, and use whichever answers first: it cuts tail latency for reads. It's dangerous for non-idempotent writes (two payments) and it adds load, so cap hedging to a small percentage of requests and only for safe, idempotent reads.
+
+Q: How do you test resilience patterns before production?
+A: Fault injection in integration tests (WireMock or Toxiproxy for latency, errors and dropped connections), chaos experiments in staging (kill pods, add network latency, fail a zone), game days with on-call engineers, and load tests with dependencies degraded. Verify the behaviour you designed: breakers open, fallbacks work, alerts fire, no money is lost or duplicated.
+
+## Rate limiting
+Q: Compare fixed window, sliding window and token bucket rate limiting.
+A: Fixed window counts per interval and allows bursts of up to 2× at window boundaries. Sliding log is exact but stores every timestamp. Sliding window counter approximates it with two counters. Token bucket allows bursts up to a capacity with a steady refill rate and O(1) state: the usual choice for APIs. Leaky bucket smooths output into a constant rate (queue), adding latency.
+
+Q: How do you implement a distributed rate limiter correctly?
+A: Shared state keyed by client (Redis), with the read-refill-take step made atomic in a Lua script that uses Redis's own clock, so concurrent instances can't both take the last token. Check limits after authentication (trusted identity). Decide the failure policy: fail open with a local fallback for fairness limits, fail closed for safety caps such as payout value per day.
+
+Q: Rate limiting by requests vs by money: how do they differ?
+A: Request limits protect the platform (fairness, capacity). Value limits protect against financial loss (maximum payout per day, per-transaction limits): they're business rules checked inside the payment transaction against durable state, fail closed, and are audited. Don't implement value limits with an approximate in-memory request limiter.
+
+## Caching
+Q: Cache-aside vs read-through vs write-through vs write-behind: what's the difference?
+A: Cache-aside: the app reads the cache, loads from the database on a miss, and populates the cache. Read-through: the cache loads on a miss itself. Write-through: writes go to the cache and the database synchronously. Write-behind: writes go to the cache and are flushed to the database asynchronously (risk of losing writes). For financial data, prefer cache-aside or write-through with the database as the source of truth.
+
+Q: How do you invalidate caches reliably across many instances?
+A: Short TTLs as a safety net, plus explicit invalidation driven by change events (CDC or outbox events consumed by every instance, or a pub/sub channel), with versioned keys or values so late invalidations can't resurrect stale data. Accept that caches are eventually consistent and keep them out of decisions that need the latest state.
+
+Q: What is cache stampede, and how do you prevent it?
+A: A popular key expires and many concurrent requests miss at once and all hit the database. Prevent it with request coalescing (a single loader per key, as Caffeine does with futures), early probabilistic refresh before expiry, jittered TTLs, and serving stale data while refreshing in the background.
+
+Q: When would you put Redis in front of PostgreSQL, and when is it a mistake?
+A: Good: reference data, session data, rate-limit counters, idempotency pre-checks, read-heavy derived views. A mistake: as the system of record for balances or payments (persistence options don't give relational constraints and multi-row transactions), or to hide inefficient queries that an index or a better query would fix. Always plan for Redis data loss.
+
+## Integration patterns
+Q: How do you integrate with a partner API that is slow and unreliable?
+A: Put an anti-corruption layer (adapter) between your domain and theirs, call it asynchronously where possible (persist the request, process from a queue), apply timeouts, retries with idempotency keys, circuit breakers and bulkheads, and reconcile daily against their reports. Keep a full request/response log (redacted) for disputes.
+
+Q: How do you deliver webhooks to merchants reliably?
+A: Events go into an outbox, a delivery service sends signed HTTP requests (HMAC over id, timestamp and body) with retries using exponential backoff and jitter over hours to days, per-merchant concurrency limits so one slow endpoint can't block others, lease-based work claiming instead of holding database locks during HTTP calls, a dead state with a replay tool, and SSRF protection on merchant-supplied URLs. Receivers de-duplicate on the event id.
+
+Q: What is the strangler fig pattern, and how would you use it to replace a legacy payment system?
+A: Put a facade (gateway or routing layer) in front of the legacy system and move functionality to the new system piece by piece, routing each capability once it's ready, until the legacy system can be retired. Use shadow traffic and output comparison before switching, reconcile both systems during coexistence, and keep the ability to route back.
+
+Q: What is an anti-corruption layer, and why does it matter in fintech integrations?
+A: A translation layer that maps an external model (a bank's ISO 20022 messages, a card processor's codes) into your domain model, so external quirks and changes don't leak into your core. It centralises mapping, validation and error translation, and it's where you handle external code lists (reason codes, status codes) explicitly.
+
+Q: How do you version and evolve asynchronous event contracts across teams?
+A: Treat events as public APIs: schemas in a registry with compatibility checks in CI, additive changes only (new optional fields), explicit versions or new topics for breaking changes, consumer-driven contract tests where practical, deprecation timelines, and documentation of event semantics (when it's emitted, ordering and idempotency guarantees).
+
+Q: What is a dead letter queue's role, and what makes one useless?
+A: It parks messages that failed after bounded retries so they don't block the stream, keeping the original payload and error metadata. It's useless if nobody monitors it, if there's no runbook or replay tool, or if it fills up with transient errors that should have been retried. Alert on its volume and age.
+
+Q: How do you design an exactly-once style ledger update from a Kafka event?
+A: In one database transaction: check or insert the event id in a processed-events table (unique constraint), post the journal entry (with its own idempotency key derived from the event id), update balances, and write any resulting events to the outbox; commit, then commit the Kafka offset. Redelivery finds the event id and does nothing.
+
+Q: What problems does request coalescing solve, and where would you use it?
+A: Many concurrent requests for the same resource are collapsed into one underlying call whose result is shared, which prevents stampedes and duplicate work. Use it for cache loads, token refreshes (one refresh for all threads when an access token expires), and FX rate lookups. Implement it with a map of in-flight futures keyed by resource.
+
+Q: How do you keep a read model (CQRS) consistent enough for users?
+A: Feed it from events with per-aggregate versions so it's idempotent and order-aware, monitor projection lag, return the write's result directly to the user rather than reading it back from the projection, and offer read-your-writes for critical views by reading from the primary or waiting for the projection to reach the write's version. Rebuild projections from the event history when their logic changes.
+
+Q: When should you not use microservices for a payment platform?
+A: Early on, with a small team or unclear domain boundaries: a modular monolith gives single-database transactions for ledger operations, simpler testing and deployment, and much less operational overhead. Split out services when there's a clear reason: independent scaling, team autonomy, different compliance scope (a PCI card vault), or deployment independence.
+
+Q: What's the difference between orchestration with a workflow engine (Temporal) and a hand-built state machine?
+A: A workflow engine gives durable execution out of the box: workflow state persisted after every step, automatic retries with backoff, timers, replay after crashes, versioning and visibility tools. A hand-built state machine is simpler to start and fully under your control, but you rebuild those features. Choose an engine when you have many long-running, multi-step processes.
+
+Q: What is the inbox pattern, and how does it complement the outbox?
+A: The consumer writes each incoming message to an inbox table (unique on message id) in its own transaction, then processes inbox rows, possibly asynchronously, marking them done. It de-duplicates, decouples receiving from processing, and lets you retry processing without asking the broker to redeliver. Outbox guarantees sending, inbox guarantees receiving once.
+
+Q: How do you migrate a consumer to a new topic or event version without losing or duplicating effects?
+A: Run the new consumer alongside the old one in shadow mode (compute but don't apply, compare results), then switch writes using idempotency keys shared by both, so an event processed by either is applied once. Keep the old consumer able to resume until the cutover is verified, and reconcile counts and totals on both paths.
+
+Q: What does "design for failure" mean in a code review?
+A: For every remote call: is there a timeout, what happens on timeout (unknown outcome handled?), is a retry safe (idempotent?), is the dependency isolated (bulkhead, breaker), is the error observable (metric, log with correlation id), and is there a test that injects the failure? If any answer is "we hope it won't happen", the change isn't ready.

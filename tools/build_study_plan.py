@@ -161,33 +161,32 @@ WEEKS = [
      "Write one ADR for a decision in one of your capstones.",
      "An ADR committed next to the capstone.",
      L(1, 6, 8, 9) + L(10, 1, 4, 9) + L(3, 29)),
-    # Weeks 27-30: the reserved mock-interview, review and application time (outside the lesson budget,
-    # except the two short reading items).
-    ("Mock interviews I + portfolio",
-     "Mocks 1-3 (design). Score from the recording; redo below-3 dimensions.",
-     "Three scored rubrics; capstone READMEs polished; GitHub profile pinned to the 5 capstones.",
+    # Weeks 27-30: mock interviews, applications and the 12-hour Track 17 final prep (which replaces the
+    # earlier generic "review weak areas" time).
+    ("Mock interviews I + portfolio + final prep (Q&A 1-300)",
+     "Mocks 1-3 (design). Score from the recording; redo below-3 dimensions. Start the 12-hour final prep: Q&A 1-300, answers hidden.",
+     "Three scored rubrics; capstone READMEs polished; GitHub profile pinned to the 5 capstones; Q&A banks 1-6 marked.",
      L(15, 5) + [ACT("Mock interviews 1-3 (45 min each, recorded)", 135),
-                 ACT("Review weak areas found in the mocks (re-read linked lessons)", 180),
-                 ACT("Portfolio polish: README numbers from your machine, repo description, pinned repos", 150)]),
-    ("Mock interviews II + applications",
-     "Mocks 4-6 (design + 2 coding).",
-     "Three scored rubrics; a tailored CV; first applications sent.",
+                 ACT("Portfolio polish: README numbers from your machine, repo description, pinned repos", 150)]
+     + L(17, 1, 2, 3, 4, 5, 6, 7)),
+    ("Mock interviews II + applications + final prep (Q&A 301-500, coding)",
+     "Mocks 4-6 (design + 2 coding). Q&A 301-500 and coding challenges C01-C10 (solve two from scratch).",
+     "Three scored rubrics; a tailored CV; first applications sent; Q&A banks 7-10 marked; two challenges solved.",
      [ACT("Mock interviews 4-6", 135),
-      ACT("Review weak areas", 200),
-      ACT("Applications: tailor CV bullets to each job post (link the capstone that proves each skill)", 120)]),
-    ("Mock interviews III",
-     "Mocks 7-9 (two deep dives + behavioural); redo the two weakest mocks.",
-     "All mocks >= 3 in every dimension, or a redo scheduled.",
+      ACT("Applications: tailor CV bullets to each job post (link the capstone that proves each skill)", 120)]
+     + L(17, 8, 9, 10, 11, 12, 13)),
+    ("Mock interviews III + self-test and tips",
+     "Mocks 7-9 (two deep dives + behavioural); redo the two weakest mocks. Self-test 1-100 closed book; tips 1-300.",
+     "All mocks >= 3 in every dimension, or a redo scheduled; self-test score >= 85%; one-page tip sheet.",
      [ACT("Mock interviews 7-9", 135),
       ACT("Redo the two weakest mocks (with a variation)", 90),
-      ACT("Review weak areas", 180),
-      ACT("Applications and recruiter calls", 120)]),
-    ("Final mock + first-90-days prep",
-     "Mock 10 (present a capstone); read the first-90-days lessons.",
-     "Your 10-minute capstone talk, rehearsed; a 30/60/90 draft for your next job.",
-     [ACT("Mock interview 10: capstone presentation", 30)] + L(16, 1, 2) +
-     [ACT("Final review of your weakest five competencies", 180),
-      ACT("Applications and interviews", 120)]),
+      ACT("Applications and recruiter calls", 120)]
+     + L(17, 14, 15, 16, 17)),
+    ("Final mock + final review + first-90-days prep",
+     "Mock 10 (present a capstone); the final review block (Track 17 L18); read the first-90-days lessons.",
+     "Your 10-minute capstone talk, rehearsed; the day-before checklist ticked; a 30/60/90 draft for your next job.",
+     [ACT("Mock interview 10: capstone presentation", 30)] + L(16, 1, 2) + L(17, 18) +
+     [ACT("Applications and interviews", 120)]),
 ]
 
 FALLING_BEHIND = [

@@ -1,0 +1,158 @@
+## Records and value objects
+Q: What does a Java record give you, and what does it not?
+A: A final class with private final fields, a canonical constructor, accessors, and `equals`/`hashCode`/`toString` derived from the components. It does not give deep immutability (a `List` component can still be mutated), it can't extend another class, and it can't add instance fields. Use the compact constructor for validation and defensive copies (`List.copyOf`).
+
+Q: How do you make a record truly immutable when it holds a collection?
+A: Copy in the compact constructor: `items = List.copyOf(items);`. `List.copyOf` returns an unmodifiable list (and rejects nulls), so neither the caller's original list nor the accessor's result can change the record's state. For arrays, clone in the constructor and in the accessor, or avoid arrays in records.
+
+Q: When would you not use a record?
+A: For JPA entities (they need a no-arg constructor, mutability and proxies), for types whose equality should not be all fields (an entity with an id), when you need inheritance, or when you need to hide representation (a record's components are its public API). Records fit DTOs, value objects, events, keys and query projections.
+
+Q: What is a value object in domain-driven design, and how does it map to Java?
+A: An object defined by its values, not identity (Money, Iban, DateRange): immutable, validated on creation, compared by value, with behaviour (`plus`, `allocate`). In Java, a record with a validating compact constructor and methods. It moves invariants out of services ("amount must be positive, currency must match") into the type itself.
+
+Q: Explain the `equals`/`hashCode` contract and a production bug when it's broken.
+A: Equal objects must have equal hash codes, and `equals` must be reflexive, symmetric, transitive and consistent. Bug: a mutable field used in `hashCode` changes after the object is put in a `HashSet`, so `contains` returns false and the entry is "lost"; or overriding `equals` without `hashCode`, so duplicates appear in a set. Records and immutable keys avoid both.
+
+Q: Why is `BigDecimal.equals` a trap in money code?
+A: It compares value and scale: `new BigDecimal("1.0").equals(new BigDecimal("1.00"))` is false, and a `HashSet<BigDecimal>` treats them as different. Use `compareTo(...) == 0` for numeric equality, or normalise the scale (`setScale` to the currency's digits) before storing or hashing.
+
+## Equality, strings and identity
+Q: What is the difference between `==` and `equals` for strings and boxed numbers?
+A: `==` compares references; `equals` compares values. String literals are interned so `==` sometimes "works", which hides the bug. `Integer` caches -128..127, so `Integer a = 127, b = 127; a == b` is true but 128 is false. Always use `equals` (or `Objects.equals` for nulls), and avoid boxed types in hot money paths.
+
+Q: Why are strings immutable in Java and why does it matter for security and performance?
+A: Immutability makes strings safe to share across threads, safe as hash keys (the hash is cached), and safe for class loading and security checks (a checked path can't change afterwards). Downside: concatenation in loops creates garbage; use `StringBuilder` (the compiler already optimises simple `+` with invokedynamic). Secrets in strings linger in memory until GC; use `char[]` where APIs allow, though it's not a full defence.
+
+## Collections
+Q: How does `HashMap` work internally, and what happens with many collisions?
+A: An array of buckets indexed by the spread hash; each bucket is a linked list, converted to a balanced tree when it holds 8 or more entries (and the table is at least 64), so worst-case lookup becomes O(log n) instead of O(n). It resizes (doubles) when size exceeds capacity × load factor (0.75), rehashing entries, which is expensive: presize when you know the count.
+
+Q: `HashMap` vs `ConcurrentHashMap` vs `Collections.synchronizedMap`: which and why?
+A: `HashMap` is not thread-safe (concurrent puts can lose entries or corrupt the structure). `synchronizedMap` locks the whole map for every call, and compound actions still need external locking. `ConcurrentHashMap` locks per bin, allows concurrent reads without locking, and offers atomic compound operations (`compute`, `merge`, `putIfAbsent`). It doesn't allow null keys or values.
+
+Q: Why does `ConcurrentHashMap` not allow null values?
+A: Ambiguity: `get(key)` returning null couldn't distinguish "absent" from "mapped to null", and in a concurrent map you can't follow up with `containsKey` atomically. Use `Optional`, a sentinel, or `computeIfAbsent`.
+
+Q: What does fail-fast iteration mean, and does it protect you from concurrency bugs?
+A: Iterators of non-concurrent collections track a modification count and throw `ConcurrentModificationException` if the collection is structurally modified during iteration (even by the same thread). It's best-effort detection, not a guarantee, and not a synchronisation mechanism. Use concurrent collections, or iterate over a snapshot.
+
+Q: When would you choose `ArrayList` over `LinkedList`?
+A: Almost always. `ArrayList` has O(1) random access and is cache-friendly; `LinkedList`'s O(1) insert needs you to already hold a node position, and each node costs extra memory and pointer chasing. For queues use `ArrayDeque`; for concurrent queues `ArrayBlockingQueue`/`LinkedBlockingQueue` or `ConcurrentLinkedQueue`.
+
+Q: What is the difference between `List.of`, `Collections.unmodifiableList` and `List.copyOf`?
+A: `List.of(...)` creates an unmodifiable list (no nulls). `unmodifiableList(list)` is a read-only view: changes to the backing list show through. `List.copyOf(list)` makes an unmodifiable copy (returns the same instance if already unmodifiable). For defensive copies in value objects, use `copyOf`.
+
+Q: Which collection gives you sorted iteration and range queries, and at what cost?
+A: `TreeMap`/`TreeSet` (red-black tree): O(log n) get/put, ordered iteration, `floorKey`, `ceilingEntry`, `subMap` for ranges (useful for time-bucketed data and consistent hashing rings). `ConcurrentSkipListMap` is the concurrent sorted alternative. Cost versus `HashMap`: slower lookups and more memory per entry.
+
+## Generics and types
+Q: What is type erasure, and what can't you do because of it?
+A: Generic type arguments exist at compile time only; at runtime `List<String>` and `List<Integer>` are both `List`. You can't do `new T()`, `instanceof List<String>`, create generic arrays, or overload methods that differ only by type argument. Pass a `Class<T>` or a type token when the runtime type is needed (as Jackson's `TypeReference` does).
+
+Q: Explain PECS with an example.
+A: "Producer extends, consumer super": use `? extends T` when you read from a structure, `? super T` when you write into it. `Collections.copy(List<? super T> dest, List<? extends T> src)`. A method summing amounts takes `List<? extends Number>`; one adding payments to a sink takes `Consumer<? super Payment>`.
+
+Q: Why are arrays covariant but generics invariant, and what bug does that prevent?
+A: `String[]` is a subtype of `Object[]`, so storing an `Integer` through an `Object[]` reference compiles and fails at runtime with `ArrayStoreException`. Generics are invariant (`List<String>` is not a `List<Object>`) so the same mistake is caught at compile time. Wildcards add controlled variance.
+
+## Modern Java features
+Q: What do sealed interfaces add, and how do they combine with pattern matching?
+A: `sealed interface PaymentEvent permits Authorised, Captured, Refunded` closes the set of implementations. A `switch` over it with record patterns is exhaustive without a `default`, so adding a new event type breaks compilation of every switch that doesn't handle it: the compiler finds the missing cases. Great for state machines and event handling.
+
+Q: Show how pattern matching for switch improves a payment status handler.
+A: `return switch (event) { case Authorised a -> hold(a.amount()); case Captured(var id, var amount) -> settle(id, amount); case Refunded r when r.partial() -> partialRefund(r); case Refunded r -> fullRefund(r); };` No casts, deconstruction with record patterns, guards with `when`, and exhaustiveness checking for sealed types.
+
+Q: What are text blocks and where do they help in fintech code?
+A: Multi-line string literals (`"""`) with incidental indentation removed. Useful for SQL, JSON test fixtures and ISO 20022 XML samples in tests, improving readability. They don't do interpolation; use `formatted(...)` or prepared-statement parameters, never string concatenation for SQL values.
+
+Q: What is `var` and when should you avoid it?
+A: Local variable type inference: the type is still static, just inferred. Avoid it when the inferred type isn't obvious from the right-hand side (`var x = service.process()`), or where it changes the type you meant (`var list = new ArrayList<Payment>()` is `ArrayList`, fine; `var amount = 0` is `int`, maybe not what you want for money).
+
+Q: What does `Optional` solve, and how is it misused?
+A: It makes "maybe absent" explicit in return types and composes (`map`, `orElseThrow`). Misuses: as a field or parameter type, in collections, `Optional.get()` without checking, or returning `null` from a method declared to return `Optional`. For collections return an empty collection instead.
+
+Q: What are scoped values, and why are they relevant with virtual threads?
+A: `ScopedValue` (final in Java 25) binds an immutable value for the dynamic extent of a call, readable by callees, and inherited by `StructuredTaskScope` subtasks. Unlike `ThreadLocal`, it can't be mutated and is cleaned up automatically, which is cheaper and safer with millions of virtual threads. Use it for request context such as tenant id or correlation id.
+
+## Exceptions and APIs
+Q: Checked vs unchecked exceptions in a service layer: what's your policy?
+A: Use unchecked exceptions for business rule violations and programming errors, with a clear hierarchy (`InsufficientFundsException extends DomainException`), and translate at the API boundary to RFC 9457 problem responses. Checked exceptions leak implementation details through signatures and lambdas. Remember Spring's `@Transactional` rolls back by default only on unchecked exceptions.
+
+Q: What's wrong with catching `Exception` and logging it in the middle of a payment flow?
+A: It swallows the failure: the caller thinks the operation succeeded, the transaction may commit partial work, and the log line lacks context. Either handle it meaningfully (compensate, convert to a domain error) or let it propagate to a boundary that logs once with correlation id and returns an error. Never catch `InterruptedException` without restoring the interrupt flag.
+
+Q: Why should you restore the interrupt flag when catching `InterruptedException`?
+A: Interruption is a cooperative cancellation request. Catching it clears the flag, so higher-level code (an executor shutting down, a structured task scope cancelling) never learns the thread was asked to stop. Call `Thread.currentThread().interrupt()` and exit, or rethrow.
+
+Q: What is try-with-resources and what happens when both the body and `close()` throw?
+A: It closes `AutoCloseable` resources in reverse order even on exceptions. If the body throws and `close()` also throws, the body's exception propagates and the close exception is added as a suppressed exception (`getSuppressed()`), so the original cause isn't lost.
+
+## Streams and functional style
+Q: When are Java streams a bad choice?
+A: For simple loops where they hurt readability, when you need checked exceptions, early exit with complex state, or very hot paths where boxing (`Stream<Long>` vs `LongStream`) and lambda overhead matter. Also never use a stream with side effects on shared mutable state, especially in parallel.
+
+Q: Should you use parallel streams in a Spring web service?
+A: Usually no. They run on the common ForkJoinPool shared by the whole JVM, so one request's parallel stream competes with others and with any `CompletableFuture` using the default pool, and blocking I/O inside starves the pool. Use them only for CPU-bound work on large in-memory data with a measured benefit, or a dedicated pool.
+
+Q: What's the difference between `map` and `flatMap` on a stream and on `Optional`?
+A: `map` transforms each element one-to-one. `flatMap` transforms each element into a stream (or Optional) and flattens the result, so you avoid `Stream<Stream<T>>` or `Optional<Optional<T>>`. Example: `customers.stream().flatMap(c -> c.accounts().stream())`.
+
+Q: How do you sum money amounts with streams correctly?
+A: For minor units: `mapToLong(Payment::amountMinor).sum()`, but beware silent overflow (use `reduce(0L, Math::addExact)` if amounts can be huge). For `BigDecimal`: `map(Payment::amount).reduce(BigDecimal.ZERO, BigDecimal::add)`. Group by currency first: summing different currencies is a bug.
+
+Q: What is a functional interface, and why would you define your own instead of using `Function`?
+A: An interface with one abstract method, usable as a lambda target. Defining your own (`interface FxRateProvider { BigDecimal rate(CurrencyPair pair); }`) gives a meaningful name, domain-specific signatures, checked exceptions if needed, and better discoverability than `Function<CurrencyPair, BigDecimal>`.
+
+## Object design and APIs
+Q: Composition or inheritance for a payment method hierarchy?
+A: Prefer composition plus a sealed interface: `sealed interface PaymentMethod permits Card, BankTransfer, Wallet` with records, and behaviour in services or strategies chosen by pattern matching. Inheritance couples subclasses to base-class internals (the fragile base class problem) and makes adding behaviour across types awkward.
+
+Q: How do you design a builder for an object with many optional fields, and when is a record enough?
+A: A static nested builder with fluent setters and validation in `build()`, producing an immutable object. A record is enough when most fields are required: use a compact constructor plus a few static factory methods (`Payment.instant(...)`). Builders add value for many optional fields and readable test fixtures.
+
+Q: What are the risks of Java serialization, and what do you use instead?
+A: Deserialising untrusted data can execute gadget chains (remote code execution), and the format is brittle across class changes. Avoid `ObjectInputStream` on untrusted input; if unavoidable, use a strict allowlist `ObjectInputFilter`. Use JSON/Avro/Protobuf with explicit schemas, and for Jackson avoid default typing with class names.
+
+Q: How does Jackson handle records, and what changed with Jackson 3 in Spring Boot 4?
+A: Jackson binds records through their canonical constructor, no annotations needed. Jackson 3 moves to the `tools.jackson` package, makes `JsonMapper` immutable and built via a builder, and changes some defaults (for example, sorted properties). In Boot 4, customise via `JsonMapperBuilderCustomizer` and pin your API contracts with tests so default changes don't silently alter payloads.
+
+Q: What is `Comparable` vs `Comparator`, and what bug appears with inconsistent `compareTo`?
+A: `Comparable` defines a natural order on the class; `Comparator` defines external orders. If `compareTo` is inconsistent with `equals` (BigDecimal: 1.0 vs 1.00), sorted sets/maps treat "equal-comparing" values as duplicates while hash sets don't, so `TreeSet` and `HashSet` contain different elements. Write comparators with `Comparator.comparing(...).thenComparing(...)`, never subtraction (overflow).
+
+Q: How do you write a correct `compareTo` for amounts held in `long`?
+A: `Long.compare(a, b)`, or `Comparator.comparingLong(Money::minor)`. Never `return (int) (a - b)`: subtraction can overflow and the cast truncates, giving wrong signs for large amounts.
+
+Q: What's the difference between `static` nested and inner classes, and why does it matter for memory?
+A: An inner (non-static) class holds a hidden reference to its enclosing instance; a static nested class doesn't. Anonymous classes and inner classes captured in long-lived callbacks or caches can keep the whole outer object graph alive (a memory leak). Prefer static nested classes and lambdas that capture only what they need.
+
+Q: Why is `final` useful on fields even in single-threaded code, and what does it guarantee for concurrency?
+A: It documents and enforces that the reference never changes. For concurrency, the Java Memory Model guarantees that a properly constructed object's final fields are visible to other threads without synchronisation once the constructor finishes (as long as `this` didn't escape during construction). That's why immutable objects are safely shareable.
+
+Q: What is the difference between `Instant`, `LocalDateTime` and `ZonedDateTime`, and which do you store?
+A: `Instant` is a point on the UTC timeline; `LocalDateTime` has no zone (ambiguous, not a moment); `ZonedDateTime` is a local time in a zone. Store instants (`timestamptz`), and convert to a zone only for display or business-date calculations. Store business dates as `LocalDate` explicitly. Using `LocalDateTime` for event times causes DST and cross-region bugs.
+
+Q: Why inject a `Clock` instead of calling `Instant.now()`?
+A: Testability and correctness: tests can fix or advance time deterministically (expiry, cut-offs, interest accrual), and you can reason about time-dependent logic. In Spring, define a `Clock` bean (`Clock.systemUTC()`) and inject it; use a monotonic source (`System.nanoTime`) for measuring durations.
+
+Q: What does `Objects.requireNonNull` buy you over letting a NullPointerException happen later?
+A: Fail fast at the boundary with a clear message, close to the cause, instead of an NPE deep in a call chain (possibly after partial side effects). Helpful NullPointerExceptions (Java 14+) improve messages, but validating constructor arguments keeps invalid objects from existing at all.
+
+## Correctness traps
+Q: How can an enum model a payment state machine safely?
+A: Each constant declares its allowed next states (`AUTHORISED -> Set.of(CAPTURED, VOIDED, EXPIRED)`), and a `transitionTo(next)` method rejects anything else. Persist the state with a version column so concurrent transitions conflict instead of overwriting. For richer state data, combine with a sealed interface of records; enums alone can't carry per-instance data.
+
+Q: How do you detect integer overflow in money arithmetic?
+A: Use `Math.addExact`, `subtractExact` and `multiplyExact`, which throw `ArithmeticException` instead of silently wrapping around (`Long.MAX_VALUE + 1` becomes a huge negative number). Silent overflow in a balance or fee calculation is a correctness incident; failing loudly is the right default.
+
+Q: What is the Turkish locale bug, and where can it hit a payment system?
+A: `"iban".toUpperCase()` in a Turkish default locale produces a dotted capital İ, so comparisons, currency codes and enum lookups (`Currency.valueOf(code.toUpperCase())`) break. Use `toUpperCase(Locale.ROOT)` for identifiers and protocol values, and a specific locale only for user-facing text.
+
+Q: Is `DecimalFormat` or `SimpleDateFormat` safe to share between threads?
+A: No: both hold mutable state, so a shared static instance produces corrupted output under concurrency (classic wrong-amount-on-statement bug). Use `java.time.format.DateTimeFormatter` (immutable, thread-safe), and create `NumberFormat`/`DecimalFormat` per use or per thread. Format money with the currency's fraction digits explicitly.
+
+Q: What happens when a class inherits the same `default` method from two interfaces?
+A: Compilation fails until the class overrides it, choosing explicitly (for example `PaymentListener.super.onEvent(e)`). Rule of thumb: class methods win over interface defaults, and a more specific interface wins over a less specific one. Default methods are for evolving interfaces, not for multiple inheritance of behaviour.
+
+Q: What does the Java module system (JPMS) give you, and do Spring Boot apps use it?
+A: Strong encapsulation (packages not exported are inaccessible, even by reflection unless opened) and explicit dependencies in `module-info.java`. Most Spring Boot applications still run on the classpath because frameworks rely on reflection and many libraries aren't modularised. You meet it mainly through `--add-opens` flags and in jlink-built minimal runtimes.

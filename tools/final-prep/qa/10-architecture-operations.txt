@@ -1,0 +1,156 @@
+## Architecture styles
+Q: What is hexagonal (ports and adapters) architecture, and why does it suit financial domains?
+A: The domain core defines ports (interfaces) for what it needs and offers; adapters implement them for HTTP, databases, Kafka or PSPs. Business rules (ledger invariants, payment state machine) stay framework-free and testable in isolation, and integrations can change (a new PSP) without touching the core. The cost is more types and mapping code.
+
+Q: What does domain-driven design bring to a payments platform?
+A: A ubiquitous language shared with finance and operations (authorisation, capture, settlement mean exact things), bounded contexts with clear models and ownership (payments, ledger, risk, reconciliation), aggregates that protect invariants in one transaction, and explicit context mapping (anti-corruption layers to schemes and banks). It guides service boundaries better than technical layering.
+
+Q: What is an aggregate, and how big should one be?
+A: A cluster of objects treated as one unit for consistency, changed through its root in a single transaction (a payment with its attempts and state). Keep aggregates small: large ones increase contention and transaction size. Reference other aggregates by id and achieve consistency between them with domain events (eventual consistency).
+
+Q: Modular monolith vs microservices: how do you decide?
+A: Start with a modular monolith when the domain boundaries are still moving, the team is small, or operations maturity is limited: you keep single-database transactions and simple deployment. Extract microservices when a module needs independent scaling, release cadence, technology or compliance isolation (a PCI card vault), and when boundaries are stable. Enforce module boundaries either way (Spring Modulith, ArchUnit).
+
+Q: What is event-driven architecture, and what are its hidden costs?
+A: Services communicate by publishing facts and reacting to them, which decouples producers from consumers and enables new consumers without changing producers. Hidden costs: eventual consistency everywhere, harder debugging and tracing, schema governance, duplicate and out-of-order handling in every consumer, and difficulty answering "what is the current state of this payment?" without a dedicated view.
+
+Q: What is CQRS, and when is it worth the complexity?
+A: Separating the write model (commands enforcing invariants) from read models (projections shaped for queries). Worth it when reads and writes have very different shapes or scale (ledger writes vs rich account-history search), or with event sourcing. For simple CRUD, it's overhead: two models, projection lag and rebuild tooling.
+
+Q: How do you decide synchronous vs asynchronous communication between services?
+A: Synchronous (HTTP/gRPC) when the caller needs the answer to proceed and the dependency is reliable and fast (authorisation decision, balance check). Asynchronous (events, queues) when work can complete later, to decouple availability and absorb load spikes (notifications, ledger projections, analytics). Asynchronous flows need status visibility for users and operators.
+
+## System design approach
+Q: How do you structure a 45-minute system design interview?
+A: Clarify requirements and scale (5 min), estimate load and storage (4), sketch the data model (4), draw the high-level design with the happy path (7), define the API (4), deep-dive into the one or two riskiest parts such as money correctness and failure handling (13), evaluate failure modes and trade-offs (5), and summarise (3). Drive the conversation and state assumptions aloud.
+
+Q: How do you do back-of-the-envelope estimation in an interview?
+A: Users → actions per day → average per second (divide by about 100,000) → peak (multiply by a stated factor, 3–10×) → bytes per record × records → storage per year, plus replicas and indexes → nodes from measured per-node capacity. Round aggressively, state every assumption, and use the result to make a decision (one primary is enough, or sharding is needed).
+
+Q: What do interviewers mean by "go deep", and how do you choose where?
+A: Show you understand a component's mechanics and failure modes, not just its name: how idempotency is enforced under concurrency, what happens when the PSP times out, how the ledger stays balanced across shards. Choose the part where money can be lost or duplicated, or ask the interviewer which part they care about most.
+
+Q: How do you present trade-offs convincingly?
+A: State the decision, the reason tied to a requirement, the cost, and when you'd change it: "PostgreSQL, because the ledger needs multi-row atomic transactions; the cost is a single-writer limit; I'd shard by account when sustained writes exceed what one primary handles in our load tests." Compare at least two options on the dimensions that matter here.
+
+Q: How would you design a system to handle 10× traffic growth?
+A: Find the first bottleneck with load tests (usually the database or a single hot key), make stateless tiers horizontally scalable, add caching for read-heavy paths, move non-critical work to asynchronous processing, partition data by the access key, and protect the system with admission control. Revisit cost, because 10× traffic shouldn't mean 10× spend.
+
+## Kubernetes and cloud
+Q: What deployment strategies exist, and which suit payment services?
+A: Rolling updates (default: gradual replacement), blue-green (switch traffic between two full environments, instant rollback), canary (a small share of traffic to the new version, with automated analysis of error rate and latency) and feature flags (deploy dark, release by flag). For payments: canary plus flags, backward-compatible schema changes, and automated rollback on SLO breach.
+
+Q: How do you make a Spring Boot service behave well on Kubernetes?
+A: Readiness and liveness probes on separate Actuator groups, graceful shutdown shorter than the termination grace period (with a short preStop sleep so endpoints are removed first), resource requests and limits sized from measurements, JVM sized by percentage, configuration from ConfigMaps and Secrets, PodDisruptionBudgets, and topology spread across zones.
+
+Q: What does a PodDisruptionBudget do, and why does it matter?
+A: It limits how many pods of a deployment can be voluntarily disrupted at once (node drains, cluster upgrades), for example `minAvailable: 2`. Without it, a node drain can evict all replicas of a service simultaneously, causing an outage during routine maintenance.
+
+Q: How does Kubernetes Horizontal Pod Autoscaling work, and what are its pitfalls?
+A: The HPA adjusts replica counts to reach a target metric (CPU utilisation, or custom metrics such as request rate or Kafka lag via KEDA). Pitfalls: CPU is a poor signal for I/O-bound services, scaling reacts with delay (JVM warm-up makes new pods slow), the database connection limit caps useful scale-out, and flapping without stabilisation windows.
+
+Q: How would you design disaster recovery across regions for a payment platform?
+A: Define RPO and RTO per service; replicate data to a second region (asynchronous replication or backups with PITR for the ledger, plus tested promotion), keep infrastructure as code so the stack can be rebuilt, replicate secrets and configuration, have DNS or global load balancer failover, and run regular DR drills measuring real RPO and RTO. Decide in advance who declares a disaster.
+
+Q: What is infrastructure as code, and what makes it safe in a regulated environment?
+A: Declarative definitions (Terraform, Pulumi, Crossplane) versioned in Git, applied through CI/CD with plans reviewed before apply, policy-as-code checks (OPA/Conftest, Sentinel), drift detection, separate state per environment, least-privilege credentials for pipelines, and audit trails. Manual console changes are not allowed or are reconciled back.
+
+Q: How do you control cloud cost for a growing platform?
+A: Tag everything by team and service, show cost per transaction, right-size instances and JVM memory from real usage, use autoscaling and scale-down schedules for non-production, commit or reserve capacity for steady workloads, manage data retention and storage tiers, and cap observability costs (metric cardinality, log volume).
+
+## SRE and incidents
+Q: What are SLIs, SLOs and error budgets, and how do they change decisions?
+A: An SLI is a measured indicator (share of successful payments under 300 ms), an SLO is its target over a window (99.9% over 28 days), and the error budget is the allowed failure (0.1%). When the budget is spent, the team prioritises reliability over features; when it's healthy, it can take more release risk. It turns reliability into an explicit, shared decision.
+
+Q: What is burn-rate alerting, and why is it better than threshold alerts?
+A: Alert on how fast the error budget is being consumed: a fast burn (for example 14.4× over 1 hour, which would exhaust a 30-day budget in about 2 days) pages someone, and a slow burn (1× or 2× over days) creates a ticket. Combining long and short windows reduces noise and catches both sudden outages and slow degradation, unlike static thresholds such as "error rate above 1%".
+
+Q: Walk through how you lead a production incident.
+A: Declare it and assign roles (incident commander, communications, operations). Stabilise first: roll back, fail over, shed load or disable a feature flag. Communicate status on a fixed rhythm to stakeholders. Investigate the root cause after mitigation, verify recovery with SLIs, then run a blameless post-incident review with concrete, owned follow-up actions.
+
+Q: What makes a post-incident review useful?
+A: A clear timeline, contributing factors (not a single "root cause" or a person to blame), what went well and what was lucky, detection and response gaps, and a small number of specific actions with owners and deadlines (a test, an alert, a runbook, a design change). Share it widely and track the actions to completion.
+
+Q: How do you reduce mean time to recovery (MTTR)?
+A: Fast detection (SLO-based alerts on symptoms), clear ownership and on-call runbooks, observability that connects alerts to traces and logs quickly, safe and fast rollback (feature flags, quick deploys), and practised incident roles. Most MTTR is spent noticing and diagnosing, not fixing.
+
+Q: What is chaos engineering, and how do you start it safely in a financial company?
+A: Running controlled experiments that inject failures (kill instances, add latency, fail a dependency) to verify the system's resilience assumptions. Start in staging with a hypothesis and a clear stop condition, with small blast radius and monitoring in place; graduate to production game days only when confident, never touching money-moving correctness without safeguards.
+
+Q: What is toil, and how do you reduce it?
+A: Manual, repetitive, automatable operational work that scales with traffic and provides no lasting value (manually re-running failed jobs, resolving reconciliation breaks one by one). Measure it, cap it as a share of the team's time, and automate the biggest sources: self-healing jobs, auto-resolution rules, better tooling.
+
+## Security architecture
+Q: What does zero trust mean for a microservices platform?
+A: No implicit trust based on network location: every request is authenticated and authorised (mTLS workload identity plus tokens), least privilege everywhere, short-lived credentials, encrypted traffic inside the cluster, and continuous verification with audit. A compromised pod can't freely call other services.
+
+Q: What are the top OWASP API Security risks you design against?
+A: Broken object level authorisation (access another customer's object by id), broken authentication, broken object property level authorisation (mass assignment, excessive data exposure), unrestricted resource consumption (no rate limits or size limits), broken function level authorisation (admin endpoints), server-side request forgery, security misconfiguration and unsafe consumption of third-party APIs.
+
+Q: How do you prevent SSRF when merchants can configure webhook URLs?
+A: Validate the URL scheme (HTTPS only), resolve the hostname and block private, loopback, link-local and metadata addresses (169.254.169.254), re-check after redirects (or disable them), pin the resolved IP for the connection to prevent DNS rebinding, send from an egress proxy with an allowlist policy, and set tight timeouts and response size limits.
+
+Q: How do you manage encryption keys for data at rest in a payment system?
+A: Envelope encryption: data keys encrypt the data, and a key-encryption key in a KMS or HSM encrypts the data keys, so the master key never leaves the HSM. Rotate keys on a schedule, keep key versions to decrypt old data, separate duties for key administration, audit every key use, and use separate keys per environment and data class.
+
+Q: What does secure software supply chain mean for a Java team?
+A: Dependency scanning (OWASP Dependency-Check, Snyk, Dependabot), pinned and verified dependencies, an internal artifact repository, SBOM generation (CycloneDX), signed builds and images (Sigstore cosign), minimal base images, reproducible builds where possible, and protected CI pipelines with least-privilege secrets. Patch critical vulnerabilities within a defined SLA.
+
+Q: How do you handle a leaked API key or credential?
+A: Revoke and rotate immediately, assess blast radius from audit logs (what was accessed with it, when), check for misuse, notify according to policy and regulation, find how it leaked (committed to Git, logged, shared), and fix the cause (secret scanning in CI, a secret manager, shorter-lived credentials).
+
+## Technical leadership and decisions
+Q: How do you document and drive an architectural decision?
+A: Write an RFC or design doc with context, requirements, options with trade-offs, recommendation, risks, rollout and rollback plan, and invite review from affected teams and security. Record the outcome in an ADR (short: context, decision, consequences) in the repository. Revisit decisions when assumptions change.
+
+Q: How do you decide build vs buy for a component like fraud scoring or KYC?
+A: Consider whether it's a differentiator for the business, total cost of ownership (engineering, operations, compliance), time to market, vendor lock-in and exit strategy, data residency and regulatory approval, integration effort and the vendor's reliability record. Commodity capabilities are usually bought; differentiating ones built, behind your own interface so you can switch.
+
+Q: How do you manage technical debt in a team under delivery pressure?
+A: Make it visible (a debt register with impact and cost), tie it to business outcomes (incidents, lead time, risk), allocate steady capacity (for example 15–20%), fix debt in areas you're already changing, and prioritise debt that threatens correctness or security. Avoid big-bang rewrites; refactor incrementally with tests.
+
+Q: How would you introduce a major platform change (for example moving to Kafka) across many teams?
+A: Start with a clear problem statement and success measures, build a paved road (libraries, templates, documentation, observability) with one pilot team, migrate incrementally with coexistence (dual publishing, strangler), offer support and office hours, track adoption, and set a deprecation timeline for the old way with leadership backing.
+
+Q: As a staff engineer, how do you influence without authority?
+A: Build trust through delivery and good judgement, understand other teams' constraints, write clearly (RFCs, decision records), use data (incidents, metrics, load tests) instead of opinions, prototype to reduce uncertainty, find sponsors, give credit generously, and commit to decisions even when yours wasn't chosen.
+
+Q: What makes an engineering metric useful rather than harmful?
+A: It measures outcomes the team can influence (DORA metrics: deployment frequency, lead time, change failure rate, time to restore), is used for learning rather than individual performance ranking, and is paired with qualitative context. Metrics used as targets get gamed: watch for that.
+
+Q: How do you evaluate a design proposal from another engineer?
+A: Check that it meets the stated requirements, handles failure modes (timeouts, duplicates, partial failures), protects data correctness and security, is operable (observability, rollout, rollback), fits existing architecture and team skills, and that its trade-offs are explicit. Ask questions rather than dictating, and separate blocking concerns from preferences.
+
+Q: How do you mentor engineers on distributed systems thinking?
+A: Review designs together asking "what happens when this call times out?", pair on incident analysis, give them ownership of a well-scoped risky component with support, share reading and post-mortems, and let them present designs and decisions. Teach by questions and real failures, not lectures.
+
+Q: How do you handle disagreement with a senior stakeholder about a risky deadline?
+A: Make the risk concrete (what can fail, likelihood, impact in money or customers), propose options (reduce scope, phase the release, add safeguards such as feature flags and limits), document the decision and its owner, and once decided, commit fully while monitoring the risk. Escalate early, not at the deadline.
+
+Q: How do you prepare a platform for regulatory audit?
+A: Evidence by design: access controls with reviews, change management through pull requests and pipelines (who approved and deployed what), immutable audit logs, data retention and deletion policies, incident and DR test records, vendor risk assessments, and documented controls mapped to the regulation (PCI DSS, SOC 2, DORA for EU financial entities).
+
+Q: What is the EU Digital Operational Resilience Act (DORA), and how does it affect engineering?
+A: An EU regulation (applying since January 2025) requiring financial entities to manage ICT risk: incident classification and reporting within strict deadlines, regular resilience testing (including threat-led penetration testing for significant entities), third-party ICT risk management (cloud providers), and governance. Engineering impact: incident tooling, testing programmes, documented dependencies and exit plans.
+
+Q: How do you design for observability from day one?
+A: Define SLIs for each user journey, instrument with OpenTelemetry/Micrometer (RED metrics, traces across sync and async hops, structured logs with correlation ids), add business events (payments by state), build dashboards per service and journey, write alerts on SLO burn, and keep cardinality and cost under control. Test that a failure you inject is visible.
+
+Q: What does platform engineering mean, and how does it help product teams?
+A: An internal platform team provides self-service, paved roads: service templates, CI/CD pipelines, observability, secrets and databases on demand, with good defaults and documentation, so product teams ship safely without becoming infrastructure experts. Success is measured by adoption and developer experience, not by mandates.
+
+Q: How do you approach a system you've just inherited that has frequent incidents?
+A: Stabilise first: read the incident history, add the missing alerts and dashboards, fix the top recurring failure causes and add runbooks. Then understand: map dependencies and data flows, measure SLIs. Then improve in steps with tests (characterisation tests before refactoring), prioritised by incident impact, while communicating progress to stakeholders.
+
+Q: What questions would you ask the interviewer at the end of a staff-level interview?
+A: What are the biggest technical risks in the next year, and who owns them? How are architecture decisions made and documented? What does on-call look like, and what was the last major incident? How does the team balance feature work and reliability? What would success look like for this role after 6 and 12 months?
+
+## Platform design questions
+Q: How do you isolate tenants in a multi-tenant fintech platform?
+A: Choose an isolation level per risk: shared tables with a tenant id on every row (enforced by row-level security or mandatory query scoping), schema per tenant, or database per tenant for large or regulated clients. Add per-tenant rate limits and quotas (noisy neighbours), tenant-scoped encryption keys, tenant id in every log, metric and trace, and tests proving one tenant can't see another's data.
+
+Q: How does data residency affect architecture?
+A: Personal and financial data may have to stay in a country or region, so you deploy regional stacks (or regional data stores) and route requests by the customer's home region, keep backups and logs in-region, restrict cross-region replication and analytics extracts, and check where third-party processors (cloud services, LLM providers, support tools) store data.
+
+Q: How do you design a public payments API that can evolve for years?
+A: Resource-oriented design with stable identifiers, idempotency keys on every mutating call, cursor-based pagination, additive changes only within a version (new optional fields; clients must ignore unknown fields), explicit versioning for breaking changes with long deprecation periods and sunset headers, webhooks for asynchronous state changes, consistent problem-detail errors, and an OpenAPI contract tested in CI.

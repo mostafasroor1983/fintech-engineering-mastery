@@ -1,0 +1,349 @@
+Q: A Spring Batch job posting 2 million ledger entries fails at item 1,200,000. It's restarted with the same job parameters. What happens with a restartable reader and chunk size 1,000?
+* It resumes after the last committed chunk, so at most one chunk is reprocessed
+- It starts again from item 1
+- It skips the failed chunk and continues
+- Spring Batch refuses to restart a failed job
+E: The JobRepository stores the position after each chunk commit. Writers must be idempotent because a partially processed chunk may be redone.
+
+Q: A Spring Batch step skips malformed records with a skip limit of 100. What must a financial job do with skipped records?
+- Nothing: skipped records are dropped by design
+* Record each skipped item (for example in an error table via a SkipListener) and reconcile totals so nothing is silently lost
+- Retry them forever
+- Fail the whole job on the first skip
+E: Skipping keeps the job moving, but every skipped financial record must be visible, repaired and reconciled.
+
+Q: In a JPA entity, `@OneToMany(fetch = FetchType.LAZY)` collections are accessed in a loop over 200 orders to build a response. What will you see in the SQL logs?
+- One query with a join
+* About 201 queries: one for the orders and one per order's collection (N+1)
+- Two queries using batch fetching automatically
+- An exception because lazy loading isn't allowed
+E: Use a fetch join, an entity graph, batch fetching or a projection query.
+
+Q: You annotate a JPA repository method with `@Lock(LockModeType.PESSIMISTIC_WRITE)`. What SQL does Hibernate typically issue on PostgreSQL?
+- `LOCK TABLE ... IN EXCLUSIVE MODE`
+* `SELECT ... FOR UPDATE`
+- `SELECT ... FOR SHARE`
+- An advisory lock call
+E: Pessimistic write locks rows until commit; set a lock timeout to avoid waiting forever.
+
+Q: An entity has `@Version`. Two users update it concurrently. What happens to the second commit?
+- It overwrites the first silently
+- Both updates are merged
+* It fails with an optimistic locking exception because the version no longer matches
+- It waits for the first transaction's lock
+E: The UPDATE includes `WHERE version = ?`; zero rows updated raises the exception, and you retry or report a conflict.
+
+Q: Which Spring Security setting is appropriate for a stateless REST API authenticated by bearer tokens in the Authorization header?
+- Enable form login and sessions
+* Stateless session management; CSRF protection can be disabled because no cookies authenticate requests
+- Keep CSRF enabled and require a CSRF token on every API call
+- Disable authentication and rely on the gateway
+E: CSRF exploits ambient cookie credentials. Bearer tokens in headers aren't sent automatically by browsers.
+
+Q: A JWT's signature is valid and it hasn't expired, but it was issued for the "reporting-api" audience. Your "payments-api" accepts it. Which check is missing?
+- Signature algorithm check
+* Audience validation
+- Issuer validation
+- Token encryption
+E: Validate `aud` so a token for one API can't be replayed against another.
+
+Q: Which is the best way to store user passwords?
+- AES-encrypted with a key in the config file
+- SHA-256 with a global salt
+* An adaptive, salted hash such as bcrypt or Argon2 via `DelegatingPasswordEncoder`
+- Base64-encoded
+E: Adaptive hashes are slow on purpose and salted per user; encryption is reversible and fast hashes are brute-forceable.
+
+Q: An access token leaked in application logs. What's the first action?
+- Delete the log file
+* Revoke/rotate the affected credentials and assess what was accessed, then fix the logging
+- Wait for the token to expire
+- Change the JWT signing algorithm
+E: Contain first, then investigate and fix the cause (mask tokens in logs).
+
+Q: You configure Resilience4j retry outside the circuit breaker. The dependency fails every call. What happens when the breaker opens?
+- Retries keep calling the dependency
+* Each retry attempt gets `CallNotPermittedException` quickly, so retries stop hammering the dependency (configure retry to ignore it)
+- The breaker closes because of the retries
+- Retries are disabled permanently
+E: The breaker protects the dependency; exclude `CallNotPermittedException` from retries so you fail fast instead of retrying a known-open breaker.
+
+Q: What's the main risk of an API gateway that contains business validation rules for payments?
+- Slower TLS handshakes
+* It couples every team to the gateway and spreads domain logic outside the owning service
+- Gateways can't call services
+- It prevents rate limiting
+E: Keep gateways to cross-cutting edge concerns; business rules belong to the domain service.
+
+Q: A Kafka topic for payment events has replication factor 3 and `min.insync.replicas=2`. Two brokers go down. What do producers with `acks=all` see?
+- Writes succeed on the remaining broker
+* Writes fail with NotEnoughReplicas errors until enough replicas return
+- Writes are buffered by the broker indefinitely
+- Consumers stop but producers continue
+E: Kafka chooses durability: it rejects writes rather than accept them on too few replicas.
+
+Q: A consumer's processing of one message always fails with a deserialization error. With Spring Kafka's default setup and no error handler configuration, what's the risk?
+- The message is silently dropped
+* The container keeps failing on the same record, blocking the partition, unless you use an ErrorHandlingDeserializer and a dead-letter recoverer
+- Kafka deletes the bad message automatically
+- The consumer group rebalances and skips it
+E: Configure `ErrorHandlingDeserializer`, bounded retries and a `DeadLetterPublishingRecoverer`.
+
+Q: You must increase partitions of a keyed topic from 12 to 24. What's the main consequence?
+- Consumers must be rewritten
+- Existing data is redistributed automatically
+* New records for some keys go to different partitions, so per-key ordering can break during the transition
+- Throughput halves
+E: Existing records stay where they are; plan the change and make consumers order-tolerant (versions).
+
+Q: A compacted Kafka topic holds account status per account id. A consumer starts fresh. What does it read?
+* At least the latest value for every key (older values may have been compacted away)
+- Only events from the last 7 days
+- Every historical status change
+- Nothing until new events arrive
+E: Compaction keeps the latest record per key, so new consumers can rebuild current state.
+
+Q: An outbox relay publishes a row to Kafka, then crashes before marking it as sent. What happens after restart?
+- The event is lost
+* The event is published again, so consumers see a duplicate and must de-duplicate
+- The database rolls back the original transaction
+- Kafka rejects the duplicate automatically
+E: The outbox is at-least-once. Consumers de-duplicate by event id.
+
+Q: Debezium's connector has been stopped for two days. The PostgreSQL disk is filling up. Why?
+- Debezium writes logs to the database disk
+* The logical replication slot retains WAL until the connector confirms it
+- Autovacuum is disabled while CDC runs
+- The outbox table grows without limit
+E: Monitor slot lag, set `max_slot_wal_keep_size`, and alert on stopped connectors.
+
+Q: A saga step "debit wallet" succeeded, and the next step "credit external account" failed permanently. What should the orchestrator do?
+- Leave the money debited and alert
+* Run the compensation (credit the wallet back) idempotently, recording the reason
+- Delete the debit row from the ledger
+- Retry the failed step forever
+E: Compensations are new business actions; ledgers are corrected with new entries, never deletions.
+
+Q: Which ordering of saga steps reduces compensation risk for a cross-border payment?
+- Send the payment first, then check fraud and limits
+* Validate and check fraud and limits, reserve funds, then send the irreversible payment last
+- Notify the customer first, then process
+- Order doesn't matter if compensations exist
+E: Do reversible steps first and the point-of-no-return step last.
+
+Q: A downstream service's p99.9 latency is 400 ms under normal load. Your endpoint's SLO is p99 below 1 s. What read timeout would you start with?
+- 50 ms
+* About 500 ms, within your overall budget
+- 10 seconds
+- No timeout, so slow calls still succeed
+E: Set it just above the dependency's tail latency and well inside your own budget, then tune from metrics.
+
+Q: Clients retry immediately on every 503, and your recovering service is hit by waves of traffic. What helps most?
+- Shorter client timeouts
+* Exponential backoff with full jitter, retry budgets and honouring Retry-After
+- More retries per client
+- Synchronised retries at fixed intervals
+E: Jitter spreads retries; budgets cap amplification.
+
+Q: Which rate limiting algorithm allows short bursts up to a limit while enforcing an average rate, with O(1) state per client?
+- Fixed window counter
+- Sliding log
+* Token bucket
+- Leaky bucket queue with unlimited capacity
+E: A token bucket's capacity sets the burst and its refill rate sets the average.
+
+Q: Redis, which backs your per-tenant fairness rate limiter, is unreachable. What's a sensible default policy?
+* Fail open with an alert and a rough local fallback limit, because it's a fairness control
+- Fail closed and reject all API traffic
+- Disable authentication too
+- Queue all requests until Redis returns
+E: Safety limits (for example payout value caps) fail closed; fairness limits usually fail open.
+
+Q: Popular cache entries for FX rate metadata all expire at midnight and the database spikes. What fixes it?
+- Longer TTLs for everything
+* Jittered TTLs plus request coalescing (one loader per key)
+- Disabling the cache at midnight
+- More database replicas only
+E: Synchronised expiry causes stampedes; spread expiries and share loads.
+
+Q: A team caches account balances in Redis for 60 seconds to speed up payment authorisation. What's wrong?
+- Redis is too slow for balances
+* Spending decisions on stale balances allow overdrafts and double spending
+- 60 seconds is too short
+- Nothing, if Redis is replicated
+E: Balance checks for spending must read the source of truth under a lock or conditional update.
+
+Q: You need search over transactions by merchant name and free text. What's the recommended architecture?
+- Add LIKE '%term%' queries on the primary
+* Feed a search engine from the database via CDC or the outbox, with versioned, idempotent updates
+- Write to the database and the search engine in the same request
+- Store transactions only in the search engine
+E: Keep the database as the source of truth; index asynchronously and rebuildably.
+
+Q: A query filters `WHERE lower(email) = :email` and ignores the index on `email`. Fix?
+- Add more memory
+* Create an expression index on `lower(email)`
+- Use OFFSET pagination
+- Switch to SERIALIZABLE
+E: An index on the column can't serve a predicate on a function of it.
+
+Q: `EXPLAIN ANALYZE` shows a nested loop where the planner estimated 10 rows but got 2 million. What's the likely cause and first fix?
+- A missing primary key; add one
+* Stale or insufficient statistics; run ANALYZE (and consider extended statistics)
+- Too many indexes; drop them
+- The table needs VACUUM FULL
+E: Large estimate errors lead to bad join choices; refresh statistics first.
+
+Q: Autovacuum can't keep up on a hot table and `n_dead_tup` keeps rising. A session has been "idle in transaction" for 6 hours. Connection?
+* The long-open transaction pins an old snapshot, so vacuum can't remove dead rows
+- Idle sessions use too much CPU
+- It prevents index-only scans only
+- No connection; it's unrelated
+E: Kill it and set `idle_in_transaction_session_timeout`.
+
+Q: Which constraint best enforces that a customer has at most one active card?
+- A CHECK constraint on the cards table
+* A unique partial index on (customer_id) WHERE status = 'ACTIVE'
+- A trigger that runs nightly
+- Application validation only
+E: The database enforces it under concurrency; nightly checks only detect violations later.
+
+Q: Your team plans PgBouncer in transaction pooling mode. Which application feature will break?
+- Short transactions with `SET LOCAL`
+* Session-level state such as session advisory locks or `SET` without LOCAL
+- Prepared statements within a transaction
+- `SELECT ... FOR UPDATE`
+E: Each transaction may run on a different server connection, so session state doesn't persist.
+
+Q: For a ledger in a single region with three availability zones, which replication setting gives RPO near zero for a zone failure?
+- Asynchronous replication to one standby
+* Synchronous replication to at least one standby in another zone
+- Nightly backups
+- Logical replication of the postings table only
+E: A commit waits until another zone has the WAL, so losing a zone loses no committed transactions.
+
+Q: Which statement about backups vs replicas is correct?
+- Replicas make backups unnecessary
+* Replicas protect against node loss; backups with PITR protect against logical errors like a bad DELETE
+- Backups give lower RPO than synchronous replicas
+- Replicas can restore to yesterday's state
+E: Replicas copy mistakes instantly; you need point-in-time recovery for those.
+
+Q: In a design interview, the interviewer asks for 50,000 payments per second at peak. What's your first move?
+- Pick Cassandra because it scales
+* Clarify the workload (reads vs writes, consistency needs), then estimate per-partition write rates to see whether one database can hold it or sharding is needed
+- Draw the microservices diagram
+- Say it's impossible with PostgreSQL
+E: Numbers drive decisions; technology names without requirements look like pattern matching.
+
+Q: An interviewer asks: "How do you know no payment was charged twice?" Best answer?
+- "Our code has retries"
+- "Kafka guarantees exactly-once"
+* "Idempotency keys and unique constraints prevent it, and daily reconciliation against PSP reports proves it, with alerts on breaks"
+- "We test it in staging"
+E: Separate prevention (keys, constraints) from proof (reconciliation).
+
+Q: A design has three services each holding part of a transfer and using 2PC across them with an XA coordinator. Main concern?
+- 2PC is too fast
+* Blocking and coupled availability: if the coordinator fails after prepare, participants hold locks in doubt
+- XA can't handle money
+- 2PC requires Kafka
+E: Prefer a saga with idempotent steps and compensations, plus reconciliation.
+
+Q: A fraud scoring service has a 50 ms budget and is down. What's the best behaviour for card authorisations?
+- Decline everything
+- Approve everything
+* Apply a pre-agreed stand-in policy by amount and risk segment, with monitoring and an owner
+- Retry the fraud service until it answers
+E: Neither extreme is acceptable; the business agrees the fallback in advance.
+
+Q: A hot merchant account receives 2,000 credits per second and the row lock becomes the bottleneck. Best option?
+- Optimistic locking with unlimited retries
+- A distributed Redis lock
+* Split the account into sub-accounts or buffer credits, since credits need no balance check
+- Increase the connection pool to 1,000
+E: Spread or buffer writes to the hot row; optimistic retries become a storm.
+
+Q: You deploy a new payment service version with a canary at 5% of traffic. Error rate on the canary rises from 0.1% to 0.8%. What should happen?
+* Automated analysis halts and rolls back the canary
+- Promote it, since 0.8% is still small
+- Increase the canary to 50% to get more data
+- Wait until the next morning
+E: Canary analysis compares against the baseline and rolls back on significant regression.
+
+Q: Liveness probes on your service call the payment database. The database has a 2-minute failover. What happens?
+- Nothing; probes ignore failovers
+* All pods fail liveness and restart repeatedly, slowing recovery and dropping in-flight work
+- Pods are removed from the load balancer only
+- Kubernetes waits for the database automatically
+E: Keep external dependencies out of liveness checks.
+
+Q: A PodDisruptionBudget of `minAvailable: 2` exists for a 3-replica service. A node drain tries to evict 2 pods at once. What happens?
+- Both are evicted
+* Only one is evicted at a time while respecting the budget
+- The drain fails permanently
+- The deployment scales to 6 pods first
+E: PDBs limit voluntary disruptions so maintenance doesn't take down the service.
+
+Q: Your HPA scales on CPU, but your I/O-bound Spring service shows rising latency with CPU at 30%. Better scaling signal?
+- Memory usage
+* Request concurrency or latency, or queue/lag metrics via KEDA
+- Number of pods
+- Disk usage
+E: CPU doesn't reflect I/O-bound saturation; scale on a signal that tracks load.
+
+Q: In an incident, payments are failing and you suspect yesterday's deploy. What's the first action?
+- Start a root-cause analysis of the code change
+* Mitigate: roll back (or disable the feature flag) and verify recovery, then investigate
+- Wait for more data
+- Restart the database
+E: Stop the bleeding first; investigate once customers are safe.
+
+Q: Which is the best structure for a behavioural answer about an incident you handled?
+- Start with the root cause in technical detail
+* STAR: brief situation and your role, then your concrete actions (mitigation first), then the outcome and the lasting fix
+- Focus on what others did wrong
+- Describe the team's actions using "we" throughout
+E: Interviewers score your own actions and judgement; "I" and concrete steps matter.
+
+Q: You disagree with a staff engineer's proposal to use event sourcing for the whole ledger. How do you handle it?
+- Escalate to the CTO immediately
+* Write down the concerns with evidence, propose a time-boxed spike or comparison, agree a decision process, then commit to the outcome
+- Implement your alternative quietly
+- Agree publicly and ignore it later
+E: "Disagree and commit" with data, in writing, is what interviewers look for.
+
+Q: An interviewer asks what you would do in your first month as a staff engineer on an unfamiliar payments team. Strongest answer?
+* Learn the systems and money flows, meet stakeholders, read incident history, ship small changes, then propose improvements with evidence
+- Propose a rewrite in week one
+- Focus only on coding tasks
+- Wait until fully trained before engaging
+E: Build context and trust before driving big changes.
+
+Q: A coding interview asks you to implement a thread-safe counter for transaction ids. Which is the best simple solution?
+- A `volatile long` with `++`
+* `AtomicLong.incrementAndGet()`
+- A `HashMap<Thread, Long>`
+- `synchronized` on a new object created in each call
+E: Volatile doesn't make `++` atomic; a new lock object per call protects nothing.
+
+Q: A test for a race condition passes 100 times in a row. What can you conclude?
+- The code is thread-safe
+* Very little, unless the test was shown to fail reliably before the fix and really runs threads concurrently
+- The JVM serialises tests
+- Race conditions can't be tested
+E: A concurrency test needs a start gate, many threads, repetitions, and a proven failure without the fix.
+
+Q: Which statement about Spring Framework 7's `@Retryable` is correct?
+- It's only available with Spring Retry
+* It's part of Spring Framework's core resilience support, enabled with `@EnableResilientMethods`
+- It retries any method safely, including non-idempotent ones
+- It replaces circuit breakers
+E: Use it for idempotent operations with backoff; circuit breaking still needs Resilience4j or similar.
+
+Q: Which observation is a high-cardinality tag that should NOT be a metric label?
+- HTTP status code
+- Currency
+* Payment id
+- Endpoint template
+E: Unique ids explode time series; put them on traces and logs.

@@ -1,0 +1,158 @@
+## Consistency models
+Q: Explain the CAP theorem precisely, and the common misreading.
+A: During a network partition, a system must choose between consistency (every read sees the latest write, i.e. linearizability) and availability (every request to a non-failed node gets a response). Misreading: "pick two of three" as a permanent design choice. Partitions aren't optional; the choice only applies while one is happening. PACELC adds that without partitions you trade latency against consistency.
+
+Q: What is linearizability, and how does it differ from serializability?
+A: Linearizability is a recency guarantee on single objects: once a write completes, every later read sees it, as if there were one copy. Serializability is a transaction isolation guarantee: concurrent transactions behave as if run in some serial order (not necessarily real-time order). Strict serializability combines both; that's what "strong consistency" usually means for a ledger.
+
+Q: What are read-your-writes and monotonic reads, and how do you provide them with read replicas?
+A: Read-your-writes: a user always sees their own updates. Monotonic reads: a user never sees data go back in time. With asynchronous replicas, route a user's reads to the primary for a short window after they write, or pin a session to one replica, or wait until the replica's replay position passes the commit position (LSN) of the user's last write.
+
+Q: What is eventual consistency, and how do you make it acceptable to users?
+A: Replicas converge if writes stop, with no bound on when. Make it acceptable by showing "as of" timestamps or pending states, reading critical data from the source of truth, giving immediate feedback from the write path (not the read model), and making consumers idempotent and order-tolerant. Measure the actual lag and alert on it.
+
+Q: What is a quorum, and does `R + W > N` give you linearizability?
+A: With N replicas, writes wait for W acknowledgements and reads query R replicas; `R + W > N` makes read and write sets overlap, so a read sees at least one up-to-date replica. It doesn't guarantee linearizability by itself: concurrent writes, sloppy quorums, clock-based conflict resolution and partial failures can still return stale or conflicting values. Dynamo-style systems need read repair and careful conflict handling.
+
+## Consensus and coordination
+Q: What problem does consensus (Raft, Paxos) solve?
+A: Getting a group of nodes to agree on a single value or an ordered log despite crashes and message delays, as long as a majority is up. It's the basis of leader election, replicated state machines, configuration stores (etcd, ZooKeeper) and the metadata layer in Kafka (KRaft). It can't make progress without a majority, which is the price of consistency.
+
+Q: Explain Raft at the level an interviewer expects.
+A: Nodes are followers, candidates or a leader. A follower that stops hearing heartbeats becomes a candidate and requests votes for a new term; a majority makes it leader. The leader appends client commands to its log and replicates them; an entry is committed once stored on a majority, then applied. Election rules guarantee the new leader has all committed entries, so committed data is never lost.
+
+Q: What is split-brain, and how do systems prevent it?
+A: Two nodes both believe they're the leader and accept writes, diverging the data. Prevention: majority quorums (a minority partition can't elect a leader or commit), leases with bounded clock assumptions, fencing tokens so the storage rejects writes from a stale leader, and STONITH (forcibly shutting down the old primary) in database failover.
+
+Q: Why is a 2-node cluster a bad idea for consensus?
+A: A majority of 2 is 2, so losing either node stops progress, which is worse than a single node. Use an odd number (3 or 5): 3 tolerates 1 failure, 5 tolerates 2. Spread them across failure domains (availability zones), and remember cross-region consensus adds the inter-region latency to every write.
+
+Q: What is a fencing token, and why do you need it with a distributed lock?
+A: A number that increases every time the lock is granted. The client sends it with each write, and the protected resource rejects writes with a token lower than one it has already seen. Without it, a client that paused (GC, network) past its lease expiry can still write after another client took the lock, corrupting data.
+
+Q: Is a Redis lock (or Redlock) safe for preventing double spending?
+A: No, not on its own. A lock with a TTL can expire while the holder is paused, and Redlock also depends on bounded clock drift and timing assumptions. Use it only for efficiency (avoiding duplicate work). For correctness, enforce the invariant at the write: a database constraint, conditional update or fencing token checked by the resource.
+
+Q: How would you do leader election for a singleton job across instances?
+A: Use a coordination service with leases: a Kubernetes `Lease` object, etcd/ZooKeeper, or a database row with an expiry that instances try to take with a conditional update. The leader renews periodically; others take over when it expires. Since leadership can overlap briefly, make the job idempotent and use fencing for writes.
+
+## Replication
+Q: Synchronous vs asynchronous replication: trade-offs for a ledger database?
+A: Synchronous: a commit waits for at least one replica, so failover loses no committed data (RPO ≈ 0), at the cost of commit latency and availability if the replica is slow. Asynchronous: lower latency, but the last few seconds of commits can be lost on failover. For ledgers, use synchronous replication to at least one standby in another zone (PostgreSQL `synchronous_standby_names = 'ANY 1 (s1, s2)'`).
+
+Q: What is replication lag, and how can it break a payment flow?
+A: The delay before a replica applies changes committed on the primary. If a service writes a payment on the primary and immediately reads it from a replica, it may not exist yet: the status check says "not found" and the client retries, creating a duplicate. Read critical data from the primary, or wait for the replica to catch up to the write's position.
+
+Q: Single-leader, multi-leader and leaderless replication: when would you use each?
+A: Single-leader: simple, consistent writes, the default for transactional data. Multi-leader: writes in several regions or offline clients, but conflicts must be resolved, which is dangerous for balances. Leaderless (Dynamo-style quorums): high write availability, for data where conflicts can be merged. Money usually stays single-leader per account.
+
+Q: How do you resolve write conflicts in multi-leader or active-active systems?
+A: Last-write-wins (loses data, relies on clocks), application merge logic, CRDTs for mergeable data types (counters, sets), or avoiding conflicts by routing all writes for a key to one home region. For balances, never use LWW: assign each account a home region and route its writes there.
+
+## Partitioning and scaling
+Q: How do you choose a partition (shard) key?
+A: It should spread load evenly, keep data that's accessed or updated together on one shard (so most transactions are single-shard), and be stable. For payments, the account or customer id usually works. Avoid keys with hot spots (a giant merchant, the current date) and plan for cross-shard operations explicitly (sagas, clearing accounts).
+
+Q: Hash partitioning vs range partitioning: trade-offs?
+A: Hash spreads keys evenly and avoids hot ranges but loses efficient range scans. Range keeps neighbouring keys together for scans (time series) but sequential keys create hot spots on the latest partition. Consistent hashing with virtual nodes limits data movement when nodes join or leave.
+
+Q: What happens to transactions that span shards, and how do you handle them?
+A: Single-shard ACID no longer applies. Options: avoid them by choosing a key that keeps related data together; use a saga with compensations and clearing accounts (each step local and idempotent); or use a database with distributed transactions (CockroachDB, Spanner) and accept the consensus latency. Two-phase commit across independent services is rarely a good choice.
+
+Q: How do you rebalance shards without downtime?
+A: Use many small logical partitions mapped to fewer physical nodes, so you move whole partitions; copy data (snapshot plus change stream), dual-read or dual-write during the move, switch the routing table atomically, then clean up. Keep the partition map in a consistent store and make clients refresh it. Rehearse with production-sized data.
+
+Q: What is a hot partition, and how do you deal with one?
+A: One partition receives a disproportionate share of traffic (a celebrity merchant, a single key), so it saturates while others idle. Options: split the key (sub-accounts with a random suffix, then aggregate), cache reads, buffer writes, or give the hot key dedicated capacity. Detect it with per-partition metrics.
+
+## Time and ordering
+Q: Why can't you order events from different machines by wall-clock timestamps?
+A: Clocks drift and NTP adjusts them (even backwards); leap seconds and VM pauses add errors of milliseconds or more. Two events a few milliseconds apart on different hosts can be recorded in the wrong order. Use a single sequencer (database sequence, Kafka partition offset), logical clocks, or explicit causal links.
+
+Q: What are Lamport clocks and vector clocks?
+A: Lamport clocks give each event a counter that is increased on every event and set to max+1 when a message arrives, providing a total order consistent with causality (but you can't tell concurrent events apart). Vector clocks keep a counter per node, so you can tell whether one event happened before another or they were concurrent, which detects conflicts.
+
+Q: How does Google Spanner achieve external consistency?
+A: TrueTime exposes clock uncertainty as an interval backed by GPS and atomic clocks. A transaction picks a commit timestamp and waits out the uncertainty ("commit wait") before making the commit visible, so timestamps respect real-time order. It trades a few milliseconds of latency for strict serializability across regions.
+
+Q: What is idempotency in the context of distributed systems, and why is it everywhere?
+A: Applying an operation once or many times has the same effect. Networks lose responses, so senders retry, and brokers redeliver: duplicates are normal. Idempotency (by key, natural id or conditional update) makes retries safe, turning at-least-once delivery into exactly-once effects.
+
+## Failure models
+Q: What failure modes should you design for in a distributed system?
+A: Crash failures, omission (lost messages), timing failures (slow nodes, GC pauses, network delays), partitions, partial failures (one dependency down), gray failures (degraded but not down), clock skew and, for external inputs, malformed or malicious data. Byzantine failures within your own trust domain are usually out of scope.
+
+Q: What's the difference between a timeout and a failure, and why does it matter?
+A: A timeout means you stopped waiting, not that the operation failed. The request may have been processed, be in progress, or be lost. For writes, a timeout leaves an unknown outcome that you must resolve by querying status or retrying idempotently, never by assuming failure.
+
+Q: What is a gray failure, and why are health checks bad at catching it?
+A: A component is partially degraded (slow, failing some requests, one bad disk) while still passing simple health checks. Load balancers keep sending traffic to it. Detect it with client-side metrics (error rate and latency per backend), outlier detection that ejects bad instances, and health checks that exercise real dependencies.
+
+Q: What is the two generals problem, and what does it teach you about acknowledgements?
+A: Two parties communicating over an unreliable channel can never be sure they agree, because every acknowledgement can itself be lost. Hence exactly-once delivery is impossible over unreliable networks: design for at-least-once delivery with idempotent processing, or at-most-once with reconciliation.
+
+Q: How do you design for a dependency that's down for an hour?
+A: Isolate it (bulkhead, circuit breaker) so the rest of the system works, degrade gracefully (cached data, queue requests for later, clear user messaging), persist intent durably so work resumes when it's back (outbox, durable queue), and have alerting and a runbook. Then test it with chaos experiments in staging.
+
+## Data structures and algorithms of distributed systems
+Q: What is a Merkle tree, and where is it used?
+A: A hash tree where each node hashes its children, so two replicas can find differing ranges by comparing hashes top-down, transferring only what differs. Used in anti-entropy repair (Cassandra), Git, blockchains and Certificate Transparency logs. For ledgers, hash chaining or Merkle trees provide tamper evidence.
+
+Q: What is a gossip protocol?
+A: Nodes periodically exchange state with a few random peers, so information spreads epidemically to the whole cluster in O(log N) rounds, tolerating failures without central coordination. Used for membership and failure detection (Cassandra, Consul's Serf). It's eventually consistent and adds background traffic.
+
+Q: What is a bloom filter, and how could you use one in payments?
+A: A compact probabilistic set: "definitely not present" or "possibly present", with a tunable false-positive rate and no false negatives. Use it as a fast pre-check before an expensive lookup (has this idempotency key or card fingerprint been seen?), always confirming positives with the authoritative store.
+
+Q: What is consistent hashing, and why does it beat `hash(key) % N`?
+A: Keys and nodes map onto a hash ring; each key belongs to the next node clockwise. Adding or removing a node moves only the keys in its range (about 1/N), whereas `% N` remaps almost every key, which empties caches or forces mass data movement. Virtual nodes even out the load.
+
+## Distributed transactions
+Q: Why is two-phase commit rarely used between microservices?
+A: The coordinator holds participants' locks between prepare and commit; if it crashes, participants block in doubt. It couples the availability of all services, needs XA support (Kafka and many stores don't have it), and adds latency. Sagas with idempotent steps and compensations, plus reconciliation, are the usual alternative.
+
+Q: What is a saga, and how do orchestration and choreography differ?
+A: A sequence of local transactions, each with a compensating action to undo it semantically if a later step fails. Orchestration: a central coordinator (a state machine persisted in a database, or Temporal) calls each step: easier to see and change. Choreography: services react to each other's events: looser coupling, but the flow is harder to follow and test. For payments, orchestration is usually clearer.
+
+Q: What makes compensations hard in financial sagas?
+A: They're new business actions, not rollbacks: a refund can fail too, some actions can't be undone (an instant payment sent, an email delivered), and intermediate states are visible to other operations. Order steps so the hardest-to-undo comes last, make compensations idempotent and retryable, and park failures for human handling.
+
+Q: What is the semantic lock (countermeasure) pattern in sagas?
+A: A step marks a record as pending (for example a hold with status PENDING) so other transactions know it's in flight and avoid acting on it, until the saga confirms or compensates. It reduces the isolation anomalies sagas introduce, because there's no global isolation across services.
+
+## Practical design questions
+Q: How do you keep data consistent between a service's database and its search index?
+A: Make the database the source of truth and feed the index asynchronously through CDC (Debezium) or the outbox, with idempotent, version-aware updates (ignore events older than the indexed version). Rebuild the index from scratch periodically or on demand, and show "as of" freshness. Never dual-write from the request path.
+
+Q: How would you implement a globally unique, roughly time-ordered id?
+A: UUIDv7 (time-ordered UUIDs, RFC 9562), or Snowflake-style ids (timestamp + node id + sequence). Time ordering keeps B-tree index inserts local (better than random UUIDv4). Don't rely on them for strict ordering across nodes, and make sure node ids are unique.
+
+Q: What are the trade-offs of active-active multi-region for a payment system?
+A: Benefits: low latency for local users and survival of a region loss. Costs: conflicting writes (mitigated by a home region per account), cross-region consensus latency if you want strong consistency, data residency rules, complex failover testing and higher cost. Many fintechs run active-passive for the ledger and active-active for stateless and read services.
+
+Q: What is the outbox pattern's relationship to change data capture?
+A: The outbox table is the event source; CDC (Debezium reading the database's write-ahead log) is one way to relay it, with low latency and no polling load. The alternative is a poller using `FOR UPDATE SKIP LOCKED`. Both are at-least-once; CDC adds infrastructure (Kafka Connect) but scales better and preserves commit order.
+
+Q: How do you detect and handle out-of-order events in consumers?
+A: Include a per-aggregate sequence number or version in each event. The consumer stores the last applied version and ignores older or duplicate events; for gaps, it buffers briefly or fetches the current state from the source. Partitioning by aggregate id keeps order within Kafka, but retries and DLT replays can still reorder.
+
+Q: Explain the difference between at-most-once, at-least-once and exactly-once delivery.
+A: At-most-once: send without retry, so messages may be lost. At-least-once: retry until acknowledged, so duplicates are possible. Exactly-once delivery is impossible over unreliable networks in general; "exactly-once" in products means exactly-once effects, achieved with at-least-once delivery plus idempotent or transactional processing.
+
+Q: What are the operational signs that a distributed system is unhealthy before customers notice?
+A: Rising tail latency, growing queue or consumer lag, increasing retry and timeout rates, circuit breakers opening, connection pool saturation, replication lag, error budget burn rate, and reconciliation breaks. Alert on symptoms (SLO burn) and use these causes for diagnosis.
+
+Q: How do you design a system that must not lose an accepted payment even if a data centre burns down?
+A: Acknowledge to the client only after the payment is durably stored in at least two failure domains (synchronous replication across zones, or a quorum write), make processing idempotent so it can resume anywhere, keep backups and point-in-time recovery tested, and run regular disaster recovery drills with measured RPO and RTO.
+
+Q: What is a write-ahead log, and why does it matter for both durability and integration?
+A: Changes are appended to a sequential log and flushed before the data pages are modified, so after a crash the database replays the log to recover committed transactions. The same log drives replication (standbys replay it) and change data capture (Debezium reads PostgreSQL's WAL via logical decoding), which is why CDC preserves commit order.
+
+Q: How do systems detect that a node has failed?
+A: Heartbeats with timeouts: if no heartbeat arrives within a deadline, the node is suspected. A fixed timeout trades fast detection against false positives (a GC pause looks like a crash). Adaptive detectors such as the phi-accrual detector (Akka, Cassandra) compute a suspicion level from the heartbeat history. Whatever the detector, a "dead" node may still be alive, so fencing is needed.
+
+Q: What are CRDTs, and could you use one for an account balance?
+A: Conflict-free replicated data types (G-counters, PN-counters, OR-sets) merge concurrent updates deterministically without coordination, so replicas always converge. A PN-counter could track a balance, but it can't enforce "balance must not go below zero" without coordination, because two replicas can each approve a debit. They fit counters, likes and presence, not money with invariants.
+
+Q: What is the difference between a lease and a lock?
+A: A lock is held until released, so a crashed holder blocks everyone (unless someone breaks it). A lease is a lock with an expiry: if the holder dies, it lapses and others can proceed, but a paused holder may keep acting after expiry. Leases favour availability; they need fencing tokens or idempotent, version-checked writes to stay safe.

@@ -1,0 +1,345 @@
+{
+  "id": "track-17",
+  "sequence": 17,
+  "title": "Final Interview Prep",
+  "shortTitle": "Final Interview Prep",
+  "slug": "final-prep",
+  "color": "#d946ef",
+  "colorMuted": "rgba(217, 70, 239, 0.15)",
+  "description": "A 12-hour final sprint for senior and staff FinTech interviews: 500 technical and architectural Q&As, 10 tested coding challenges, 100 scenario-based self-test questions and 300 high-impact interview tips.",
+  "difficulty": "senior",
+  "estimatedHours": 12.0,
+  "status": "published",
+  "priority": "critical",
+  "lessons": [
+    {
+      "id": "track-17-lesson-01",
+      "sequence": 1,
+      "title": "Start Here: The 12-Hour Final Prep Plan",
+      "slug": "start-here",
+      "path": "content/tracks/track-17-final-prep/lesson-01-start-here/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 15,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "interview",
+        "study-plan",
+        "time-boxing",
+        "triage",
+        "senior",
+        "staff"
+      ]
+    },
+    {
+      "id": "track-17-lesson-02",
+      "sequence": 2,
+      "title": "Q&A 1-50: Financial Systems and Payments",
+      "slug": "qa-financial-systems",
+      "path": "content/tracks/track-17-final-prep/lesson-02-qa-financial-systems/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 40,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "payments",
+        "ledger",
+        "reconciliation",
+        "compliance",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-03",
+      "sequence": 3,
+      "title": "Q&A 51-100: Java Language, Records and Value Objects",
+      "slug": "qa-java-language",
+      "path": "content/tracks/track-17-final-prep/lesson-03-qa-java-language/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 40,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "java",
+        "records",
+        "collections",
+        "generics",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-04",
+      "sequence": 4,
+      "title": "Q&A 101-150: Java Concurrency and Virtual Threads",
+      "slug": "qa-java-concurrency",
+      "path": "content/tracks/track-17-final-prep/lesson-04-qa-java-concurrency/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 40,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "concurrency",
+        "virtual-threads",
+        "jmm",
+        "locks",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-05",
+      "sequence": 5,
+      "title": "Q&A 151-200: JVM, GC, Memory and Performance",
+      "slug": "qa-jvm-performance",
+      "path": "content/tracks/track-17-final-prep/lesson-05-qa-jvm-performance/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 40,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "jvm",
+        "gc",
+        "memory",
+        "profiling",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-06",
+      "sequence": 6,
+      "title": "Q&A 201-250: Spring Core, Boot, Transactions and Data",
+      "slug": "qa-spring-core-data",
+      "path": "content/tracks/track-17-final-prep/lesson-06-qa-spring-core-data/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 40,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "spring",
+        "spring-boot",
+        "transactions",
+        "jpa",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-07",
+      "sequence": 7,
+      "title": "Q&A 251-300: Spring Security, Cloud, Batch, Messaging and AI",
+      "slug": "qa-spring-ecosystem",
+      "path": "content/tracks/track-17-final-prep/lesson-07-qa-spring-ecosystem/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 40,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "spring-security",
+        "spring-batch",
+        "kafka",
+        "spring-ai",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-08",
+      "sequence": 8,
+      "title": "Q&A 301-350: Distributed Systems Foundations",
+      "slug": "qa-distributed-foundations",
+      "path": "content/tracks/track-17-final-prep/lesson-08-qa-distributed-foundations/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 40,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "distributed-systems",
+        "consistency",
+        "consensus",
+        "partitioning",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-09",
+      "sequence": 9,
+      "title": "Q&A 351-400: Distributed Patterns in Practice",
+      "slug": "qa-distributed-patterns",
+      "path": "content/tracks/track-17-final-prep/lesson-09-qa-distributed-patterns/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 40,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "idempotency",
+        "outbox",
+        "saga",
+        "resilience",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-10",
+      "sequence": 10,
+      "title": "Q&A 401-450: Databases and Data Architecture",
+      "slug": "qa-databases",
+      "path": "content/tracks/track-17-final-prep/lesson-10-qa-databases/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 40,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "postgresql",
+        "indexing",
+        "mvcc",
+        "replication",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-11",
+      "sequence": 11,
+      "title": "Q&A 451-500: Modern Architecture, Operations and Leadership",
+      "slug": "qa-architecture-operations",
+      "path": "content/tracks/track-17-final-prep/lesson-11-qa-architecture-operations/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 40,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "architecture",
+        "ddd",
+        "kubernetes",
+        "sre",
+        "leadership",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-12",
+      "sequence": 12,
+      "title": "Coding Challenges C01-C05: Money, Idempotency, Transfers, Rate Limiting, Ledger",
+      "slug": "coding-challenges-1",
+      "path": "content/tracks/track-17-final-prep/lesson-12-coding-challenges-1/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "coding",
+        "java",
+        "concurrency",
+        "idempotency",
+        "money",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-13",
+      "sequence": 13,
+      "title": "Coding Challenges C06-C10: Reconciliation, Velocity, Retry, Consistent Hashing, Circuit Breaker",
+      "slug": "coding-challenges-2",
+      "path": "content/tracks/track-17-final-prep/lesson-13-coding-challenges-2/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 60,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "coding",
+        "java",
+        "distributed-systems",
+        "resilience",
+        "reconciliation",
+        "interview"
+      ]
+    },
+    {
+      "id": "track-17-lesson-14",
+      "sequence": 14,
+      "title": "Self-Test 1-50: Scenario-Based Multiple Choice",
+      "slug": "self-test-1",
+      "path": "content/tracks/track-17-final-prep/lesson-14-self-test-1/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 30,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "self-test",
+        "multiple-choice",
+        "interview",
+        "scenarios"
+      ]
+    },
+    {
+      "id": "track-17-lesson-15",
+      "sequence": 15,
+      "title": "Self-Test 51-100: Scenario-Based Multiple Choice",
+      "slug": "self-test-2",
+      "path": "content/tracks/track-17-final-prep/lesson-15-self-test-2/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 30,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "self-test",
+        "multiple-choice",
+        "interview",
+        "scenarios"
+      ]
+    },
+    {
+      "id": "track-17-lesson-16",
+      "sequence": 16,
+      "title": "Tips 1-150: Design Framing, Trade-offs, Fintech Correctness, Java/Spring Answers, Coding",
+      "slug": "tips-1",
+      "path": "content/tracks/track-17-final-prep/lesson-16-tips-1/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 30,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "tips",
+        "interview",
+        "communication",
+        "senior",
+        "staff"
+      ]
+    },
+    {
+      "id": "track-17-lesson-17",
+      "sequence": 17,
+      "title": "Tips 151-300: Live Debugging, Behavioural, Traps, Communication, Interview Day",
+      "slug": "tips-2",
+      "path": "content/tracks/track-17-final-prep/lesson-17-tips-2/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 30,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "tips",
+        "interview",
+        "communication",
+        "senior",
+        "staff"
+      ]
+    },
+    {
+      "id": "track-17-lesson-18",
+      "sequence": 18,
+      "title": "Final Review: Your Misses, Pitches, Stories and the Day-Before Checklist",
+      "slug": "final-review",
+      "path": "content/tracks/track-17-final-prep/lesson-18-final-review/index.md",
+      "difficulty": "senior",
+      "estimatedMinutes": 65,
+      "status": "published",
+      "tier": "core",
+      "tags": [
+        "final-review",
+        "interview",
+        "checklist",
+        "triage",
+        "senior",
+        "staff"
+      ]
+    }
+  ],
+  "mainPathMinutes": 720,
+  "optionalLessonCount": 0
+}

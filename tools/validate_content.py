@@ -119,7 +119,7 @@ MAX_T06_MIN = 100
 MAIN_PATH_CAP_HOURS = 260
 # New-content tracks: every lesson is main path and counted from its real estimatedMinutes,
 # and the 75-minute cap is a hard error for them (it is a warning for older lessons).
-NEW_CONTENT_TRACKS = ("track-13", "track-14", "track-15", "track-16")
+NEW_CONTENT_TRACKS = ("track-13", "track-14", "track-15", "track-16", "track-17")
 CAPSTONE_COUNT = 5
 CAPSTONE_HOURS_EACH = 12
 DELETED_TRACKS = ("track-04-async-reactive", "track-07-financial-crime")  # slugs: ids 04/07 were reused by renumbering
@@ -178,7 +178,8 @@ def _check_capstones(docs_dir, tracks_meta, errors, warnings):
             ("build_capstone_pages.py", "Capstone pages out of sync with examples/*/README.md: run tools/build_capstone_pages.py"),
             ("sync_manifest_tiers.py", "Lesson tiers in _track.json out of sync with CORE/SUPPORTING sets: run tools/sync_manifest_tiers.py"),
             ("build_study_plan.py", "Study plan invalid or out of date: run tools/build_study_plan.py"),
-            ("i18n/build_study_plan_ar.py", "Arabic study plan out of date: run tools/i18n/build_study_plan_ar.py")):
+            ("i18n/build_study_plan_ar.py", "Arabic study plan out of date: run tools/i18n/build_study_plan_ar.py"),
+            ("build_final_prep.py", "Track 17 lessons out of date with tools/final-prep/: run tools/build_final_prep.py")):
         path = os.path.join(repo_root, "tools", script)
         if os.path.exists(path):
             result = subprocess.run([sys.executable, path, "--check"], capture_output=True, text=True)

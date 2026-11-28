@@ -1,0 +1,159 @@
+## Debugging live failures
+- Lead with mitigation in any incident answer: roll back, fail over, disable the flag, shed load; investigate after customers are safe.
+- Start from symptoms and SLIs (error rate, latency, success rate), then narrow down with traces, logs and metrics.
+- Ask "what changed?" first: deploys, configuration, traffic, dependencies, data.
+- Correlate the start of the problem with deploy and config-change timelines.
+- Take three thread dumps a few seconds apart; what persists across them is the real problem.
+- Many threads waiting on a connection pool means exhaustion; find what holds connections (slow queries, remote calls inside transactions).
+- High latency with low CPU usually means waiting: locks, pools, slow dependencies, missing timeouts.
+- High CPU: profile with async-profiler for 30 seconds and read the flame graph before guessing.
+- Rising old-generation usage after each GC over hours suggests a leak; confirm with heap dumps taken apart in time.
+- OOM-killed containers with a healthy heap point to non-heap memory; check Native Memory Tracking.
+- Latency spikes that don't match GC pauses: check CPU throttling, safepoints and downstream latency.
+- For database slowness, check `pg_stat_activity` for blocking, `pg_stat_statements` for top queries, and EXPLAIN plans.
+- Growing Kafka consumer lag: check for a poison message, a slow dependency in the consumer, rebalances or a hot partition.
+- A sudden rise in duplicates: look for retries without idempotency, consumer rebalances, or an outbox relay restart.
+- Payments stuck in UNKNOWN: check the PSP's status, the inquiry job, and network errors to the provider.
+- Reconciliation breaks spiking after a release: compare event schemas, rounding and timing changes in the new version.
+- Distinguish "the dependency is down" from "the dependency is slow"; slow is usually worse because it holds resources.
+- Check whether the problem is in one instance, one zone or everywhere; that tells you whether it's local or systemic.
+- Use feature flags to turn off a suspected feature quickly instead of redeploying.
+- Communicate status on a fixed rhythm during an incident, even when there's no news.
+- Write a timeline as you go; reconstructing it later is unreliable.
+- After recovery, verify with business metrics (payments succeeding), not just green dashboards.
+- Look for the lucky factors in a post-incident review; luck is a hidden risk.
+- Every incident should produce at least one test or alert that would have caught it earlier.
+- When you can't reproduce a production bug, add targeted logging or tracing and wait for the next occurrence rather than guessing.
+- Check clocks and time zones when date-related bugs appear around midnight, month ends or DST changes.
+- For intermittent failures, look for a resource limit: file descriptors, ephemeral ports, connection pools, thread caps.
+- Never debug by restarting everything repeatedly; capture evidence (dumps, logs) before restarting.
+- Keep heap dumps and logs secure; they contain customer data.
+- In interviews, narrate your hypothesis, the evidence that confirmed or rejected it, and the next step.
+
+## Behavioural and ownership
+- Prepare six true STAR stories: an incident, a correctness bug, a disagreement, an ambiguous project, mentoring, and a mistake.
+- Keep each story to about two minutes; most of the time goes on your actions.
+- Use "I" for your actions and "we" only for team outcomes.
+- Include one concrete technical detail per action step; it's what makes a senior story credible.
+- End each story with a lasting change: a test, an alert, a runbook, a process.
+- Quantify results only with real numbers; "fewer pages after that" beats an invented percentage.
+- For "tell me about a failure", pick a real mistake, own it, and explain the guardrail that now prevents it.
+- For conflict questions, describe the other person's position fairly and how you decided on evidence.
+- Show "disagree and commit": you raised concerns, a decision was made, and you supported it fully.
+- For ambiguity questions, describe how you clarified the goal, made assumptions explicit and delivered in increments.
+- For mentoring, describe what the other person achieved, not how clever you were.
+- For ownership, show you followed a problem beyond your team's boundary until it was solved.
+- Show you communicate risk early: "I flagged it two weeks before the deadline with options."
+- Avoid blaming individuals, teams or vendors; describe systems and decisions.
+- Have a 60–90 second "tell me about yourself" that ends with why this role is the next step.
+- Prepare an answer for "why are you leaving?" that's positive and forward-looking.
+- Prepare an answer for "why this company?" tied to its product, domain or engineering challenges.
+- For staff-level roles, include a story about influencing a decision across several teams.
+- Include a story where you made something simpler or removed work; it shows judgement.
+- Include a story about improving reliability or developer experience with measurable effect.
+- Practise stories aloud and record yourself; written stories sound different when spoken.
+- If you lack a big story for a theme, use a smaller true one rather than inventing.
+- Expect follow-ups ("what would you do differently?"); prepare one for each story.
+- Show learning: what you now do differently because of the experience.
+- Mention how you kept stakeholders informed in incident and project stories.
+- For leadership without authority, mention RFCs, prototypes, data and sponsors.
+- Don't speak negatively about previous employers; interviewers project it onto themselves.
+- Show you care about customers' money and trust; in fintech it's a core value.
+- Be honest about what you don't know; curiosity scores better than bluffing.
+- Close behavioural rounds by asking a thoughtful question about the team's challenges.
+
+## Common interview traps
+- Trap: "Use Kafka, so it's exactly-once." Answer with idempotent consumers and the outbox instead.
+- Trap: marking a timed-out payment as failed. Say UNKNOWN and explain resolution.
+- Trap: a distributed lock as the guarantee against double spending. Use database constraints or fencing.
+- Trap: `double` for money. Never.
+- Trap: "we'll add a cache" for a correctness problem. Caches add staleness, not consistency.
+- Trap: 2PC across microservices as the default. Prefer sagas and reconciliation, and explain why.
+- Trap: OFFSET pagination for large datasets. Use keyset pagination.
+- Trap: `FetchType.EAGER` as the N+1 fix. Use fetch joins or projections.
+- Trap: H2 for database tests. Use Testcontainers with the real engine.
+- Trap: liveness probes that check the database. Use readiness for dependencies.
+- Trap: retries at every layer. Retry at one layer with budgets and jitter.
+- Trap: no timeouts on HTTP clients. Always set connect and read timeouts.
+- Trap: putting a remote call inside a `@Transactional` method. Split into intent, call, result.
+- Trap: assuming `@Transactional` works on self-invocation or private methods.
+- Trap: "virtual threads make everything faster." They raise concurrency; limits move downstream.
+- Trap: parallel streams in a web service. They share the common pool.
+- Trap: `volatile` for compound updates. Use atomics or locks.
+- Trap: `synchronized` on a singleton service method that calls the database. It serialises everything and doesn't protect other instances.
+- Trap: ordering events by wall-clock time across machines. Use sequence numbers or partition order.
+- Trap: increasing Kafka partitions casually on a keyed topic. It remaps keys.
+- Trap: "eventual consistency is fine" for balance checks. Not for spending decisions.
+- Trap: forgetting authorisation on object ids (BOLA). Scope queries to the owner.
+- Trap: logging full requests with card numbers or personal data.
+- Trap: storing secrets in configuration files or Git.
+- Trap: claiming exact throughput numbers for a database from memory. Say you'd measure.
+- Trap: designing for the happy path only. Volunteer the failure path.
+- Trap: jumping into code without clarifying requirements and edge cases.
+- Trap: going silent while thinking. Narrate your reasoning.
+- Trap: defending a weak answer instead of correcting it. Saying "let me revise that" is a strength.
+- Trap: running out of time before the deep dive or before testing your code. Watch the clock.
+
+## Communication and staff-level signals
+- Structure answers: headline first, then reasoning, then detail if asked.
+- Use precise words: linearizable, idempotent, at-least-once, serializable. Then explain them simply.
+- Check in with the interviewer every few minutes: "Is this the level of detail you want?"
+- When asked an open question, give a framework, then go deep on one part.
+- Admit uncertainty with a plan: "I'm not sure of the default; I'd verify, but the design doesn't depend on it."
+- Connect technical choices to business outcomes: money lost, customers affected, regulatory risk, cost.
+- Mention operability: how the system is deployed, monitored, debugged and rolled back.
+- Mention the team: who owns what, how decisions are made and documented.
+- Show you think about migration and coexistence, not only the target state.
+- Talk about risks and how you'd reduce them: prototypes, load tests, staged rollouts.
+- Be explicit about what you'd do first, second and third; prioritisation is a staff signal.
+- Show you can say no or "not yet" with reasons.
+- Refer to real experience briefly ("in a previous system we saw this exact failure") without long war stories.
+- Draw before you talk through complex flows; a sequence diagram saves minutes.
+- Summarise at natural breakpoints so the interviewer can follow and redirect.
+- Ask clarifying questions that change the design, not ones that stall it.
+- Use the interviewer's terminology once they introduce it.
+- When challenged, acknowledge the point, then reason about it; don't get defensive.
+- Show breadth with one sentence and depth with a paragraph; don't spend depth on everything.
+- Avoid buzzword stacking; each technology you name should have a reason.
+- Quantify where you can: latency budgets, volumes, error rates, costs.
+- Use analogies sparingly and only to clarify, not to replace precision.
+- In leadership questions, show how you grow other engineers and raise the team's standards.
+- In architecture discussions, mention standards and paved roads that help many teams, not just one system.
+- Talk about documentation (RFCs, ADRs, runbooks) as engineering tools, not bureaucracy.
+- Show you consider security and compliance as design inputs from the start.
+- Show cost awareness: what the design costs to run and how it scales with traffic.
+- Show you can simplify: remove a component, merge services, delete code.
+- End each round with a short recap of the key decisions and open questions.
+- Thank the interviewer and keep your energy consistent across rounds; each interviewer scores independently.
+
+## Before and during the interview day
+- Re-read the job description and map each requirement to a story or project you can discuss.
+- Research the company's products, payment flows and recent engineering blog posts.
+- Prepare two or three questions per interviewer type (engineer, manager, staff, product).
+- Test your video setup, microphone and screen sharing the day before.
+- Keep a blank paper or digital whiteboard ready for design rounds.
+- Have water, and plan short breaks between rounds if the schedule allows.
+- Sleep well the night before; a rested brain beats one more hour of cramming.
+- Do a 20-minute warm-up on the day: one design pitch aloud, one coding pattern, one STAR story.
+- Review your 30-second answers for the topics you fear most.
+- Arrive (or log in) five minutes early and calm your breathing.
+- Read each question twice before answering; misreading costs more than a pause.
+- If you blank, restate the problem and start with what you know.
+- Write down the interviewer's constraints as they give them.
+- Manage time actively: note the start time and plan checkpoints.
+- If you realise a mistake, correct it openly; it shows rigour.
+- Don't compare rounds or dwell on a weak one; each round is scored independently.
+- Keep answers focused; long monologues lose interviewers.
+- Ask for clarification instead of guessing what the interviewer meant.
+- Show enthusiasm for the domain; fintech interviewers value people who care about money correctness.
+- Note down topics you struggled with after each round for later practice.
+- Send a short thank-you note if it's customary for the company.
+- Prepare your salary expectations and research the market range before the recruiter call.
+- Ask the recruiter about the loop format and which competencies each round assesses.
+- Prepare your own laptop environment for coding rounds: JDK, IDE settings, a scratch project.
+- Know how to run a quick JUnit test from the command line in case the environment is minimal.
+- Keep a one-page cheat sheet of your stories and key numbers, but don't read from it during rounds.
+- Breathe and slow down when nervous; speaking slowly sounds confident.
+- If a question is outside your experience, connect it to the closest thing you have done.
+- Finish strong: summarise, ask your question, thank them.
+- Afterwards, write a short reflection; every interview is practice for the next one.

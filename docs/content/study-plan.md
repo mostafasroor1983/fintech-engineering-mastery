@@ -14,11 +14,11 @@ below that on purpose: the spare time is your slack for missed sessions.
 
 | | Hours |
 |---|---|
-| Lessons (main path) | 167.8 |
+| Lessons (main path) | 179.8 |
 | Capstones (5 × 12 h) | 60.0 |
-| Diagnostic, checkpoints, mocks, review, portfolio, applications | 37.1 |
-| **Scheduled total** | **264.9** of 300 |
-| Unscheduled slack | 35.1 |
+| Diagnostic, checkpoints, mocks, review, portfolio, applications | 24.8 |
+| **Scheduled total** | **264.6** of 300 |
+| Unscheduled slack | 35.4 |
 
 **How to use it:** do the lessons in order inside a week. Each lesson's minutes already include reading,
 running the code, the exercises and answering the interview questions aloud. Track progress in the site.
@@ -57,10 +57,10 @@ messaging, capstone and system-design work all build on it.
 | 24 | System design I | 545 (9.1 h) |
 | 25 | System design II + architecture | 535 (8.9 h) |
 | 26 | Architecture + platform | 595 (9.9 h) |
-| 27 | Mock interviews I + portfolio | 500 (8.3 h) |
-| 28 | Mock interviews II + applications | 455 (7.6 h) |
-| 29 | Mock interviews III | 525 (8.8 h) |
-| 30 | Final mock + first-90-days prep | 425 (7.1 h) |
+| 27 | Mock interviews I + portfolio + final prep (Q&A 1-300) | 575 (9.6 h) |
+| 28 | Mock interviews II + applications + final prep (Q&A 301-500, coding) | 535 (8.9 h) |
+| 29 | Mock interviews III + self-test and tips | 465 (7.8 h) |
+| 30 | Final mock + final review + first-90-days prep | 310 (5.2 h) |
 
 ### Week 1: Diagnostic + databases (520 min, 8.7 h)
 
@@ -358,45 +358,59 @@ messaging, capstone and system-design work all build on it.
 **Exercise:** Write one ADR for a decision in one of your capstones.  
 **Deliverable:** An ADR committed next to the capstone.
 
-### Week 27: Mock interviews I + portfolio (500 min, 8.3 h)
+### Week 27: Mock interviews I + portfolio + final prep (Q&A 1-300) (575 min, 9.6 h)
 
 - [Interview Playbook L05: Ten Timed Mock Interviews with Rubrics](interview/05-mock-interviews/index.md) · 35 min · core
 - Mock interviews 1-3 (45 min each, recorded) · 135 min
-- Review weak areas found in the mocks (re-read linked lessons) · 180 min
 - Portfolio polish: README numbers from your machine, repo description, pinned repos · 150 min
+- [Final Interview Prep L01: Start Here: The 12-Hour Final Prep Plan](tracks/track-17-final-prep/lesson-01-start-here/index.md) · 15 min · core
+- [Final Interview Prep L02: Q&A 1-50: Financial Systems and Payments](tracks/track-17-final-prep/lesson-02-qa-financial-systems/index.md) · 40 min · core
+- [Final Interview Prep L03: Q&A 51-100: Java Language, Records and Value Objects](tracks/track-17-final-prep/lesson-03-qa-java-language/index.md) · 40 min · core
+- [Final Interview Prep L04: Q&A 101-150: Java Concurrency and Virtual Threads](tracks/track-17-final-prep/lesson-04-qa-java-concurrency/index.md) · 40 min · core
+- [Final Interview Prep L05: Q&A 151-200: JVM, GC, Memory and Performance](tracks/track-17-final-prep/lesson-05-qa-jvm-performance/index.md) · 40 min · core
+- [Final Interview Prep L06: Q&A 201-250: Spring Core, Boot, Transactions and Data](tracks/track-17-final-prep/lesson-06-qa-spring-core-data/index.md) · 40 min · core
+- [Final Interview Prep L07: Q&A 251-300: Spring Security, Cloud, Batch, Messaging and AI](tracks/track-17-final-prep/lesson-07-qa-spring-ecosystem/index.md) · 40 min · core
 
-**Exercise:** Mocks 1-3 (design). Score from the recording; redo below-3 dimensions.  
-**Deliverable:** Three scored rubrics; capstone READMEs polished; GitHub profile pinned to the 5 capstones.
+**Exercise:** Mocks 1-3 (design). Score from the recording; redo below-3 dimensions. Start the 12-hour final prep: Q&A 1-300, answers hidden.  
+**Deliverable:** Three scored rubrics; capstone READMEs polished; GitHub profile pinned to the 5 capstones; Q&A banks 1-6 marked.
 
-### Week 28: Mock interviews II + applications (455 min, 7.6 h)
+### Week 28: Mock interviews II + applications + final prep (Q&A 301-500, coding) (535 min, 8.9 h)
 
 - Mock interviews 4-6 · 135 min
-- Review weak areas · 200 min
 - Applications: tailor CV bullets to each job post (link the capstone that proves each skill) · 120 min
+- [Final Interview Prep L08: Q&A 301-350: Distributed Systems Foundations](tracks/track-17-final-prep/lesson-08-qa-distributed-foundations/index.md) · 40 min · core
+- [Final Interview Prep L09: Q&A 351-400: Distributed Patterns in Practice](tracks/track-17-final-prep/lesson-09-qa-distributed-patterns/index.md) · 40 min · core
+- [Final Interview Prep L10: Q&A 401-450: Databases and Data Architecture](tracks/track-17-final-prep/lesson-10-qa-databases/index.md) · 40 min · core
+- [Final Interview Prep L11: Q&A 451-500: Modern Architecture, Operations and Leadership](tracks/track-17-final-prep/lesson-11-qa-architecture-operations/index.md) · 40 min · core
+- [Final Interview Prep L12: Coding Challenges C01-C05: Money, Idempotency, Transfers, Rate Limiting, Ledger](tracks/track-17-final-prep/lesson-12-coding-challenges-1/index.md) · 60 min · core
+- [Final Interview Prep L13: Coding Challenges C06-C10: Reconciliation, Velocity, Retry, Consistent Hashing, Circuit Breaker](tracks/track-17-final-prep/lesson-13-coding-challenges-2/index.md) · 60 min · core
 
-**Exercise:** Mocks 4-6 (design + 2 coding).  
-**Deliverable:** Three scored rubrics; a tailored CV; first applications sent.
+**Exercise:** Mocks 4-6 (design + 2 coding). Q&A 301-500 and coding challenges C01-C10 (solve two from scratch).  
+**Deliverable:** Three scored rubrics; a tailored CV; first applications sent; Q&A banks 7-10 marked; two challenges solved.
 
-### Week 29: Mock interviews III (525 min, 8.8 h)
+### Week 29: Mock interviews III + self-test and tips (465 min, 7.8 h)
 
 - Mock interviews 7-9 · 135 min
 - Redo the two weakest mocks (with a variation) · 90 min
-- Review weak areas · 180 min
 - Applications and recruiter calls · 120 min
+- [Final Interview Prep L14: Self-Test 1-50: Scenario-Based Multiple Choice](tracks/track-17-final-prep/lesson-14-self-test-1/index.md) · 30 min · core
+- [Final Interview Prep L15: Self-Test 51-100: Scenario-Based Multiple Choice](tracks/track-17-final-prep/lesson-15-self-test-2/index.md) · 30 min · core
+- [Final Interview Prep L16: Tips 1-150: Design Framing, Trade-offs, Fintech Correctness, Java/Spring Answers, Coding](tracks/track-17-final-prep/lesson-16-tips-1/index.md) · 30 min · core
+- [Final Interview Prep L17: Tips 151-300: Live Debugging, Behavioural, Traps, Communication, Interview Day](tracks/track-17-final-prep/lesson-17-tips-2/index.md) · 30 min · core
 
-**Exercise:** Mocks 7-9 (two deep dives + behavioural); redo the two weakest mocks.  
-**Deliverable:** All mocks >= 3 in every dimension, or a redo scheduled.
+**Exercise:** Mocks 7-9 (two deep dives + behavioural); redo the two weakest mocks. Self-test 1-100 closed book; tips 1-300.  
+**Deliverable:** All mocks >= 3 in every dimension, or a redo scheduled; self-test score >= 85%; one-page tip sheet.
 
-### Week 30: Final mock + first-90-days prep (425 min, 7.1 h)
+### Week 30: Final mock + final review + first-90-days prep (310 min, 5.2 h)
 
 - Mock interview 10: capstone presentation · 30 min
 - [First 90 Days L01: Your First 90 Days and Reading an Unfamiliar Spring Codebase](new-job/01-first-90-days/index.md) · 50 min · supporting
 - [First 90 Days L02: Production Safety: First PR, On-Call Readiness and Safe Migrations](new-job/02-production-safety/index.md) · 45 min · supporting
-- Final review of your weakest five competencies · 180 min
+- [Final Interview Prep L18: Final Review: Your Misses, Pitches, Stories and the Day-Before Checklist](tracks/track-17-final-prep/lesson-18-final-review/index.md) · 65 min · core
 - Applications and interviews · 120 min
 
-**Exercise:** Mock 10 (present a capstone); read the first-90-days lessons.  
-**Deliverable:** Your 10-minute capstone talk, rehearsed; a 30/60/90 draft for your next job.
+**Exercise:** Mock 10 (present a capstone); the final review block (Track 17 L18); read the first-90-days lessons.  
+**Deliverable:** Your 10-minute capstone talk, rehearsed; the day-before checklist ticked; a 30/60/90 draft for your next job.
 
 ## Falling-behind plan
 

@@ -1,0 +1,157 @@
+## Memory model
+Q: What is the Java Memory Model's happens-before relation, in one paragraph?
+A: If action A happens-before action B, B is guaranteed to see A's effects. It's established by: program order within a thread, unlocking a monitor before a later lock of the same monitor, a volatile write before a later read of that variable, `Thread.start` before the started thread's actions, a thread's actions before another thread's successful `join`, and hand-offs through concurrent collections and futures. Without happens-before, other threads may see stale or reordered values.
+
+Q: What does `volatile` guarantee, and what doesn't it?
+A: Visibility and ordering for that variable: a write is visible to subsequent reads in other threads, and it prevents reordering across the access. It doesn't make compound actions atomic: `count++` on a volatile is read-modify-write and still races. Use `AtomicLong`, `LongAdder` or a lock for compound updates; volatile fits flags and safely published references.
+
+Q: What is safe publication and how can an object escape before it's fully constructed?
+A: Safe publication makes a fully constructed object visible to other threads: via a final field, a volatile field, a lock, or a concurrent collection. Escape happens when the constructor leaks `this` (registers a listener, starts a thread) so another thread sees a half-initialised object. Final fields of a properly constructed object are visible without synchronisation.
+
+Q: Why is double-checked locking broken without `volatile`?
+A: Without volatile, the write of the reference can be reordered before the object's constructor writes complete, so a second thread may see a non-null reference to a partially constructed object. Declaring the field `volatile` fixes it; simpler alternatives are the holder-class idiom (lazy, thread-safe through class initialisation) or an enum singleton.
+
+## Locks and atomics
+Q: `synchronized` vs `ReentrantLock`: when do you pick each?
+A: Both give mutual exclusion and visibility and are reentrant. `ReentrantLock` adds `tryLock` with a timeout (deadlock avoidance), interruptible waiting, optional fairness, and multiple `Condition`s. `synchronized` is simpler and can't be forgotten in a `finally`. On JDK 21–23, blocking inside `synchronized` pins virtual threads; JDK 24 (JEP 491) removed that pinning.
+
+Q: What is a deadlock, and how do you prevent it in money transfers?
+A: Threads each hold a lock the other needs: transfer A→B locks A then waits for B while B→A locks B then waits for A. Prevent it with a global lock order (always lock the lower account id first), `tryLock` with timeout and retry, or avoiding nested locks entirely (a database conditional update per row inside one transaction, with consistent ordering).
+
+Q: How do you find a deadlock in production?
+A: Take a thread dump (`jcmd <pid> Thread.print` or `jstack`): the JVM reports "Found one Java-level deadlock" with the cycle of threads and monitors/locks. For database deadlocks, PostgreSQL logs them and aborts one transaction with SQLSTATE 40P01; check `pg_locks` and the logs. Then fix the lock ordering and add a concurrency test that reproduces it.
+
+Q: Explain compare-and-swap and the ABA problem.
+A: CAS atomically sets a value only if it still equals an expected value; atomics use it for lock-free updates in a retry loop. ABA: a value changes from A to B and back to A, so CAS succeeds even though the state changed in between (dangerous in lock-free stacks with reused nodes). Fix with a version stamp (`AtomicStampedReference`) or by not reusing nodes; for counters ABA doesn't matter.
+
+Q: `AtomicLong` vs `LongAdder`: which for a high-contention counter?
+A: `LongAdder` spreads increments across cells and sums on read, so it scales far better under heavy contention (metrics, request counters). `AtomicLong` is better when you need the exact current value often or compare-and-set semantics (sequence numbers). Never use either for money balances that need business invariants: those belong in a transaction.
+
+Q: What is a livelock and how is it different from a deadlock and starvation?
+A: Livelock: threads keep reacting to each other and retrying (for example, both back off and retry in lockstep) without progress, while not blocked. Deadlock: threads block forever. Starvation: a thread never gets a resource because others keep winning (unfair locks, priority). Randomised backoff (jitter) breaks livelocks.
+
+Q: What does a `ReadWriteLock` buy you, and when is it slower than a plain lock?
+A: Many concurrent readers or one writer. It helps when reads are long and frequent and writes rare. With short critical sections or many writers, its extra bookkeeping makes it slower than `ReentrantLock`, and writers can starve. `StampedLock` offers optimistic reads for read-mostly data, but it's not reentrant.
+
+## Executors and pools
+Q: How do you size a thread pool?
+A: CPU-bound: about the number of cores. I/O-bound: cores × (1 + wait time / compute time), then measure under load. But the real constraint is usually downstream: a pool of 200 threads in front of a 20-connection database pool just queues on the database. With virtual threads, size the downstream limits (connection pool, semaphores, rate limits) rather than the thread count.
+
+Q: Why should you never use `Executors.newFixedThreadPool` or `newCachedThreadPool` blindly in production?
+A: `newFixedThreadPool` uses an unbounded queue: under overload, tasks pile up in memory and latency grows without limit until OOM. `newCachedThreadPool` creates unbounded threads: a burst creates thousands. Build a `ThreadPoolExecutor` with a bounded queue and an explicit rejection policy (fail fast or caller-runs for backpressure), and name the threads.
+
+Q: What rejection policies does `ThreadPoolExecutor` offer and which fits a payment API?
+A: Abort (throw `RejectedExecutionException`), CallerRuns (the submitting thread runs the task, slowing the producer: natural backpressure), Discard and DiscardOldest (silently drop work: dangerous for payments). For an API, abort and return 503/429 with `Retry-After`, or caller-runs for internal pipelines. Never silently drop financial work.
+
+Q: How do you shut down an executor gracefully?
+A: `shutdown()` to stop accepting tasks, `awaitTermination(timeout)` for in-flight work, then `shutdownNow()` to interrupt stragglers, handling the returned unstarted tasks. Tasks must respond to interruption. In Spring, let the container manage the executor's lifecycle so it shuts down with the context.
+
+## CompletableFuture
+Q: Where do `CompletableFuture` callbacks run?
+A: Non-async stages (`thenApply`) run on the thread that completes the previous stage, or on the caller's thread if it is already complete. `*Async` variants run on the executor you pass, or the common ForkJoinPool if you don't. Blocking I/O on the common pool starves everything that shares it, so always pass a dedicated executor for I/O.
+
+Q: How do you fan out three calls in parallel and fail fast if one fails?
+A: Classic: `allOf` waits for all and doesn't cancel the others on failure, so you add `orTimeout` per call and handle exceptions in each stage. Better on Java 21+: structured concurrency (`StructuredTaskScope`, a preview API on JDK 21–24 with a redesigned API on 25): subtasks run in a scope that cancels siblings on the first failure and can't outlive the scope.
+
+Q: What's the difference between `thenApply`, `thenCompose` and `thenCombine`?
+A: `thenApply` maps the result synchronously. `thenCompose` chains another async call that returns a future (flatMap), avoiding `CompletableFuture<CompletableFuture<T>>`. `thenCombine` waits for two independent futures and combines their results.
+
+Q: How do you add a timeout to a `CompletableFuture`, and does it cancel the underlying work?
+A: `orTimeout(d, unit)` completes it exceptionally with `TimeoutException`; `completeOnTimeout(value, d, unit)` supplies a fallback. Neither stops the underlying task: the HTTP call keeps running unless the client itself has a timeout. Set timeouts on the client (connect/read) as well, and treat the future timeout as a deadline for the caller.
+
+Q: Why is `exceptionally` placement important in a `CompletableFuture` chain?
+A: It only handles failures from stages before it. Placed early, later stages' failures escape; placed late, it may mask which stage failed. Use `handle`/`whenComplete` deliberately, unwrap `CompletionException` to get the real cause, and log with context once.
+
+## Virtual threads
+Q: What are virtual threads, and what problem do they solve?
+A: Lightweight threads (final in Java 21) scheduled by the JVM onto a few carrier (platform) threads. When a virtual thread blocks on I/O, it unmounts and frees the carrier, so you can run hundreds of thousands of blocking tasks with simple thread-per-request code. They raise concurrency for I/O-bound work; they don't make CPU-bound work faster.
+
+Q: What is pinning, and is it still a problem?
+A: A virtual thread is pinned to its carrier when it can't unmount while blocked: on JDK 21–23, blocking inside `synchronized` or during a native call. Pinned carriers reduce throughput and can deadlock if all carriers are pinned. JDK 24 (JEP 491) lets virtual threads unmount inside `synchronized`; native frames still pin. Detect it with JFR's `jdk.VirtualThreadPinned` event.
+
+Q: What goes wrong when you switch a Spring service to virtual threads without other changes?
+A: Concurrency jumps, so the bottleneck moves downstream: the HikariCP pool (say 10 connections) now has thousands of waiters, requests time out on `getConnection`, and downstream services get flooded. You need explicit limits (connection pool sizing, semaphores, rate limiters), timeouts, and a load test before and after.
+
+Q: Should you pool virtual threads?
+A: No. They're cheap to create; create one per task (`Executors.newVirtualThreadPerTaskExecutor()`). Pooling them defeats the model and reintroduces queueing. To limit concurrency against a resource, use a `Semaphore` around that resource, not a pool of threads.
+
+Q: What happens to `ThreadLocal` caches with virtual threads?
+A: Each virtual thread has its own `ThreadLocal` values, and there are many short-lived threads, so per-thread caches (formatters, buffers) are created per task and lose their benefit while increasing memory use. Prefer immutable shared objects, explicit parameters or `ScopedValue` for context.
+
+Q: How do you enable virtual threads in Spring Boot, and what still uses platform threads?
+A: `spring.threads.virtual.enabled=true` makes Tomcat/Jetty request handling, `@Async`, scheduled tasks and several Spring integrations use virtual threads. CPU-heavy work, code with native frames that pin, and libraries with large `ThreadLocal` caches still deserve care. Verify with thread dumps (`jcmd <pid> Thread.dump_to_file -format=json`).
+
+Q: What is structured concurrency, and why does it matter for request handling?
+A: Subtasks are bound to a scope: they start inside it, the scope waits for them, failures cancel siblings, and nothing outlives the scope. It removes thread leaks and "orphan" work after a request has already failed, and makes thread dumps show the task hierarchy. In Java it's `StructuredTaskScope` (preview through JDK 25, API redesigned in 25).
+
+## Concurrent data structures
+Q: Why is `ConcurrentHashMap.get` followed by `put` a race, and how do you fix it?
+A: Another thread can insert between the check and the put (check-then-act), so two threads both "create" an entry. Use the atomic `putIfAbsent`, `computeIfAbsent`, `compute` or `merge`. Keep the function passed to `compute` short and non-blocking: it runs while holding the bin's lock.
+
+Q: What's the risk of doing I/O inside `computeIfAbsent`?
+A: The mapping function runs under the bin lock, so other threads touching the same bin block for the duration of the I/O, and recursive updates to the same map from inside the function can deadlock or throw `IllegalStateException`. Store a `CompletableFuture` as the value instead (memoisation): `computeIfAbsent(key, k -> supplyAsync(() -> load(k), executor))`.
+
+Q: Compare `ArrayBlockingQueue`, `LinkedBlockingQueue` and `SynchronousQueue`.
+A: `ArrayBlockingQueue` is bounded with one lock: good, predictable backpressure. `LinkedBlockingQueue` is optionally bounded (unbounded by default: a memory risk) with separate put/take locks for throughput. `SynchronousQueue` has no capacity: each put waits for a take, used by cached pools for direct hand-off.
+
+Q: What is `CopyOnWriteArrayList` good for, and when is it terrible?
+A: Read-mostly lists that are iterated often and modified rarely (listeners, configuration): iteration needs no locking and never throws `ConcurrentModificationException`. Every write copies the whole array, so it's terrible for frequently modified or large lists.
+
+## Coordination primitives
+Q: `CountDownLatch` vs `CyclicBarrier` vs `Phaser` vs `Semaphore`?
+A: Latch: one-shot wait for N events (start gates in tests). Barrier: N threads wait for each other, reusable per round. Phaser: a flexible, dynamic barrier with registration. Semaphore: limits concurrent access to N permits (bulkheads, connection limits). Each has a timeout variant; always use it in production code.
+
+Q: How would you implement a bulkhead with standard Java?
+A: A `Semaphore` with N permits around calls to a dependency: `tryAcquire(timeout)` to fail fast when full, release in `finally`. It caps concurrent calls so a slow dependency can't use up all threads or connections. Resilience4j's `Bulkhead`, or Spring Framework 7's `@ConcurrencyLimit`, give the same with metrics.
+
+Q: How do you write a test that proves a race condition exists and is fixed?
+A: Many threads, a shared resource, a `CountDownLatch` start gate so they really run together, an assertion on an invariant (total money constant, exactly one success), repeated many times (`@RepeatedTest`). It must fail reliably before the fix. For low-level memory-model questions use jcstress, which explores reorderings.
+
+Q: What is false sharing, and when does it matter?
+A: Two threads write to different variables that sit on the same CPU cache line (64 bytes), so the line bounces between cores and performance collapses even without logical contention. It matters in hot counters and low-latency queues; padding or `@Contended` (with `-XX:-RestrictContended`) separates them. `LongAdder` already handles it.
+
+## Production concurrency
+Q: Your service hangs under load and CPU is low. What do you check?
+A: Take three thread dumps a few seconds apart. Many threads BLOCKED on the same lock or WAITING in `HikariPool.getConnection` means lock contention or pool exhaustion; threads in socket reads point to a slow dependency without timeouts. Check connection pool metrics, then fix with timeouts, pool sizing and bulkheads.
+
+Q: Why are timeouts a concurrency concern, not only a resilience one?
+A: Without timeouts, every blocked call holds a thread, a connection and memory indefinitely; a slow dependency then exhausts the pool and takes down unrelated endpoints. Timeouts bound the resources each request can hold. Set connect, read and overall timeouts on every client, and propagate deadlines downstream.
+
+Q: How do you make a scheduled job safe when several instances of the service run?
+A: Ensure exactly one instance processes each unit of work: claim rows with `SELECT … FOR UPDATE SKIP LOCKED` (each instance takes different rows), or a lease/lock table with expiry and fencing tokens, or ShedLock for "run once" jobs. Make the job idempotent anyway, because leases can expire mid-run.
+
+Q: What is the difference between concurrency and parallelism?
+A: Concurrency is structuring a program as independently progressing tasks (they may interleave on one core); parallelism is executing tasks simultaneously on multiple cores. Virtual threads improve concurrency for I/O-bound work; parallel streams or fork/join target parallelism for CPU-bound work.
+
+Q: Why does `Thread.stop()` not exist anymore, and how do you cancel work?
+A: Stopping a thread at an arbitrary point could leave objects in inconsistent states (half-updated balances), so it was deprecated and removed. Cancellation is cooperative: interrupt the thread or cancel the future, and the task checks the interrupt flag or reacts to `InterruptedException` at safe points.
+
+Q: How can a `parallelStream` cause a production incident?
+A: It uses the JVM-wide common ForkJoinPool. A parallel stream doing blocking I/O (calling a service per element) occupies its threads, so every other parallel stream and default `CompletableFuture` in the JVM stalls. Symptoms: unrelated endpoints slow down together. Fix: no blocking in parallel streams; use a dedicated executor.
+
+Q: What is a race condition in a check-then-act on the database, and how do you fix it?
+A: Two requests both read "balance 100", both check "100 ≥ 80", both debit: balance -60. Fix in the database: a conditional atomic update (`UPDATE … SET balance = balance - :x WHERE id = :id AND balance >= :x`, 0 rows means insufficient funds), or `SELECT … FOR UPDATE`, or optimistic locking with `@Version` and retry. Application-level locks don't protect across instances.
+
+Q: Optimistic or pessimistic locking for a wallet balance?
+A: Pessimistic (`SELECT … FOR UPDATE`, ordered by id) for hot or frequently contended balances: retries under contention become storms. Optimistic (`@Version`) for rarely contended rows, with bounded retries. Either way keep a database constraint (`balance >= 0`) as a backstop.
+
+Q: How do virtual threads change the way you handle backpressure?
+A: You can't rely on a small thread pool to limit work any more, since threads are effectively unlimited. Limits must be explicit: semaphores per dependency, bounded queues, rate limiters, connection pool sizes and admission control at the edge (429/503). Otherwise you push unlimited load downstream.
+
+Q: What JFR events and tools help diagnose concurrency problems?
+A: JFR events: `jdk.JavaMonitorEnter` (lock contention), `jdk.ThreadPark`, `jdk.VirtualThreadPinned`, `jdk.ThreadSleep`; JDK Mission Control shows lock instances and stacks. async-profiler's lock and wall-clock modes show where threads wait. Thread dumps for snapshots; the JSON format includes virtual threads.
+
+Q: How do you design an in-memory cache that's safe under concurrency and doesn't stampede the database?
+A: Use a proven cache (Caffeine) with size and TTL bounds; for loads, store futures so concurrent misses for the same key share one load (no stampede), refresh asynchronously ahead of expiry, and add jitter to TTLs so many keys don't expire together. Never cache balances used for spending decisions.
+
+Q: What's wrong with `synchronized` on a Spring singleton service method that does a database call?
+A: It serialises all requests through one monitor on one instance: throughput collapses to one call at a time and latency stacks up. And it doesn't protect anything across multiple instances of the service. Use database-level concurrency control (row locks, conditional updates, constraints) instead.
+
+Q: How do you pass request context (correlation id, tenant) across asynchronous boundaries?
+A: MDC and `ThreadLocal` don't cross thread switches by default. Use Micrometer context propagation (`ContextSnapshot`, Spring's `TaskDecorator`), OpenTelemetry context with wrapped executors, or `ScopedValue` with structured concurrency. Test that logs from async work still carry the correlation id.
+
+Q: What is the producer-consumer pattern, and how do you stop it from losing work on shutdown?
+A: Producers put work on a bounded `BlockingQueue`, consumers take it, and the bound gives backpressure. On shutdown: stop producers, let consumers drain the queue (or persist pending items), then stop consumers with a poison pill or interruption. For financial work, the queue should be durable (a database table or Kafka topic), because an in-memory queue loses everything on a crash.
+
+Q: How does the `@Async` annotation in Spring interact with transactions and exceptions?
+A: The method runs on another thread, so it doesn't join the caller's transaction (transactions are thread-bound) and the caller can't catch its exceptions unless it returns a `CompletableFuture`. Self-invocation bypasses the proxy, so it runs synchronously. Configure a bounded `TaskExecutor` and an `AsyncUncaughtExceptionHandler` for `void` methods.

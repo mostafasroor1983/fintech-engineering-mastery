@@ -1,8 +1,8 @@
 {
   "version": "1.0",
-  "lastUpdated": "2026-11-13",
-  "totalTracks": 16,
-  "totalLessons": 272,
+  "lastUpdated": "2026-11-28",
+  "totalTracks": 17,
+  "totalLessons": 290,
   "tracks": [
     {
       "id": "track-01",
@@ -99,6 +99,12 @@
       "slug": "first-90-days",
       "lessons": [],
       "lessonCount": 2
+    },
+    {
+      "id": "track-17",
+      "slug": "final-prep",
+      "lessons": [],
+      "lessonCount": 18
     }
   ],
   "decisionLabScenarios": [

@@ -1,0 +1,156 @@
+## Spring Security
+Q: How does the Spring Security filter chain process a request?
+A: A `DelegatingFilterProxy` hands the request to `FilterChainProxy`, which picks the first `SecurityFilterChain` whose matcher fits and runs its filters in order: security context loading, CSRF, authentication (bearer token, form, mTLS), exception translation and authorisation. The result is an `Authentication` in the `SecurityContext`, used by URL and method authorisation.
+
+Q: How do you configure a Spring Boot service as an OAuth2 resource server for JWTs?
+A: Add the resource-server starter, set the issuer (`spring.security.oauth2.resourceserver.jwt.issuer-uri`) so keys come from the JWKS endpoint, and define a `SecurityFilterChain` with `oauth2ResourceServer(o -> o.jwt(...))` and authorisation rules. Validate issuer, audience, expiry and signature algorithm; map scopes or roles with a `JwtAuthenticationConverter`.
+
+Q: Scopes vs roles in authorisation: what's the difference and how do you use both?
+A: Scopes describe what a client application is allowed to do on behalf of a user (`payments:write`); roles describe what the user is allowed to do. A request needs both: the token's scope permits the operation and the user's role or ownership permits it on this resource. Spring maps scopes to `SCOPE_` authorities by default.
+
+Q: What are the most common JWT mistakes?
+A: Accepting `alg: none` or confusing algorithms (HS256 with a public key), not validating audience (a token for another API is accepted), long lifetimes without revocation, sensitive data in the payload (it's only encoded, not encrypted), and storing tokens in browser local storage. Use short-lived access tokens, refresh token rotation, and library defaults that pin algorithms.
+
+Q: How do you secure service-to-service calls inside a cluster?
+A: mTLS for transport identity (a service mesh or SPIFFE/SPIRE identities), plus OAuth2 client-credentials tokens (or token exchange) for authorisation at the application layer: a zero-trust model where network location grants nothing. Each service checks the caller's identity and the scopes it holds.
+
+Q: How does method security work, and what's the self-invocation trap?
+A: `@EnableMethodSecurity` with `@PreAuthorize("hasAuthority('SCOPE_payments:write') and @ownership.check(#id, authentication)")` checks before the method runs, using a proxy. A call from another method in the same class skips the proxy and therefore the check. Prefer authorisation at the web layer plus ownership checks in queries.
+
+Q: When do you need CSRF protection, and when can you disable it?
+A: For browser sessions authenticated by cookies, because a malicious site can make the browser send authenticated requests. For stateless APIs authenticated by bearer tokens in headers (not cookies), CSRF doesn't apply and is commonly disabled. If a SPA uses cookie sessions, keep CSRF with the cookie-to-header token pattern.
+
+Q: What changed in Spring Security 7 that you would mention in an interview?
+A: Lambda DSL only (the deprecated `and()` chaining is gone), the OAuth2 Authorization Server is now part of Spring Security itself, built-in multi-factor authentication support, and removals of long-deprecated APIs. Configuration is `SecurityFilterChain` beans; `WebSecurityConfigurerAdapter` has been gone since 6.0.
+
+## Spring Cloud and resilience
+Q: What does Spring Cloud provide, and which parts are still relevant on Kubernetes?
+A: Config, service discovery, load balancing, gateway, circuit breaker abstraction, streams, Vault and Kubernetes integrations. On Kubernetes, discovery and load balancing come from Services and the mesh, and config often from ConfigMaps and Secrets, so Spring Cloud Gateway, Spring Cloud Vault/Kubernetes config, Circuit Breaker and Stream are the parts teams still commonly use.
+
+Q: How do you configure a circuit breaker for a PSP call with Resilience4j?
+A: Sliding window (count- or time-based), failure-rate and slow-call-rate thresholds, minimum number of calls, wait duration in the open state, and permitted calls in half-open. Combine with a time limiter (or client read timeout), a bulkhead, and retries only for idempotent calls. Define the fallback: for a payment, "unknown, check later", never "assume failed".
+
+Q: What order should retry, circuit breaker, bulkhead and timeout be applied in?
+A: Typically: bulkhead (limit concurrency) → time limiter (bound each attempt) → circuit breaker (fail fast when the dependency is unhealthy) → retry around the whole thing, or retry inside the breaker so retries count as failures, depending on whether you want retries to trip the breaker. State your choice. Resilience4j's decorator order is Retry(CircuitBreaker(RateLimiter(TimeLimiter(Bulkhead(call))))).
+
+Q: What does an API gateway do in a fintech architecture, and what shouldn't it do?
+A: Edge concerns: TLS termination, authentication and token validation, rate limiting per client, request size limits, routing, versioning and observability. It shouldn't hold business logic (payment rules, ledger decisions) or become a shared bottleneck that every team must change for every feature.
+
+Q: How does Spring Cloud Config compare with Kubernetes ConfigMaps for configuration?
+A: Config Server centralises versioned configuration (Git-backed) with refresh, encryption and environment profiles across platforms. ConfigMaps are native, simple and tied to deployments, with secrets separate. On Kubernetes many teams use ConfigMaps/Secrets plus a secret manager and redeploy (or restart) on change, which is simpler and auditable through GitOps.
+
+## Spring Batch
+Q: Explain Spring Batch's core concepts.
+A: A `Job` has `Step`s; a chunk-oriented step reads items (`ItemReader`), processes them (`ItemProcessor`) and writes chunks (`ItemWriter`) in a transaction per chunk. The `JobRepository` stores job and step executions and execution context in database tables, which enables restart from the last committed chunk. Job parameters identify a job instance.
+
+Q: How does restartability work in Spring Batch, and what must your reader support?
+A: After each chunk commit, the step saves its position (for example the read count or the last key) in the execution context. On restart of the same job instance, the reader resumes from that position. Readers must be restartable: database readers should page by key or save state; file readers record line counts. Writers must be idempotent in case a chunk is partially reprocessed.
+
+Q: How do you make a Spring Batch job that posts ledger entries safe to rerun?
+A: Each item has a natural idempotency key (source record id); the writer inserts with a unique constraint and `ON CONFLICT DO NOTHING`, or checks a processed table in the same transaction. Use job parameters that uniquely identify the business date, so the same date isn't run twice as different instances, and reconcile totals at the end of the job.
+
+Q: How do you scale a Spring Batch job?
+A: Multi-threaded steps (readers must be thread-safe), partitioning (split the input by key range across worker threads or remote workers, each with its own reader), remote chunking (the manager reads, workers process and write via a broker), or parallel independent steps. Partitioning by key range keeps ordering and restart semantics simplest.
+
+Q: Skip vs retry in Spring Batch: when do you use each?
+A: Retry for transient errors (deadlocks, timeouts) on the same item; skip for bad data that will never succeed (a malformed line), with a skip limit and a `SkipListener` that records skipped items to an error table for repair. Never skip silently in financial jobs: every skipped record must be visible and reconciled.
+
+## Messaging with Kafka
+Q: How does Kafka guarantee ordering, and how do you keep events for one account in order?
+A: Ordering is guaranteed only within a partition. Use the account id as the message key so all its events go to the same partition. Ordering breaks if you change the partition count (keys remap), use multiple producers for one key without coordination, or process a partition with several threads in parallel.
+
+Q: What do `acks=all`, `min.insync.replicas` and idempotent producers give you?
+A: `acks=all` makes the leader wait for all in-sync replicas; `min.insync.replicas=2` (with replication factor 3) rejects writes when fewer than 2 replicas are in sync, so an acknowledged write survives one broker loss. `enable.idempotence=true` (default in modern clients) stops broker-side duplicates caused by producer retries and keeps per-partition ordering.
+
+Q: Does Kafka's exactly-once mean your consumer processes each message once?
+A: Only for read-process-write within Kafka: transactional producers commit output records and consumer offsets atomically, and consumers with `isolation.level=read_committed` see only committed data. Side effects outside Kafka (database writes, HTTP calls) aren't covered: use idempotent consumers (processed-event table in the same database transaction) or the outbox.
+
+Q: How do you build an idempotent Kafka consumer in Spring?
+A: In one database transaction: insert the event id into a `processed_event` table with a unique constraint, apply the business change, commit; then commit the offset. A redelivered event hits the constraint and is skipped. Use the event's own id (not partition/offset, which can change if topics are migrated), and retain processed ids longer than the possible redelivery window.
+
+Q: What causes consumer group rebalances, and how do you reduce their impact?
+A: Members joining or leaving, missed heartbeats, or exceeding `max.poll.interval.ms` because processing a batch took too long. Partitions move and uncommitted work is redone. Mitigate: keep processing per poll short (smaller `max.poll.records`), use the cooperative sticky assignor, static membership (`group.instance.id`) for rolling restarts, and idempotent processing.
+
+Q: How do you handle a poison message in Spring Kafka?
+A: A `DefaultErrorHandler` with bounded retries and backoff, classifying non-retryable exceptions (deserialization, validation) to skip retries, and a `DeadLetterPublishingRecoverer` that sends the record with error headers to a DLT. Use `ErrorHandlingDeserializer` so bad bytes don't crash the container. Monitor and alert on DLT volume and have a replay tool.
+
+Q: What is the transactional outbox, and how does it relate to Kafka?
+A: You write the business change and an event row in the same database transaction; a relay (a poller, or CDC with Debezium reading the WAL) publishes the event to Kafka and marks it sent. It removes the dual-write problem (DB commit succeeds, Kafka publish fails, or the reverse). Delivery is at-least-once, so consumers de-duplicate by event id.
+
+Q: How do you choose the number of Kafka partitions for a topic?
+A: Enough for target consumer parallelism (one consumer thread per partition at most) and throughput (measure per-partition throughput), with headroom, since increasing partitions later remaps keys and breaks per-key ordering during the change. Too many partitions increase broker metadata, file handles, recovery time and end-to-end latency.
+
+Q: Kafka vs RabbitMQ: when would you choose each?
+A: Kafka: a durable, replayable log, high throughput, ordering per partition, multiple independent consumer groups, event sourcing and stream processing. RabbitMQ: flexible routing (exchanges, bindings), per-message acknowledgement, priorities, TTLs and request/reply, for work queues and command messaging. In fintech, Kafka usually carries domain events; RabbitMQ or a database queue carries tasks.
+
+Q: What is a compacted topic, and when do you use one?
+A: Kafka keeps at least the latest record per key and removes older ones in the background (a null value is a tombstone that deletes the key). Use it for current-state data such as account status or reference data, so a new consumer can rebuild state by reading the topic. Not for event histories you need in full.
+
+Q: How do you evolve event schemas without breaking consumers?
+A: Use a schema registry (Avro, Protobuf or JSON Schema) with a compatibility mode: BACKWARD lets new consumers read old data (add optional fields with defaults, remove fields), FORWARD lets old consumers read new data. Never rename or retype a field in place: add a new field, migrate, then deprecate. Version topics for breaking changes.
+
+Q: What does Spring for Apache Kafka 4 (Boot 4) change that you should know?
+A: It targets Kafka 4 clients (KRaft-only clusters, ZooKeeper gone), supports the new consumer group rebalance protocol (KIP-848, `group.protocol=consumer`), and aligns with Spring Framework 7 (JSpecify null-safety, Jackson 3 serializers). Some deprecated APIs were removed, so check `KafkaTemplate` and listener configuration during the upgrade.
+
+## Integration, streams and AI
+Q: What is Spring Integration and when is it useful?
+A: An implementation of enterprise integration patterns (channels, transformers, routers, splitters, aggregators, adapters for files, SFTP, JMS, Kafka, HTTP) with a Java DSL. Useful for file-based bank integrations (poll SFTP, parse, route, archive) and protocol bridging. For simple Kafka consumers, plain Spring Kafka is clearer.
+
+Q: How would you ingest a daily bank statement from SFTP reliably?
+A: Poll the SFTP directory (Spring Integration SFTP adapter or a scheduled job), download to a staging area, compute SHA-256 and reject duplicates, validate (schema, balance continuity), parse in streaming mode, persist lines idempotently, archive the file with a retention policy, and alert if the expected file hasn't arrived by the cut-off.
+
+Q: What is Spring AI, and how would you use it responsibly in a fintech product?
+A: A Spring abstraction over LLM providers (chat clients, embeddings, vector stores, tool calling, structured output). Responsible uses: summarising disputes for agents, classifying support tickets, drafting explanations, retrieval-augmented answers over policy documents. Never let the model make money-moving decisions on its own: keep humans or deterministic rules in the loop, log prompts and outputs for audit, and redact personal data.
+
+Q: What are the main risks of adding LLM features to a regulated system?
+A: Prompt injection (untrusted text steering the model to leak data or call tools), hallucinated facts presented as authoritative, personal data sent to third-party providers, non-deterministic outputs that are hard to audit, and model or provider changes altering behaviour. Mitigate with allowlisted tools, output validation, data minimisation, evaluation sets and an audit trail.
+
+Q: How do you implement retrieval-augmented generation (RAG) with Spring AI?
+A: Chunk and embed documents into a vector store (pgvector, for example) with metadata for access control; at query time retrieve the top relevant chunks filtered by the user's permissions, put them in the prompt with clear instructions, and return answers with citations. Evaluate retrieval quality and answer faithfulness with a test set, and re-index when documents change.
+
+Q: What is Spring Cloud Stream, and what's the trade-off of its abstraction?
+A: A binder abstraction over Kafka, RabbitMQ and others using functional beans (`Function`, `Consumer`, `Supplier`) bound to destinations by configuration. It reduces boilerplate and eases switching brokers. The trade-off: broker-specific features (Kafka transactions, partition assignment, error handling details) are less visible and sometimes harder to control.
+
+## Observability in Spring
+Q: How do metrics, tracing and logs fit together in Spring Boot 4?
+A: Micrometer Observation API instruments once and produces both metrics (Micrometer, exported to Prometheus or OTLP) and traces (OpenTelemetry via Micrometer Tracing); logs carry trace and span ids so you can jump from a log line to a trace. Boot 4 adds an OpenTelemetry starter for OTLP export. Instrument business operations with custom observations.
+
+Q: What are high- vs low-cardinality tags, and why does it matter?
+A: Low-cardinality tags (status, endpoint template, currency) have few values and are safe as metric dimensions. High-cardinality values (user id, payment id) explode the number of time series and the monitoring bill; put them on traces and logs, not metrics. Micrometer's `KeyValues` distinguish the two for observations.
+
+Q: How do you propagate trace context through Kafka?
+A: Producers inject W3C trace context into record headers and consumers extract it to continue the trace; Spring Kafka does this when observation is enabled (`observationEnabled` on the template and the listener container). It links an API request to the asynchronous processing it triggered, which is essential for debugging payment flows.
+
+Q: How do you set up structured logging in Spring Boot?
+A: Since Boot 3.4, `logging.structured.format.console=ecs` (or `logstash`, `gelf`) emits JSON logs with the trace and span ids, plus MDC fields such as correlation id and tenant. Avoid logging personal or card data, use consistent field names across services, and sample noisy debug logs.
+
+Q: What does a production-ready Spring service need before go-live?
+A: Health and readiness probes, graceful shutdown, timeouts on every client, resilience patterns on dependencies, metrics and traces with dashboards and SLO alerts, structured logs, secrets from a secret manager, security scans and dependency updates, a load test, a runbook and a tested rollback. Make it a checklist reviewed for each new service.
+
+Q: How do you test Spring Kafka consumers?
+A: Integration tests with Testcontainers Kafka (`@ServiceConnection`): publish a record, wait with Awaitility until the side effect is visible in the database, and test redelivery by publishing the same event twice (expect one effect), poison messages (expect a DLT record), and consumer restarts. `EmbeddedKafka` works too, but a real broker catches more configuration problems.
+
+Q: When would you choose a reactive stack (WebFlux) over Spring MVC with virtual threads?
+A: WebFlux suits streaming (SSE, WebSockets), very high concurrency with non-blocking drivers end to end (R2DBC, reactive Kafka), and backpressure across the pipeline. With virtual threads, Spring MVC handles high I/O concurrency with simpler blocking code, better stack traces and easier debugging. Mixing blocking calls into WebFlux is the worst of both.
+
+## More ecosystem questions
+Q: How should passwords be stored, and what does Spring Security provide?
+A: Never encrypted or plainly hashed: use an adaptive, salted password hash (bcrypt, scrypt, Argon2 or PBKDF2) tuned to take tens of milliseconds. Spring Security's `DelegatingPasswordEncoder` stores the algorithm id with each hash (`{bcrypt}…`) so you can upgrade algorithms and re-hash on next login. Add rate limiting and lockout on login to slow online guessing.
+
+Q: How do you make RabbitMQ delivery reliable?
+A: Publisher confirms (the broker acknowledges that a message is persisted) and mandatory/returns for unroutable messages on the producer side; durable queues and persistent messages, or quorum queues for replication; manual acknowledgements on the consumer side, sent only after processing commits, with a dead-letter exchange for rejected messages. Consumers must still be idempotent: redelivery happens.
+
+Q: How do you monitor consumer lag, and what does growing lag tell you?
+A: Lag is the difference between the latest offset and the committed offset per partition (Burrow, Kafka exporter, broker or Micrometer client metrics). Steadily growing lag means consumers can't keep up (slow processing, too few partitions or consumers, a stuck partition from a poison message); a sudden jump on one partition suggests a hot key or a stuck consumer. Alert on lag converted to time, not raw message counts.
+
+Q: What is Spring Modulith, and why would a team use it?
+A: A toolkit for modular monoliths: it verifies module boundaries (no access to another module's internals), documents the module structure, and supports event-based interaction between modules with an event publication registry (a transactional outbox for application events) and externalisation of events to Kafka or AMQP. It lets teams get clear boundaries without the operational cost of microservices first.
+
+Q: Batch or streaming for computing end-of-day settlement positions?
+A: Settlement is defined against a cut-off and must be exactly reproducible, so a batch over the closed business date (Spring Batch, SQL) is natural and auditable. Streaming suits real-time positions for monitoring and liquidity. Many systems do both: stream for live views, batch for the authoritative figures, and reconcile the two.
+
+Q: How do you rate-limit clients at a Spring Cloud Gateway?
+A: The `RequestRateLimiter` filter with the Redis rate limiter (a token bucket in Redis via a Lua script) keyed by client id from the token (`KeyResolver`), with `replenishRate`, `burstCapacity` and `requestedTokens`. It returns 429. Decide fail-open or fail-closed if Redis is unavailable, and key on the authenticated client, not the IP, for partner APIs.
+
+Q: How do you replay messages from a dead-letter topic safely?
+A: Fix the cause first, then replay with a tool that reads the DLT, optionally filters or transforms records, and republishes them to the original topic (or a retry topic) with the original key and headers. Consumers must be idempotent, and replay should be rate-limited and audited. Never replay blindly after a code bug that has already partially processed the same events.
