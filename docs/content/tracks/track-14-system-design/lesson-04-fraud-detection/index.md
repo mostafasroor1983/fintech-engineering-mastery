@@ -301,3 +301,78 @@ with delayed labels; and shadow, then canary, model releases."
 - [Track 04: Fraud detection architecture](#/tracks/track-04/lessons/track-04-lesson-16)
 - [Track 06: Fallback patterns](#/tracks/track-06/lessons/track-06-lesson-14)
 - [Capstone 3: card authorisation with fraud hook](#/capstone/card-authorisation)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1404-01",
+    "question": "The fraud scoring service is down during authorisation. What is the right behaviour?",
+    "options": [
+      "Decline every payment until it recovers",
+      "Approve every payment until it recovers",
+      "Retry the scoring call until it answers",
+      "Apply a pre-agreed stand-in policy by amount and risk segment, behind a timeout and circuit breaker, monitored and owned by the risk team"
+    ],
+    "correct": 3,
+    "explanation": "Neither approve-all nor decline-all is acceptable. A documented stand-in policy keeps low-risk payments flowing and holds or declines high-risk ones while scoring is unavailable."
+  },
+  {
+    "id": "kc-1404-02",
+    "question": "What is training-serving skew?",
+    "options": [
+      "The model is trained on more data than it serves",
+      "Features are computed differently for training than at serving time, so the live model sees inputs it was not trained on",
+      "Serving is slower than training",
+      "The training cluster and serving cluster run different JVM versions"
+    ],
+    "correct": 1,
+    "explanation": "Avoid it with one definition of each feature, shared by the batch (training) and online (serving) paths, typically through a feature store, and by logging the features actually used at decision time."
+  },
+  {
+    "id": "kc-1404-03",
+    "question": "Why pre-compute features into one online store instead of calling other services during scoring?",
+    "options": [
+      "Live fan-out to several services breaks the tens-of-milliseconds latency budget and makes every dependency a failure point",
+      "Online stores are cheaper than databases",
+      "Other services do not have the data",
+      "Regulators require a feature store"
+    ],
+    "correct": 0,
+    "explanation": "The synchronous path should read pre-computed features with one fast lookup, under a timeout. The asynchronous path keeps them fresh from the event stream."
+  },
+  {
+    "id": "kc-1404-04",
+    "question": "How do you deploy a new fraud model safely?",
+    "options": [
+      "Replace the old model at night when traffic is low",
+      "Deploy it to all traffic with a feature flag turned on",
+      "Run it in shadow mode (score but don't act) and compare decisions, then canary a small share of traffic, watching approval and decline rates, with instant rollback",
+      "Ask the data scientists to sign off and deploy"
+    ],
+    "correct": 2,
+    "explanation": "Shadow mode shows how the new model would decide without customer impact; the canary limits the blast radius; approval and decline rates are the business signals to watch."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1404",
+  "title": "Fraud detection pipeline design",
+  "description": "Turn the lesson's design into concrete artefacts you could defend in an interview.",
+  "tasks": [
+    {
+      "id": "pc-1404-01",
+      "description": "Write the latency budget for the synchronous path (total authorisation budget, network, feature lookup, rules, model, margin) and the stand-in policy table used when scoring times out, by amount band and merchant risk."
+    },
+    {
+      "id": "pc-1404-02",
+      "description": "Design three features (e.g. card spend in the last 1 h, distinct merchants in 24 h, distance from last transaction): their event-time windows, how late events are handled, and how the same definition feeds training and serving."
+    },
+    {
+      "id": "pc-1404-03",
+      "description": "Write a rollout plan for a new model: shadow-mode comparison metrics, canary percentage and duration, the alert thresholds on approval and decline rates, and the rollback step."
+    }
+  ]
+}
+-->

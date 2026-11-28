@@ -157,3 +157,78 @@ and isolation levels handle concurrency. Reconciliation and an append-only audit
 - [Track 09: Exactly-once semantics](#/tracks/track-09/lessons/track-09-lesson-05)
 - [Track 02: Distributed locks](#/tracks/track-02/lessons/track-02-lesson-09)
 - [Capstone 4: reconciliation](#/capstone/settlement-reconciliation)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1504-01",
+    "question": "Does Kafka's exactly-once semantics mean a consumer that writes to a database won't process a record twice?",
+    "options": [
+      "Yes, if enable.idempotence=true",
+      "No: EOS covers Kafka-to-Kafka processing inside a transaction; a consumer that writes to a database must de-duplicate by event id in the same DB transaction",
+      "Yes, if acks=all",
+      "Yes, if the consumer group has one member"
+    ],
+    "correct": 1,
+    "explanation": "Producer idempotence only prevents duplicate writes to Kafka from producer retries. Database effects need an idempotent consumer or the outbox."
+  },
+  {
+    "id": "kc-1504-02",
+    "question": "How do you prevent a lost update on an account balance?",
+    "options": [
+      "Read the balance in Java, subtract, and write it back",
+      "Use READ COMMITTED isolation, which prevents lost updates",
+      "An atomic UPDATE … SET balance = balance - :x WHERE id = :id AND balance >= :x, or SELECT … FOR UPDATE, or @Version",
+      "Cache the balance in Redis"
+    ],
+    "correct": 2,
+    "explanation": "Read-modify-write in application code is the bug. PostgreSQL's default READ COMMITTED allows lost updates from that pattern."
+  },
+  {
+    "id": "kc-1504-03",
+    "question": "Saga or two-phase commit for a transfer between services that own separate databases?",
+    "options": [
+      "A saga with compensations and a clearing/suspense account, each step idempotent, because 2PC blocks on coordinator failure and XA is rarely available across stores",
+      "2PC, because it is atomic",
+      "Neither: write to both databases and hope",
+      "A distributed Redis lock"
+    ],
+    "correct": 0,
+    "explanation": "Compensation is a new business action (such as a refund), not a rollback, and intermediate states are visible, so they must be modelled."
+  },
+  {
+    "id": "kc-1504-04",
+    "question": "What makes an idempotency key design correct?",
+    "options": [
+      "A server-generated key returned after the first request",
+      "A key stored only in memory for one minute",
+      "Accepting the same key with a different body as a new request",
+      "A client-generated key per operation, scoped per client, stored with a request hash under a unique constraint, with the response stored for replays; same key + different body is rejected"
+    ],
+    "correct": 3,
+    "explanation": "The request hash catches client bugs that reuse a key for a different operation; replaying silently would hide them."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1504",
+  "title": "Answer with the money consequence",
+  "description": "Practise the fintech half of the question bank.",
+  "tasks": [
+    {
+      "id": "pc-1504-01",
+      "description": "Pick ten random rows from questions 31–60. For each, say the one-line answer aloud, then add the sentence \"…so the money…\" that states the consequence for the customer's money."
+    },
+    {
+      "id": "pc-1504-02",
+      "description": "Write a short SQL demo in PostgreSQL showing a lost update under READ COMMITTED with two sessions, and the conditional UPDATE that prevents it."
+    },
+    {
+      "id": "pc-1504-03",
+      "description": "Write an idempotency table (key, client id, request hash, response, created_at) and a test that proves: a replay returns the stored response, and the same key with a different body returns 422."
+    }
+  ]
+}
+-->

@@ -121,7 +121,7 @@
 
 ## ADR-011 — No Build Step Required for Core Function
 
-**Decision:** The website functions without a build or compilation step. The optional build script (`scripts/build-search-index.js`) generates `search-index.json` but is not required for page rendering.
+**Decision:** The website functions without a build or compilation step. The optional build script (`rebuild_search_index.py`) generates `search-index.json` but is not required for page rendering.
 
 **Rationale:** Simplicity. GitHub Pages serves static files directly. Authors can add content and see results without running any toolchain.
 

@@ -1,0 +1,3 @@
+# Python tools under tools/ and the repo root (validator, generators, code check).
+pyyaml>=6.0
+pglast>=7.0   # PostgreSQL parser used by tools/check_code_blocks.py

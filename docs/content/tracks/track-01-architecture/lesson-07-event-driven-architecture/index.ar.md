@@ -122,7 +122,7 @@ references:
 
 ‏Avro صيغة التسلسل المفضلة لأحداث التكامل في أنظمة التقنية المالية في الإنتاج. فهي تدعم تطور المخطط، وترميزًا ثنائيًا مضغوطًا، والتكامل مع سجل المخططات (Schema Registry).
 
-```json
+```jsonc
 // src/main/avro/payment-completed-v2.avsc
 {
   "namespace": "com.meridian.payment.events",

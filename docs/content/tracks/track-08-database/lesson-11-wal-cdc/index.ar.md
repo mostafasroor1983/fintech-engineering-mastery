@@ -170,7 +170,7 @@ ALTER TABLE ledger_entries REPLICA IDENTITY FULL;
 
 يحتوي كل حدث Debezium على حالة الصف قبل التغيير وبعده. وتُظهر الأمثلة أدناه غلاف حدث التغيير الكامل، أي *دون* تحويل `ExtractNewRecordState` ‏("unwrap")؛ ومع تحويل unwrap من الإعداد أعلاه، يستقبل المستهلكون حالة `after` المسطّحة فقط (مع حقل `__deleted` للحذف).
 
-```json
+```jsonc
 // INSERT event for a new transaction
 {
   "schema": { "..." },
@@ -299,7 +299,7 @@ public class TransactionService {
 
 ### محوّل Outbox Event Router في Debezium
 
-```json
+```jsonc
 // Kafka Connect connector with Outbox Event Router SMT
 {
   "name": "payments-outbox-connector",
@@ -492,7 +492,7 @@ curl -X POST \
 
 حين يتصل Debezium بقاعدة بيانات أول مرة، ينفذ لقطة أولية لتحميل البيانات القائمة قبل التحول إلى التدفق.
 
-```json
+```jsonc
 // Snapshot configuration options
 {
   "snapshot.mode": "initial",

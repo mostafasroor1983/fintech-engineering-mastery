@@ -291,7 +291,7 @@ EM.Capstone = (function () {
 
       '</div></div>';
 
-    // Post-render: syntax highlighting, Mermaid, KaTeX
+    // Post-render: syntax highlighting, Mermaid
     EM.Renderer.postProcess(document.getElementById('project-content'));
 
     EM.Router.setActiveNav('/capstone');

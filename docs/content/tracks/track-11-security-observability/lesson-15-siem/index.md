@@ -77,7 +77,7 @@ public class AuthenticationEventPublisher implements
 
 ### Structured Security Event Schema
 
-All security events must follow a consistent schema so the SIEM can correlate them across sources.
+All security events must follow a consistent schema so the SIEM can correlate them across sources. Rather than inventing field names, consider aligning with a standard schema such as the Elastic Common Schema (ECS) or OCSF — SIEM content and detection rules then work out of the box.
 
 ```json
 {
@@ -96,7 +96,7 @@ All security events must follow a consistent schema so the SIEM can correlate th
     "type": "customer",
     "id": "CUST-123456",
     "email_hash": "sha256:a3f7...",
-    "ip_address": "192.168.1.100",
+    "ip_address": "203.0.113.45",
     "ip_country": "GB",
     "user_agent": "Mozilla/5.0 ...",
     "session_id": "sess-abc123"
@@ -146,6 +146,9 @@ ACTION:
 RATIONALE:
   Legitimate users don't fail authentication for 10 different accounts in 60 seconds.
   This pattern indicates automated credential stuffing from a botnet or proxy.
+  Note: modern stuffing tools rotate through thousands of residential proxy IPs
+  (a few attempts per IP), so pair this rule with one on the GLOBAL failure
+  rate and failure ratio across all IPs.
 ```
 
 ### Rule 2: Account Takeover Attempt
@@ -217,8 +220,8 @@ ACTION:
 
 ### Structured Log Forwarding from Spring Boot
 
-```yaml
-# logback-spring.xml — structured JSON logs for SIEM ingestion
+```xml
+<!-- logback-spring.xml — structured JSON logs for SIEM ingestion -->
 <configuration>
   <appender name="JSON_STDOUT" class="ch.qos.logback.core.ConsoleAppender">
     <encoder class="net.logstash.logback.encoder.LogstashEncoder">
@@ -240,7 +243,10 @@ ACTION:
     <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
     <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
       <fileNamePattern>/var/log/payment-service/security-events.%d{yyyy-MM-dd}.log</fileNamePattern>
-      <maxHistory>90</maxHistory>  <!-- 90-day retention for PCI compliance -->
+      <!-- Local buffer only: a shipper (Fluent Bit, Filebeat) forwards the file
+           to the SIEM, which keeps the retention PCI DSS 10.5.1 requires
+           (12 months, the last 3 immediately available) -->
+      <maxHistory>7</maxHistory>
     </rollingPolicy>
   </appender>
 
@@ -257,38 +263,46 @@ ACTION:
 
 ### Splunk Search Queries for Financial Security
 
+Field names that contain dots must be wrapped in single quotes inside `eval` and `where` expressions.
+
+**Credential stuffing detection:**
+
 ```spl
--- Credential stuffing detection
 index=payment_logs sourcetype=auth_events event.type="AUTHENTICATION_FAILURE"
 | bucket span=1m _time
 | stats dc(actor.id) as unique_accounts, count as attempts by _time, actor.ip_address
 | where unique_accounts > 10
 | sort -unique_accounts
 | table _time, actor.ip_address, unique_accounts, attempts
+```
 
+**Payment fraud pattern — login from an unusual country followed by a high-value payment** (the customer's usual country comes from a lookup table, because it is not in the events):
 
--- Payment fraud pattern: new location + high value transaction
-index=payment_logs (event.type="AUTHENTICATION_SUCCESS" OR event.type="PAYMENT_SUBMITTED")
-| transaction actor.id maxspan=10m startswith="AUTHENTICATION_SUCCESS" endswith="PAYMENT_SUBMITTED"
-| where mvcount(eventtype) = 2
-| eval location_change = if(mvindex(actor.ip_country,0) != customer.usual_country, 1, 0)
-| where location_change = 1 AND payment.amount > 1000
-| table actor.id, actor.ip_country, payment.amount, payment.destination_iban, _time
+```spl
+index=payment_logs event.type IN ("AUTHENTICATION_SUCCESS", "PAYMENT_SUBMITTED")
+| transaction actor.id maxspan=10m
+    startswith=eval('event.type'="AUTHENTICATION_SUCCESS")
+    endswith=eval('event.type'="PAYMENT_SUBMITTED")
+| lookup customer_profile customer_id AS actor.id OUTPUT usual_country
+| where mvindex('actor.ip_country', 0) != usual_country AND 'payment.amount' > 1000
+| table _time, actor.id, actor.ip_country, usual_country, payment.amount, payment.destination_iban
+```
 
+**After-hours admin access** (outside 08:00–18:00 on weekdays, or any time at the weekend; set the time zone the business hours refer to):
 
--- After-hours admin access
+```spl
 index=payment_logs event.type="ADMIN_LOGIN"
-| eval hour = strftime(_time, "%H")
-| where (tonumber(hour) < 8 OR tonumber(hour) > 18)
-| eval day_of_week = strftime(_time, "%A")
-| where NOT (day_of_week = "Saturday" OR day_of_week = "Sunday")
+| eval hour = tonumber(strftime(_time, "%H")), weekday = tonumber(strftime(_time, "%u"))
+| where hour < 8 OR hour >= 18 OR weekday >= 6
 | table _time, actor.id, actor.ip_address, actor.ip_country, event.environment
+```
 
+**Rejected-payment volume spike** (compared with the rolling average of the previous 168 hours = 7 days):
 
--- Failed payment volume spike (using 7-day rolling average)
+```spl
 index=payment_logs event.type="PAYMENT_REJECTED"
 | timechart span=1h count as rejected_count
-| streamstats avg(rejected_count) as rolling_avg window=168  // 7 days * 24 hours
+| streamstats current=f window=168 avg(rejected_count) as rolling_avg
 | where rejected_count > rolling_avg * 3
 | table _time, rejected_count, rolling_avg
 ```
@@ -298,23 +312,22 @@ index=payment_logs event.type="PAYMENT_REJECTED"
 ```
 # Elastic Event Query Language (EQL) rules for payment security
 
-# Rule: Brute force on payment API
+# Rule: brute force on payment API — 5 failures from one IP within 1 minute
 sequence by actor.ip_address with maxspan=1m
   [authentication where event.outcome == "failure"] with runs=5
 
-# Rule: Impossible travel — login from two distant locations within 1 hour
-sequence by actor.id with maxspan=60m
-  [authentication where event.outcome == "success"] as login1
-  [authentication where event.outcome == "success"
-    and actor.ip_country != login1.actor.ip_country] as login2
-| where geo_distance(login1.actor.geo, login2.actor.geo) > 500  // km
+# Rule: repeated failures followed by a success — the password was guessed
+sequence by actor.id with maxspan=5m
+  [authentication where event.outcome == "failure"] with runs=5
+  [authentication where event.outcome == "success"]
 
-# Rule: First-time admin command
+# Rule: admin login followed by a data export or bulk payment
 sequence by actor.id with maxspan=5m
   [authentication where actor.role == "ADMIN" and event.outcome == "success"]
-  [admin where event.type == "DATA_EXPORT" or event.type == "BULK_PAYMENT"]
-| where not actor.id in (known_admin_ids_with_export_history)
+  [any where event.type in ("DATA_EXPORT", "BULK_PAYMENT")]
 ```
+
+EQL sequences match on shared join keys (`by actor.id`); they cannot compare field values *between* events (e.g. the distance between two login locations) or remember history. For **impossible travel** use an ES|QL rule or a machine-learning job, and for **first-time behaviour** (an admin exporting data for the first time) use a *new terms* rule.
 
 ---
 
@@ -364,7 +377,7 @@ Common false positives in financial SIEM and how to reduce them:
 
 2. Unusual transaction volume
    False positive: End-of-month bulk payment processing
-   Fix: Add time-of-month context; whitelist known bulk payment schedules
+   Fix: Add time-of-month context; allowlist known bulk payment schedules
 
 3. Multiple failed logins
    False positive: Mobile app aggressively retrying on network error
@@ -379,11 +392,11 @@ Common false positives in financial SIEM and how to reduce them:
 
 ## Compliance Reporting from SIEM
 
-PCI DSS and FCA require evidence that security events are logged and reviewed.
+PCI DSS (Requirement 10) and supervisors (for example under DORA's ICT risk-management rules) expect evidence that security events are logged and reviewed.
+
+**All admin access in the last 90 days** (supports PCI DSS 10.2.1.2 — all actions by accounts with administrative access are logged):
 
 ```spl
--- PCI DSS compliance report: all admin access in last 90 days
--- (Required for PCI DSS Requirement 10.2.1)
 index=payment_logs event.type="ADMIN_LOGIN" earliest=-90d
 | stats count as login_count, 
         dc(actor.ip_address) as unique_ips,
@@ -391,10 +404,11 @@ index=payment_logs event.type="ADMIN_LOGIN" earliest=-90d
         latest(_time) as last_seen
   by actor.id, actor.ip_country
 | outputlookup pci_admin_access_90d.csv
+```
 
+**Failed logins in the last 30 days** (supports PCI DSS 10.2.1.4 — invalid logical access attempts are logged):
 
--- Authentication failure report: all failed logins last 30 days
--- (Required for PCI DSS Requirement 10.2.4)
+```spl
 index=payment_logs event.type="AUTHENTICATION_FAILURE" earliest=-30d
 | stats count by actor.ip_address, detail.failure_reason
 | sort -count
@@ -409,7 +423,7 @@ index=payment_logs event.type="AUTHENTICATION_FAILURE" earliest=-30d
 - Correlation rules must model attacker behaviour, not just individual events: credential stuffing is invisible looking at single events, obvious looking at patterns across events
 - Financial services SIEM must cover: authentication events, payment operations, admin access, after-hours activity, and anomalous transaction patterns
 - Alert triage requires discipline: measure false positive rates monthly and tune rules when FP rate exceeds 50%—alert fatigue in the SOC is as dangerous as alert fatigue in engineering
-- PCI DSS Requirement 10 mandates that all system components generate audit logs, and those logs are reviewed daily—SIEM automation is the only practical way to satisfy this requirement
+- PCI DSS Requirement 10 mandates audit logs for all system components, daily review of security events and critical-system logs (10.4.1), and — since 31 March 2025 — automated mechanisms for that review (10.4.1.1); SIEM automation is how this is met in practice
 - Elastic EQL and Splunk SPL are powerful tools for ad-hoc investigation—analysts should be comfortable writing queries to follow up on SIEM alerts
 
 <!-- KNOWLEDGE-CHECK
@@ -417,19 +431,34 @@ index=payment_logs event.type="AUTHENTICATION_FAILURE" earliest=-30d
   "questions": [
     {
       "text": "What is the fundamental difference between a SIEM system and a standard log aggregation platform like Elasticsearch?",
-      "options": ["SIEM systems store more log data", "SIEM systems correlate events across multiple sources over time to detect patterns indicating attacks, while log aggregation simply stores and indexes individual log entries for search", "SIEM systems are faster to query", "SIEM systems can only process security logs"],
+      "options": [
+        "SIEM systems store more log data",
+        "SIEM systems correlate events across multiple sources over time to detect patterns indicating attacks, while log aggregation simply stores and indexes individual log entries for search",
+        "SIEM systems are faster to query",
+        "SIEM systems can only process security logs"
+      ],
       "correct": 1,
       "explanation": "Log aggregation makes individual events searchable. SIEM adds correlation — detecting that 5 failed logins for 200 different accounts from one IP in 60 seconds is a credential stuffing attack, something invisible when looking at individual log entries. SIEM applies rules, machine learning, and temporal correlation across millions of events."
     },
     {
       "text": "What PCI DSS requirement mandates daily log review, and how does SIEM automation satisfy this requirement?",
-      "options": ["PCI DSS Requirement 6.3 — SIEM satisfies it by scanning logs for code vulnerabilities", "PCI DSS Requirement 10 — SIEM automation satisfies the daily review requirement by continuously applying detection rules and generating alerts for suspicious activity, creating an automated audit trail of review activity", "PCI DSS Requirement 8.2 — SIEM satisfies it by enforcing password policies", "PCI DSS Requirement 12.1 — SIEM satisfies it by maintaining security policies"],
+      "options": [
+        "PCI DSS Requirement 6.3 — SIEM satisfies it by scanning logs for code vulnerabilities",
+        "PCI DSS Requirement 10 — SIEM automation satisfies the daily review requirement by continuously applying detection rules and generating alerts for suspicious activity, creating an automated audit trail of review activity",
+        "PCI DSS Requirement 8.2 — SIEM satisfies it by enforcing password policies",
+        "PCI DSS Requirement 12.1 — SIEM satisfies it by maintaining security policies"
+      ],
       "correct": 1,
-      "explanation": "PCI DSS Requirement 10.4 mandates that all security events and logs of system components are reviewed at least daily. With millions of daily log entries, human review is impossible. SIEM automation applies detection rules continuously, generates alerts for anomalies, and produces daily summary reports — satisfying the spirit and letter of the requirement."
+      "explanation": "PCI DSS 10.4.1 requires security events and the logs of critical system components to be reviewed at least daily, and 10.4.1.1 (mandatory since 31 March 2025) requires automated mechanisms to perform those reviews. With millions of daily log entries, human review is impossible. SIEM automation applies detection rules continuously, generates alerts for anomalies, and produces daily summary reports — satisfying the requirement, with analysts investigating what the automation surfaces."
     },
     {
       "text": "What is the recommended action when a SIEM correlation rule has a false positive rate exceeding 50%?",
-      "options": ["Accept the false positives — it is better to have too many alerts than too few", "Disable the rule entirely and replace it with manual review", "Tune the rule by adding additional conditions, increasing thresholds, or adding exclusions for known legitimate patterns — alert fatigue in the SOC is as dangerous as missing real attacks", "Increase analyst headcount to handle the volume"],
+      "options": [
+        "Accept the false positives — it is better to have too many alerts than too few",
+        "Disable the rule entirely and replace it with manual review",
+        "Tune the rule by adding additional conditions, increasing thresholds, or adding exclusions for known legitimate patterns — alert fatigue in the SOC is as dangerous as missing real attacks",
+        "Increase analyst headcount to handle the volume"
+      ],
       "correct": 2,
       "explanation": "A SIEM rule generating more false positives than true positives causes alert fatigue — analysts stop investigating alerts because they expect noise. This means real attacks go uninvestigated. Rules must be continuously tuned using feedback from analyst investigations to maintain a manageable true positive rate."
     }
@@ -443,10 +472,22 @@ index=payment_logs event.type="AUTHENTICATION_FAILURE" earliest=-30d
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
-    {"id": "1", "description": "Design a structured security event taxonomy for a payment platform: define JSON schemas for authentication events (LOGIN_SUCCESS, LOGIN_FAILURE, MFA_FAILURE), payment events (PAYMENT_SUBMITTED, PAYMENT_APPROVED, PAYMENT_REJECTED), and security events (RATE_LIMIT_EXCEEDED, INVALID_TOKEN_PRESENTED, SUSPICIOUS_ACTIVITY_DETECTED) with all required fields."},
-    {"id": "2", "description": "Write Elasticsearch EQL (Event Query Language) detection rules for three attack patterns: credential stuffing (>50 failed logins for different accounts from one IP in 10 minutes), account takeover indicator (login from new country within 1 hour of a domestic login), and velocity fraud (>10 payment submissions from one customer in 5 minutes)."},
-    {"id": "3", "description": "Implement a Spring Boot SecurityAuditService that writes security events to both an append-only database table (using REQUIRES_NEW transaction propagation) and publishes them to a Kafka topic for SIEM ingestion, with GDPR-compliant IP address hashing."},
-    {"id": "4", "description": "Create a SIEM alert triage dashboard in Grafana or Kibana showing: alert volume by rule name over 24 hours, false positive rate per rule (alerts where analyst marked 'no action needed'), mean time to close by severity, and a table of open alerts sorted by severity and age."}
+    {
+      "id": "1",
+      "description": "Design a structured security event taxonomy for a payment platform: define JSON schemas for authentication events (LOGIN_SUCCESS, LOGIN_FAILURE, MFA_FAILURE), payment events (PAYMENT_SUBMITTED, PAYMENT_APPROVED, PAYMENT_REJECTED), and security events (RATE_LIMIT_EXCEEDED, INVALID_TOKEN_PRESENTED, SUSPICIOUS_ACTIVITY_DETECTED) with all required fields."
+    },
+    {
+      "id": "2",
+      "description": "Write Elastic EQL (Event Query Language) detection rules for three attack patterns: credential stuffing from one IP (>50 failed logins in 10 minutes), repeated failures followed by a success for the same account, and velocity fraud (>10 payment submissions from one customer in 5 minutes). Then explain which rule type (ES|QL, machine learning, or new terms) you would use for impossible travel and why EQL cannot express it."
+    },
+    {
+      "id": "3",
+      "description": "Implement a Spring Boot SecurityAuditService that writes security events to both an append-only database table (using REQUIRES_NEW transaction propagation) and publishes them to a Kafka topic for SIEM ingestion, with IP addresses pseudonymised using a keyed hash (HMAC) — note that pseudonymised data is still personal data under GDPR, so retention and access rules still apply."
+    },
+    {
+      "id": "4",
+      "description": "Create a SIEM alert triage dashboard in Grafana or Kibana showing: alert volume by rule name over 24 hours, false positive rate per rule (alerts where analyst marked 'no action needed'), mean time to close by severity, and a table of open alerts sorted by severity and age."
+    }
   ]
 }
 -->

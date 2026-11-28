@@ -120,8 +120,8 @@ For each major business initiative in the company's strategy, ask three question
 |---|---|---|---|
 | Launch real-time FX in 6 markets | Multi-currency settlement engine | FX rates tightly coupled to GBP-only settlement | 6-month delay, estimated £8M revenue impact |
 | Embedded finance API for 10 partners | Developer-grade public API, SLA-backed | Existing API not versioned, no sandbox | Partnership blocked; competitors gaining 3 accounts |
-| PSD2/Open Banking compliance | Account data APIs, consent management | No consent store, 1990s-era account data model | Regulatory risk, potential fine |
-| 10x volume by 2026 | Horizontal scaling of payment rails | Single-threaded settlement prevents horizontal scale | Existential scaling ceiling at 3x current volume |
+| Open banking compliance (PSD2 rules today, PSD3/PSR changes ahead) | Account data APIs, consent management | No consent store, 1990s-era account data model | Regulatory risk, potential fine |
+| 10x volume by 2028 | Horizontal scaling of payment rails | Single-threaded settlement prevents horizontal scale | Existential scaling ceiling at 3x current volume |
 
 This table is your strategy's foundation. Every technical initiative maps to a business row. Any technical work that does not map to a row requires either removal from the roadmap or a conversation with the business about adding the row.
 
@@ -139,7 +139,7 @@ A good north star has three components:
 **Target Architecture** — the structural end state (can be a diagram)
 **Capability Targets** — measurable outcomes that signal arrival
 
-**Example North Star — Fintech Payments Platform (2026)**
+**Example North Star — Fintech Payments Platform (end of 2028)**
 
 *Principles*
 - APIs are products: every capability is accessible via a versioned, documented, SLA-backed API
@@ -198,24 +198,24 @@ API gateway implementation        3         2        5         4      14
 Observability platform            2         4        4         3      13
 Monolith strangling (Phase 1)     3         3        3         2      11
 FX multi-currency support         5         1        1         4      11
-PSD2 consent management           3         5        2         5      15
+Open banking consent mgmt         3         5        2         5      15
 ```
 
 ### Sequencing Rules for Regulated Environments
 
 Financial institutions have additional sequencing constraints:
 
-1. **Compliance deadlines are non-negotiable.** If PSD2 compliance has a regulatory deadline, it sequences above everything else regardless of score.
+1. **Compliance deadlines are non-negotiable.** If an open banking requirement has a regulatory deadline, it sequences above everything else regardless of score.
 2. **Foundation before features.** An API gateway that handles auth/rate-limiting/versioning enables every subsequent API project. Build the foundation first, even if individual features score higher.
 3. **Risk reduction before growth.** A settlement engine rewrite that eliminates a known scaling ceiling must precede volume-dependent initiatives.
-4. **Migration tax.** Every architectural migration carries a 20-40% overhead on adjacent feature work. Factor this into sequencing — back-load feature delivery during heavy platform migration quarters.
+4. **Migration tax.** Every architectural migration carries an overhead on adjacent feature work — 20-40% is a common rule of thumb. Factor this into sequencing — back-load feature delivery during heavy platform migration quarters.
 
 ### Two-Year Roadmap Template
 
 ```
 YEAR 1
 ==========================================================================
-Q1  | PSD2 Consent Management (Phase 1) | Observability Platform MVP
+Q1  | Open Banking Consent (Phase 1)    | Observability Platform MVP
     | [Regulatory]                       | [Foundation]
 ==========================================================================
 Q2  | API Gateway (Auth + Versioning)   | Settlement Engine Spike + Design
@@ -257,7 +257,7 @@ Technical OKRs fail when they describe outputs (shipped features) rather than ou
 > KR1: Settlement engine handles 50,000 TPS at P99 <= 100ms (baseline: 5,000 TPS, 340ms)
 > KR2: Partner API available in sandbox; first external partner integrated within 60 days of launch
 > KR3: Deployment frequency per payments service >= 5/week (baseline: 1.2/week)
-> KR4: Zero regulatory findings related to PSD2 consent management
+> KR4: Zero regulatory findings related to open banking consent management
 
 ### Cascading OKRs Through Teams
 
@@ -360,7 +360,7 @@ Track these metrics at a monthly strategy review:
 | Initiative on-track rate | RAG status per initiative in JIRA/Linear | Engineering managers |
 | OKR progress | Weekly OKR review notes | Each team lead |
 | Architecture conformance | Automated architecture fitness functions | Platform team |
-| Technical debt delta | Weekly DORA metrics trend | DevEx team |
+| Technical debt delta | Tech-debt backlog trend (items opened vs closed), alongside the DORA metrics trend | DevEx team |
 | Regulatory finding age | Ticket age distribution | CISO/Compliance |
 
 ### Quarterly Strategy Review Agenda
@@ -431,7 +431,7 @@ Fix: One principal engineer owns the strategy document and is accountable for it
 Use this as the cover page for your full strategy document:
 
 ```
-PAYMENTS PLATFORM TECHNICAL STRATEGY 2025-2027
+PAYMENTS PLATFORM TECHNICAL STRATEGY 2027-2028
 Last reviewed: [DATE] | Owner: [Principal Engineer Name]
 
 SITUATION
@@ -443,14 +443,14 @@ WHAT MUST CHANGE
 1. Settlement architecture must support horizontal scaling to 50k TPS
 2. All public capabilities must be available through a versioned, SLA-backed API
 3. Developer experience must improve to support 10+ deployments per service per week
-4. PSD2 consent management must be live by [regulatory deadline]
+4. Open banking consent management must be live by [regulatory deadline]
 
-NORTH STAR (End of 2027)
+NORTH STAR (End of 2028)
 Independently deployable services, event-driven backbone, developer-grade
 partner API, observable by default.
 
-KEY INITIATIVES (2025)
-Q1: PSD2 Consent Management (Regulatory)
+KEY INITIATIVES (2027)
+Q1: Open Banking Consent Management (Regulatory)
 Q2: API Gateway MVP (Foundation)
 Q3-Q4: Settlement Engine Rewrite (Platform)
 

@@ -105,7 +105,7 @@ FROM generate_series(1, 10000000) AS n;
 
 ### السكربت 1: الاستعلام عن الرصيد (كثيف القراءة)
 
-```bash
+```sql
 -- File: balance_lookup.sql
 \set account_id random(1, 10000000)
 
@@ -133,7 +133,7 @@ pgbench \
 
 ### السكربت 2: خصم معاملة (كثيف الكتابة)
 
-```bash
+```sql
 -- File: debit_transaction.sql
 \set account_id random(1, 10000000)
 \set amount random(100, 10000)
@@ -178,7 +178,7 @@ COMMIT;
 
 ### السكربت 3: تحويل متزامن (أعلى تنازع)
 
-```bash
+```sql
 -- File: transfer.sql
 \set source_account random(1, 10000000)
 \set target_account random(1, 10000000)

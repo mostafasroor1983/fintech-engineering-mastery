@@ -78,13 +78,13 @@ Risks are scored on a 5×5 matrix of likelihood (1=rare, 5=almost certain) × im
 **Risk bands:**
 - 15–25: Critical — immediate mitigation required, escalate to CTO/CISO
 - 8–14: High — mitigate within 30 days, included in next sprint
-- 4–7: Medium — mitigate within 90 days, risk accepted with documented justification
+- 4–7: Medium — mitigate within 90 days, or formally accept with documented justification
 - 1–3: Low — accept or mitigate at next convenient opportunity
 
 **Risk register entry format:**
 
 ```yaml
-risk_id: RISK-2024-047
+risk_id: RISK-2026-047
 title: "BOLA vulnerability in account retrieval endpoint"
 threat_category: Information Disclosure
 asset: Customer account balance and transaction history
@@ -100,7 +100,7 @@ residual_risk_score: 20  # Authentication alone does not prevent BOLA
 treatment: Mitigate
 mitigation: Add ownership check to account repository query
 owner: payments-team
-due_date: 2024-11-15
+due_date: 2026-12-15
 status: In Progress
 ```
 
@@ -148,7 +148,7 @@ graph TD
 
 **Level 2 — Metrics:** Each service exposes RED metrics (Rate, Errors, Duration) per endpoint. Dashboards show SLO status. Alerts trigger on error budget burn rate.
 
-**Level 3 — Traces:** OpenTelemetry instruments every service. A single payment transaction produces a trace that shows every service call, database query, and external API call with precise timing. Sampling strategy: 100% for errors, 1% for successful transactions, 100% for transactions over 2 seconds.
+**Level 3 — Traces:** OpenTelemetry instruments every service. A single payment transaction produces a trace that shows every service call, database query, and external API call with precise timing. Sampling strategy: 100% for errors, 1% for successful transactions, 100% for transactions over 2 seconds — which requires *tail-based* sampling (e.g. in the OpenTelemetry Collector), because errors and latency are only known once the trace has finished.
 
 **Level 4 — Continuous Profiling:** Profiling agents run in production and capture CPU flame graphs. When a latency regression is detected via metrics, the profiling data shows which code path caused it without requiring a reproduction.
 
@@ -171,25 +171,33 @@ Error budget = 43.2 minutes of allowed failures
 **Burn rate alerts:**
 
 ```yaml
-# Prometheus alerting rules
+# Prometheus alerting rules. sum() is essential: dividing the raw series
+# would match each 5xx series only with itself (labels must match 1:1).
+# In practice, precompute these ratios with recording rules.
 groups:
   - name: payment-slo-alerts
     rules:
-      # Page immediately: consuming error budget 14x faster than sustainable
-      # Will exhaust 100% of monthly budget in ~2 hours
+      # Page immediately: consuming error budget 14.4x faster than sustainable
+      # = 2% of the 30-day budget per hour; ALL of it in ~2 days (30 d / 14.4)
       - alert: PaymentApiErrorBudgetFastBurn
         expr: |
           (
-            rate(http_requests_total{service="payment-api",status=~"5.."}[1h])
+            sum(rate(http_requests_total{service="payment-api",status=~"5.."}[1h]))
             /
-            rate(http_requests_total{service="payment-api"}[1h])
-          ) > (1 - 0.999) * 14
-        for: 5m
+            sum(rate(http_requests_total{service="payment-api"}[1h]))
+          ) > 14.4 * (1 - 0.999)
+          and
+          (
+            sum(rate(http_requests_total{service="payment-api",status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{service="payment-api"}[5m]))
+          ) > 14.4 * (1 - 0.999)
+        for: 2m
         labels:
           severity: page
           slo: payment-api-availability
         annotations:
-          summary: "Payment API error budget burning 14x — page immediately"
+          summary: "Payment API error budget burning 14.4x — page immediately"
           runbook: "https://wiki.internal/runbooks/payment-api-fast-burn"
 
       # Ticket: consuming error budget 2x faster than sustainable
@@ -197,11 +205,17 @@ groups:
       - alert: PaymentApiErrorBudgetSlowBurn
         expr: |
           (
-            rate(http_requests_total{service="payment-api",status=~"5.."}[6h])
+            sum(rate(http_requests_total{service="payment-api",status=~"5.."}[6h]))
             /
-            rate(http_requests_total{service="payment-api"}[6h])
-          ) > (1 - 0.999) * 2
-        for: 60m
+            sum(rate(http_requests_total{service="payment-api"}[6h]))
+          ) > 2 * (1 - 0.999)
+          and
+          (
+            sum(rate(http_requests_total{service="payment-api",status=~"5.."}[30m]))
+            /
+            sum(rate(http_requests_total{service="payment-api"}[30m]))
+          ) > 2 * (1 - 0.999)
+        for: 15m
         labels:
           severity: ticket
           slo: payment-api-availability
@@ -209,7 +223,7 @@ groups:
           summary: "Payment API error budget burning 2x — investigate this week"
 ```
 
-The 14x burn rate alert uses a 1-hour window (fast burn). The 2x burn rate alert uses a 6-hour window (slow burn). Together they catch both sudden outages and gradual degradation.
+The 14.4x burn rate alert uses a 1-hour window (fast burn); the 2x alert uses a 6-hour window (slow burn). Each also requires a short window (5m / 30m) to still be burning, so the alert resolves quickly once the problem is fixed. Together they catch both sudden outages and gradual degradation. (The Google SRE Workbook also recommends a 6x-over-6h page and a 1x-over-3-days ticket — tune the set to your SLO.)
 
 ---
 
@@ -274,16 +288,16 @@ public class Payment {
 
 ## Compliance-Driven Decisions
 
-Three regulatory frameworks intersect in UK/EU fintech. Each mandates specific controls:
+Three regulatory frameworks intersect in UK fintech. Each mandates specific controls (in the EU, DORA plays the role of the third column — ICT risk management, major-incident reporting, and threat-led penetration testing):
 
-| Requirement | PCI-DSS | GDPR | FCA (PS21/3) |
+| Requirement | PCI-DSS | GDPR | FCA/PRA operational resilience (PS21/3) |
 |-------------|---------|------|-------------|
-| Data protection | Render PAN unreadable (Req 3) | Appropriate technical measures | Adequate cyber resilience |
-| Transmission security | TLS everywhere (Req 4) | Encryption in transit | Encrypted communications |
+| Data protection | Render PAN unreadable (Req 3) | Appropriate technical measures | Protect important business services |
+| Transmission security | Strong cryptography over open networks (Req 4) | Encryption in transit | Covered by general systems-and-controls rules |
 | Access control | Least privilege (Req 7) | Need-to-know basis | Access controls |
-| Audit logging | Log all cardholder data access (Req 10) | Log processing activities | Audit trail for regulatory review |
+| Audit logging | Log all cardholder data access (Req 10) | Records of processing activities | Audit trail for regulatory review |
 | Incident response | Incident response plan (Req 12) | 72-hour breach notification | Operational incident reporting |
-| Testing | Annual pentest + quarterly scans (Req 11) | Security testing | Scenario-based testing (CBEST) |
+| Testing | Annual pentest + quarterly scans (Req 11) | Regular testing of security measures | Scenario testing against impact tolerances (plus CBEST for systemically important firms) |
 
 When a control addresses multiple frameworks simultaneously, document it as such in the risk register. This demonstrates to auditors that the security programme is coherent rather than ad hoc.
 
@@ -324,14 +338,16 @@ A team proposes a new endpoint: `POST /payments/initiate` for a merchant-facing 
 After controls, all risks reduce to score ≤ 8 (medium or below). One residual risk remains:
 
 ```yaml
-risk_id: RISK-2024-048
+risk_id: RISK-2026-048
 title: "HMAC replay attack on payment initiation"
 residual_risk_score: 6
 treatment: Accept
 justification: >
-  Idempotency key (UUID, 10-minute TTL) prevents replay within the attack
-  window. Full replay prevention would require per-request nonce storage
-  with significant complexity. Risk accepted by CISO.
+  The signature covers a timestamp (requests older than 5 minutes are
+  rejected) and the idempotency key, which is stored for 10 minutes, so a
+  captured request cannot be replayed with a new key. The remaining risk is
+  theft of a merchant's signing key, reduced by mTLS and regular key
+  rotation. Risk accepted by CISO.
 ```
 
 **Step 3: Observability requirements**
@@ -340,7 +356,7 @@ For this endpoint at Level 3 maturity:
 - Logs: payment ID, merchant ID, amount, currency, PAN last four, event type
 - Metrics: request rate, error rate, latency p50/p95/p99 — SLO: 99.95% success, p95 < 500ms
 - Traces: full distributed trace including DB write and downstream notification service
-- Alerts: 14x burn rate → page, 2x burn rate → ticket, latency p95 > 1s → ticket
+- Alerts: 14.4x burn rate → page, 2x burn rate → ticket, latency p95 > 1s → ticket
 
 ---
 
@@ -371,13 +387,13 @@ log.debug("Payment request: {}", objectMapper.writeValueAsString(paymentRequest)
 // paymentRequest contains a full PAN — now in every log platform that receives DEBUG level
 ```
 
-PAN in logs is an automatic PCI-DSS scope violation. The card schemes require notification. The fine can be £5,000–£100,000 per month until remediation.
+PAN in logs brings every system that stores those logs into PCI DSS scope, and if the logs were exposed it may be a reportable account data compromise. Card schemes can fine the acquirer, who passes the cost on — figures of $5,000–$100,000 per month of non-compliance are often cited, though actual fines are not public.
 
 **Prevention:** Establish a "no PAN in logs" policy enforced at three levels:
 
 1. Code review checklist: reviewer must verify no PAN logging
 2. Static analysis: Semgrep rule that flags logging of fields annotated with `@SensitiveField`
-3. Runtime detection: log anomaly detection that alerts on patterns matching PAN format (`\d{13,19}`) in log payloads
+3. Runtime detection: log anomaly detection that alerts on patterns matching PAN format (`\d{13,19}`, then a Luhn check to cut false positives) in log payloads
 
 ```yaml
 # Semgrep rule: detect logging of sensitive fields
@@ -417,7 +433,7 @@ Control selection criteria:
 5. Recovery time: how long to recover if the control fails?
 ```
 
-For mTLS, the operational cost is manageable only with a service mesh (Istio, Linkerd) that handles certificate rotation automatically. Without the mesh, consider API key authentication with automated rotation instead — lower operational cost, still achieves authentication.
+For mTLS, the operational cost is manageable only with a service mesh (Istio, Linkerd) that handles certificate rotation automatically. Without a mesh, automate rotation another way (cert-manager or SPIRE with workload hot-reload) — or consider API key authentication with automated rotation instead: lower operational cost, still achieves authentication.
 
 ---
 
@@ -427,7 +443,7 @@ For mTLS, the operational cost is manageable only with a service mesh (Istio, Li
 - [ ] You can score risks on a 5x5 likelihood × impact matrix and assign them to risk bands with appropriate SLAs
 - [ ] You can categorise security controls as preventive, detective, or corrective and select at least one per category for any new feature
 - [ ] You can describe all four levels of the observability maturity model and assess where a given system sits
-- [ ] You can write Prometheus alerting rules for 14x and 2x error budget burn rates
+- [ ] You can write Prometheus alerting rules for 14.4x and 2x error budget burn rates (long + short windows)
 - [ ] You can resolve the security/observability tension using structured logging with field masking
 - [ ] You can apply the build vs buy framework to common security controls and justify the recommendation
 - [ ] You can walk through all three decision scenarios (threat model, risk scoring, observability requirements) for a new payment endpoint in under 15 minutes
@@ -435,9 +451,9 @@ For mTLS, the operational cost is manageable only with a service mesh (Istio, Li
 ---
 
 <!-- KNOWLEDGE-CHECK
-{"questions":[{"text":"You are threat modelling a new payment webhook endpoint that calls a merchant-supplied URL. Which STRIDE category most directly applies to the risk that an attacker registers http://169.254.169.254/ as their webhook URL?","options":["Spoofing — the attacker is pretending to be a legitimate merchant","Tampering — the attacker modifies the webhook payload","Information Disclosure — the attacker can retrieve internal metadata via SSRF","Denial of Service — the attacker floods the webhook endpoint"],"correct":2,"explanation":"SSRF (Server-Side Request Forgery) allows the attacker to make the server issue requests to internal resources. By registering an internal metadata endpoint as the webhook URL, the attacker causes the server to retrieve and potentially return sensitive internal credentials. This maps to Information Disclosure in STRIDE — confidential data (IAM credentials, internal service responses) is disclosed to an unauthorised party."},{"text":"Your payment API has an SLO of 99.9% availability over 30 days. A 14x burn rate alert fires. Approximately how long until the entire monthly error budget is exhausted at the current burn rate?","options":["About 2 hours","About 15 days","About 1 week","About 6 hours"],"correct":0,"explanation":"The monthly error budget for 99.9% SLO over 30 days is 43.2 minutes. At 14x the sustainable burn rate, the budget is exhausted in 30 days / 14 = approximately 2.1 days worth of budget... but the 14x burn rate calculation uses the 1-hour window precisely because at 14x, the monthly budget exhausts in roughly 2 hours. This is why a 14x burn rate triggers an immediate page."},{"text":"A developer proposes logging the full payment request object (including PAN) at DEBUG level to help diagnose a production issue. What is the most appropriate response?","options":["Allow it temporarily in the staging environment only, never production","Allow it since DEBUG logs are not normally shipped to the SIEM","Reject it and implement structured logging with PAN masking to last four digits instead","Allow it since the logs are encrypted at rest in the log platform"],"correct":2,"explanation":"PAN must never appear in logs regardless of log level, environment, or encryption at rest status. PCI-DSS considers PAN in logs a scope violation. The correct approach is structured logging with masking — log enough context to debug the issue (PAN last four, payment ID, timestamp, error type) without logging sensitive data. Encryption at rest in the log platform does not prevent exposure to log platform users."}]}
+{"questions": [{"text": "You are threat modelling a new payment webhook endpoint that calls a merchant-supplied URL. Which STRIDE category most directly applies to the risk that an attacker registers http://169.254.169.254/ as their webhook URL?", "options": ["Spoofing — the attacker is pretending to be a legitimate merchant", "Tampering — the attacker modifies the webhook payload", "Information Disclosure — the attacker can retrieve internal metadata via SSRF", "Denial of Service — the attacker floods the webhook endpoint"], "correct": 2, "explanation": "SSRF (Server-Side Request Forgery) allows the attacker to make the server issue requests to internal resources. By registering an internal metadata endpoint as the webhook URL, the attacker causes the server to retrieve and potentially return sensitive internal credentials. This maps to Information Disclosure in STRIDE — confidential data (IAM credentials, internal service responses) is disclosed to an unauthorised party."}, {"text": "Your payment API has an SLO of 99.9% availability over 30 days. A 14.4x burn rate alert fires. Approximately how long until the entire monthly error budget is exhausted at the current burn rate?", "options": ["About 2 days", "About 15 days", "About 2 hours", "About 6 hours"], "correct": 0, "explanation": "A burn rate of 1 uses up exactly the whole budget in the SLO window (30 days). At 14.4x, the budget lasts 30 days / 14.4 ≈ 2.1 days — and 2% of it is gone every hour. That is why a 14.4x burn rate, confirmed over a 1-hour and a 5-minute window, triggers an immediate page: left alone, a week's worth of budget disappears in about half a day. (A 2x burn rate would last about 15 days — ticket territory.)"}, {"text": "A developer proposes logging the full payment request object (including PAN) at DEBUG level to help diagnose a production issue. What is the most appropriate response?", "options": ["Allow it temporarily in the staging environment only, never production", "Allow it since DEBUG logs are not normally shipped to the SIEM", "Reject it and implement structured logging with PAN masking to last four digits instead", "Allow it since the logs are encrypted at rest in the log platform"], "correct": 2, "explanation": "PAN must never appear in logs regardless of log level, environment, or encryption at rest status. PCI-DSS considers PAN in logs a scope violation. The correct approach is structured logging with masking — log enough context to debug the issue (PAN last four, payment ID, timestamp, error type) without logging sensitive data. Encryption at rest in the log platform does not prevent exposure to log platform users."}]}
 -->
 
 <!-- PRACTICAL-CHALLENGE
-{"title":"Security and Observability Decision Framework Applied","difficulty":"principal","estimatedMinutes":90,"tasks":[{"id":"1","description":"Apply the full STRIDE framework to a new API endpoint: POST /transfers/international. For each of the 6 STRIDE categories, identify a specific threat scenario relevant to international payments, score it on the 5x5 risk matrix, propose a concrete technical control, and write a risk register entry in YAML format for the two highest-scoring residual risks."},{"id":"2","description":"Implement a structured logging framework in Spring Boot that: (1) uses a custom @SensitiveField annotation with FULL_MASK, LAST_FOUR, and HASH strategies, (2) implements a Jackson serialiser that applies masking before log output, (3) logs at least 8 fields per payment event (payment ID, amount, currency, masked PAN, hashed account ID, merchant ID, latency, event type), (4) includes a Semgrep rule that detects raw sensitive field logging."},{"id":"3","description":"Write Prometheus alerting rules for a payment API with SLO 99.95% over 30 days. Create: (1) a 14x burn rate page alert using a 1-hour window, (2) a 2x burn rate ticket alert using a 6-hour window, (3) a latency SLO alert for p95 latency exceeding 500ms, (4) a Grafana dashboard panel showing error budget remaining as a percentage. Document the error budget calculation."},{"id":"4","description":"Conduct a build vs buy analysis for three security controls: WAF, field-level encryption for PAN, and SSO/IAM. For each, document: the security benefit, one-time implementation cost (story points), ongoing operational cost, failure mode impact, and your recommendation with justification. Present findings as a decision record (ADR format) suitable for review by the CISO."}]}
+{"title": "Security and Observability Decision Framework Applied", "difficulty": "principal", "estimatedMinutes": 90, "tasks": [{"id": "1", "description": "Apply the full STRIDE framework to a new API endpoint: POST /transfers/international. For each of the 6 STRIDE categories, identify a specific threat scenario relevant to international payments, score it on the 5x5 risk matrix, propose a concrete technical control, and write a risk register entry in YAML format for the two highest-scoring residual risks."}, {"id": "2", "description": "Implement a structured logging framework in Spring Boot that: (1) uses a custom @SensitiveField annotation with FULL_MASK, LAST_FOUR, and HASH strategies, (2) implements a Jackson serialiser that applies masking before log output, (3) logs at least 8 fields per payment event (payment ID, amount, currency, masked PAN, hashed account ID, merchant ID, latency, event type), (4) includes a Semgrep rule that detects raw sensitive field logging."}, {"id": "3", "description": "Write Prometheus alerting rules for a payment API with SLO 99.95% over 30 days. Create: (1) a 14.4x burn rate page alert using a 1-hour window confirmed by a 5-minute window, (2) a 2x burn rate ticket alert using a 6-hour window confirmed by a 30-minute window, (3) a latency SLO alert for p95 latency exceeding 500ms, (4) a Grafana dashboard panel showing error budget remaining as a percentage. Document the error budget calculation."}, {"id": "4", "description": "Conduct a build vs buy analysis for three security controls: WAF, field-level encryption for PAN, and SSO/IAM. For each, document: the security benefit, one-time implementation cost (story points), ongoing operational cost, failure mode impact, and your recommendation with justification. Present findings as a decision record (ADR format) suitable for review by the CISO."}]}
 -->

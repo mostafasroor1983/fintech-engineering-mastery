@@ -78,7 +78,7 @@ Response:
 ```
 
 > [!WARNING]
-> Client secrets must be stored in Vault or Kubernetes secrets, never in environment variables in Dockerfiles or application.properties committed to git. Rotate client secrets quarterly.
+> Client secrets must be stored in Vault or Kubernetes secrets, never in environment variables in Dockerfiles or application.properties committed to git. Rotate client secrets quarterly. Stronger still — and required by FAPI / Open Banking profiles — is client authentication without a shared secret: `private_key_jwt` (the client signs an assertion) or mutual-TLS client certificates.
 
 ---
 
@@ -145,7 +145,7 @@ A JWT is three Base64URL-encoded JSON objects separated by dots: `header.payload
 
 ## JWT Validation Checklist
 
-Incomplete JWT validation is one of the most common authentication vulnerabilities. Validate every claim, in order.
+Incomplete JWT validation is one of the most common authentication vulnerabilities. Validate every claim, in order. The hand-written validator below makes every step visible; in production prefer a maintained implementation (Spring Security's `NimbusJwtDecoder` with validators, as shown later, or Nimbus' `DefaultJWTProcessor`) and add only the business checks yourself.
 
 ```java
 @Component
@@ -176,15 +176,26 @@ public class PaymentJwtValidator {
 
         // 3. Fetch public key by kid (with caching — see JWK caching section)
         String kid = header.getKeyID();
-        RSAKey publicKey = jwksClient.getKey(kid);
+        JWK publicKey = jwksClient.getKey(kid);
         if (publicKey == null) {
             throw new TokenValidationException("Unknown key ID: " + kid);
         }
+        // The key must be meant for this algorithm (an RSA key for RS256,
+        // an EC key for ES256) -- never let the token header pick the key type
+        if (publicKey.getAlgorithm() != null && !publicKey.getAlgorithm().equals(algorithm)) {
+            throw new TokenValidationException("Key " + kid + " is not for " + algorithm);
+        }
 
-        // 4. Verify signature
-        JWSVerifier verifier;
+        // 4. Verify signature (RSA or EC verifier, matching the key)
         try {
-            verifier = new RSASSAVerifier(publicKey.toRSAPublicKey());
+            JWSVerifier verifier = switch (publicKey) {
+                case RSAKey rsa when algorithm.equals(JWSAlgorithm.RS256) ->
+                    new RSASSAVerifier(rsa.toRSAPublicKey());
+                case ECKey ec when algorithm.equals(JWSAlgorithm.ES256) ->
+                    new ECDSAVerifier(ec.toECPublicKey());
+                default -> throw new TokenValidationException(
+                    "Key type does not match algorithm " + algorithm);
+            };
             if (!signedJWT.verify(verifier)) {
                 throw new TokenValidationException("Token signature is invalid");
             }
@@ -233,14 +244,21 @@ public class PaymentJwtValidator {
                 "Token audience does not include " + serviceAudience + ": " + audiences);
         }
 
-        // 11. For payment operations: validate auth_level = strong
+        // 11. Scope: the required permission must be present (space-delimited
+        //     "scope" claim, per RFC 8693 / OAuth2 conventions)
+        String scope = (String) claims.getClaim("scope");
+        if (scope == null || !Set.of(scope.split(" ")).contains("payments:write")) {
+            throw new InsufficientScopeException("payments:write scope required");
+        }
+
+        // 12. For payment operations: validate auth_level = strong
         String authLevel = (String) claims.getClaim("auth_level");
         if (!"strong".equals(authLevel)) {
             throw new InsufficientAuthenticationException(
                 "Payment operations require strong authentication (MFA)");
         }
 
-        // 12. Check token revocation via jti (for logout/revoke scenarios)
+        // 13. Check token revocation via jti (for logout/revoke scenarios)
         String jti = claims.getJWTID();
         if (tokenRevocationService.isRevoked(jti)) {
             throw new TokenValidationException("Token has been revoked");
@@ -285,9 +303,16 @@ public class RefreshTokenService {
             throw new InvalidTokenException("Refresh token has expired");
         }
 
-        // Mark old token as used (rotation)
-        stored.markAsUsed();
-        refreshTokenRepository.save(stored);
+        // Mark old token as used (rotation) -- ATOMICALLY: two parallel
+        // refresh calls with the same token must not both succeed.
+        //   UPDATE refresh_tokens SET used = true
+        //    WHERE token_hash = ? AND used = false      -> must update 1 row
+        // (or an optimistic-lock @Version on the entity)
+        int updated = refreshTokenRepository.markUsedIfUnused(stored.getTokenHash());
+        if (updated == 0) {
+            invalidateAllSessionsForUser(stored.getUserId());
+            throw new SecurityException("Concurrent refresh token reuse detected");
+        }
 
         // Issue new access token + new refresh token
         String newAccessToken = jwtIssuer.issueAccessToken(stored.getUserId(), stored.getScopes());
@@ -326,8 +351,9 @@ public class SecurityConfig {
             .sessionManagement(session ->
                 session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .authorizeHttpRequests(auth -> auth
-                // Health check and metrics endpoints — no auth required
-                .requestMatchers("/actuator/health", "/actuator/prometheus").permitAll()
+                // Health check — no auth required. (Metrics belong on a
+                // separate internal management port, not the public API)
+                .requestMatchers("/actuator/health").permitAll()
                 // Payment submission — requires payments:write scope + strong auth
                 .requestMatchers(HttpMethod.POST, "/api/v1/payments")
                     .hasAuthority("SCOPE_payments:write")
@@ -357,11 +383,23 @@ public class SecurityConfig {
 
     @Bean
     public JwtDecoder paymentJwtDecoder() {
-        return NimbusJwtDecoder
+        // The Nimbus JWK source caches the key set (default 5 minutes) and
+        // refetches on an unknown kid -- no extra cache code needed
+        NimbusJwtDecoder decoder = NimbusJwtDecoder
             .withJwkSetUri("https://auth.payments.example.com/.well-known/jwks.json")
             .jwsAlgorithm(SignatureAlgorithm.RS256)
-            .cache(Duration.ofMinutes(5))   // Cache JWKs — see JWK caching section
+            .jwsAlgorithm(SignatureAlgorithm.ES256)
             .build();
+
+        // By default only exp/nbf are checked: issuer and AUDIENCE must be
+        // added explicitly -- without them a token issued for another
+        // service (or another issuer) would be accepted
+        OAuth2TokenValidator<Jwt> audience = new JwtClaimValidator<List<String>>(
+            JwtClaimNames.AUD, aud -> aud != null && aud.contains("payment-service"));
+        decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(
+            JwtValidators.createDefaultWithIssuer("https://auth.payments.example.com"),
+            audience));
+        return decoder;
     }
 
     @Bean
@@ -399,33 +437,42 @@ Fetching the JWKS endpoint on every token validation is a performance and reliab
 @Component
 public class CachingJWKSClient {
 
-    private final Cache<String, RSAKey> keyCache;
     private final String jwksUri;
+    private final Cache<String, JWK> keyCache = Caffeine.newBuilder()
+        .maximumSize(10)                          // typically 2-3 keys in rotation
+        .expireAfterWrite(5, TimeUnit.MINUTES)    // refresh keys every 5 minutes
+        .build();
+    // (refreshAfterWrite would need a LoadingCache -- with a plain Cache,
+    //  Caffeine rejects it at build time)
+
+    private volatile Instant lastFetch = Instant.EPOCH;
 
     public CachingJWKSClient(@Value("${auth.jwks-uri}") String jwksUri) {
         this.jwksUri = jwksUri;
-        this.keyCache = Caffeine.newBuilder()
-            .maximumSize(10)              // JWKs rotate; typically 2-3 keys in JWKS
-            .expireAfterWrite(5, TimeUnit.MINUTES)   // Refresh every 5 minutes
-            .refreshAfterWrite(1, TimeUnit.MINUTES)  // Async refresh at 1 min (Caffeine LoadingCache)
-            .build();
     }
 
-    public RSAKey getKey(String kid) {
-        return keyCache.get(kid, this::fetchKeyFromJwks);
+    public JWK getKey(String kid) {
+        JWK key = keyCache.getIfPresent(kid);
+        if (key != null) {
+            return key;
+        }
+        // Unknown kid: refetch the key set -- but at most once every 30s.
+        // Otherwise tokens with random kids would trigger a JWKS request each
+        // (a cheap denial-of-service against the auth server)
+        if (Duration.between(lastFetch, Instant.now()).toSeconds() >= 30) {
+            reloadKeySet();
+        }
+        return keyCache.getIfPresent(kid);   // null -> caller rejects the token
     }
 
-    private RSAKey fetchKeyFromJwks(String kid) {
+    private synchronized void reloadKeySet() {
         try {
-            JWKSet jwkSet = JWKSet.load(new URL(jwksUri));
-            JWK jwk = jwkSet.getKeyByKeyId(kid);
-            if (jwk == null) {
-                throw new TokenValidationException("Key not found in JWKS: " + kid);
-            }
-            return (RSAKey) jwk;
+            JWKSet jwkSet = JWKSet.load(URI.create(jwksUri).toURL());
+            jwkSet.getKeys().forEach(k -> keyCache.put(k.getKeyID(), k));
+            lastFetch = Instant.now();
         } catch (IOException | ParseException e) {
             log.error("Failed to fetch JWKS from {}", jwksUri, e);
-            throw new TokenValidationException("JWKS fetch failed");
+            // keep serving the cached keys
         }
     }
 }
@@ -433,7 +480,7 @@ public class CachingJWKSClient {
 
 **Handling key rotation without downtime:**
 
-When the auth server rotates its signing key, tokens signed with the old key will fail validation if the cache still holds only the old key. The `kid` in the JWT header triggers a cache miss, and the new key is fetched automatically. This is why `kid` is mandatory in the JWT header for production systems.
+When the auth server rotates its signing key, tokens signed with the NEW key arrive while the cache still holds only the old one. The unknown `kid` in the JWT header triggers a (rate-limited) refetch, and the new key is picked up automatically. Auth servers publish the new key in the JWKS before they start signing with it, and keep the old one there until old tokens have expired. This is why `kid` is mandatory in the JWT header for production systems.
 
 ---
 
@@ -467,15 +514,19 @@ public class PaymentController {
         // Additional runtime checks beyond Spring Security's @PreAuthorize
         String customerId = jwt.getClaimAsString("customer_id");
 
-        // Verify customer can only submit payments for their own accounts
-        if (!request.getSourceAccountId().startsWith("ACC-" + customerId)) {
+        // Verify the customer owns the source account -- an exact lookup,
+        // never a string prefix test (with a prefix check, customer 12
+        // would "own" the accounts of customers 123, 1234, ...)
+        if (!accountService.isOwnedBy(request.getSourceAccountId(), customerId)) {
             throw new AccessDeniedException(
                 "Cannot submit payments from accounts you do not own");
         }
 
-        // For international transfers, require additional scope
-        if (request.isInternational() &&
-                !jwt.getClaimAsStringList("scope").contains("transfers:international")) {
+        // For international transfers, require additional scope. "scope" is
+        // ONE space-delimited string -- split it (or use the SCOPE_
+        // authorities Spring Security already derived from it)
+        Set<String> scopes = Set.of(jwt.getClaimAsString("scope").split(" "));
+        if (request.isInternational() && !scopes.contains("transfers:international")) {
             throw new AccessDeniedException(
                 "International transfers require transfers:international scope");
         }
@@ -514,13 +565,18 @@ public class TokenRevocationService {
     public void revokeToken(String jti, Instant expiry) {
         String key = REVOCATION_KEY_PREFIX + jti;
         Duration ttl = Duration.between(Instant.now(), expiry);
+        if (ttl.isNegative() || ttl.isZero()) {
+            return;   // already expired -- nothing to revoke
+        }
         // Store revocation until token would have expired anyway (auto-cleanup)
         redis.opsForValue().set(key, "1", ttl);
         log.info("Token revoked jti={}", jti);
     }
 
     public boolean isRevoked(String jti) {
-        // O(1) Redis lookup on every token validation
+        // O(1) Redis lookup on every token validation. Decide explicitly what
+        // happens if Redis is down: fail closed (reject) for payment writes,
+        // possibly fail open for low-risk reads
         return Boolean.TRUE.equals(redis.hasKey(REVOCATION_KEY_PREFIX + jti));
     }
 }

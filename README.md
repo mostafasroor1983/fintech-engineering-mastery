@@ -2,7 +2,7 @@
 
 A focused self-study program for **Senior Software Engineer** roles at large fintechs and banks:
 payments, ledgers, wallets, FX, cards, reconciliation and resilience, in **Java 21 and Spring Boot 4**.
-It is sized to **30 weeks × 10 hours**: a 228.5-hour main path (lessons + five capstone projects), plus
+It is sized to **30 weeks × 10 hours**: a 227.8-hour main path (167.8 h of lessons + 60 h for five capstone projects), plus
 reserved time for mock interviews, review and slack.
 
 **Start here:**
@@ -14,6 +14,7 @@ reserved time for mock interviews, review and slack.
 | Interview playbook | Track 15 (`docs/content/interview/`): STAR stories, the 45-minute design round, top 60 questions, 10 mock interviews |
 | First 90 days in a new job | Track 16 (`docs/content/new-job/`) |
 | Review notes and decisions | [`docs/review/`](docs/review/) |
+| Arabic version | Every lesson, lab, capstone page, the study plan and the glossary (`*.ar.md`, `docs/data/ar/`); switch language in the site's top bar |
 
 **Live site:** deploy to GitHub Pages using the instructions below, or run it locally in 10 seconds.
 
@@ -40,20 +41,21 @@ Open `http://localhost:8080` in your browser.
 
 ## Deploy to GitHub Pages
 
-### Automatic (recommended)
+The default branch is **`v1`**. The site needs no build step: GitHub Pages serves the `docs/` folder as is.
 
-1. Push the repository to GitHub.
-2. Go to **Settings → Pages**.
-3. Under **Source**, select **GitHub Actions**.
-4. The workflow at `.github/workflows/deploy.yml` runs automatically on every push to `main` and publishes the `docs/` folder.
-5. Your site will be live at `https://<username>.github.io/<repo-name>/`.
-
-### Manual (branch-based)
+### Branch-based (current setup)
 
 1. Go to **Settings → Pages**.
 2. Set **Source** to **Deploy from a branch**.
-3. Choose branch `main`, folder `/docs`.
-4. Click **Save**.
+3. Choose branch `v1`, folder `/docs`, and click **Save**.
+4. Every push to `v1` republishes the site at `https://<username>.github.io/<repo-name>/`.
+
+### GitHub Actions (alternative)
+
+`.github/workflows/deploy.yml` validates the content and then publishes `docs/`. It runs only when started
+by hand (**Actions → Deploy to GitHub Pages → Run workflow**), so it doesn't compete with the branch-based
+setup. To use it instead, set **Source** to **GitHub Actions** and add a `push: branches: [v1]` trigger
+to the workflow.
 
 > The `docs/.nojekyll` file is already in place — this disables Jekyll and ensures `_track.json` files (which start with `_`) are served correctly.
 
@@ -80,12 +82,12 @@ Track 05 (transaction integrity) is entirely Core and is studied early (weeks 3�
 | 11 | `track-11` | Security, Observability & Production Engineering | 20 | 5.4 h | 25.8 h |
 | 12 | `track-12` | Staff & Principal Engineering Leadership | 14 | 6.2 h | 17.4 h |
 | 13 | `track-13` | Spring Boot 4 for Senior Fintech Engineers | 8 | 9.7 h | 9.7 h |
-| 14 | `track-14` | System Design for Fintech Interviews | 8 | 9.8 h | 9.8 h |
+| 14 | `track-14` | System Design for Fintech Interviews | 8 | 9.1 h | 9.1 h |
 | 15 | `track-15` | Interview Playbook | 5 | 4.2 h | 4.2 h |
 | 16 | `track-16` | First 90 Days | 2 | 1.6 h | 1.6 h |
-| | | **Total** | **272** | **168.6 h** | **355.7 h** |
+| | | **Total** | **272** | **167.8 h** | **354.8 h** |
 
-Plus **five capstone projects** (12 h each, 60 h, in the main path) and **20 Decision Lab scenarios**.
+Plus **five capstone projects** (12 h each, 60 h, in the main path), **20 Decision Lab scenarios** and **25 Concurrency Lab experiments**.
 
 ---
 
@@ -97,6 +99,7 @@ Plus **five capstone projects** (12 h each, 60 h, in the main path) and **20 Dec
 - **Breadcrumb** — Dashboard → Curriculum → Track → Lesson, all clickable
 - **Prev / Next** — in-lesson navigation between sequential lessons
 - **Keyboard shortcuts** — `/` or `Ctrl+K` opens search from anywhere
+- **Study plan and glossary pages** — `#/study-plan` and `#/glossary` render `docs/content/study-plan.md` and `glossary.md` (or their Arabic versions), with repo file links turned into site links
 
 ### Content
 - **Markdown lessons** — rendered client-side with `marked.js`; custom heading renderer adds anchor IDs
@@ -107,12 +110,13 @@ Plus **five capstone projects** (12 h each, 60 h, in the main path) and **20 Dec
 - **Progress tracking** — mark lessons complete; overall and per-track progress rings on the Dashboard and Curriculum pages
 
 ### Search
-- **Full-text search** via `lunr.js` over 327 indexed documents (lessons, tracks, scenarios, capstones)
+- **Full-text search** via `lunr.js` over 338 indexed documents (lessons, tracks, scenarios, experiments, capstones), with a separate Arabic index
 - Searches title (boost ×10), tags (×6), subtitle (×4), track name (×3), body text (×1)
 - Results grouped by type with direct links
 
-### Theme
+### Theme and language
 - Dark mode (default) and light mode toggle — preference persisted via `localStorage`
+- English / Arabic switch in the top bar (right-to-left layout for Arabic); pages without an Arabic file fall back to English with a notice
 
 ---
 
@@ -127,16 +131,18 @@ fintech-engineering-mastery/
 │   │   ├── interview/                 # Track 15 lessons (interview playbook)
 │   │   ├── new-job/                   # Track 16 lessons (first 90 days)
 │   │   ├── capstone/project-*/        # GENERATED from examples/*/README.md
-│   │   ├── study-plan.md              # GENERATED 30-week plan
-│   │   └── glossary.md                # Terms defined in the lessons
+│   │   ├── study-plan.md              # GENERATED 30-week plan (study-plan.ar.md: Arabic, also generated)
+│   │   └── glossary.md                # Terms defined in the lessons (glossary.ar.md: Arabic)
 │   ├── data/                          # tracks.json, search-index.json, curriculum-index.json, capstone-projects.json
+│   │   └── ar/                        # Arabic versions of the data files (GENERATED by tools/i18n/build_ar_data.py)
 │   └── review/                        # Phase reports, corrections log, decisions, archive of replaced content
 ├── examples/                          # Maven multi-module project: capstones + lesson code, all tested
 ├── tools/
 │   ├── validate_content.py            # The validator (run before every commit)
 │   ├── build_capstone_pages.py        # examples/*/README.md -> capstone pages + manifests
 │   ├── sync_manifest_tiers.py         # tiers -> _track.json and tracks.json totals
-│   └── build_study_plan.py            # schedule -> docs/content/study-plan.md (with checks)
+│   ├── build_study_plan.py            # schedule -> docs/content/study-plan.md (with checks)
+│   └── i18n/                          # Arabic: lesson assembler, data/track builders, Arabic study plan, glossary of terms
 ├── rebuild_search_index.py            # Rebuild docs/data/search-index.json
 └── README.md
 ```
@@ -147,8 +153,13 @@ fintech-engineering-mastery/
 python3 tools/sync_manifest_tiers.py     # after changing tiers (CORE_IDS / SUPPORTING_IDS in the validator)
 python3 tools/build_capstone_pages.py    # after editing a capstone README in examples/
 python3 tools/build_study_plan.py        # after changing the schedule or lesson minutes
+python3 tools/i18n/build_study_plan_ar.py  # after build_study_plan.py (Arabic plan)
 python3 rebuild_search_index.py          # after adding or editing lessons
+python3 tools/i18n/build_ar_data.py      # after the line above (Arabic search index and data)
 python3 tools/validate_content.py --verbose   # must print "All checks passed"
+python3 tools/site_check.py               # every page in headless Chrome (EN + AR): zero console errors, all diagrams render
+python3 tools/check_code_blocks.py        # parse every code block (Java, SQL, YAML, JSON, Bash, properties); needs pip install -r tools/requirements.txt
+python3 tools/responsive_check.py         # 14 device classes (320px to 3440px, touch, landscape), EN/AR, dark/light: overflow, 44px targets, 12px text, contrast; needs pip install playwright
 
 cd examples && mvn test                  # all modules; needs Docker (Testcontainers)
 ```
@@ -202,15 +213,14 @@ prerequisites: [track-03-lesson-02, track-03-lesson-07]
 
 ## Rebuilding the Search Index
 
-After adding new lessons, regenerate the search index:
+After adding or editing lessons, regenerate the search indexes (English, then Arabic):
 
 ```bash
-# Python (no dependencies)
-python3 rebuild_search_index.py
-
-# Node.js
-node scripts/build-search-index.js
+python3 rebuild_search_index.py          # docs/data/search-index.json (no dependencies)
+python3 tools/i18n/build_ar_data.py      # docs/data/ar/search-index.json and the other Arabic data
 ```
+
+The validator fails if a lesson's text in `search-index.json` no longer matches the lesson file.
 
 ---
 
@@ -222,11 +232,11 @@ All runtime libraries are loaded from jsDelivr CDN — no npm install or bundler
 |---------|---------|---------|
 | `marked` | 14.1.3 | Markdown → HTML |
 | `js-yaml` | 4.1.0 | YAML frontmatter parsing |
-| `mermaid` | 11.4.1 | Architecture and sequence diagrams |
-| `prismjs` | 1.29.0 | Syntax highlighting (Java, SQL, YAML, JSON, Bash) |
+| `mermaid` | 11.4.1 | Architecture and sequence diagrams (loaded only when a page has a diagram) |
+| `prismjs` | 1.29.0 | Syntax highlighting; the autoloader fetches each language on first use |
 | `lunr` | 2.3.9 | Full-text search index |
-| `katex` | 0.16.11 | Mathematical notation (CSS; JS loaded on demand) |
 
+Every CDN script is pinned to an exact version and checked with a Subresource Integrity (SRI) hash.
 The site works offline after the first load (CDN assets cached by the browser).
 
 ---

@@ -1,0 +1,100 @@
+name: CI
+
+# Runs on every push to v1 and on every pull request:
+#   content  - the validator, a syntax check of every code block, and a check that
+#              every generated file is up to date
+#   site     - every page in headless Chrome, English and Arabic, with zero errors, plus
+#              a responsive/accessibility check across 14 device classes
+#   examples - compiles and tests the capstones (Testcontainers uses the runner's Docker)
+on:
+  push:
+    branches: [v1]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  content:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install validator dependencies
+        run: python -m pip install --quiet -r tools/requirements.txt
+
+      - name: Validate content
+        run: python tools/validate_content.py
+
+      - name: Syntax-check every code block (Java, SQL, YAML, JSON, Bash, properties)
+        run: |
+          mvn -q -B -ntp dependency:get -Dartifact=com.github.javaparser:javaparser-core:3.26.4
+          python tools/check_code_blocks.py
+
+      - name: Generated files are up to date
+        # Re-runs every generator; any difference means someone edited a source
+        # without regenerating. The diff shows what to run.
+        run: |
+          python tools/i18n/build_ar_tracks.py
+          python rebuild_search_index.py
+          python tools/i18n/build_ar_data.py
+          # lastBuilt is today's date, so ignore it when comparing the search indexes
+          git diff --exit-code -I '"lastBuilt"' -- docs/ || {
+            echo "::error::Generated files are out of date. Run the commands above locally and commit the result."
+            exit 1
+          }
+
+  site:
+    # Loads every page in headless Chrome (preinstalled on the runner), English and Arabic,
+    # and fails on console errors, failed requests or diagrams that don't render.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check every page renders without errors
+        run: python tools/site_check.py --json site-check-report.json
+
+      - name: Responsive and accessibility check (14 device classes, EN/AR, dark/light)
+        run: |
+          python -m pip install --quiet playwright
+          python tools/responsive_check.py --json responsive-report.json
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-check-report
+          path: |
+            site-check-report.json
+            responsive-report.json
+          if-no-files-found: ignore
+
+  examples:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build and test (load tests excluded)
+        run: mvn -B -ntp verify

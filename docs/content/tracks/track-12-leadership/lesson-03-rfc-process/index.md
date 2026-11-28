@@ -25,7 +25,7 @@ As an individual contributor without direct reports, your influence over technic
 
 **Surface concerns early**: Code is expensive to change. Architecture is more expensive. An RFC that surfaces a critical objection during the comment period saves weeks of rework.
 
-**Create organisational memory**: Two years from now, when someone asks "why did we build a Kafka-based settlement pipeline instead of a synchronous one?", the RFC answer that question. Without it, the institutional knowledge lives only in one engineer's head.
+**Create organisational memory**: Two years from now, when someone asks "why did we build a Kafka-based settlement pipeline instead of a synchronous one?", the RFC answers that question. Without it, the institutional knowledge lives only in one engineer's head.
 
 **Scale your impact**: You can personally review 2-3 designs in a week. An RFC process lets you create standards that affect 20 designs without touching each one.
 
@@ -100,12 +100,15 @@ service to the settlement service. This creates three problems:
 
 ## Proposed Solution
 
-Introduce a Kafka-based settlement pipeline. Payment service publishes a
-`PaymentSettlementRequested` event after payment authorisation. Settlement service
-consumes events asynchronously.
+Introduce a Kafka-based settlement pipeline. Payment service records a
+`PaymentSettlementRequested` event in an outbox table IN THE SAME database
+transaction as the payment authorisation; a relay (Debezium CDC) publishes it to
+Kafka. Settlement service consumes events asynchronously. (Publishing to Kafka
+directly after the commit would be a dual write: a crash between the two steps
+loses the event.)
 
 **Architecture**:
-```
+~~~
 Payment Service ──publish──► Kafka Topic (payment-settlements) ──consume──► Settlement Service
                                                                                       │
                                                                                       ▼
@@ -115,30 +118,31 @@ Payment Service ──publish──► Kafka Topic (payment-settlements) ──c
                                                                      publish PaymentSettled event
                                                                                       │
 Payment Service ◄──consume────────────────────────────────────────────────────────────
-```
+~~~
 
 **Failure handling**: If settlement fails (e.g., insufficient funds discovered during settlement), publish a `PaymentSettlementFailed` event. Payment service handles compensating transaction.
 
-**Kafka configuration**: Settlement topic with 20 partitions (supports 20x parallelism), replication factor 3, retention 7 days (allows replaying recent events for recovery).
+**Kafka configuration**: Settlement topic with 20 partitions (supports 20x parallelism), keyed by payment_id (keeps each payment's events in order), replication factor 3 with min.insync.replicas=2, retention 7 days (allows replaying recent events for recovery).
 
 ---
 
 ## Alternatives Considered
 
-### Alternative 1: Saga pattern with choreography (rejected)
-Multiple services emit events that trigger each other.
-Rejected because: debugging distributed failures becomes extremely difficult.
-The settlement pipeline is two services; additional complexity of saga is not justified.
+### Alternative 1: Orchestrated saga with a workflow engine (rejected)
+A central orchestrator (e.g. Temporal) drives each settlement step.
+Rejected because: the settlement pipeline is two services; running and
+operating a workflow engine is not justified yet. Revisit if more steps are added.
 
 ### Alternative 2: Synchronous with queue-based retry (rejected)
 Payment service retries settlement call with exponential backoff.
 Rejected because: does not solve throughput problem; Tomcat thread blocks during retry wait.
 Settlement service failures still cause payment submissions to slow down.
 
-### Alternative 3: Database-based outbox pattern (viable alternative)
-Payment service writes to outbox table in its database; a separate process polls and publishes to Kafka.
-Trade-off: Simpler (no Kafka dependency for Payment service), but adds polling latency (seconds).
-Could be chosen if Kafka operational overhead is a concern.
+### Alternative 3: Publish directly to Kafka after the database commit (rejected)
+Payment service commits the payment, then calls the Kafka producer.
+Rejected because: it is a dual write — if the service crashes after the commit
+but before the publish, the payment is never settled. The outbox in the proposed
+solution makes "payment recorded" and "event recorded" one atomic step.
 
 ---
 
@@ -238,13 +242,16 @@ I support the decision but want to record my concern for the record:
 The proposed Kafka consumer uses at-least-once delivery. The idempotency
 implementation assumes payment_id is sufficient for deduplication.
 If the same payment_id is ever reused (e.g., after a system migration),
-we will have silent duplicate settlements.
+we will have silent duplicate settlements — and a legitimate second
+settlement attempt for the same payment would be wrongly dropped.
 
-Recommendation: add a composite idempotency key that includes both
-payment_id and event_timestamp.
+Recommendation: deduplicate on a dedicated settlement_request_id (UUID
+generated once when the settlement is requested and carried unchanged
+through every retry). Do NOT include a timestamp in the key: a retry
+would get a new timestamp and slip past deduplication.
 
 Decision maker acknowledged this concern. It has been captured as a
-follow-up: PAY-5678 "Composite idempotency key for settlement events"
+follow-up: PAY-5678 "Dedicated settlement_request_id for deduplication"
 ```
 
 ---

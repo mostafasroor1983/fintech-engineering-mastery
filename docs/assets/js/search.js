@@ -415,14 +415,14 @@ EM.Search = (function () {
     }
 
     var tags = (doc.tags || []).slice(0, 4).map(function (t) {
-      return '<span class="tag-chip" dir="ltr" style="font-size:11px">' + _esc(t) + '</span>';
+      return '<span class="tag-chip" dir="ltr" style="font-size:0.75rem">' + _esc(t) + '</span>';
     }).join('');
 
     var excerpt = _excerpt(doc.body, query, 180);
 
     var statusBadge = '';
     if (doc.status === 'in-development') {
-      statusBadge = '<span class="badge badge-in-development" style="font-size:10px">' + EM.t('badge.inDev') + '</span>';
+      statusBadge = '<span class="badge badge-in-development" style="font-size:0.75rem">' + EM.t('badge.inDev') + '</span>';
     }
 
     var metaLine =

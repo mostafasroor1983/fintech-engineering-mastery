@@ -11,8 +11,10 @@ import json
 import os
 import re
 import sys
+from datetime import date
 
-BASE = '/Users/mostafasrour/Desktop/fintech-engineering-mastery/docs'
+# Resolve docs/ next to this script, so it works from any clone or folder.
+BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'docs')
 TRACKS_JSON = os.path.join(BASE, 'data', 'tracks.json')
 SEARCH_INDEX = os.path.join(BASE, 'data', 'search-index.json')
 TRACKS_DIR = os.path.join(BASE, 'content', 'tracks')
@@ -203,7 +205,7 @@ def main():
 
     result = {
         'version': '1.0',
-        'lastBuilt': '2026-11-11',
+        'lastBuilt': date.today().isoformat(),
         'totalDocs': total,
         'documents': all_docs
     }

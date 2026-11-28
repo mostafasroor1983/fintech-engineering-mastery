@@ -23,6 +23,7 @@ EM.Renderer = (function () {
       'les.trackNotFound': 'Track not found: {id}', 'les.lessonNotFound': 'Lesson not found: {id}',
       'les.netErr': 'Network error loading lesson: {p}', 'les.loadErr': 'Could not load lesson content from: {p}',
       'les.note': 'Note', 'les.tip': 'Tip', 'les.important': 'Important', 'les.warning': 'Warning', 'les.danger': 'Danger',
+      'les.tableRegion': 'Table (scrolls sideways)',
       'les.copy': 'Copy', 'les.copyCode': 'Copy code', 'les.copied': 'Copied!', 'les.copyErr': 'Error',
       'les.question': 'Question {n} of {total}', 'les.score': 'Score: {a} / {b}',
       'les.zoomOut': 'Zoom out', 'les.zoomIn': 'Zoom in', 'les.zoomReset': 'Reset zoom', 'les.full': 'Fullscreen', 'les.close': 'Close',
@@ -30,7 +31,7 @@ EM.Renderer = (function () {
       'les.kcSubN': '{n} questions — click an option to answer', 'les.challenge': 'Practical Challenge'
     },
     ar: {
-      'les.prereqs': 'المتطلبات السابقة:', 'les.track': 'المسار {n} — {t}', 'les.trackLesson': 'المسار {n} — الدرس {l}',
+      'les.tableRegion': 'جدول (يُمرَّر أفقيًا)', 'les.prereqs': 'المتطلبات السابقة:', 'les.track': 'المسار {n} — {t}', 'les.trackLesson': 'المسار {n} — الدرس {l}',
       'les.complete': 'تحديد كمكتمل', 'les.completed': 'مكتمل', 'les.prev': '→ السابق', 'les.next': 'التالي ←',
       'les.soon': 'قريبًا', 'les.inDev': 'الدرس قيد الإعداد',
       'les.inDevMsg': 'هذا الدرس جزء من المنهج المنشور وسيُضاف في تحديث قادم. المخطط والمتطلبات السابقة والوقت المتوقع معروضة في الأعلى.',
@@ -47,6 +48,16 @@ EM.Renderer = (function () {
   });
   var _markedReady   = false;
   var _mermaidReady  = false;
+  var _mermaidLoad   = null;   // Promise while mermaid.min.js is being fetched
+
+  /* Mermaid is 2.5 MB, so it is fetched only when a page has a diagram (pinned + SRI) */
+  var MERMAID_URL = 'https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js';
+  var MERMAID_SRI = 'sha384-rbtjAdnIQE/aQJGEgXrVUlMibdfTSa4PQju4HDhN3sR2PmaKFzhEafuePsl9H/9I';
+
+  /* Prism's autoloader fetches languages from here; fence names Prism doesn't know map to a close one */
+  var PRISM_COMPONENTS = 'https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/';
+  // '' means plain text: no Prism language is requested
+  var LANG_ALIASES = { spl: 'splunk-spl', logql: 'promql', jsonnet: 'javascript', jsonc: 'json', tsv: '' };
 
   /* ----------------------------------------------------------
      Utilities
@@ -124,6 +135,7 @@ EM.Renderer = (function () {
           var hlLang  = lang;
           if (lang === 'java17') { version = 'java17'; hlLang = 'java'; }
           if (lang === 'java21') { version = 'java21'; hlLang = 'java'; }
+          if (Object.prototype.hasOwnProperty.call(LANG_ALIASES, hlLang)) hlLang = LANG_ALIASES[hlLang];
 
           var langClass    = hlLang ? 'language-' + hlLang : '';
           var versionAttr  = version ? ' data-version="' + version + '"' : '';
@@ -266,8 +278,13 @@ EM.Renderer = (function () {
       prereqs = '<div class="lesson-prereqs">' +
         '<span class="lesson-prereqs-label">' + EM.t('les.prereqs') + '</span>' +
         meta.prerequisites.map(function (p) {
-          return '<button class="prereq-link" onclick="EM.Router.navigate(\'/tracks/' +
-            (appTrack ? appTrack.id : '') + '/lessons/' + _esc(p) + '\')">' + _esc(p) + '</button>';
+          // Lesson ids carry their track (track-05-lesson-14), so cross-track prerequisites route correctly
+          var m = /^(track-\d+)-lesson-\d+$/.exec(p);
+          var pTrack = m ? m[1] : (appTrack ? appTrack.id : '');
+          var label = p;
+          (trackData && trackData.lessons || []).forEach(function (l) { if (l.id === p) label = l.title; });
+          return '<button class="prereq-link" title="' + _esc(p) + '" onclick="EM.Router.navigate(\'/tracks/' +
+            pTrack + '/lessons/' + _esc(p) + '\')">' + _esc(label) + '</button>';
         }).join('<span style="color:var(--text-muted)"> · </span>') +
       '</div>';
     }
@@ -372,9 +389,11 @@ EM.Renderer = (function () {
      Post-Processing: runs after HTML is injected into DOM
   ---------------------------------------------------------- */
   function initComponents(container) {
-    var body = container.querySelector('#lesson-body');
+    // #lesson-body on lessons; doc pages (study plan, glossary) use the class only
+    var body = container.querySelector('#lesson-body') || container.querySelector('.lesson-body');
     if (!body) return;
 
+    _wrapTables(body);
     _transformCallouts(body);
     _buildCodeTabs(body);
     _addCopyButtons(body);
@@ -382,6 +401,23 @@ EM.Renderer = (function () {
     _initPrism(body);
     _initKnowledgeCheck(body);
     _initPracticalChallenge(body, container);
+  }
+
+  /* ----------------------------------------------------------
+     Wide tables scroll inside their own box instead of widening the page.
+     The box is focusable and labelled so keyboard users can scroll it (WCAG 2.1.1).
+  ---------------------------------------------------------- */
+  function _wrapTables(body) {
+    body.querySelectorAll('table').forEach(function (table) {
+      if (table.parentElement && table.parentElement.classList.contains('table-scroll')) return;
+      var box = document.createElement('div');
+      box.className = 'table-scroll';
+      box.setAttribute('role', 'region');
+      box.setAttribute('tabindex', '0');
+      box.setAttribute('aria-label', EM.t('les.tableRegion'));
+      table.parentNode.insertBefore(box, table);
+      box.appendChild(table);
+    });
   }
 
   /* ----------------------------------------------------------
@@ -564,10 +600,32 @@ EM.Renderer = (function () {
   /* ----------------------------------------------------------
      Initialize Mermaid
   ---------------------------------------------------------- */
+  function _loadMermaid() {
+    if (typeof mermaid !== 'undefined') return Promise.resolve();
+    if (!_mermaidLoad) {
+      _mermaidLoad = new Promise(function (resolve, reject) {
+        var s = document.createElement('script');
+        s.src = MERMAID_URL;
+        s.integrity = MERMAID_SRI;
+        s.crossOrigin = 'anonymous';
+        s.referrerPolicy = 'no-referrer';
+        s.onload = resolve;
+        s.onerror = function () { _mermaidLoad = null; reject(new Error('Could not load Mermaid')); };
+        document.head.appendChild(s);
+      });
+    }
+    return _mermaidLoad;
+  }
+
   function _initMermaid(body) {
-    if (typeof mermaid === 'undefined') return;
     var elements = body.querySelectorAll('.mermaid');
     if (!elements.length) return;
+    if (typeof mermaid === 'undefined') {
+      _loadMermaid().then(function () { _initMermaid(body); }, function (err) {
+        console.warn('[EM.Renderer]', err.message); // diagrams stay as readable source text
+      });
+      return;
+    }
 
     var theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default';
 
@@ -575,7 +633,7 @@ EM.Renderer = (function () {
       mermaid.initialize({
         startOnLoad: false,
         theme:       theme,
-        fontFamily:  'Inter, system-ui, sans-serif',
+        fontFamily:  "'Google Sans', system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif",
         fontSize:    16,
         flowchart:   { htmlLabels: true, curve: 'basis', nodeSpacing: 50, rankSpacing: 60 },
         sequence:    { actorMargin: 60, messageMargin: 50, fontSize: 14 },
@@ -594,7 +652,11 @@ EM.Renderer = (function () {
       _mermaidReady = true;
     }
 
-    mermaid.run({ nodes: Array.from(elements) }).then(function () {
+    // Mermaid sizes boxes by measuring text, so wait for the web font or labels get clipped
+    var fontsReady = (document.fonts && document.fonts.ready) ? document.fonts.ready : Promise.resolve();
+    fontsReady.then(function () {
+      return mermaid.run({ nodes: Array.from(elements) });
+    }).then(function () {
       _wrapDiagramsWithZoom(body);
     }).catch(function (err) {
       console.warn('[EM.Renderer] Mermaid render error:', err);
@@ -721,21 +783,8 @@ EM.Renderer = (function () {
   ---------------------------------------------------------- */
   function _initPrism(body) {
     if (typeof Prism === 'undefined') return;
+    if (Prism.plugins && Prism.plugins.autoloader) Prism.plugins.autoloader.languages_path = PRISM_COMPONENTS;
     Prism.highlightAllUnder(body);
-  }
-
-  /* ----------------------------------------------------------
-     Initialize KaTeX
-  ---------------------------------------------------------- */
-  function _initKatex(body) {
-    if (typeof renderMathInElement === 'undefined') return;
-    renderMathInElement(body, {
-      delimiters: [
-        { left: '$$', right: '$$', display: true },
-        { left: '$',  right: '$',  display: false }
-      ],
-      throwOnError: false
-    });
   }
 
   /* ----------------------------------------------------------
@@ -1051,6 +1100,7 @@ EM.Renderer = (function () {
   /* Post-process rendered markdown outside a lesson page (used by capstone.js). */
   function postProcess(el) {
     if (!el) return;
+    _wrapTables(el);
     _transformCallouts(el);
     _buildCodeTabs(el);
     _addCopyButtons(el);

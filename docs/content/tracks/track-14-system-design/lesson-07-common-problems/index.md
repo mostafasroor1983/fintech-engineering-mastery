@@ -240,3 +240,78 @@ and unknown rail outcomes)."
 - [Track 02: Distributed locks](#/tracks/track-02/lessons/track-02-lesson-09)
 - [Track 04: Real-time payments](#/tracks/track-04/lessons/track-04-lesson-08)
 - [Reference: patterns, estimation, database choice](#/tracks/track-14/lessons/track-14-lesson-08)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1407-01",
+    "question": "What is the signature risk to name early in an FX conversion design?",
+    "options": [
+      "Network latency between data centres",
+      "Using a quote twice or after it expires, and rounding that creates or destroys money",
+      "The size of the market-data feed",
+      "Choosing between REST and gRPC"
+    ],
+    "correct": 1,
+    "explanation": "A quote must be consumed exactly once before expiry (one conditional UPDATE), and rounding must be a written rule applied in one place, with each currency balancing separately in the ledger."
+  },
+  {
+    "id": "kc-1407-02",
+    "question": "Why must webhook delivery be at-least-once?",
+    "options": [
+      "Because HTTP does not support exactly-once by law",
+      "Because receivers prefer duplicates",
+      "We can't know whether a timed-out request was processed by the receiver, so we retry with the same Webhook-Id and the receiver de-duplicates",
+      "Because Kafka is at-least-once"
+    ],
+    "correct": 2,
+    "explanation": "Exactly-once delivery to a third party over an unreliable network is impossible. Sign the payload (HMAC over id, timestamp and body) and document de-duplication by id."
+  },
+  {
+    "id": "kc-1407-03",
+    "question": "Is Redlock safe for preventing double spending?",
+    "options": [
+      "No: a paused client can outlive its lease and still write. Correctness needs fencing tokens or, better, a database constraint or conditional update at the write itself",
+      "Yes, with five or more Redis nodes",
+      "Yes, if the TTL is long enough",
+      "Yes, because Redis is single-threaded"
+    ],
+    "correct": 0,
+    "explanation": "More nodes don't fix a paused client (GC, VM stall). Use Redis locks only for efficiency, such as avoiding duplicate work, never for money correctness."
+  },
+  {
+    "id": "kc-1407-04",
+    "question": "An instant payment times out at the rail. What do you do?",
+    "options": [
+      "Retry it with a new end-to-end id",
+      "Mark it failed and refund the customer",
+      "Ask the customer to try again",
+      "Mark it unknown, query the rail's status by our end-to-end id, resolve it, and reconcile at end of day; never resend with a new id"
+    ],
+    "correct": 3,
+    "explanation": "Instant payments are final once the rail accepts them and can't be recalled freely, so a resend with a new id can send the money twice."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1407",
+  "title": "Six problems, six pitches",
+  "description": "Turn the compact answers into practised, timed responses.",
+  "tasks": [
+    {
+      "id": "pc-1407-01",
+      "description": "For each of the six problems (wallet, settlement, webhooks, FX, locking, cards/P2P), write the signature risk in one sentence and the mechanism that handles it."
+    },
+    {
+      "id": "pc-1407-02",
+      "description": "Pick one problem and expand it to the full 45-minute RESHADED answer on paper, with estimates, schema, both sequences and a failure table."
+    },
+    {
+      "id": "pc-1407-03",
+      "description": "Record yourself giving all six 60-second pitches. Replay them and check each one names its signature risk in the first 15 seconds."
+    }
+  ]
+}
+-->

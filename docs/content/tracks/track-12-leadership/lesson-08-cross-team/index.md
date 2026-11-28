@@ -121,7 +121,7 @@ Synchronous service calls between payment-service, fraud-service, and
 notification-service create a dependency chain that causes 3–5 P2 incidents
 per quarter. In Q3, payment-service latency degradation caused fraud-service
 timeouts, which caused 23% of payments to fail during peak processing.
-Evidence: incident reports INC-2024-087, INC-2024-134, INC-2024-201.
+Evidence: incident reports INC-2026-087, INC-2026-134, INC-2026-201.
 
 ## Options
 
@@ -301,6 +301,8 @@ Bring a document. Executives rarely remember verbal conversations accurately eno
 ---
 
 ## Case Study: Introducing Event-Driven Architecture Across 8 Teams
+
+*(An illustrative composite scenario.)*
 
 **Context:** A fintech processes 50M payments/month. Synchronous dependencies between 8 services cause cascading failures. A principal engineer wants to migrate to event-driven architecture. They have no authority over any of the 8 teams.
 

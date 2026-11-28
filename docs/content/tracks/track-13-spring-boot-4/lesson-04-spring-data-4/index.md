@@ -23,8 +23,8 @@ tags:
   - "lettuce-6"
 
 topics:
-  - "Spring Data JPA 4 + Hibernate 7 virtual-thread safety"
-  - "Record entities with @Entity on Java 21 records"
+  - "Spring Data JPA 4 + Hibernate 7 migration"
+  - "Records as embeddables and projections (not entities)"
   - "Spring Data JDBC 4 aggregate root design"
   - "ListCrudRepository vs JpaRepository"
   - "Spring Data Redis 4 / Lettuce 6 distributed lock"
@@ -46,30 +46,31 @@ references:
 
 # Spring Data 4 — JDBC, JPA, and Redis
 
-Spring Data 4 ships with Spring Boot 4 and brings three significant changes: Hibernate 7 as the JPA provider (with virtual-thread safety and record entity support), revised repository hierarchy recommendations, and Spring Data Redis 4 backed by Lettuce 6 (which eliminates Netty pinning issues with virtual threads). This lesson covers each module with production fintech examples.
+Spring Boot 4 ships the Spring Data 2025.1 release train (Spring Data JPA 4, JDBC 4, Redis 4). The changes that matter most: Hibernate ORM 7 as the JPA provider (Jakarta Persistence 3.2), JSpecify null-safety in the repository APIs, a revised `Specification` API, and continued use of Lettuce as the Redis driver. This lesson covers each module with production fintech examples — including where Java records fit in the persistence layer, and where they do not.
 
 ---
 
 ## 1. Spring Data JPA 4 + Hibernate 7
 
-Hibernate 7 is the first Hibernate release that is fully virtual-thread safe. The two most visible changes for Spring Data JPA users are:
+Hibernate ORM 7 implements Jakarta Persistence 3.2. The changes most visible to Spring Data JPA users:
 
-**Virtual-thread safety**: all internal `synchronized` blocks replaced with `ReentrantLock`. Session acquisition, dirty checking, and batch flushing are all safe to call from virtual threads without pinning carrier threads (covered in Lesson 03).
+**Removed legacy `Session` methods**: `save()`, `update()`, `saveOrUpdate()` and the old `delete()` variants (deprecated since Hibernate 6.0) are gone — use the Jakarta Persistence operations `persist()`, `merge()` and `remove()`. Spring Data repositories already use these, but hand-written DAO code may not.
 
-**Record entity support**: Hibernate 7 supports immutable record entities. This is a significant ergonomic improvement for fintech event-sourced systems where domain events are naturally immutable.
+**Stricter behaviour**: several leniencies from Hibernate 5/6 were removed (for example around detached entity handling and query validation), so run the full integration test suite — not just unit tests — when upgrading.
 
-**`@jakarta.persistence.*` package stability**: the full migration from `javax.persistence.*` to `jakarta.persistence.*` was completed in SB3 (Hibernate 6). SB4/Hibernate 7 adds no package changes — but Hibernate 7 drops several deprecated annotations (`@Type`, `@TypeDef`, `@AnyMetaDef`) that were carried forward from Hibernate 5/6.
+**Virtual threads**: Hibernate runs fine on virtual threads. Pinning risk comes mostly from JDBC drivers using `synchronized` while waiting on the network — on Java 21–23 check your driver version; on Java 24+ that pinning is gone (see Lesson 03).
 
-### Dropped Hibernate Annotations (SB4 Migration Risk)
+**Annotations removed back in Hibernate 6**: the `javax.persistence` → `jakarta.persistence` move and the removal of Hibernate 5's string-based type annotations happened in Spring Boot 3 (Hibernate 6). Services that skipped that migration must do it now:
 
-| Dropped in Hibernate 7 | Replacement |
+### Hibernate 5-era Annotations (Removed in Hibernate 6 — Must Go Before SB4)
+
+| Hibernate 5 style | Hibernate 6/7 replacement |
 |---|---|
 | `@Type(type = "org.hibernate.type.TextType")` | `@JdbcTypeCode(SqlTypes.LONGVARCHAR)` |
-| `@TypeDef(name = "json", typeClass = JsonType.class)` | `@JdbcTypeCode(SqlTypes.JSON)` natively in Hibernate 7 |
+| `@TypeDef(name = "json", typeClass = JsonType.class)` | `@JdbcTypeCode(SqlTypes.JSON)` (native since Hibernate 6) |
 | `@AnyMetaDef` | `@Any` with `@AnyDiscriminator` and `@AnyKeyJavaClass` |
-| `@NaturalId(mutable = false)` changed | Still exists but `mutable` default changed |
 
-For fintech services using Hypersistence Utils (the popular Hibernate 5/6 `JsonType` library), Hibernate 7 ships native JSON mapping via `@JdbcTypeCode(SqlTypes.JSON)` — no third-party dependency needed.
+For fintech services using Hypersistence Utils' `JsonType`, native JSON mapping via `@JdbcTypeCode(SqlTypes.JSON)` (available since Hibernate 6) usually removes the need for the third-party dependency.
 
 ```java
 // Before (SB3.x with Hypersistence Utils)
@@ -80,7 +81,7 @@ public class Payment {
     private Map<String, Object> metadata;
 }
 
-// After (SB4 / Hibernate 7)
+// After (Hibernate 6/7, native JSON mapping)
 @Entity
 public class Payment {
     @JdbcTypeCode(SqlTypes.JSON)
@@ -91,87 +92,101 @@ public class Payment {
 
 ---
 
-## 2. Record Entities in Hibernate 7
+## 2. Records in the Persistence Layer
 
-Hibernate 7 supports `record` types as JPA entities. Records are immutable value types in Java 21, making them a natural fit for append-only event tables, audit trails, and reference data.
+Records are immutable value types — a natural fit for money amounts, references and event data. But **a Jakarta Persistence entity cannot be a record**: an entity needs a no-argument constructor, and Hibernate must be able to set its fields (generated ids, lazy-loading proxies, dirty checking). Neither Hibernate 6 nor 7 supports record entities. Records *do* work well in two places:
 
-**Constraints for record entities**:
-- Must have an `@Id` field
-- Cannot be updated (Hibernate ignores `UPDATE` on records) — use `@Immutable`
-- All fields must be in the canonical constructor
-- Cannot use lazy loading on associations (since you can't set fields after construction)
+- **`@Embeddable` value objects** (supported since Hibernate 6.0) — e.g. a `Money(amount, currency)` embedded in an entity
+- **Projections** — Spring Data maps query results directly into records
+
+For append-only data such as payment events, use a regular class entity with no setters and `@Immutable`:
 
 ```java
-// PaymentEvent — immutable event record for event sourcing
-@Entity
-@Table(name = "payment_events")
-@Immutable  // Tells Hibernate: never generate UPDATE SQL for this entity
-public record PaymentEvent(
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
-    UUID id,
-
-    @Column(name = "payment_id", nullable = false)
-    UUID paymentId,
-
-    @Column(name = "account_id", nullable = false)
-    UUID accountId,
-
-    @Enumerated(EnumType.STRING)
-    @Column(name = "event_type", nullable = false)
-    PaymentEventType eventType,
-
-    @JdbcTypeCode(SqlTypes.JSON)
-    @Column(name = "event_payload", columnDefinition = "jsonb")
-    Map<String, Object> payload,
-
-    @Column(name = "occurred_at", nullable = false)
-    Instant occurredAt,
-
-    @Column(name = "idempotency_key", unique = true)
-    String idempotencyKey
+// Value object: a record mapped as an embeddable (Hibernate 6.0+)
+@Embeddable
+public record Money(
+    @Column(name = "amount", precision = 19, scale = 4, nullable = false) BigDecimal amount,
+    @Column(name = "currency", length = 3, nullable = false) String currency
 ) {
-    // Compact constructor for validation
-    public PaymentEvent {
-        Objects.requireNonNull(paymentId, "paymentId must not be null");
-        Objects.requireNonNull(accountId, "accountId must not be null");
-        Objects.requireNonNull(eventType, "eventType must not be null");
-        Objects.requireNonNull(occurredAt, "occurredAt must not be null");
-        // Defensive copy for mutable map
-        payload = payload != null ? Map.copyOf(payload) : Map.of();
-    }
-
-    // Factory methods — record entities are created via constructor only
-    public static PaymentEvent paymentInitiated(
-            UUID paymentId, UUID accountId, MonetaryAmount amount) {
-        return new PaymentEvent(
-            null,  // id generated by Hibernate on INSERT
-            paymentId, accountId,
-            PaymentEventType.INITIATED,
-            Map.of("amount", amount.getNumber().toString(),
-                   "currency", amount.getCurrency().getCurrencyCode()),
-            Instant.now(),
-            null
-        );
+    public Money {
+        Objects.requireNonNull(amount, "amount must not be null");
+        Objects.requireNonNull(currency, "currency must not be null");
     }
 }
 
-// Repository — always use the RETURN VALUE of save() for the generated id
+// Append-only payment event: an immutable CLASS entity
+@Entity
+@Table(name = "payment_events")
+@Immutable  // Hibernate never generates UPDATE SQL for this entity
+public class PaymentEvent {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @Column(name = "payment_id", nullable = false, updatable = false)
+    private UUID paymentId;
+
+    @Column(name = "account_id", nullable = false, updatable = false)
+    private UUID accountId;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "event_type", nullable = false, updatable = false)
+    private PaymentEventType eventType;
+
+    @Embedded
+    private Money amount;
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "event_payload", columnDefinition = "jsonb", updatable = false)
+    private Map<String, Object> payload;
+
+    @Column(name = "occurred_at", nullable = false, updatable = false)
+    private Instant occurredAt;
+
+    @Column(name = "idempotency_key", unique = true, updatable = false)
+    private String idempotencyKey;
+
+    protected PaymentEvent() { }   // required by Jakarta Persistence
+
+    private PaymentEvent(UUID paymentId, UUID accountId, PaymentEventType eventType,
+                         Money amount, Map<String, Object> payload, String idempotencyKey) {
+        this.paymentId = Objects.requireNonNull(paymentId);
+        this.accountId = Objects.requireNonNull(accountId);
+        this.eventType = Objects.requireNonNull(eventType);
+        this.amount = amount;
+        this.payload = payload != null ? Map.copyOf(payload) : Map.of();
+        this.occurredAt = Instant.now();
+        this.idempotencyKey = idempotencyKey;
+    }
+
+    public static PaymentEvent paymentInitiated(UUID paymentId, UUID accountId,
+                                                Money amount, String idempotencyKey) {
+        return new PaymentEvent(paymentId, accountId, PaymentEventType.INITIATED,
+                                amount, Map.of(), idempotencyKey);
+    }
+
+    public UUID getId() { return id; }
+    public UUID getPaymentId() { return paymentId; }
+    public Money getAmount() { return amount; }
+    public Instant getOccurredAt() { return occurredAt; }
+    // ... getters only, no setters
+}
+
+// Records as read-only projections
+public record PaymentEventView(UUID paymentId, PaymentEventType eventType, Instant occurredAt) {}
+
 public interface PaymentEventRepository extends ListCrudRepository<PaymentEvent, UUID> {
 
     List<PaymentEvent> findByPaymentIdOrderByOccurredAtAsc(UUID paymentId);
 
-    @Query("SELECT e FROM PaymentEvent e WHERE e.accountId = :accountId " +
-           "AND e.occurredAt >= :since ORDER BY e.occurredAt DESC")
-    List<PaymentEvent> findRecentByAccount(
-        @Param("accountId") UUID accountId,
-        @Param("since") Instant since
-    );
+    // Spring Data maps each result row straight into the record
+    List<PaymentEventView> findByAccountIdAndOccurredAtAfterOrderByOccurredAtDesc(
+        UUID accountId, Instant since);
 }
 ```
 
-**What Hibernate 7 does with record entities**: on `save()`, it generates an `INSERT`. On `findById()`, it reconstructs the record using the canonical constructor. The key gotcha: `save(event)` returns a *new* record instance with the generated `id` populated. The original `event` passed in still has `id = null`. Always use the return value: `var saved = repository.save(event);`.
+**What happens on `save()`**: for a new class entity, Spring Data calls `persist()`, and Hibernate sets the generated `id` on the same instance. `save()` returns the managed instance — for new entities that is the same object, for detached ones `merge()` returns a *different* instance. Make it a habit to use the return value: `var saved = repository.save(event);`.
 
 ---
 
@@ -280,21 +295,23 @@ public interface PaymentAggregateRepository
 
 ## 4. Repository Hierarchy: `ListCrudRepository` vs `JpaRepository`
 
-Spring Data 4 clarifies the repository hierarchy. The key recommendation is to use `ListCrudRepository` for new code instead of `CrudRepository`:
+Since Spring Data 3.0, the `List*` variants exist and `PagingAndSortingRepository` no longer extends `CrudRepository` — combine the interfaces you need. The recommendation is to use `ListCrudRepository` for new code instead of `CrudRepository`:
 
 ```mermaid
 graph TD
     R["Repository (marker)"]
     CR["CrudRepository\nReturns Iterable"]
-    LCR["ListCrudRepository\nReturns List (preferred SD4)"]
-    PASR["PagingAndSortingRepository"]
+    LCR["ListCrudRepository\nReturns List (since Spring Data 3.0)"]
+    PASR["PagingAndSortingRepository\n(no longer extends CrudRepository)"]
+    LPASR["ListPagingAndSortingRepository"]
     JPR["JpaRepository\nFlush, batch ops, example queries"]
 
     R --> CR
     CR --> LCR
-    CR --> PASR
+    R --> PASR
+    PASR --> LPASR
     LCR --> JPR
-    PASR --> JPR
+    LPASR --> JPR
 ```
 
 **When to use each**:
@@ -333,7 +350,7 @@ public PaymentPage listPayments(UUID accountId, int page, int size) {
 }
 ```
 
-For financial reports at scale (millions of payments per account), `Page` with `COUNT(*)` is expensive. Use `Slice` for user-facing pagination and keyset pagination (cursor-based) for large exports. SD4 supports keyset pagination via `ScrollPosition` for forward-only traversal.
+For financial reports at scale (millions of payments per account), `Page` with `COUNT(*)` is expensive. Use `Slice` for user-facing pagination and keyset pagination (cursor-based) for large exports. Spring Data (since 3.1) supports keyset pagination via `ScrollPosition` and `Window<T>` return types.
 
 ---
 
@@ -393,8 +410,10 @@ public class PaymentSearchService {
     }
 
     public Page<Payment> search(PaymentSearchRequest filter, Pageable pageable) {
-        Specification<Payment> spec = Specification
-            .where(PaymentSpecifications.hasAccountId(filter.accountId()))
+        // Spring Data JPA 4: Specification.where(...) is deprecated —
+        // start from unrestricted() and chain the filters
+        Specification<Payment> spec = Specification.<Payment>unrestricted()
+            .and(PaymentSpecifications.hasAccountId(filter.accountId()))
             .and(PaymentSpecifications.hasStatus(filter.status()))
             .and(PaymentSpecifications.hasCurrency(filter.currency()))
             .and(PaymentSpecifications.createdBetween(filter.from(), filter.to()))
@@ -415,15 +434,17 @@ public record PaymentSearchRequest(
 ) {}
 ```
 
-**SD4 change**: in Spring Data 3.x, `Specification.where(null)` returned a spec that produced `WHERE 1=1`. In SD4, null specs are filtered out during predicate construction — the query has no `WHERE` clause at all if all specs return null, which generates cleaner SQL and avoids the need for `cb.conjunction()` workarounds.
+**How null filters behave**: a `Specification` whose lambda returns `null` adds no predicate, so unset filters simply disappear from the `WHERE` clause (this was already the case in Spring Data 3). **SD4 change**: `Specification.where(…)` is deprecated in favour of `Specification.unrestricted()`, and new `PredicateSpecification`, `UpdateSpecification` and `DeleteSpecification` types allow the same composable style for bulk updates and deletes.
 
 ---
 
 ## 6. Spring Data Redis 4 / Lettuce 6
 
-Spring Data Redis 4 ships with Lettuce 6.x as the default driver. Lettuce 6 uses Netty 4.2, which contains virtual-thread compatibility fixes for the network event loop.
+Spring Data Redis 4 keeps Lettuce (6.x) as the default driver, on Netty 4.2. Lettuce is non-blocking internally: a blocking `RedisTemplate` call from a virtual thread simply parks the virtual thread until Netty's event loop delivers the response.
 
-### Virtual-Thread Compatible Connection Pooling
+### Connection Configuration
+
+A single shared Lettuce connection is thread-safe and is usually enough; enable pooling (which needs `commons-pool2` on the classpath) only for blocking commands (`BLPOP`, transactions with `MULTI`) or when profiling shows the shared connection is a bottleneck.
 
 ```yaml
 # application.yaml — Spring Data Redis 4 / Lettuce 6 configuration
@@ -435,7 +456,7 @@ spring:
       timeout: 1000ms
       lettuce:
         pool:
-          max-active: 16        # CPU cores * 2 — same guidance as HikariCP
+          max-active: 16        # only used when commons-pool2 is present
           max-idle: 8
           min-idle: 4
           max-wait: 500ms       # Fail fast on Redis unavailability
@@ -444,7 +465,7 @@ spring:
 
 ### Distributed Lock with `RedisTemplate` and Lettuce 6
 
-A distributed lock is a common requirement for idempotent payment processing. The pattern uses `SET key value NX PX ttl` (atomic set-if-not-exists with expiry):
+A distributed lock is a common way to stop two instances from processing the same payment at the same time. The pattern uses `SET key value NX PX ttl` (atomic set-if-not-exists with expiry). Keep in mind that a lock with a TTL is a *performance* optimisation, not a correctness guarantee: if processing outlives the TTL (a GC pause, a slow gateway), a second holder can get in. The real guarantee must come from the database — a unique constraint on the idempotency key.
 
 ```java
 @Component
@@ -543,10 +564,12 @@ public class IdempotentPaymentService {
                 return PaymentResult.alreadyProcessed(existing.get());
             }
 
-            // Process and persist
+            // Process and persist. The UNIQUE constraint on idempotency_key is
+            // the real guarantee: if the lock TTL expired and another instance
+            // got here first, this insert fails instead of double-charging
             var payment = Payment.from(request);
-            paymentRepository.save(payment);
-            return PaymentResult.created(payment);
+            var saved = paymentRepository.save(payment);
+            return PaymentResult.created(saved);
         });
     }
 }
@@ -554,11 +577,11 @@ public class IdempotentPaymentService {
 
 ### `ReactiveRedisTemplate` vs `RedisTemplate` in SB4
 
-For typical SB4 payment services using the blocking stack with virtual threads, `StringRedisTemplate` and `RedisTemplate<K, V>` are the correct choices. The virtual thread parks while Lettuce's Netty event loop awaits the Redis response — no carrier thread is wasted.
+For typical SB4 payment services using the blocking stack (with or without virtual threads), `StringRedisTemplate` and `RedisTemplate<K, V>` are the correct choices. With virtual threads enabled, the virtual thread parks while Lettuce's Netty event loop awaits the Redis response — no carrier thread is wasted.
 
 ```
 Decision rule for SB4:
-- Service uses virtual threads (the default) + blocking stack → use RedisTemplate
+- Service uses the blocking stack (virtual threads optional) → use RedisTemplate
 - Service uses Project Reactor (Flux/Mono) end-to-end → use ReactiveRedisTemplate
 - Do NOT mix: calling ReactiveRedisTemplate.block() on a virtual thread works but
   loses the benefit of virtual threads and adds Reactor overhead
@@ -568,7 +591,7 @@ Decision rule for SB4:
 
 ## Summary
 
-Spring Data 4 builds on the Java 21 foundation. Hibernate 7 record entities enable immutable event types directly in the JPA layer without the complexity of custom `UserType` implementations. `ListCrudRepository` replaces `CrudRepository` as the preferred base interface. The `JpaSpecificationExecutor` pattern remains the right tool for dynamic payment filters. For distributed locking, `RedisTemplate` with `setIfAbsent` and a Lua compare-and-delete script is the production-grade pattern — Lettuce 6's Netty event loop handles the I/O while virtual threads park.
+Spring Data 4 builds on Hibernate ORM 7 and Jakarta Persistence 3.2. Records belong in the persistence layer as `@Embeddable` value objects and projections — entities stay classes, made append-only with `@Immutable` and no setters. `ListCrudRepository` replaces `CrudRepository` as the preferred base interface. The `JpaSpecificationExecutor` pattern remains the right tool for dynamic payment filters (now starting from `Specification.unrestricted()`). For distributed locking, `RedisTemplate` with `setIfAbsent` and a Lua compare-and-delete script is the standard pattern — backed by a database unique constraint for true idempotency.
 
 The next lessons in this track (05 onwards) cover Spring Security 7, Spring Kafka 4, and the full migration runbook from SB3.x to SB4.
 
@@ -578,15 +601,15 @@ The next lessons in this track (05 onwards) cover Spring Security 7, Spring Kafk
 [
   {
     "id": "kc-15-04-01",
-    "question": "A team annotates a `PaymentEvent` Java 21 record with `@Entity` and `@Immutable` in a Hibernate 7 / Spring Data JPA 4 application. After calling `repository.save(event)`, they call `event.id()` and find it is `null`. The database row was inserted successfully with a generated UUID. What is the cause?",
+    "question": "A developer tries to map a `PaymentEvent` Java record as a JPA entity (`@Entity public record PaymentEvent(@Id UUID id, ...)`) in a Spring Boot 4 / Hibernate 7 application. What happens, and what is the recommended design?",
     "options": [
-      "Hibernate 7 does not support `@GeneratedValue(strategy = GenerationType.UUID)` on record entities — use `@GeneratedValue(strategy = GenerationType.IDENTITY)` instead",
-      "Records are immutable — Hibernate cannot set the generated `id` back on the record instance after INSERT. The `save()` return value contains the persisted instance with the generated ID; the original `event` reference remains unchanged",
-      "The `@Immutable` annotation prevents Hibernate from populating the ID field — remove it to allow Hibernate to set the generated ID",
-      "Spring Data JPA 4 requires `@IdClass` on record entities when using `@GeneratedValue`"
+      "It works as long as the record is also annotated with `@Immutable`",
+      "Records cannot be Jakarta Persistence entities (an entity needs a no-arg constructor and settable state), so the mapping fails; use an immutable class entity (no setters, `@Immutable`) and use records for `@Embeddable` value objects and query projections",
+      "It works, but only with `GenerationType.IDENTITY` id generation",
+      "It works only in Spring Data JDBC, which is why Spring Data JPA 4 deprecates entities"
     ],
     "correct": 1,
-    "explanation": "Java records are immutable — their fields are set only during construction. When Hibernate inserts a record entity and generates a UUID/sequence ID, it cannot mutate the record instance. Instead, `repository.save(entity)` returns a *new* entity instance (the return value) with the `id` field populated. This is the same contract as for regular entities, but developers often miss it with records because they expect Hibernate to mutate the passed-in instance. Always use the return value of `save()`: `var saved = repository.save(event); var id = saved.id();`"
+    "explanation": "Jakarta Persistence requires entities to have a no-argument constructor and state that the provider can set — Hibernate assigns generated ids, creates lazy proxies, and tracks changes. Records have final fields and only a canonical constructor, so neither Hibernate 6 nor 7 supports record entities. Records are supported as @Embeddable value objects (Hibernate 6.0+) and as projection types in Spring Data queries. For append-only data, an entity class without setters plus @Immutable gives the same safety."
   },
   {
     "id": "kc-15-04-02",
@@ -635,7 +658,7 @@ The next lessons in this track (05 onwards) cover Spring Security 7, Spring Kafk
   "tasks": [
     {
       "id": "pc-15-04-01",
-      "description": "Define a `PaymentEvent` record entity annotated with `@Entity`, `@Immutable`, and `@Table(\"payment_events\")`. Include fields: `id` (UUID, `@GeneratedValue(strategy = UUID)`), `paymentId` (UUID), `eventType` (enum, `@Enumerated(EnumType.STRING)`), `payload` (`Map<String, Object>`, `@JdbcTypeCode(SqlTypes.JSON)`, `columnDefinition = \"jsonb\"`), and `occurredAt` (Instant). Write a `PaymentEventRepository extends ListCrudRepository<PaymentEvent, UUID>` with a `findByPaymentIdOrderByOccurredAtAsc(UUID paymentId)` derived query. Write an integration test using `@DataJpaTest` with a Testcontainers PostgreSQL instance that persists a `PaymentEvent` via `save()`, asserts the returned entity has a non-null `id`, and retrieves it by `paymentId`."
+      "description": "Define a `Money` record mapped as `@Embeddable` (amount with precision 19/scale 4, ISO currency code) and an immutable `PaymentEvent` class entity annotated with `@Entity`, `@Immutable`, and `@Table(name = \"payment_events\")` — no setters, a protected no-arg constructor, and a static factory method. Include fields: `id` (UUID, `@GeneratedValue(strategy = UUID)`), `paymentId` (UUID), `eventType` (enum, `@Enumerated(EnumType.STRING)`), the embedded `Money`, `payload` (`Map<String, Object>`, `@JdbcTypeCode(SqlTypes.JSON)`, `columnDefinition = \"jsonb\"`), and `occurredAt` (Instant). Write a `PaymentEventRepository extends ListCrudRepository<PaymentEvent, UUID>` with a `findByPaymentIdOrderByOccurredAtAsc(UUID paymentId)` derived query and a record projection query. Write an integration test using `@DataJpaTest` with a Testcontainers PostgreSQL instance that persists a `PaymentEvent` via `save()`, asserts the returned entity has a non-null `id`, and retrieves it by `paymentId`."
     },
     {
       "id": "pc-15-04-02",
@@ -643,7 +666,7 @@ The next lessons in this track (05 onwards) cover Spring Security 7, Spring Kafk
     },
     {
       "id": "pc-15-04-03",
-      "description": "Implement a `PaymentSpecifications` class with five static factory methods: `hasAccountId`, `hasStatus`, `hasCurrency`, `createdBetween(Instant from, Instant to)`, and `amountAtLeast(BigDecimal minimum)`. Each must return a `Specification<Payment>` that returns `null` (not a no-op predicate) when the filter value is null, so it is excluded from the `Specification.where(...).and(...)` chain. Write a test that queries with only `hasAccountId` and `hasCurrency` set (others null) and verifies the generated SQL (via Hibernate's `format_sql` logging) contains only `account_id` and `currency` predicates, not empty `AND 1=1` clauses."
+      "description": "Implement a `PaymentSpecifications` class with five static factory methods: `hasAccountId`, `hasStatus`, `hasCurrency`, `createdBetween(Instant from, Instant to)`, and `amountAtLeast(BigDecimal minimum)`. Each must return a `Specification<Payment>` whose lambda returns `null` (no predicate) when the filter value is null. Combine them starting from `Specification.unrestricted()`. Write a test that queries with only `hasAccountId` and `hasCurrency` set (others null) and verifies the generated SQL (via Hibernate's `format_sql` logging) contains only the `account_id` and `currency` predicates."
     },
     {
       "id": "pc-15-04-04",

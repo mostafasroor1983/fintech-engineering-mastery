@@ -287,7 +287,7 @@ public class PoolExhaustionDetector {
 
 Java 21 adds a thread dump that includes virtual threads, grouped by **thread container** (executor or `StructuredTaskScope`). The exact JSON fields depend on the JDK version — newer JDKs add more state and lock details. A simplified example:
 
-```java21
+```jsonc
 // Java 21 thread dump includes virtual threads
 // Use: jcmd <pid> Thread.dump_to_file -format=json threads.json
 
@@ -352,7 +352,7 @@ flowchart TD
     C -->|No| E[Transient — monitor for recurrence]
     D -->|All blocking on same lock| F[Pool exhaustion or\nlock contention bottleneck]
     D -->|Circular wait| G[Deadlock — fix lock ordering]
-    D -->|Waiting for external service\n(often RUNNABLE in socketRead)| H[Circuit breaker / timeout issue]
+    D -->|"Waiting for external service\n(often RUNNABLE in socketRead)"| H[Circuit breaker / timeout issue]
     D -->|All RUNNABLE, high CPU| I[CPU spinning — check for tight loops]
     F --> J[Add circuit breaker\nand timeout]
     G --> K[Fix lock ordering\nor use tryLock]

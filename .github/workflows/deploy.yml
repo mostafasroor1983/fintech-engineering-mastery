@@ -35,7 +35,7 @@ jobs:
 
       - name: Validate content before publishing
         run: |
-          python3 -m pip install --quiet pyyaml
+          python3 -m pip install --quiet -r tools/requirements.txt
           python3 tools/validate_content.py
 
       - name: Upload artifact

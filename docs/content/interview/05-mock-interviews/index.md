@@ -130,3 +130,78 @@ rubric, and redo anything below 'hire' in any dimension within a week."
 - [Track 14: Reference sheets](#/tracks/track-14/lessons/track-14-lesson-08)
 - [Running the 45-minute design round](#/tracks/track-15/lessons/track-15-lesson-02)
 - [Capstone projects](#/capstone)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1505-01",
+    "question": "What is the pass bar for a mock interview with the five-dimension rubric?",
+    "options": [
+      "An average of 3 or more",
+      "At least 3 in every dimension",
+      "At least 4 in technical depth",
+      "Finishing within the time limit"
+    ],
+    "correct": 1,
+    "explanation": "An average can hide a weak dimension. Any score below 3 means studying the linked lesson and redoing the mock within a week."
+  },
+  {
+    "id": "kc-1505-02",
+    "question": "How should you score a mock you did alone?",
+    "options": [
+      "From memory, right after finishing",
+      "By reading the \"strong answer covers\" column first",
+      "From the recording only: if it wasn't said aloud, it didn't happen",
+      "By asking yourself how confident you felt"
+    ],
+    "correct": 2,
+    "explanation": "Candidates remember what they meant to say. Scoring from the recording, before reading the model points, removes that bias."
+  },
+  {
+    "id": "kc-1505-03",
+    "question": "You scored below 3 on a mock yesterday. When should you redo it?",
+    "options": [
+      "Not the next day with the same prompt: wait a few days or vary the scale or a constraint, so you reason instead of reciting",
+      "Immediately, with the same prompt",
+      "Never; move on to the next mock",
+      "Only after finishing all ten mocks"
+    ],
+    "correct": 0,
+    "explanation": "Redoing the same prompt the next day trains recall, not reasoning. Change the traffic (10×) or add a constraint (multi-region)."
+  },
+  {
+    "id": "kc-1505-04",
+    "question": "In mock 10 (present a project), what should the ten-minute presentation focus on?",
+    "options": [
+      "A file-by-file tour of the code",
+      "Every library in the build file",
+      "The full commit history",
+      "The problem, a diagram, two key decisions with their trade-offs and the tests that prove them, and known limits"
+    ],
+    "correct": 3,
+    "explanation": "Interviewers assess judgement, not file structure. Two well-argued decisions with evidence beat a complete tour."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1505",
+  "title": "Run and score your mocks",
+  "description": "Start the mock-interview cycle with honest scoring.",
+  "tasks": [
+    {
+      "id": "pc-1505-01",
+      "description": "Run mock 1 (payment acceptance API) with a 45-minute timer and record the audio. Score all five rubric dimensions from the recording before reading the \"strong answer covers\" column."
+    },
+    {
+      "id": "pc-1505-02",
+      "description": "Write the three biggest gaps from that mock, the lesson you will reread for each, and the date of the redo (with a variation in scale or constraint)."
+    },
+    {
+      "id": "pc-1505-03",
+      "description": "Ask a peer to score one of your recordings. Compare their scores with yours and note any dimension where you scored yourself higher by one point or more."
+    }
+  ]
+}
+-->

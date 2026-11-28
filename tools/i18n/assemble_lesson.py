@@ -9,7 +9,8 @@ The draft is the Arabic prose with placeholders, so code is never retyped by han
                        copied byte for byte
 
 Usage (from the repo root):
-  python3 tools/i18n/assemble_lesson.py <lesson-dir> <draft-file>
+  python3 tools/i18n/assemble_lesson.py <lesson-dir> <draft-file> [<track-dir>]
+(<track-dir> holds _track.ar.json; defaults to the lesson's parent directory.)
 Writes <lesson-dir>/index.ar.md and checks that every English code block was used once,
 and that KNOWLEDGE-CHECK / PRACTICAL-CHALLENGE blocks are valid JSON.
 """
@@ -19,7 +20,7 @@ FENCE = re.compile(r'^(```|~~~)[^\n]*\n.*?^\1[ \t]*$', re.M | re.S)
 BLOCK = re.compile(r'<!--\s*(KNOWLEDGE-CHECK|PRACTICAL-CHALLENGE)\s*(\{.*?\})\s*-->', re.S)
 
 
-def main(lesson_dir, draft_path):
+def main(lesson_dir, draft_path, track_dir=None):
     en = open(os.path.join(lesson_dir, 'index.md'), encoding='utf-8').read()
     draft = open(draft_path, encoding='utf-8').read()
 
@@ -27,7 +28,7 @@ def main(lesson_dir, draft_path):
     body = en[fm.end():] if fm else en
     blocks = [m.group(0) for m in FENCE.finditer(body)]
 
-    track_dir = os.path.dirname(os.path.abspath(lesson_dir))
+    track_dir = track_dir or os.path.dirname(os.path.abspath(lesson_dir))
     tr = json.load(open(os.path.join(track_dir, '_track.ar.json'), encoding='utf-8'))
     lesson_id = re.search(r'^id:\s*"?([\w-]+)"?', en, re.M).group(1)
     lesson = next(l for l in tr['lessons'] if l['id'] == lesson_id)
@@ -62,4 +63,4 @@ def main(lesson_dir, draft_path):
 
 
 if __name__ == '__main__':
-    main(*sys.argv[1:3])
+    main(*sys.argv[1:4])

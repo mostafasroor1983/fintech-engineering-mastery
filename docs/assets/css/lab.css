@@ -145,7 +145,7 @@
 
 .scenario-num {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 600;
   letter-spacing: 0.08em;
   color: var(--accent);
@@ -203,7 +203,7 @@
 }
 
 .scenario-score-label {
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -301,7 +301,7 @@
 
 .scenario-context-label {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 700;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -339,7 +339,7 @@
 
 .constraint-chip {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   background: var(--bg-code);
   color: var(--text-secondary);
   padding: 3px var(--sp-3);
@@ -395,11 +395,11 @@
 .stage-step-bubble.active {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .stage-step-label {
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   color: var(--text-muted);
   margin-inline-start: var(--sp-2);
   white-space: nowrap;
@@ -438,7 +438,7 @@
   justify-content: space-between;
   gap: var(--sp-2);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -525,7 +525,7 @@
 
 .option-card:hover:not(:disabled) .option-label {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 /* Selected state */
@@ -536,7 +536,7 @@
 
 .option-card.selected .option-label {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 /* Correct / incorrect after reveal */
@@ -601,7 +601,7 @@
 
 .stage-rationale-label {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -750,7 +750,7 @@
 
 .debrief-stage-num {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 700;
   letter-spacing: 0.08em;
   color: var(--text-muted);
@@ -781,7 +781,7 @@
 
 .debrief-answer-label {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 700;
   color: var(--text-muted);
   min-width: 60px;
@@ -890,7 +890,7 @@
 
 .debrief-related-num {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 700;
   color: var(--accent);
   background: var(--accent-muted);
@@ -996,14 +996,14 @@
 
 .debrief-kicker {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 700;
   letter-spacing: 0.08em;
   color: var(--text-muted);
   text-transform: uppercase;
   margin-bottom: var(--sp-2);
 }
-html[lang="ar"] .debrief-kicker { font-family: var(--font-arabic); letter-spacing: 0; font-size: 13px; }
+html[lang="ar"] .debrief-kicker { font-family: var(--font-arabic); letter-spacing: 0; font-size: 0.8125rem; }
 /* English content block inside the Arabic UI */
 [dir="rtl"] [dir="ltr"] { text-align: left; }
 
@@ -1030,7 +1030,7 @@ html[lang="ar"] .debrief-kicker { font-family: var(--font-arabic); letter-spacin
   background: var(--bg-elevated);
   color: var(--text-secondary);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 700;
   vertical-align: 1px;
 }

@@ -169,3 +169,78 @@ PostgreSQL for money, Kafka for events, Redis for counters, search and warehouse
 - [System design framework](#/tracks/track-14/lessons/track-14-lesson-01)
 - [Mock interviews and rubrics](#/tracks/track-15/lessons/track-15-lesson-05)
 - [Track 08: Database decision framework](#/tracks/track-08/lessons/track-08-lesson-22)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1408-01",
+    "question": "Which store is the default choice for balances, ledgers and idempotency keys, and why?",
+    "options": [
+      "Redis, because it is the fastest",
+      "PostgreSQL (or another relational database), because it gives multi-row ACID transactions and constraints",
+      "Kafka, because it keeps every event",
+      "A document database, because the schema is flexible"
+    ],
+    "correct": 1,
+    "explanation": "Money needs atomic updates across several rows (debit, credit, idempotency key) and constraints the database enforces. Redis is a cache or counter store, not a system of record."
+  },
+  {
+    "id": "kc-1408-02",
+    "question": "How should you talk about database throughput in an interview?",
+    "options": [
+      "Quote a fixed number, such as \"PostgreSQL does 10,000 inserts per second\"",
+      "Avoid numbers entirely",
+      "Say the load looks within reach of one primary with short transactions, and that you would confirm with a load test",
+      "Say databases scale without limits"
+    ],
+    "correct": 2,
+    "explanation": "Throughput depends on hardware, schema, transaction shape and configuration. State the estimate and how you would measure it."
+  },
+  {
+    "id": "kc-1408-03",
+    "question": "What do RPO and RTO mean?",
+    "options": [
+      "RPO is how much data you can lose (time since the last safe copy); RTO is how long until the service is back",
+      "RPO is requests per operation; RTO is round-trip overhead",
+      "RPO is the recovery plan owner; RTO is the recovery test outcome",
+      "Both measure latency during failover"
+    ],
+    "correct": 0,
+    "explanation": "For a payments ledger, RPO should be near zero (synchronous replica in another zone) and RTO minutes with a tested automated failover. Both are business decisions with costs."
+  },
+  {
+    "id": "kc-1408-04",
+    "question": "Roughly how many requests per second is 1 million requests per day, on average?",
+    "options": [
+      "About 1,000 per second",
+      "About 1 per second",
+      "About 120 per second",
+      "About 12 per second"
+    ],
+    "correct": 3,
+    "explanation": "One day is 86,400 seconds, so 1,000,000 ÷ 86,400 ≈ 11.6. Then apply a stated peak factor (2–10×) for capacity planning."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1408",
+  "title": "Build your one-page references",
+  "description": "Make your own versions of the three reference sheets and test them under time pressure.",
+  "tasks": [
+    {
+      "id": "pc-1408-01",
+      "description": "Write a one-page patterns sheet from memory: at least ten fintech problems, each with its pattern, its cost and when not to use it. Check it against the lesson's table and fix the gaps."
+    },
+    {
+      "id": "pc-1408-02",
+      "description": "Do three estimations in five minutes each, showing the chain (users → actions/day → average/s → peak → storage/year → nodes): a card network authorisation feed, a P2P wallet and a statement service."
+    },
+    {
+      "id": "pc-1408-03",
+      "description": "For one design of your choice, list every data store and finish the sentence \"…because I need ___, and the cost is ___\" for each one."
+    }
+  ]
+}
+-->

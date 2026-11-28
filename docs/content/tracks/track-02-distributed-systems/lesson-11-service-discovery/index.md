@@ -194,7 +194,7 @@ HashiCorp Consul extends service discovery into a full **service mesh**: service
 
 ### Registering a Service with Consul
 
-```json
+```jsonc
 // consul-service-definition.json — payment-processor service
 {
   "service": {

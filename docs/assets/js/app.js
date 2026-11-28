@@ -22,6 +22,8 @@ EM.Icons = {
   arrow:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>',
   build:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6"/><path d="M9 12h6"/><path d="M9 15h4"/></svg>',
   globe:      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
+  calendar:   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
+  book:       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>',
   threads:    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="15" y2="12"/><line x1="3" y1="18" x2="18" y2="18"/><circle cx="18" cy="6" r="2"/><circle cx="18" cy="12" r="2"/><circle cx="21" cy="18" r="2"/></svg>'
 };
 
@@ -158,7 +160,7 @@ EM.App = {
 
     var isCollapsed = localStorage.getItem('em_sidebar_collapsed') === '1';
     document.getElementById('top-bar').innerHTML =
-      '<button id="menu-btn" class="topbar-btn" onclick="EM.App.toggleMobile()" aria-label="' + EM.t('top.menu') + '">' +
+      '<button id="menu-btn" class="topbar-btn" onclick="EM.App.toggleMobile()" aria-controls="sidebar" aria-expanded="false" aria-label="' + EM.t('top.menu') + '">' +
         EM.Icons.menu +
       '</button>' +
       '<button id="sidebar-toggle-btn" class="topbar-btn sidebar-toggle-btn" onclick="EM.App.toggleSidebar()" ' +
@@ -199,6 +201,8 @@ EM.App = {
       { route: '/decision-lab',    icon: EM.Icons.lab,        label: EM.t('nav.decisionLab')    },
       { route: '/concurrency-lab', icon: EM.Icons.threads,    label: EM.t('nav.concurrencyLab') },
       { route: '/capstone',        icon: EM.Icons.capstone,   label: EM.t('nav.capstone')       },
+      { route: '/study-plan',      icon: EM.Icons.calendar,   label: EM.t('nav.studyPlan')      },
+      { route: '/glossary',        icon: EM.Icons.book,       label: EM.t('nav.glossary')       },
       { route: '/search',          icon: EM.Icons.search,     label: EM.t('nav.search')         },
       { route: '/about',           icon: EM.Icons.about,      label: EM.t('nav.about')          }
     ];
@@ -260,10 +264,17 @@ EM.App = {
     var sidebar  = document.getElementById('sidebar');
     var isOpen   = sidebar.classList.contains('open');
 
+    var menuBtn  = document.getElementById('menu-btn');
+
     if (isOpen) {
       sidebar.classList.remove('open');
       var overlay = document.getElementById('sidebar-overlay');
       if (overlay) overlay.remove();
+      if (menuBtn) {
+        menuBtn.setAttribute('aria-expanded', 'false');
+        // Return focus to the button only if it was inside the drawer (keyboard use)
+        if (sidebar.contains(document.activeElement)) menuBtn.focus();
+      }
     } else {
       sidebar.classList.add('open');
       var ov = document.createElement('div');
@@ -271,6 +282,10 @@ EM.App = {
       ov.className = 'sidebar-overlay';
       ov.onclick   = function () { EM.App.toggleMobile(); };
       document.getElementById('app-body').appendChild(ov);
+      if (menuBtn) menuBtn.setAttribute('aria-expanded', 'true');
+      // Move focus into the drawer so keyboard and screen-reader users land in it
+      var first = sidebar.querySelector('.nav-item.active, .nav-item');
+      if (first) setTimeout(function () { first.focus({ preventScroll: true }); }, 0);
     }
   },
 
@@ -315,11 +330,18 @@ EM.App = {
     EM.Router.register('/tracks/:trackId/lessons/:lessonId', function (p)   { return EM.Renderer.renderLesson(p.trackId, p.lessonId); });
     EM.Router.register('/search',                       function ()         { return EM.Search.renderPage(); });
     EM.Router.register('/about',                        function ()         { return EM.Pages.about(); });
+    EM.Router.register('/study-plan',                   function ()         { return EM.Pages.doc('content/study-plan.md'); });
+    EM.Router.register('/glossary',                     function ()         { return EM.Pages.doc('content/glossary.md'); });
 
     // Close mobile sidebar on any navigation
     window.addEventListener('hashchange', function () { EM.App._closeMobile(); });
 
     // Global keyboard shortcut: '/' or Ctrl+K → focus search
+    // Escape closes the mobile navigation drawer
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') EM.App._closeMobile();
+    });
+
     document.addEventListener('keydown', function (e) {
       // Skip if focus is already in an input / textarea
       var tag = document.activeElement && document.activeElement.tagName;
@@ -541,7 +563,7 @@ EM.Pages.trackDetail = async function (trackId) {
       '</div>' +
       '<div style="display:flex;align-items:flex-start;gap:var(--sp-5)">' +
         '<div style="flex:1">' +
-          '<div style="font-size:11px;font-family:var(--font-mono);font-weight:600;' +
+          '<div style="font-size:0.75rem;font-family:var(--font-mono);font-weight:600;' +
             'letter-spacing:0.08em;color:var(--text-muted);margin-bottom:var(--sp-2)">' +
             EM.t('common.track', { n: num }) +
           '</div>' +
@@ -685,6 +707,46 @@ EM.Pages.comingSoon = function (title, iconKey) {
 /* ----------------------------------------------------------
    About
 ---------------------------------------------------------- */
+/* ------------------------------------------------------------
+   Markdown document pages (study plan, glossary).
+   These files are also read on GitHub, so their links are repo file paths;
+   here they are turned into site routes.
+------------------------------------------------------------ */
+EM.Pages._docHref = function (href) {
+  var m;
+  if (/^(https?:|mailto:|#)/.test(href)) return href;
+  if ((m = /(?:^|\/)tracks\/(track-\d+)-[^/]+\/lesson-(\d+)-[^/]+\/index(?:\.ar)?\.md$/.exec(href)))
+    return '#/tracks/' + m[1] + '/lessons/' + m[1] + '-lesson-' + m[2];
+  if ((m = /(?:^|\/)(interview|new-job)\/(\d+)-[^/]+\/index(?:\.ar)?\.md$/.exec(href))) {
+    var t = m[1] === 'interview' ? 'track-15' : 'track-16';
+    return '#/tracks/' + t + '/lessons/' + t + '-lesson-' + m[2];
+  }
+  if ((m = /(?:^|\/)capstone\/(project-[a-z])-[^/]+\/index(?:\.ar)?\.md$/.exec(href)))
+    return '#/capstone/' + m[1];
+  return null;  // repo-only file (review notes, examples): shown as plain text
+};
+
+EM.Pages.doc = async function (path) {
+  var res;
+  try {
+    res = await EM.I18n.fetchText(path);
+  } catch (e) {
+    return '<div class="page"><p class="error-text">' + EM.esc(EM.t('err.failedPage')) + '</p></div>';
+  }
+  var md = res.body.replace(/^---[\s\S]*?---\n?/, '').replace(/<!--[\s\S]*?-->\n?/g, '');
+  var box = document.createElement('div');
+  box.innerHTML = EM.Renderer.convertMd(md);
+  Array.prototype.forEach.call(box.querySelectorAll('a[href]'), function (a) {
+    var target = EM.Pages._docHref(a.getAttribute('href'));
+    if (target) { a.setAttribute('href', target); return; }
+    a.replaceWith(document.createTextNode(a.textContent));
+  });
+  return '<div class="page">' +
+    (res.fallback ? EM.I18n.fallbackNote() : '') +
+    '<div class="lesson-body doc-page"' + (res.fallback ? ' dir="ltr"' : '') + '>' + box.innerHTML + '</div>' +
+  '</div>';
+};
+
 EM.Pages.about = function () {
   var ar = EM.I18n.lang() === 'ar';
 
@@ -751,7 +813,7 @@ EM.Pages.about = function () {
     h5: 'المراجع المعتمدة',
     h6: 'بنية الموقع',
     p7: 'هذا <strong>موقع ثابت</strong> مبني بـ HTML5 وCSS3 وJavaScript بدون أطر عمل، وبدون تسجيل دخول أو خوادم خلفية. يُستضاف على GitHub Pages، ويُحفظ تقدّمك في متصفحك (LocalStorage).',
-    p8: 'محتوى الدروس مكتوب بصيغة Markdown ويُعرض باستخدام marked.js. المخططات بـ Mermaid.js، وتلوين الشيفرة بـ Prism.js، والمعادلات بـ KaTeX عند الحاجة.',
+    p8: 'محتوى الدروس مكتوب بصيغة Markdown ويُعرض باستخدام marked.js. المخططات بـ Mermaid.js (تُحمّل عند الحاجة فقط)، وتلوين الشيفرة بـ Prism.js.',
     h7: 'اللغة',
     p9: 'الموقع متاح بالعربية والإنجليزية. استخدم زر اللغة في أعلى الصفحة للتبديل. المصطلحات التقنية الشائعة (مثل Kafka وidempotency وSELECT FOR UPDATE) تبقى بالإنجليزية لأنها الصيغة المستخدمة في العمل والمقابلات. الصفحات التي لم تُترجم بعد تظهر بالإنجليزية مع تنبيه.'
   } : {
@@ -768,7 +830,7 @@ EM.Pages.about = function () {
     h5: 'Authoritative References',
     h6: 'Website Architecture',
     p7: 'This is a <strong>static website</strong> built with HTML5, CSS3, and Vanilla JavaScript. No React, Next.js, authentication, or backend services. Hosted on GitHub Pages. Progress is stored in your browser\'s LocalStorage.',
-    p8: 'Lesson content is Markdown-based and rendered at runtime using marked.js. Architecture diagrams use Mermaid.js. Code examples use Prism.js for syntax highlighting. Mathematical notation uses KaTeX where needed.',
+    p8: 'Lesson content is Markdown-based and rendered at runtime using marked.js. Architecture diagrams use Mermaid.js. Code examples use Prism.js for syntax highlighting. Mermaid is loaded only on pages that have a diagram.',
     h7: 'Language',
     p9: 'The site is available in English and Arabic. Use the language button in the top bar to switch. Pages that are not translated yet are shown in English with a short notice.'
   };

@@ -23,6 +23,9 @@ prerequisites:
 
 The OWASP Top 10 is not a list of theoretical vulnerabilities — in fintech, every category has caused real financial losses. Broken access control exposes customer payment histories. SQL injection exfiltrates account credentials. SSRF allows attackers to pivot into internal systems from a webhook handler. This lesson maps every OWASP Top 10 category to concrete fintech attack scenarios, shows the vulnerable Java code, and provides the production-grade fix.
 
+> [!NOTE]
+> The lesson follows the 2021 edition of the OWASP Top 10, which most tools and audits still reference. The 2025 edition reorganises the list — for example, software supply-chain failures get their own category and SSRF is folded into broken access control — but the attacks and fixes below stay the same.
+
 ---
 
 ## A01: Broken Access Control
@@ -82,8 +85,10 @@ public class PaymentController {
 
     @GetMapping
     public List<Payment> getMyPayments(Authentication authentication) {
-        // Only return payments belonging to the authenticated user
-        String userId = ((UserDetails) authentication.getPrincipal()).getUsername();
+        // Only return payments belonging to the authenticated user.
+        // getName() works for every authentication type -- with an OAuth2
+        // resource server the principal is a Jwt, not a UserDetails
+        String userId = authentication.getName();
         return paymentRepository.findByUserId(userId);
     }
 }
@@ -284,7 +289,14 @@ public class TransferService {
 
     private static final BigDecimal DAILY_LIMIT = new BigDecimal("10000.00");
 
+    @Transactional
     public TransferResult transfer(TransferRequest request, String authenticatedUserId) {
+
+        // Rule 0: amount must be positive -- check FIRST (a negative amount
+        // would otherwise "pass" the balance and limit checks)
+        if (request.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
+            throw new BusinessRuleViolationException("INVALID_AMOUNT", "Transfer amount must be positive");
+        }
 
         // Rule 1: prevent self-transfer
         if (request.getSourceAccountId().equals(request.getDestAccountId())) {
@@ -294,7 +306,10 @@ public class TransferService {
             );
         }
 
-        Account source = accountRepository.findByIdAndOwnerId(
+        // SELECT ... FOR UPDATE: lock the source account row, so two parallel
+        // transfers cannot both pass the balance and daily-limit checks
+        // (check-then-act race)
+        Account source = accountRepository.findByIdAndOwnerIdForUpdate(
             request.getSourceAccountId(), authenticatedUserId
         ).orElseThrow(() -> new AccessDeniedException("Account not found or not owned by caller"));
 
@@ -312,11 +327,6 @@ public class TransferService {
                 "Daily transfer limit of " + DAILY_LIMIT + " would be exceeded. " +
                 "Today's usage: " + todaysTotal
             );
-        }
-
-        // Rule 4: amount must be positive
-        if (request.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
-            throw new BusinessRuleViolationException("INVALID_AMOUNT", "Transfer amount must be positive");
         }
 
         return executeTransfer(source, request);
@@ -362,15 +372,18 @@ management:
     health:
       show-details: when-authorized    # only show component details to authenticated admins
     env:
-      enabled: false    # never expose environment variables
-  metrics:
-    export:
-      prometheus:
+      access: none      # never expose environment variables
+                        # (older Boot versions: enabled: false)
+  prometheus:
+    metrics:
+      export:
         enabled: true
 ```
 
 ```java
-// Secure the management port with IP allowlist in SecurityFilterChain
+// Secure the actuator endpoints with authentication and roles (the
+// management port itself should additionally be unreachable from outside
+// the cluster -- NetworkPolicy / no public Service)
 @Configuration
 public class ActuatorSecurityConfig {
 
@@ -394,7 +407,7 @@ public class ActuatorSecurityConfig {
 
 ## A06: Vulnerable Components
 
-Log4Shell (CVE-2021-44228) demonstrated that a single vulnerable dependency in a payment processor could allow full remote code execution. Dependency management and Software Bill of Materials (SBOM) are now a compliance requirement.
+Log4Shell (CVE-2021-44228) demonstrated that a single vulnerable dependency in a payment processor could allow full remote code execution. Dependency management is now an explicit compliance requirement — PCI DSS 6.3.2 requires an inventory of bespoke and third-party software components, which an SBOM provides.
 
 ### Detecting Vulnerable Dependencies
 
@@ -427,26 +440,22 @@ Log4Shell (CVE-2021-44228) demonstrated that a single vulnerable dependency in a
     output-file: sbom.spdx.json
 
 - name: Scan SBOM for vulnerabilities
-  uses: anchore/scan-action@v3
+  uses: anchore/scan-action@v6   # pin to a commit SHA in production
   with:
     sbom: sbom.spdx.json
     fail-build: true
     severity-cutoff: high
 ```
 
-```java
-// application.yml — override Log4j2 version to patched version
-// pom.xml
+```xml
+<!-- pom.xml — override a vulnerable transitive version.
+     With the Spring Boot parent, overriding the managed version property
+     is enough: every Log4j2 artifact follows it (no explicit dependency
+     needed). Spring Boot logs with Logback by default -- Log4j2 is only
+     present if a dependency pulls it in. -->
 <properties>
-  <!-- Override transitive Log4j2 version — fix Log4Shell -->
-  <log4j2.version>2.23.1</log4j2.version>
+  <log4j2.version>2.24.3</log4j2.version>
 </properties>
-
-<dependency>
-  <groupId>org.apache.logging.log4j</groupId>
-  <artifactId>log4j-core</artifactId>
-  <version>${log4j2.version}</version>
-</dependency>
 ```
 
 ---
@@ -471,13 +480,16 @@ public class JwtTokenFilter extends OncePerRequestFilter {
                                     FilterChain filterChain) throws ServletException, IOException {
         String token = extractToken(request);
         if (token != null) {
-            // Only verifies signature — does NOT check exp, iss, aud
+            // Verifies the signature (and exp IF the token has one) — but
+            // does NOT check iss or aud, accepts tokens WITHOUT exp, and uses a
+            // shared HMAC secret that every verifying service must hold
             Claims claims = Jwts.parserBuilder()
                 .setSigningKey(jwtSecret.getBytes())
                 .build()
                 .parseClaimsJws(token)
                 .getBody();
-            // Expired tokens, tokens from other issuers, tokens for other services — all accepted!
+            // Tokens from other issuers, tokens for other services, and
+            // never-expiring tokens — all accepted!
             setAuthentication(claims);
         }
         filterChain.doFilter(request, response);
@@ -502,7 +514,10 @@ public class JwtTokenFilter extends OncePerRequestFilter {
 
     @PostConstruct
     public void loadPublicKey() throws Exception {
-        // Use asymmetric keys (RS256/ES256) — symmetric secrets are shared and can be stolen
+        // Use asymmetric keys (RS256/ES256) — symmetric secrets are shared and can be stolen.
+        // The file is DER-encoded here; a PEM file must be base64-decoded
+        // (without the BEGIN/END lines) first. In practice, fetch keys from
+        // the issuer's JWKS endpoint instead of a file.
         byte[] keyBytes = Files.readAllBytes(Paths.get(publicKeyPath));
         KeyFactory kf = KeyFactory.getInstance("RSA");
         publicKey = kf.generatePublic(new X509EncodedKeySpec(keyBytes));
@@ -515,6 +530,7 @@ public class JwtTokenFilter extends OncePerRequestFilter {
         String token = extractToken(request);
         if (token != null) {
             try {
+                // (jjwt 0.11 API shown; 0.12 renames it to Jwts.parser().verifyWith(...))
                 Claims claims = Jwts.parserBuilder()
                     .setSigningKey(publicKey)              // asymmetric key verification
                     .requireIssuer(EXPECTED_ISSUER)        // reject tokens from other issuers
@@ -524,10 +540,10 @@ public class JwtTokenFilter extends OncePerRequestFilter {
                     .parseClaimsJws(token)
                     .getBody();
 
-                // exp is validated automatically by Jwts when parsing
-                // Additional check: token must not be from before the service started (replay)
-                if (claims.getIssuedAt().before(serviceStartTime)) {
-                    response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Token predates service startup");
+                // exp is validated when present -- also REQUIRE it, so a
+                // token without expiry is never accepted
+                if (claims.getExpiration() == null) {
+                    response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Token has no expiry");
                     return;
                 }
 
@@ -576,17 +592,17 @@ spec:
 docker build -t registry.example.com/payment-service:${GIT_SHA} .
 docker push registry.example.com/payment-service:${GIT_SHA}
 
-# 2. Sign with Cosign using keyless signing (Sigstore OIDC)
-cosign sign \
-  --key cosign.key \
-  registry.example.com/payment-service:${GIT_SHA}
+# 2. Sign the image DIGEST (a tag can be moved) with a key held in a KMS
+#    (or use keyless signing: cosign sign --yes <image> with the CI OIDC identity)
+DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' registry.example.com/payment-service:${GIT_SHA})
+cosign sign --key awskms:///alias/cosign-signing "$DIGEST"
 
 # 3. Attest SBOM
 cosign attest \
-  --key cosign.key \
+  --key awskms:///alias/cosign-signing \
   --predicate sbom.spdx.json \
   --type spdxjson \
-  registry.example.com/payment-service:${GIT_SHA}
+  "$DIGEST"
 ```
 
 ```yaml
@@ -657,74 +673,84 @@ public class FundTransferService {
 
     private static final Logger auditLog = LoggerFactory.getLogger("AUDIT");
 
-    @Autowired
-    private AuditRepository auditRepository;
+    private final AuditWriter auditWriter;          // see below
+    private final AccountRepository accountRepository;
+    private final ObjectMapper objectMapper;
+
+    // ... constructor
 
     @Transactional
-    public TransferResult transfer(TransferRequest request, Authentication auth) {
-        String traceId = MDC.get("traceId");
-        String actor   = auth.getName();
-
-        // Structured audit log entry BEFORE the operation (pre-action audit)
+    public TransferResult transfer(TransferRequest request, Authentication auth,
+                                   HttpServletRequest httpRequest) {
         AuditEvent preEvent = AuditEvent.builder()
             .eventType("FUND_TRANSFER_INITIATED")
-            .actor(actor)
-            .ipAddress(RequestContextHolder.currentRequestAttributes()
-                .getAttribute("remoteAddr", RequestAttributes.SCOPE_REQUEST).toString())
+            .actor(auth.getName())
+            .ipAddress(httpRequest.getRemoteAddr())   // real client IP via trusted proxy config
             .sourceAccountId(request.getSourceId())
             .destinationAccountId(request.getDestId())
             .amount(request.getAmount())
             .currency(request.getCurrency())
-            .traceId(traceId)
+            .traceId(MDC.get("traceId"))
             .timestamp(Instant.now())
             .build();
-
-        auditRepository.save(preEvent);
-        auditLog.info(auditJson(preEvent));
+        auditWriter.write(preEvent);
 
         try {
-            Account source = accountRepository.findById(request.getSourceId());
-            Account dest   = accountRepository.findById(request.getDestId());
+            Account source = accountRepository.findById(request.getSourceId()).orElseThrow();
+            Account dest   = accountRepository.findById(request.getDestId()).orElseThrow();
 
             source.debit(request.getAmount());
             dest.credit(request.getAmount());
 
-            accountRepository.save(source);
-            accountRepository.save(dest);
-
-            // Post-action audit with result (immutable — cannot be deleted)
-            AuditEvent successEvent = preEvent.toBuilder()
+            // Success record in the SAME transaction as the transfer: it
+            // commits exactly when the money moves
+            auditWriter.writeInTransaction(preEvent.toBuilder()
                 .eventType("FUND_TRANSFER_COMPLETED")
                 .result("SUCCESS")
-                .transactionId(source.getLastTransactionId())
-                .build();
-            auditRepository.save(successEvent);
-            auditLog.info(auditJson(successEvent));
+                .build());
+            return TransferResult.success();
 
-            return TransferResult.success(source.getLastTransactionId());
-
-        } catch (Exception ex) {
-            AuditEvent failureEvent = preEvent.toBuilder()
+        } catch (RuntimeException ex) {
+            // The outer transaction is about to roll back -- a failure record
+            // saved in it would be rolled back too. AuditWriter.write() uses
+            // REQUIRES_NEW, so the failure is recorded regardless
+            auditWriter.write(preEvent.toBuilder()
                 .eventType("FUND_TRANSFER_FAILED")
                 .result("FAILURE")
-                .failureReason(ex.getMessage())
-                .build();
-            auditRepository.save(failureEvent);
-            auditLog.error(auditJson(failureEvent));
+                .failureReason(ex.getClass().getSimpleName())
+                .build());
             throw ex;
         }
     }
+}
 
-    private String auditJson(AuditEvent event) {
-        // Structured JSON — parseable by SIEM without regex
-        return String.format(
-            "{\"event\":\"%s\",\"actor\":\"%s\",\"source\":\"%s\",\"dest\":\"%s\"," +
-            "\"amount\":%s,\"currency\":\"%s\",\"trace\":\"%s\",\"ts\":\"%s\"}",
-            event.getEventType(), event.getActor(),
-            event.getSourceAccountId(), event.getDestinationAccountId(),
-            event.getAmount(), event.getCurrency(),
-            event.getTraceId(), event.getTimestamp()
-        );
+@Component
+class AuditWriter {
+    private static final Logger auditLog = LoggerFactory.getLogger("AUDIT");
+    private final AuditRepository auditRepository;
+    private final ObjectMapper objectMapper;
+
+    AuditWriter(AuditRepository auditRepository, ObjectMapper objectMapper) {
+        this.auditRepository = auditRepository;
+        this.objectMapper = objectMapper;
+    }
+
+    // Own transaction: survives a rollback of the caller's transaction
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void write(AuditEvent event) { persist(event); }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void writeInTransaction(AuditEvent event) { persist(event); }
+
+    private void persist(AuditEvent event) {
+        auditRepository.save(event);
+        try {
+            // Structured JSON via a JSON library -- String.format would break
+            // (or allow injection) as soon as a value contains a quote
+            auditLog.info(objectMapper.writeValueAsString(event));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Audit event not serialisable", e);
+        }
     }
 }
 ```
@@ -765,15 +791,20 @@ public class WebhookDispatchService {
 
     private static final Set<String> ALLOWED_SCHEMES = Set.of("https");
 
-    // Allowlisted CIDR ranges that webhooks are allowed to reach (external internet only)
+    // Ranges webhooks must never reach (InetAddressRange: a small CIDR
+    // helper class or library -- the JDK has none). Also normalise
+    // IPv4-mapped IPv6 addresses (::ffff:10.0.0.1) before checking
     private static final List<InetAddressRange> BLOCKED_RANGES = List.of(
-        InetAddressRange.parse("10.0.0.0/8"),        // RFC1918 private
+        InetAddressRange.parse("0.0.0.0/8"),          // "this network"
+        InetAddressRange.parse("10.0.0.0/8"),         // RFC1918 private
+        InetAddressRange.parse("100.64.0.0/10"),      // carrier-grade NAT
         InetAddressRange.parse("172.16.0.0/12"),      // RFC1918 private
         InetAddressRange.parse("192.168.0.0/16"),     // RFC1918 private
-        InetAddressRange.parse("169.254.0.0/16"),     // link-local (AWS metadata)
+        InetAddressRange.parse("169.254.0.0/16"),     // link-local (cloud metadata)
         InetAddressRange.parse("127.0.0.0/8"),        // loopback
-        InetAddressRange.parse("::1/128"),             // IPv6 loopback
-        InetAddressRange.parse("fc00::/7")             // IPv6 unique local
+        InetAddressRange.parse("::1/128"),            // IPv6 loopback
+        InetAddressRange.parse("fc00::/7"),           // IPv6 unique local (incl. AWS IMDS fd00:ec2::254)
+        InetAddressRange.parse("fe80::/10")           // IPv6 link-local
     );
 
     public void validateWebhookUrl(String webhookUrl) {
@@ -789,9 +820,10 @@ public class WebhookDispatchService {
             throw new InvalidWebhookUrlException("Webhook URL must use HTTPS scheme");
         }
 
-        // 2. Resolve hostname to IP and check against blocked ranges
-        // (prevents DNS rebinding: hostname resolves to public IP during validation
-        //  but to internal IP when the request is made)
+        // 2. Resolve hostname to IP and check against blocked ranges.
+        // On its own this does NOT stop DNS rebinding: the hostname may
+        // resolve to a public IP now and to an internal IP when the HTTP
+        // client resolves it again. See dispatch below.
         String host = uri.getHost();
         try {
             InetAddress[] addresses = InetAddress.getAllByName(host);
@@ -816,6 +848,15 @@ public class WebhookDispatchService {
 
     public void dispatchPaymentWebhook(String webhookUrl, PaymentEvent event) {
         validateWebhookUrl(webhookUrl);
+        // Against DNS rebinding and redirects, the HTTP client must:
+        //  - connect to the IP that was VALIDATED (custom DNS resolver that
+        //    applies the same range check at connect time), or send all
+        //    webhooks through an egress proxy that enforces the rules
+        //    (e.g. Smokescreen) -- the most robust option;
+        //  - NOT follow redirects (a 302 to http://169.254.169.254/ bypasses
+        //    every check above);
+        //  - use short timeouts.
+        // In the cloud, also require IMDSv2 (session tokens) on the nodes.
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
@@ -823,8 +864,8 @@ public class WebhookDispatchService {
         String signature = hmacSha256(event, webhookSigningKey);
         headers.set("X-Fintech-Signature", "sha256=" + signature);
 
-        restTemplate.postForEntity(webhookUrl,
-            new HttpEntity<>(event, headers), Void.class);
+        webhookRestTemplate.postForEntity(webhookUrl,     // redirects disabled,
+            new HttpEntity<>(event, headers), Void.class); // pinned resolver
     }
 }
 ```
@@ -879,11 +920,15 @@ public Statement getStatement(
 Application Performance Monitoring (APM) agents, Spring Boot request logging filters, and API gateways frequently log full HTTP request bodies. If the body contains a card number or account credentials, it appears in every log aggregation platform accessible to developers.
 
 ```java
-// PITFALL — Spring Boot HTTP trace logging exposes payment data
-management:
-  trace:
-    http:
-      enabled: true   # logs full request/response bodies — includes PANs
+// PITFALL — request logging with payloads exposes payment data
+@Bean
+public CommonsRequestLoggingFilter requestLoggingFilter() {
+    CommonsRequestLoggingFilter filter = new CommonsRequestLoggingFilter();
+    filter.setIncludePayload(true);    // logs full request bodies — includes PANs
+    filter.setMaxPayloadLength(10_000);
+    return filter;
+}
+// (APM agents and API gateways often have the same "capture body" options)
 
 // FIX — custom request logging filter that masks sensitive fields
 @Component
@@ -922,16 +967,24 @@ public List<Account> getAllAccounts(HttpServletRequest request) {
     return accountRepository.findAll();
 }
 
-// FIX — configure trusted proxy list; only extract IP from known proxies
-// In Spring Security:
-http.requestMatcher(request -> {
-    // Only trust X-Forwarded-For if it comes from a known load balancer IP
-    String remoteAddr = request.getRemoteAddr();
-    if (TRUSTED_PROXY_IPS.contains(remoteAddr)) {
-        return getForwardedFor(request);
+// FIX — let the server derive the client IP, trusting X-Forwarded-For
+// ONLY when the connection comes from a known proxy. application.yml:
+//   server:
+//     forward-headers-strategy: native
+//     tomcat:
+//       remoteip:
+//         internal-proxies: "10\\.0\\.1\\.\\d{1,3}"   # load balancer subnet
+// Then request.getRemoteAddr() returns the real client IP.
+// And never make an IP check the ONLY protection of an admin API —
+// require authentication and an admin role as well.
+@GetMapping("/admin/accounts")
+@PreAuthorize("hasRole('ADMIN')")
+public List<Account> getAllAccounts(HttpServletRequest request) {
+    if (!adminNetworks.contains(request.getRemoteAddr())) {
+        throw new AccessDeniedException("Admin network only");
     }
-    return remoteAddr;
-});
+    return accountRepository.findAll();
+}
 ```
 
 ---
@@ -944,17 +997,17 @@ http.requestMatcher(request -> {
 - [ ] All database queries use PreparedStatement or JPA named parameters
 - [ ] Business rule validation (self-transfer, daily limits, positive amounts) enforced in service layer
 - [ ] Actuator endpoints restricted to management port with IP allowlist
-- [ ] `management.endpoint.env.enabled=false` in all environments
+- [ ] `env` actuator endpoint disabled (`management.endpoint.env.access=none`) in all environments
 - [ ] OWASP Dependency Check plugin runs in CI; build fails on CVSS >= 7
 - [ ] SBOM generated for every build and stored with the release
 - [ ] JWT validation checks exp, iss, aud, and nbf claims — not just signature
 - [ ] Asymmetric JWT signing (RS256/ES256) — no shared HMAC secrets
 - [ ] Container images signed with Cosign; Kyverno admission webhook enforces signatures
-- [ ] Audit log written for every fund transfer (pre and post-action)
+- [ ] Audit log written for every fund transfer (pre and post-action); failure records survive the transaction rollback
 - [ ] Audit log forwarded to immutable SIEM (append-only)
 - [ ] Webhook URLs validated against SSRF allowlist before first use and before dispatch
-- [ ] DNS rebinding protection: webhook URL re-resolved at dispatch time
+- [ ] DNS rebinding and redirect protection: connect only to the validated IP (or via an egress proxy), redirects disabled
 
-<!-- KNOWLEDGE-CHECK {"questions":[{"text":"A user authenticates as user-A and calls GET /api/v1/payments/txn-99999. The payment belongs to user-B. The controller only checks that the user is authenticated (not anonymous). What OWASP category does this represent, and what is the correct fix?","options":["A03 Injection — fix with PreparedStatement to prevent the lookup","A01 Broken Access Control — fix with @PreAuthorize(\"@paymentSecurity.isOwner(#id, authentication)\") to verify ownership","A07 Authentication Failures — fix by requiring MFA for payment lookups","A02 Cryptographic Failures — fix by encrypting payment IDs"],"correct":1,"explanation":"This is A01 Broken Access Control, specifically horizontal privilege escalation — a user accesses another user's resource at the same privilege level. Authentication confirms identity but does not establish ownership. The fix is an ownership check using Spring Security's @PreAuthorize annotation with a custom security evaluator bean that verifies the authenticated user owns the requested payment. PreparedStatement fixes injection, MFA fixes authentication strength, and encrypting IDs only provides obscurity — not access control."},{"text":"A payment service fetches merchant webhook URLs after each transaction. A merchant registers the URL http://169.254.169.254/latest/meta-data/iam/security-credentials/payment-role. What attack is this, and what is the primary defence?","options":["A03 SQL Injection — defend with parameterised queries","A10 SSRF — defend with a strict URL allowlist that blocks private/link-local IP ranges and only permits HTTPS to public internet addresses","A01 Broken Access Control — defend with JWT token validation on the webhook endpoint","A04 Insecure Design — defend with rate limiting on webhook delivery"],"correct":1,"explanation":"This is A10 Server-Side Request Forgery (SSRF). The attacker causes the payment service to make a request to the AWS EC2 instance metadata service (169.254.169.254), which returns temporary IAM credentials. The primary defence is validating the webhook URL before fetching it: resolve the hostname to its IP address(es) and reject any that fall within RFC1918 private ranges, 169.254.0.0/16 link-local, and loopback ranges. Only HTTPS to public internet addresses should be permitted."},{"text":"A JWT token is issued by the authentication service. The payment-service validates the signature but does not check the exp, iss, or aud claims. An attacker obtains a token issued 2 days ago (exp has passed). What can the attacker do?","options":["Nothing — the JWT signature verification prevents replay of old tokens.","Replay the expired token indefinitely to call any payment endpoint, because the service only checks the signature and the signature is still mathematically valid on an expired token.","The attacker must forge a new token — expired tokens cannot be replayed.","The attacker can only use the token for 30 seconds after expiry due to clock skew tolerance."],"correct":1,"explanation":"JWT signature verification only proves the token was signed by the expected private key. It does not enforce temporal validity. If the exp claim is not checked, an expired token's signature remains mathematically valid forever. The attacker can replay a 2-day-old token indefinitely. The fix is to call requireExpiration() (or equivalent) during JWT parsing, which rejects tokens where exp is in the past. The iss claim check prevents tokens from other issuers, and the aud claim check prevents tokens issued for other services from being used against the payment-service."}]} -->
+<!-- KNOWLEDGE-CHECK {"questions": [{"text": "A user authenticates as user-A and calls GET /api/v1/payments/txn-99999. The payment belongs to user-B. The controller only checks that the user is authenticated (not anonymous). What OWASP category does this represent, and what is the correct fix?", "options": ["A03 Injection — fix with PreparedStatement to prevent the lookup", "A01 Broken Access Control — fix with @PreAuthorize(\"@paymentSecurity.isOwner(#id, authentication)\") to verify ownership", "A07 Authentication Failures — fix by requiring MFA for payment lookups", "A02 Cryptographic Failures — fix by encrypting payment IDs"], "correct": 1, "explanation": "This is A01 Broken Access Control, specifically horizontal privilege escalation — a user accesses another user's resource at the same privilege level. Authentication confirms identity but does not establish ownership. The fix is an ownership check using Spring Security's @PreAuthorize annotation with a custom security evaluator bean that verifies the authenticated user owns the requested payment. PreparedStatement fixes injection, MFA fixes authentication strength, and encrypting IDs only provides obscurity — not access control."}, {"text": "A payment service fetches merchant webhook URLs after each transaction. A merchant registers the URL http://169.254.169.254/latest/meta-data/iam/security-credentials/payment-role. What attack is this, and what is the primary defence?", "options": ["A03 SQL Injection — defend with parameterised queries", "A10 SSRF — defend with a strict URL allowlist that blocks private/link-local IP ranges and only permits HTTPS to public internet addresses", "A01 Broken Access Control — defend with JWT token validation on the webhook endpoint", "A04 Insecure Design — defend with rate limiting on webhook delivery"], "correct": 1, "explanation": "This is A10 Server-Side Request Forgery (SSRF). The attacker causes the payment service to make a request to the AWS EC2 instance metadata service (169.254.169.254), which returns temporary IAM credentials. The primary defence is validating the webhook URL before fetching it: resolve the hostname to its IP address(es) and reject any that fall within RFC1918 private ranges, 169.254.0.0/16 link-local, and loopback ranges. Only HTTPS to public internet addresses should be permitted."}, {"text": "A JWT token is issued by the authentication service. The payment-service validates the signature but does not check the exp, iss, or aud claims. An attacker obtains a token issued 2 days ago (exp has passed). What can the attacker do?", "options": ["Nothing — the JWT signature verification prevents replay of old tokens.", "Replay the expired token indefinitely to call any payment endpoint, because the service only checks the signature and the signature is still mathematically valid on an expired token.", "The attacker must forge a new token — expired tokens cannot be replayed.", "The attacker can only use the token for 30 seconds after expiry due to clock skew tolerance."], "correct": 1, "explanation": "JWT signature verification only proves the token was signed by the expected private key. It does not enforce temporal validity. If the exp claim is not checked, an expired token's signature remains mathematically valid forever, and the attacker can replay a 2-day-old token indefinitely. The fix is a parser configuration that validates exp — and rejects tokens that have no exp at all (most libraries only check it when present). The iss check prevents tokens from other issuers, and the aud check prevents tokens issued for other services from being used against the payment-service."}]} -->
 
 <!-- PRACTICAL-CHALLENGE {"title":"OWASP Top 10 Security Hardening for Payment Service","difficulty":"advanced","estimatedMinutes":120,"tasks":[{"id":"1","description":"Audit a sample Spring Boot payment REST controller for A01 Broken Access Control and A07 Authentication Failures. The controller exposes GET /payments/{id}, GET /payments (all payments), and POST /transfers. Add @PreAuthorize ownership checks using a custom PaymentSecurityEvaluator bean. Add full JWT claim validation (exp, iss, aud, nbf) using an asymmetric RS256 key. Write integration tests using Spring Security test support that verify: (a) user-A cannot access user-B's payment, (b) an expired token is rejected with 401, (c) a token with the wrong audience is rejected."},{"id":"2","description":"Implement SSRF protection for a webhook dispatch service. Write a WebhookUrlValidator class that: resolves the hostname, checks all resolved IPs against RFC1918/link-local/loopback CIDR blocks, rejects non-HTTPS schemes, and rejects URLs containing credentials. Write unit tests covering: HTTP scheme rejection, 10.x.x.x IP rejection, 169.254.x.x rejection, valid HTTPS public URL acceptance, and DNS-resolved private IP rejection. Integrate the validator into a WebhookDispatchService that also adds an HMAC-SHA256 signature header."},{"id":"3","description":"Implement structured immutable audit logging for fund transfers (A09). Create an AuditEvent entity with fields: eventType, actor, ipAddress, sourceAccountId, destinationAccountId, amount, currency, traceId, timestamp, result, failureReason. Write a FundTransferAuditService that logs both pre-action (FUND_TRANSFER_INITIATED) and post-action (FUND_TRANSFER_COMPLETED or FUND_TRANSFER_FAILED) events as structured JSON. Configure the audit log to write to a dedicated append-only Loki stream with label {stream=\"audit\"}. Add a LogQL query that surfaces all failed transfers in the last 24 hours."},{"id":"4","description":"Configure OWASP Dependency Check in the Maven build (fail on CVSS >= 7). Add a GitHub Actions workflow that builds the payment-service Docker image, generates an SPDX SBOM using Syft, scans the SBOM with Grype, and fails the build on HIGH or CRITICAL CVEs. Set up a Kyverno ClusterPolicy in a local kind cluster that rejects unsigned container images in the payments namespace. Sign the image with Cosign and demonstrate that an unsigned image is rejected by the admission webhook."}]} -->

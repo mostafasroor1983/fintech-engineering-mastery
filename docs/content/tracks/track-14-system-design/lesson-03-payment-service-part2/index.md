@@ -244,3 +244,78 @@ reconciliation as the proof."
 - [Track 05: Transactional outbox](#/tracks/track-05/lessons/track-05-lesson-13)
 - [Track 05: Scenario G: duplicate Kafka delivery](#/tracks/track-05/lessons/track-05-lesson-08)
 - [Capstone 1](#/capstone/payment-service)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1403-01",
+    "question": "The call to the PSP times out. What should the service do?",
+    "options": [
+      "Mark the payment FAILED so the merchant can retry",
+      "Mark it UNKNOWN, answer 202 PROCESSING, and let an inquiry worker ask the PSP for the real outcome using the same reference",
+      "Retry immediately with a new idempotency key",
+      "Roll back the ledger and send a refund"
+    ],
+    "correct": 1,
+    "explanation": "A timeout means the outcome is unknown, not failed. Marking it FAILED invites a retry that may charge twice. The inquiry worker resolves it, and reconciliation is the final safety net."
+  },
+  {
+    "id": "kc-1403-02",
+    "question": "The merchant retries with the same key while the first request is still inside the PSP call. What happens?",
+    "options": [
+      "A second payment is created",
+      "The server waits forever",
+      "The key is already claimed in TX1, so the server answers 409 \"in progress\" (or replays the stored response once the first finishes)",
+      "The second request overwrites the first"
+    ],
+    "correct": 2,
+    "explanation": "Insert-first claiming means the second request finds the key. If the first is still running it gets 409; once the first has completed, the stored response is replayed."
+  },
+  {
+    "id": "kc-1403-03",
+    "question": "Why not publish the payment event to Kafka directly after the database commit?",
+    "options": [
+      "A crash between the commit and the publish loses the event; the outbox writes it in the same transaction and a relay publishes it at least once",
+      "Kafka cannot accept events from Java services",
+      "It would be too fast for consumers",
+      "Kafka requires XA with PostgreSQL"
+    ],
+    "correct": 0,
+    "explanation": "This is the dual-write problem. The transactional outbox makes the event part of the commit; consumers de-duplicate by event id because the relay is at-least-once."
+  },
+  {
+    "id": "kc-1403-04",
+    "question": "How do you know there are no duplicate charges in production?",
+    "options": [
+      "Because the code has retries",
+      "Because Kafka is exactly-once",
+      "By checking logs manually each week",
+      "Unique constraints prevent them, and daily reconciliation against the PSP's settlement report proves it, with an alert on any break"
+    ],
+    "correct": 3,
+    "explanation": "Prevention (keys and constraints) and proof (reconciliation) are separate. Reconciliation compares two independent records and surfaces any difference."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1403",
+  "title": "Payment service: deep dives and failures",
+  "description": "Build and test the two deep dives from this lesson in a small Spring Boot service (or extend capstone 1).",
+  "tasks": [
+    {
+      "id": "pc-1403-01",
+      "description": "Implement insert-first idempotency: claim the key under a unique constraint, store the response, replay it on retry, and reject the same key with a different body. Prove it with a test that fires 20 concurrent requests with one key and asserts exactly one payment."
+    },
+    {
+      "id": "pc-1403-02",
+      "description": "Add the UNKNOWN state: a PSP stub that times out leaves the payment UNKNOWN and the API returns 202; an inquiry job resolves it to CAPTURED or FAILED by querying the stub. Test both outcomes."
+    },
+    {
+      "id": "pc-1403-03",
+      "description": "Write the failure-mode table (at least five rows: PSP timeout, PSP down, DB failover, Kafka down, duplicate event) and three SLOs with how each is measured."
+    }
+  ]
+}
+-->

@@ -302,7 +302,7 @@ For maximum restriction, create a custom profile that allows only the syscalls y
 > [!WARNING]
 > The list below is a shortened illustration — a real JVM needs more (e.g. `rt_sigreturn`, `sigaltstack`, `madvise`, `prctl`, `gettid`, `newfstatat`/`statx`, `pread64`, `clock_nanosleep`), and the exact set depends on JDK version, GC and libraries. Do not write the list by hand: **record** it (Security Profiles Operator, or `strace -f -c` under a full test load), review it, and test every code path — a missing syscall crashes the service in production. Each kubelet node also needs the profile file.
 
-```json
+```jsonc
 // /var/lib/kubelet/seccomp/profiles/payment-processor.json
 {
   "defaultAction": "SCMP_ACT_ERRNO",

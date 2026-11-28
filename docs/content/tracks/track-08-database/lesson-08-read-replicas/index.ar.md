@@ -63,25 +63,25 @@ FROM pg_stat_replication;
 
 **المتزامن:** ينتظر الأساسي تأكيد النسخة قبل إعادة النجاح للعميل. فلا يضيع أي التزام مؤكد إذا فشل الأساسي (ما دمت تتحول إلى نسخة متزامنة)، لكن كل كتابة تدفع جولة النسخة — وإذا لم تتوفر نسخة متزامنة، تنتظر عمليات الالتزام.
 
-```sql
--- Configure synchronous replication for a critical replica
--- postgresql.conf on primary:
+```ini
+# Configure synchronous replication for a critical replica
+# postgresql.conf on primary:
 synchronous_standby_names = 'FIRST 1 (replica1, replica2)'
--- FIRST 1: wait for at least 1 of the named standbys to confirm
+# FIRST 1: wait for at least 1 of the named standbys to confirm
 
--- Synchronous confirmation levels:
--- synchronous_commit = remote_write  (replica wrote to OS buffer)
--- synchronous_commit = remote_apply  (replica applied changes — readable)
--- synchronous_commit = on            (replica flushed to disk)
+# Synchronous confirmation levels:
+# synchronous_commit = remote_write  (replica wrote to OS buffer)
+# synchronous_commit = remote_apply  (replica applied changes — readable)
+# synchronous_commit = on            (replica flushed to disk)
 ```
 
-```sql
--- For a fintech system: use synchronous replication for the primary replica
--- Use asynchronous for read-only reporting replicas
--- postgresql.conf:
+```ini
+# For a fintech system: use synchronous replication for the primary replica
+# Use asynchronous for read-only reporting replicas
+# postgresql.conf:
 synchronous_standby_names = 'FIRST 1 (replica_sync)'
--- replica_sync: synchronous, used for critical reads
--- replica_reporting: asynchronous, used for heavy analytics
+# replica_sync: synchronous, used for critical reads
+# replica_reporting: asynchronous, used for heavy analytics
 ```
 
 ## 2. قياس تأخر النسخ

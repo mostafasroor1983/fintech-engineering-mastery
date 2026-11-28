@@ -9,7 +9,7 @@ difficulty: principal
 estimatedMinutes: 85
 status: published
 tags: [MirrorMaker, multi-region, geo-replication, failover, Kafka]
-prerequisites: [kafka-architecture, kafka-connect]
+prerequisites: ["track-09-lesson-01", "track-09-lesson-08"]
 ---
 
 # ‏Kafka متعدد المناطق — MirrorMaker 2 والنسخ

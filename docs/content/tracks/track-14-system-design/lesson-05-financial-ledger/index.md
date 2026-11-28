@@ -264,3 +264,78 @@ for balances and statements; reconciliation proves it all."
 - [Track 05: Double-entry ledger](#/tracks/track-05/lessons/track-05-lesson-01)
 - [Track 05: Scenario J: concurrent balance updates at scale](#/tracks/track-05/lessons/track-05-lesson-11)
 - [Capstone 2: wallet ledger](#/capstone/wallet-ledger)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1405-01",
+    "question": "A support engineer runs UPDATE account SET balance = … to fix a customer's balance. Why is this wrong in a double-entry ledger?",
+    "options": [
+      "It is too slow on large tables",
+      "Balances are derived from postings; a direct update leaves no posting, no reason and books that no longer balance. Corrections must be new (reversing) entries",
+      "UPDATE statements are not allowed in PostgreSQL",
+      "It is fine if done inside a transaction"
+    ],
+    "correct": 1,
+    "explanation": "The postings are the truth and the audit trail. Block updates to postings in the database, and let a reconciliation job compare cached balances with the postings."
+  },
+  {
+    "id": "kc-1405-02",
+    "question": "A merchant account receives about 145 credits per second and its row lock becomes the bottleneck. Which option fits best?",
+    "options": [
+      "Optimistic locking with retries on the account row",
+      "A distributed Redis lock around each posting",
+      "Split the account into sub-accounts (credit a random one, sum them for the balance), or buffer credits without locking the balance row",
+      "Increase the database connection pool"
+    ],
+    "correct": 2,
+    "explanation": "Credits need no balance check, so they can be spread or buffered. Optimistic locking on the hottest row turns contention into a retry storm."
+  },
+  {
+    "id": "kc-1405-03",
+    "question": "A transfer moves money between accounts on two different shards. How is it kept correct?",
+    "options": [
+      "A saga through per-shard clearing accounts: debit A and credit clearing on shard 1, then debit clearing and credit B on shard 2, each step idempotent, with compensation and a reconciliation that clearing nets to zero",
+      "Two-phase commit across the shards",
+      "Write both postings to shard 1 and copy them later",
+      "Lock both shards with a global lock"
+    ],
+    "correct": 0,
+    "explanation": "Each step balances locally, so each shard's books stay correct. The money sits visibly in a clearing account until the saga finishes, and reconciliation proves clearing nets to zero."
+  },
+  {
+    "id": "kc-1405-04",
+    "question": "How do you produce a statement for an old month quickly?",
+    "options": [
+      "Sum all postings since the account was opened",
+      "Read it from application logs",
+      "Rebuild it from Kafka from the beginning",
+      "Use postings partitioned by time and indexed by (account, time), plus opening balances per period, and store issued statements immutably"
+    ],
+    "correct": 3,
+    "explanation": "Summing from the start of time grows forever. Period checkpoints (opening balances) bound the work, and issued statements must not change once sent."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1405",
+  "title": "Ledger at scale",
+  "description": "Practise the ledger design decisions with real SQL and tests.",
+  "tasks": [
+    {
+      "id": "pc-1405-01",
+      "description": "Create journal_entry and posting tables in PostgreSQL with a deferred constraint trigger that rejects an entry whose postings don't sum to zero per currency, and a trigger or grants that block UPDATE and DELETE on postings. Test both."
+    },
+    {
+      "id": "pc-1405-02",
+      "description": "Implement a hot-account strategy with 16 sub-accounts: credits go to a random sub-account, the balance sums them. Load-test 1,000 concurrent credits and compare throughput with a single account row."
+    },
+    {
+      "id": "pc-1405-03",
+      "description": "Write the cross-shard transfer saga as a sequence diagram with clearing accounts, including the compensation path, and the reconciliation query that checks clearing nets to zero."
+    }
+  ]
+}
+-->

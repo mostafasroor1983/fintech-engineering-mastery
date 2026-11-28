@@ -322,9 +322,12 @@ log.dirs=/var/lib/kafka/data
 
 ```properties
 # broker.properties: set broker.rack to availability zone
-broker.rack=us-east-1a    # broker 0
-broker.rack=us-east-1b    # broker 1
-broker.rack=us-east-1c    # broker 2
+# broker 0
+broker.rack=us-east-1a
+# broker 1
+broker.rack=us-east-1b
+# broker 2
+broker.rack=us-east-1c
 ```
 
 ```java

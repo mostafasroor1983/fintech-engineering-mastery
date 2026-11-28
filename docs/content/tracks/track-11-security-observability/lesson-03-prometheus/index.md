@@ -56,13 +56,13 @@ payments_processed_total{status="success",payment_method="bank_transfer",currenc
 A gauge represents a snapshot value that can go up or down.
 
 ```
-# HELP outbox_pending_events_total Number of events waiting in the transactional outbox
-# TYPE outbox_pending_events_total gauge
-outbox_pending_events_total{topic="payment.completed"} 12
-outbox_pending_events_total{topic="fraud.alert"} 0
+# HELP outbox_pending_events Number of events waiting in the transactional outbox
+# TYPE outbox_pending_events gauge
+outbox_pending_events{topic="payment.completed"} 12
+outbox_pending_events{topic="fraud.alert"} 0
 ```
 
-Gauges are ideal for queue depths, connection pool sizes, and cache hit ratios.
+Gauges are ideal for queue depths, connection pool sizes, and cache hit ratios. (The `_total` suffix is reserved for counters — a gauge never has it.)
 
 ### Histogram
 
@@ -118,17 +118,14 @@ management:
     web:
       exposure:
         include: prometheus,health,info
-  endpoint:
-    prometheus:
-      enabled: true
   metrics:
     distribution:
       percentiles-histogram:
         payment.latency: true          # enables histogram buckets
-      sla:
+      slo:                             # extra buckets at the SLO boundaries
         payment.latency: 50ms,100ms,250ms,500ms,1000ms
-      percentiles:
-        payment.latency: 0.5,0.95,0.99
+      # (avoid "percentiles:" here: client-side percentiles are computed per
+      #  instance and cannot be aggregated across pods)
     tags:
       application: payment-service
       environment: production
@@ -138,63 +135,63 @@ management:
 ### Payment Latency Histogram (Java)
 
 ```java
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
-import io.micrometer.core.instrument.Counter;
 import org.springframework.stereotype.Service;
+
+import java.time.Duration;
 
 @Service
 public class PaymentMetrics {
 
+    private final MeterRegistry registry;
     private final Timer paymentLatency;
-    private final Counter paymentSuccessCounter;
-    private final Counter paymentFailureCounter;
-    private final io.micrometer.core.instrument.Gauge outboxPendingGauge;
 
     public PaymentMetrics(MeterRegistry registry, OutboxRepository outboxRepository) {
+        this.registry = registry;
 
         // Histogram for end-to-end payment latency
         this.paymentLatency = Timer.builder("payment.latency")
             .description("End-to-end payment processing latency")
-            .tags("service", "payment-service")
             .publishPercentileHistogram(true)
             .minimumExpectedValue(Duration.ofMillis(10))
             .maximumExpectedValue(Duration.ofSeconds(10))
             .register(registry);
 
-        // Counters partitioned by outcome and payment method
-        this.paymentSuccessCounter = Counter.builder("payments.processed")
-            .description("Total payments processed successfully")
-            .tags("status", "success")
-            .register(registry);
-
-        this.paymentFailureCounter = Counter.builder("payments.processed")
-            .description("Total payments that failed")
-            .tags("status", "failure")
-            .register(registry);
-
-        // Gauge for transactional outbox lag
-        io.micrometer.core.instrument.Gauge.builder("outbox.pending.events",
+        // Gauge for transactional outbox lag. Every replica reports the same
+        // DB count -- aggregate it with max(), not sum(), in PromQL. The
+        // query runs on every scrape: keep it cheap (or cache the value).
+        Gauge.builder("outbox.pending.events",
                 outboxRepository, OutboxRepository::countPending)
             .description("Number of events pending in the transactional outbox")
             .register(registry);
     }
 
     public PaymentResult processPayment(PaymentRequest request) {
-        return paymentLatency.recordCallable(() -> {
+        return paymentLatency.record(() -> {
             try {
                 PaymentResult result = doProcessPayment(request);
-                paymentSuccessCounter.increment();
+                outcome("success", "none").increment();
                 return result;
             } catch (PaymentException ex) {
-                // Add failure reason as a tag for root cause analysis
-                Counter.builder("payments.processed")
-                    .tags("status", "failure", "reason", ex.getErrorCode())
-                    .register(registry)
-                    .increment();
+                // failure reason as a tag (bounded set of error codes)
+                outcome("failure", ex.getErrorCode()).increment();
                 throw ex;
             }
         });
+    }
+
+    // The Prometheus registry requires every meter with the same name to
+    // have the SAME set of tag keys -- so "reason" is always present
+    // ("none" for successes). Mixing {status} and {status,reason} under one
+    // name fails at registration. Micrometer caches the counter per tag set.
+    private Counter outcome(String status, String reason) {
+        return Counter.builder("payments.processed")
+            .description("Payments processed, by outcome")
+            .tags("status", status, "reason", reason)
+            .register(registry);
     }
 }
 ```
@@ -286,22 +283,23 @@ sum(rate(payments_processed_total[5m]))
 # Total TPS across all regions
 sum(rate(payments_processed_total[5m]))
 
-# Max p99 latency across all pods
+# p99 latency per pod (find the outlier pod)
 max by(pod) (
   histogram_quantile(0.99,
     sum by(le, pod) (rate(payment_latency_seconds_bucket[5m]))
   )
 )
 
-# Outbox lag summed across all partitions
-sum by(topic) (outbox_pending_events_total)
+# Outbox backlog per topic: every replica reports the same DB count,
+# so take max (sum would multiply it by the replica count)
+max by(topic) (outbox_pending_events)
 ```
 
 ---
 
 ## 4. Scrape Configuration for Kubernetes Pods
 
-Prometheus discovers targets using Kubernetes service discovery. Annotate pods to control scraping.
+Prometheus discovers targets using Kubernetes service discovery. Annotate pods to control scraping. (With the Prometheus Operator, the usual way is a `PodMonitor` or `ServiceMonitor` resource instead of annotations; the annotation convention below is for plain Prometheus.)
 
 ### Pod Annotations
 
@@ -344,12 +342,14 @@ scrape_configs:
       - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
         action: keep
         regex: "true"
-      # Use the annotated port
-      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+      # Use the annotated port: keep the pod IP from __address__ and swap
+      # in the port (replacing __address__ with only the port would leave
+      # Prometheus without a host to scrape)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
         action: replace
         target_label: __address__
-        regex: (.+)
-        replacement: ${1}
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
       # Use the annotated path
       - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
         action: replace
@@ -398,8 +398,9 @@ spec:
           labels:
             severity: critical
             team: payments
-            runbook: "https://wiki.example.com/runbooks/payment-error-rate"
           annotations:
+            # runbook links are annotations (labels identify the alert)
+            runbook_url: "https://wiki.example.com/runbooks/payment-error-rate"
             summary: "Payment error rate is {{ $value | humanizePercentage }}"
             description: >
               Payment error rate has exceeded 1% for more than 2 minutes.
@@ -443,10 +444,10 @@ spec:
 
     - name: outbox.lag
       rules:
-        # Alert when outbox has been lagging more than 60 seconds worth of events
+        # Alert when more than 1000 events wait in the outbox for 60s
         - alert: OutboxLagHigh
           expr: |
-            sum by(topic) (outbox_pending_events_total) > 1000
+            max by(topic) (outbox_pending_events) > 1000
           for: 60s
           labels:
             severity: warning
@@ -460,10 +461,13 @@ spec:
 
         # Dead outbox — no events processed in 5 minutes when queue is non-empty
         - alert: OutboxRelayStalled
+          # Both sides aggregated to the SAME labels (topic): "and" matches
+          # series by labels, so a side keeping pod/instance labels would
+          # never match and the alert could never fire
           expr: |
-            (sum by(topic) (outbox_pending_events_total) > 0)
+            (max by(topic) (outbox_pending_events) > 0)
             and
-            (rate(outbox_events_published_total[5m]) == 0)
+            (sum by(topic) (rate(outbox_events_published_total[5m])) == 0)
           for: 5m
           labels:
             severity: critical
@@ -489,40 +493,36 @@ spec:
     - name: payment.rates
       interval: 30s
       rules:
-        # Pre-compute payment TPS per method
-        - record: job:payments_success_rate:rate5m
+        # Pre-compute payment TPS per method and currency
+        - record: payment_method_currency:payments_processed_success:rate5m
           expr: |
             sum by(payment_method, currency) (
               rate(payments_processed_total{status="success"}[5m])
             )
 
-        # Pre-compute error ratio for SLO tracking
-        - record: job:payments_error_ratio:rate5m
+        # Pre-compute error ratio for SLO tracking (aggregated over everything)
+        - record: cluster:payments_error_ratio:rate5m
           expr: |
             sum(rate(payments_processed_total{status="failure"}[5m]))
             /
             sum(rate(payments_processed_total[5m]))
 
-        # Pre-compute p99 latency
-        - record: job:payment_latency_p99:rate5m
+        # Pre-compute the aggregated bucket rates once...
+        - record: le:payment_latency_seconds_bucket:rate5m
           expr: |
-            histogram_quantile(0.99,
-              sum by(le) (
-                rate(payment_latency_seconds_bucket[5m])
-              )
-            )
+            sum by(le) (rate(payment_latency_seconds_bucket[5m]))
 
-        # Pre-compute p50 latency
-        - record: job:payment_latency_p50:rate5m
+        # ...and derive quantiles from them cheaply
+        - record: cluster:payment_latency_seconds:p99_5m
           expr: |
-            histogram_quantile(0.50,
-              sum by(le) (
-                rate(payment_latency_seconds_bucket[5m])
-              )
-            )
+            histogram_quantile(0.99, le:payment_latency_seconds_bucket:rate5m)
+
+        - record: cluster:payment_latency_seconds:p50_5m
+          expr: |
+            histogram_quantile(0.50, le:payment_latency_seconds_bucket:rate5m)
 ```
 
-Recording rule names follow the convention `level:metric:operations` to make their origin clear in dashboards.
+Recording rule names follow the convention `level:metric:operations` — *level* names the labels that remain after aggregation (`cluster` when everything is summed, `payment_method_currency` when those two are kept) — to make their origin clear in dashboards.
 
 ---
 
@@ -562,7 +562,7 @@ Recording rule names follow the convention `level:metric:operations` to make the
 
 ### Pitfall 1: Histogram Bucket Misconfiguration Hides True Latency
 
-The default Micrometer histogram buckets often do not align with your SLOs. If your SLO is p99 < 500ms but all your latencies fall in the last bucket (`+Inf`), `histogram_quantile` returns `+Inf` and your alert never fires.
+The default Micrometer histogram buckets often do not align with your SLOs, and the quantile is interpolated *within* a bucket — so with a bucket from 300ms to 1s, a "p99 = 480ms" is an estimate that may hide a real p99 of 900ms. And if the quantile falls into the last (`+Inf`) bucket, `histogram_quantile` simply returns the upper bound of the highest finite bucket — latencies beyond your largest bucket become invisible.
 
 **Fix**: always configure explicit SLO-aligned buckets.
 
@@ -571,7 +571,7 @@ The default Micrometer histogram buckets often do not align with your SLOs. If y
 management:
   metrics:
     distribution:
-      sla:
+      slo:
         payment.latency: 50ms,100ms,200ms,300ms,500ms,750ms,1000ms,2000ms,5000ms
       percentiles-histogram:
         payment.latency: true
@@ -583,24 +583,25 @@ Verify by querying raw buckets: `payment_latency_seconds_bucket`. Ensure observa
 
 A label whose value comes from user input or is generated per-request (e.g., transaction ID, IP address, account number) produces one time series per unique value. With millions of transactions, this exhausts Prometheus memory and causes Out-Of-Memory restarts.
 
-**Fix**: enforce a cardinality allowlist in Micrometer using `MeterFilter`.
+**Fix**: strip forbidden tags and cap the number of series per meter in Micrometer with `MeterFilter`s.
 
 ```java
 @Bean
-public MeterFilter cardinalityEnforcementFilter() {
-    return MeterFilter.denyUnless(id -> {
-        // Only allow known, bounded label value sets
-        String paymentMethod = id.getTag("payment_method");
-        if (paymentMethod != null) {
-            return Set.of("card", "bank_transfer", "wallet", "crypto")
-                      .contains(paymentMethod);
-        }
-        return true;
-    });
+public MeterFilter stripUnboundedTags() {
+    // Remove per-entity identifiers from every meter, wherever they come from
+    return MeterFilter.ignoreTags("account_id", "transaction_id", "user_id");
+}
+
+@Bean
+public MeterFilter capUriTagCardinality() {
+    // At most 100 distinct "uri" values for HTTP metrics; beyond that new
+    // values are denied instead of creating new time series
+    return MeterFilter.maximumAllowableTags(
+        "http.server.requests", "uri", 100, MeterFilter.deny());
 }
 ```
 
-Also configure `prometheus.tsdb.max-block-chunk-size` and use recording rules to pre-aggregate before storing.
+As a second line of defence on the Prometheus side, set `sample_limit` and `label_limit` in the scrape config, so one misbehaving service cannot flood the server — the scrape fails visibly instead.
 
 ### Pitfall 3: Alert Flapping Due to Short Evaluation Windows
 
@@ -614,14 +615,14 @@ route:
   receiver: payments-pagerduty
   group_wait: 30s
   group_interval: 5m
-  repeat_interval: 4h          # do not re-page until incident has lasted 4h
+  repeat_interval: 4h          # re-notify every 4h while the alert keeps firing
   routes:
-    - match:
-        severity: critical
+    - matchers:                # "match:" is the deprecated older syntax
+        - severity="critical"
       receiver: payments-pagerduty
       repeat_interval: 1h
-    - match:
-        severity: warning
+    - matchers:
+        - severity="warning"
       receiver: payments-slack
       repeat_interval: 24h
 ```
@@ -637,7 +638,8 @@ route:
 - [ ] PrometheusRule CRDs deployed and loaded (verify with `kubectl get prometheusrule`)
 - [ ] Alertmanager routes tested with `amtool check-config`
 - [ ] Recording rules cover all dashboard panels used in SLO tracking
-- [ ] High-cardinality label protection implemented via MeterFilter
+- [ ] High-cardinality label protection implemented via MeterFilter (ignoreTags / maximumAllowableTags) and scrape `sample_limit`
+- [ ] All meters sharing a name use the same tag keys
 - [ ] Scrape target annotations verified — check `Status > Targets` in Prometheus UI
 - [ ] Alert `for:` durations reviewed and documented in runbooks
 - [ ] Outbox lag alert firing and routed to correct receiver
@@ -676,7 +678,7 @@ route:
         "The alert is silenced until business hours"
       ],
       "correct": 2,
-      "explanation": "With for: 0, an alert fires on the first evaluation that satisfies the condition, with no stabilisation period. A single-scrape anomaly immediately triggers the alert, causing alert flapping. Production alerts should always use a meaningful for: duration (2m for critical, 5m for warnings) to filter transient noise."
+      "explanation": "With for: 0, an alert becomes firing on the first evaluation that satisfies the condition, with no stabilisation period. Alertmanager only waits the short group_wait (e.g. 30s) to batch alerts, then pages — so a momentary anomaly wakes the on-call engineer, and the alert flaps. Production alerts should always use a meaningful for: duration (2m for critical, 5m for warnings) to filter transient noise."
     }
   ]
 } -->
@@ -700,7 +702,7 @@ route:
     },
     {
       "id": "task-4",
-      "description": "Add two recording rules to pre-compute p99 latency and error ratio with the naming convention job:metric:operation. Add a MeterFilter bean that rejects any metric with an unbounded label (specifically reject account_id, transaction_id, and user_id tags). Write a unit test using SimpleMeterRegistry to verify the filter blocks cardinality bombs."
+      "description": "Add recording rules that pre-compute the aggregated latency bucket rates, the p99 latency and the error ratio, named with the level:metric:operations convention (level = labels kept). Add MeterFilter beans that strip unbounded tags (account_id, transaction_id, user_id) and cap the uri tag cardinality. Write a unit test using SimpleMeterRegistry to verify the filters block cardinality bombs."
     }
   ]
 } -->

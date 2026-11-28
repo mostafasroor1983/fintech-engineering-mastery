@@ -120,8 +120,8 @@ spiffe://fintech.example.com/ns/core/sa/account-service
 
 ### SPIRE Server Configuration
 
-```yaml
-# spire-server.conf
+```hcl
+# spire-server.conf (HCL)
 server {
   bind_address = "0.0.0.0"
   bind_port    = "8081"
@@ -131,7 +131,7 @@ server {
 
   # SVID TTL: certificates expire after 1 hour
   # SPIRE rotates at 50% of TTL (every 30 minutes) for zero-downtime
-  default_svid_ttl = "1h"
+  default_x509_svid_ttl = "1h"
   ca_ttl           = "24h"
 }
 
@@ -164,6 +164,8 @@ plugins {
 
 ### Registration Entry for Payment Service
 
+In Kubernetes, the **SPIRE Controller Manager** usually creates these entries automatically from `ClusterSPIFFEID` resources (e.g. one template `spiffe://fintech.example.com/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}`). The manual equivalent for one workload:
+
 ```bash
 # Register payment-service workload identity
 spire-server entry create \
@@ -171,7 +173,7 @@ spire-server entry create \
   -parentID   spiffe://fintech.example.com/spire/agent/k8s_psat/prod-eu-west-1/node1 \
   -selector   k8s:ns:payments \
   -selector   k8s:sa:payment-service \
-  -ttl        3600    # 1 hour SVID TTL
+  -x509SVIDTTL 3600   # 1 hour SVID TTL
 ```
 
 ---
@@ -183,7 +185,7 @@ Istio automates mTLS using SPIFFE-compatible SVIDs issued by its own CA (Citadel
 ### Enforce STRICT mTLS Across the Payments Namespace
 
 ```yaml
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: PeerAuthentication
 metadata:
   name: payments-namespace-strict-mtls
@@ -196,7 +198,7 @@ spec:
 ### Per-Port Exceptions (Legacy Integration)
 
 ```yaml
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: PeerAuthentication
 metadata:
   name: payment-service-mtls
@@ -222,14 +224,16 @@ Vault's database secrets engine generates short-lived database credentials on de
 ### Vault Configuration for Payment Service DB
 
 ```hcl
+# Terraform (Vault provider)
 # Enable the database secrets engine
-path "sys/mounts/database" {
-  capabilities = ["create", "read", "update"]
+resource "vault_mount" "database" {
+  path = "database"
+  type = "database"
 }
 
 # Configure the PostgreSQL connection
 resource "vault_database_secret_backend_connection" "payments_db" {
-  backend       = "database"
+  backend       = vault_mount.database.path
   name          = "payments-postgres"
   allowed_roles = ["payment-service-role"]
 
@@ -270,8 +274,10 @@ resource "vault_database_secret_backend_role" "payment_service" {
 ```
 
 ```yaml
-# bootstrap.yml
+# application.yml (bootstrap.yml is the legacy mechanism)
 spring:
+  config:
+    import: vault://
   cloud:
     vault:
       host: vault.vault.svc.cluster.local
@@ -285,8 +291,11 @@ spring:
         enabled: true
         role: payment-service-role
         backend: database
-        # Spring Cloud Vault automatically renews credentials before TTL expiry
-        # and refreshes the DataSource connection pool
+        # Spring Cloud Vault sets spring.datasource.username/password at
+        # start-up and RENEWS the lease before each TTL expiry -- up to
+        # max_ttl (2h here). It does not reconfigure an existing connection
+        # pool: when max_ttl is reached, the application must obtain a new
+        # credential and switch the pool (see the secret-management lesson)
 ```
 
 ```java
@@ -308,7 +317,9 @@ public class DatabaseConfig {
         config.setJdbcUrl(url);
         config.setUsername(username);
         config.setPassword(password);
-        // HikariCP will re-authenticate when credentials rotate
+        // Values are read ONCE at start-up. Renewal keeps this user valid
+        // until max_ttl; after that the pool needs new credentials -- e.g.
+        // via HikariConfigMXBean.setUsername/setPassword + softEvictConnections
         config.setConnectionTimeout(30_000);
         config.setMaximumPoolSize(10);
         return new HikariDataSource(config);
@@ -401,7 +412,7 @@ AuthorizationPolicy operates at Layer 7 and can enforce JWT claims alongside mTL
 ### Payment Service: Only Accept Requests From API Gateway
 
 ```yaml
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: payment-service-allow-gateway
@@ -422,26 +433,27 @@ spec:
             methods: ["POST"]
             paths: ["/api/v1/payments", "/api/v1/payments/*"]
       when:
-        # JWT: require valid audience and not-expired token
+        # JWT claims are only available after a RequestAuthentication
+        # (below) has validated the token
         - key: request.auth.claims[aud]
           values: ["payment-service"]
-
 ---
-# Deny everything else (defense in depth — NetworkPolicy is Layer 3,
-# AuthorizationPolicy is Layer 7)
-apiVersion: security.istio.io/v1beta1
-kind: AuthorizationPolicy
+# Validates JWTs (signature via JWKS, expiry) for payment-service
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
 metadata:
-  name: payment-service-deny-all
+  name: payment-service-jwt
   namespace: payments
 spec:
   selector:
     matchLabels:
       app: payment-service
-  action: DENY
-  rules:
-    - {}   # deny all requests that don't match an ALLOW policy
+  jwtRules:
+    - issuer: "https://auth.fintech.example.com"
+      jwksUri: "https://auth.fintech.example.com/.well-known/jwks.json"
 ```
+
+No separate "deny everything else" policy is needed: as soon as one ALLOW policy applies to a workload, every request that matches no ALLOW rule is denied. Do **not** add a DENY policy with an empty rule (`rules: [{}]`) — DENY policies are evaluated *before* ALLOW policies, so it would block every request, including the allowed ones.
 
 ---
 
@@ -450,12 +462,10 @@ spec:
 Open Policy Agent (OPA) provides fine-grained authorisation decisions beyond what Istio's AuthorizationPolicy can express.
 
 ```rego
-# policies/service-access.rego
+# policies/service-access.rego (Rego v1 syntax, OPA 1.0+)
 package fintech.service_access
 
-import future.keywords.in
-
-# Default: deny all
+# Default: deny all -- anything not explicitly allowed below is refused
 default allow := false
 
 # Allow payment-service to call account-service read endpoints
@@ -480,15 +490,16 @@ allow if {
     input.destination.service == "ledger-service"
 }
 
-# Deny account-service from calling payment-service (reverse dependency)
-deny if {
-    input.source.spiffe_id == "spiffe://fintech.example.com/ns/core/sa/account-service"
-    input.destination.service == "payment-service"
-}
+# account-service -> payment-service (a reverse dependency) needs no rule:
+# no "allow" matches it, so the default denies it. A separate "deny" rule
+# would only take effect if the decision were written as "allow and not deny".
 ```
 
 ```yaml
-# OPA deployed as Envoy external authorization
+# OPA deployed as Envoy external authorization: needs the OPA-Envoy plugin
+# image (tag suffix "-envoy") and its gRPC ext_authz server. Istio also needs
+# an extensionProvider in the mesh config plus an AuthorizationPolicy with
+# action: CUSTOM that sends requests to it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -499,11 +510,13 @@ spec:
     spec:
       containers:
         - name: opa
-          image: openpolicyagent/opa:0.68.0
+          image: openpolicyagent/opa:1.4.2-envoy
           args:
             - "run"
             - "--server"
             - "--addr=:8181"
+            - "--set=plugins.envoy_ext_authz_grpc.addr=:9191"
+            - "--set=plugins.envoy_ext_authz_grpc.path=fintech/service_access/allow"
             - "--bundle=/policies"
           volumeMounts:
             - name: policies
@@ -520,12 +533,12 @@ spec:
 
 | PCI-DSS Requirement | Zero-Trust Control |
 |--------------------|--------------------|
-| Req 1: Network segmentation | NetworkPolicy default-deny-all; Istio mesh perimeter |
-| Req 2: No default credentials | Vault dynamic credentials; no static passwords |
+| Req 1: Network security controls / segmentation | NetworkPolicy default-deny-all; Istio mesh policies |
+| Req 2: Secure configurations (no default credentials) | No vendor-default or shared passwords; hardened defaults |
 | Req 7: Restrict access to system components | AuthorizationPolicy; OPA service-to-service rules |
-| Req 8: Identify and authenticate access | SPIFFE SVID; mTLS mutual authentication |
+| Req 8: Identify and authenticate access (incl. 8.6 system/application accounts) | SPIFFE SVID; mTLS mutual authentication; Vault dynamic credentials |
+| Req 4: Encryption in transit | mTLS between all services |
 | Req 10: Audit logging | Istio access logs; OPA decision logs; Vault audit log |
-| Req 12.3: Targeted risk analysis | SPIRE registration entry = explicit trust declaration |
 
 ---
 
@@ -559,7 +572,9 @@ SELECT usename, valuntil
 FROM pg_user
 WHERE valuntil IS NULL
    OR valuntil > NOW() + INTERVAL '2 hours';
--- Any result means a non-Vault credential exists — investigate immediately
+-- Expected exceptions: superusers and the Vault admin user itself (whose
+-- password Vault rotates). Any other result is a non-Vault credential —
+-- investigate immediately
 ```
 
 ### Pitfall 3: NetworkPolicy Breaks DNS and Causes Silent Service Failures
@@ -599,6 +614,6 @@ Add a network connectivity smoke test to your readiness probe logic or post-depl
 - [ ] OPA policies committed to git; PCI-DSS control mapping documented
 - [ ] Vault audit log enabled and forwarded to SIEM
 
-<!-- KNOWLEDGE-CHECK {"questions":[{"text":"A SPIFFE X.509 SVID for the payment-service in the payments namespace of the fintech.example.com trust domain should have which URI SAN?","options":["https://fintech.example.com/payments/payment-service","spiffe://fintech.example.com/ns/payments/sa/payment-service","CN=payment-service,OU=payments,O=fintech.example.com","spiffe://payments/payment-service@fintech.example.com"],"correct":1,"explanation":"SPIFFE SVIDs use the URI format spiffe://trust-domain/workload-path. The trust domain is the organisation identifier (fintech.example.com) and the path conventionally encodes the Kubernetes namespace and service account: /ns/<namespace>/sa/<service-account>. The HTTPS scheme and X.500 DN formats are not valid SPIFFE ID formats."},{"text":"Vault issues a database credential with default_ttl=1h to the payment-service. The service has been running for 55 minutes when it needs to execute a database query. What happens?","options":["The query fails with an authentication error because the credential has expired.","Spring Cloud Vault automatically renews the lease before expiry and the query succeeds with the same credential.","Vault generates a new credential and Spring Cloud Vault transparently rotates the DataSource connection pool.","The service must be restarted to obtain a new credential."],"correct":1,"explanation":"Spring Cloud Vault's lease renewal mechanism monitors TTLs and renews leases before expiry (typically at 2/3 of TTL). For a 1-hour TTL credential, renewal occurs around the 40-minute mark. The same username and password remain valid until the lease expires. If renewal fails, Vault will generate a new credential and Spring Cloud Vault will refresh the DataSource. Manual restarts are never required for credential rotation when Spring Cloud Vault is correctly configured."},{"text":"A Kubernetes NetworkPolicy default-deny-all is applied to the payments namespace. Immediately afterwards, the payment-service pods log UnknownHostException when trying to reach account-service. What is the most likely cause?","options":["The account-service NetworkPolicy is blocking ingress from payments namespace.","DNS egress on UDP/TCP port 53 to kube-dns was not explicitly allowed, so service discovery fails.","Istio's PeerAuthentication is in STRICT mode preventing the connection.","The payment-service SPIFFE SVID has expired."],"correct":1,"explanation":"A default-deny-all NetworkPolicy blocks all egress, including DNS queries to kube-dns on port 53. Without DNS, service names like account-service.core.svc.cluster.local cannot be resolved, causing UnknownHostException before any TCP connection is attempted. The fix is to apply an explicit egress NetworkPolicy allowing UDP and TCP port 53 to the kube-dns pods in kube-system before applying the default-deny-all."}]} -->
+<!-- KNOWLEDGE-CHECK {"questions": [{"text": "A SPIFFE X.509 SVID for the payment-service in the payments namespace of the fintech.example.com trust domain should have which URI SAN?", "options": ["https://fintech.example.com/payments/payment-service", "spiffe://fintech.example.com/ns/payments/sa/payment-service", "CN=payment-service,OU=payments,O=fintech.example.com", "spiffe://payments/payment-service@fintech.example.com"], "correct": 1, "explanation": "SPIFFE SVIDs use the URI format spiffe://trust-domain/workload-path. The trust domain is the organisation identifier (fintech.example.com) and the path conventionally encodes the Kubernetes namespace and service account: /ns/<namespace>/sa/<service-account>. The HTTPS scheme and X.500 DN formats are not valid SPIFFE ID formats."}, {"text": "Vault issues a database credential with default_ttl=1h to the payment-service. The service has been running for 55 minutes when it needs to execute a database query. What happens?", "options": ["The query fails with an authentication error because the credential has expired.", "Spring Cloud Vault automatically renews the lease before expiry and the query succeeds with the same credential.", "Vault generates a new credential and Spring Cloud Vault transparently rotates the DataSource connection pool.", "The service must be restarted to obtain a new credential."], "correct": 1, "explanation": "Spring Cloud Vault's lease renewal monitors TTLs and renews leases before expiry. For a 1-hour TTL credential the lease is renewed well before the hour is up, and the same username and password stay valid — so the query succeeds. Renewal can only extend the lease up to max_ttl (2 hours here). After that Vault revokes the credential, and the application must obtain a new one and switch its connection pool: Spring Cloud Vault can request the new secret and publish an event, but it does not reconfigure an existing HikariCP pool by itself — that needs code (or a restart/rollout)."}, {"text": "A Kubernetes NetworkPolicy default-deny-all is applied to the payments namespace. Immediately afterwards, the payment-service pods log UnknownHostException when trying to reach account-service. What is the most likely cause?", "options": ["The account-service NetworkPolicy is blocking ingress from payments namespace.", "DNS egress on UDP/TCP port 53 to kube-dns was not explicitly allowed, so service discovery fails.", "Istio's PeerAuthentication is in STRICT mode preventing the connection.", "The payment-service SPIFFE SVID has expired."], "correct": 1, "explanation": "A default-deny-all NetworkPolicy blocks all egress, including DNS queries to kube-dns on port 53. Without DNS, service names like account-service.core.svc.cluster.local cannot be resolved, causing UnknownHostException before any TCP connection is attempted. The fix is to apply an explicit egress NetworkPolicy allowing UDP and TCP port 53 to the kube-dns pods in kube-system before applying the default-deny-all."}]} -->
 
-<!-- PRACTICAL-CHALLENGE {"title":"Implement Zero-Trust Service Mesh for Payment Microservices","difficulty":"advanced","estimatedMinutes":120,"tasks":[{"id":"1","description":"Deploy SPIRE in a local kind cluster. Create SPIFFE registration entries for payment-service (spiffe://fintech.example.com/ns/payments/sa/payment-service) and account-service (spiffe://fintech.example.com/ns/core/sa/account-service) using Kubernetes PSAT attestation. Verify that each service fetches an X.509 SVID with the correct URI SAN and that the SVID rotates within 1 hour. Use spire-server entry show to confirm the registration."},{"id":"2","description":"Configure Vault's database secrets engine to issue PostgreSQL credentials for the payment-service with a 1-hour TTL. Create a Vault policy that allows only the payment-service Kubernetes service account to request credentials using the payment-service-role. Integrate with Spring Boot using spring-cloud-vault-config-databases. Write an integration test that verifies the DataSource reconnects successfully after a forced credential rotation."},{"id":"3","description":"Apply a default-deny-all NetworkPolicy to the payments namespace. Add explicit allow rules for: DNS (UDP/TCP 53 to kube-dns), payment-service to postgres on port 5432, payment-service to account-service on port 8080, and Prometheus scraping on port 8080. Apply PeerAuthentication STRICT to the payments namespace. Write a shell script that validates all connectivity rules pass and all blocked paths are actually blocked using kubectl exec and nc."},{"id":"4","description":"Write an OPA/Rego policy that enforces: payment-service can call account-service GET endpoints only, fraud-detection-service can call account-service GET endpoints only, no service can call payment-service except the api-gateway, and all other service-to-service calls are denied. Write OPA unit tests using rego_test for all four rules. Deploy the policy as an Envoy external authorization filter in Istio and verify with curl that an unauthorised call returns 403."}]} -->
+<!-- PRACTICAL-CHALLENGE {"title": "Implement Zero-Trust Service Mesh for Payment Microservices", "difficulty": "advanced", "estimatedMinutes": 120, "tasks": [{"id": "1", "description": "Deploy SPIRE in a local kind cluster. Create SPIFFE registration entries for payment-service (spiffe://fintech.example.com/ns/payments/sa/payment-service) and account-service (spiffe://fintech.example.com/ns/core/sa/account-service) using Kubernetes PSAT attestation. Verify that each service fetches an X.509 SVID with the correct URI SAN and that the SVID rotates within 1 hour. Use spire-server entry show to confirm the registration."}, {"id": "2", "description": "Configure Vault's database secrets engine to issue PostgreSQL credentials for the payment-service with a 1-hour TTL and 2-hour max TTL. Create a Vault policy that allows only the payment-service Kubernetes service account to request credentials using the payment-service-role. Integrate with Spring Boot using spring-cloud-vault-config-databases, and add code that switches the HikariCP pool to a new credential before max TTL. Write an integration test that verifies the DataSource keeps working across a forced credential rotation."}, {"id": "3", "description": "Apply a default-deny-all NetworkPolicy to the payments namespace. Add explicit allow rules for: DNS (UDP/TCP 53 to kube-dns), payment-service to postgres on port 5432, payment-service to account-service on port 8080, and Prometheus scraping on port 8080. Apply PeerAuthentication STRICT to the payments namespace. Write a shell script that validates all connectivity rules pass and all blocked paths are actually blocked using kubectl exec and nc."}, {"id": "4", "description": "Write an OPA/Rego policy that enforces: payment-service can call account-service GET endpoints only, fraud-detection-service can call account-service GET endpoints only, no service can call payment-service except the api-gateway, and all other service-to-service calls are denied. Write OPA unit tests using rego_test for all four rules. Deploy the policy as an Envoy external authorization filter in Istio and verify with curl that an unauthorised call returns 403."}]} -->

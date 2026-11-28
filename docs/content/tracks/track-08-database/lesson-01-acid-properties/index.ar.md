@@ -217,18 +217,18 @@ public BalanceSheetReport generateBalanceSheet(LocalDate asOf) {
 1. **‏fsync لـ WAL** — قبل إعادة النجاح لـ COMMIT، يُفرّغ سجل WAL إلى القرص
 2. **النسخ المتزامن** — حين تُضبط نسخ احتياطية متزامنة، يجعل `synchronous_commit = on` الخادم الأساسي ينتظر حتى *تفرّغ* النسخ المطلوبة WAL إلى قرصها (`remote_write` ينتظر فقط حتى تكتبه، و`remote_apply` حتى يصبح مرئيًا عليها)
 
-```sql
--- Configure synchronous replication for a financial production environment
--- postgresql.conf
+```ini
+# Configure synchronous replication for a financial production environment
+# postgresql.conf
 
-synchronous_commit = on                                -- wait for standby WAL flush
-synchronous_standby_names = 'ANY 1 (standby1, standby2)' -- any one of two confirms
--- (With only ONE synchronous standby, commits stop when that standby fails.)
+synchronous_commit = on                                # wait for standby WAL flush
+synchronous_standby_names = 'ANY 1 (standby1, standby2)' # any one of two confirms
+# (With only ONE synchronous standby, commits stop when that standby fails.)
 
--- WARNING: synchronous_commit = off returns before the local WAL flush:
--- a crash can lose the last fraction of a second of commits (no corruption).
--- Never use it for financial writes or audit records. Acceptable for:
--- analytics events, caches, other reconstructable non-financial state.
+# WARNING: synchronous_commit = off returns before the local WAL flush:
+# a crash can lose the last fraction of a second of commits (no corruption).
+# Never use it for financial writes or audit records. Acceptable for:
+# analytics events, caches, other reconstructable non-financial state.
 ```
 
 ### التحقق من الديمومة

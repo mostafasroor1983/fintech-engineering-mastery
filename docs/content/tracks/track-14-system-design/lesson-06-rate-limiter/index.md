@@ -248,3 +248,78 @@ changed without deploys."
 - [Track 02: Distributed rate limiting](#/tracks/track-02/lessons/track-02-lesson-17)
 - [Track 01: Rate limiting, throttling and back pressure](#/tracks/track-01/lessons/track-01-lesson-14)
 - [Capstone 5: instant P2P](#/capstone/instant-p2p)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1406-01",
+    "question": "Why is the token bucket's read-refill-take step run as a Redis Lua script?",
+    "options": [
+      "Lua is faster than Java",
+      "Redis runs the script without interleaving other commands on the key, so two API instances can't both take the last token; GET then SET from Java would race",
+      "Lua scripts are persisted to disk",
+      "It avoids the need for authentication"
+    ],
+    "correct": 1,
+    "explanation": "The step must be atomic across instances. The script also uses Redis's own clock (TIME), so app servers with drifting clocks can't break the refill math."
+  },
+  {
+    "id": "kc-1406-02",
+    "question": "Redis, used for per-tenant fairness limits, becomes slow or unavailable. What should the limiter do?",
+    "options": [
+      "Fail closed: reject all requests until Redis recovers",
+      "Retry Redis until it answers",
+      "Fail open with an alert and fall back to a rough local in-memory bucket per instance",
+      "Switch every tenant to the lowest tier"
+    ],
+    "correct": 2,
+    "explanation": "For a fairness control, a Redis outage should degrade fairness, not stop payments. Safety controls, such as a hard daily cap on payout value, fail closed instead."
+  },
+  {
+    "id": "kc-1406-03",
+    "question": "Each of 10 API instances allows 100 requests per second per tenant using local counters. What is the real limit?",
+    "options": [
+      "About 1,000 per second, and it grows with every instance autoscaling adds",
+      "Exactly 100 per second",
+      "100 per second divided by 10",
+      "It depends on the load balancer only"
+    ],
+    "correct": 0,
+    "explanation": "Per-instance limits multiply with the instance count. The real limit needs shared state; local buckets are only a degraded fallback."
+  },
+  {
+    "id": "kc-1406-04",
+    "question": "A tenant goes over its limit. What response is correct?",
+    "options": [
+      "200 with an error message in the body",
+      "503 Service Unavailable",
+      "401 Unauthorized",
+      "429 Too Many Requests with a Retry-After header and a problem+json body"
+    ],
+    "correct": 3,
+    "explanation": "429 says the client sent too many; 503 says the server is unavailable. Clients react differently, so the distinction matters for their retry and alerting logic."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1406",
+  "title": "Distributed rate limiter",
+  "description": "Build a per-tenant rate limiter and prove its behaviour with tests.",
+  "tasks": [
+    {
+      "id": "pc-1406-01",
+      "description": "Implement a token bucket in a Redis Lua script that uses redis.call('TIME'), with capacity and refill rate as arguments, returning {allowed, retryMs}. Call it from a Spring filter that runs after authentication and returns 429 with Retry-After."
+    },
+    {
+      "id": "pc-1406-02",
+      "description": "Write integration tests on real Redis (Testcontainers): a burst up to capacity passes, the next request gets 429, and a request after the refill interval passes again. Add a two-tenant test proving a noisy tenant doesn't consume the quiet tenant's quota."
+    },
+    {
+      "id": "pc-1406-03",
+      "description": "Add the failure policy: a 200 ms Redis timeout, fail open with a local per-instance bucket and a metric/alert. Test it by pausing the Redis container."
+    }
+  ]
+}
+-->

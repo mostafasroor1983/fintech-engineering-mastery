@@ -20,7 +20,7 @@ tags:
 
 # Data Encryption — At-Rest and In-Transit for Finance
 
-Financial data at rest and in transit is subject to the most stringent protection requirements of any industry. PCI-DSS Requirement 3 mandates that Primary Account Numbers (PANs) are rendered unreadable anywhere they are stored. Requirement 4 mandates strong cryptography over open networks. GDPR requires appropriate technical measures for personal data. The FCA expects firms to protect sensitive customer information as a condition of authorisation.
+Financial data at rest and in transit is subject to the most stringent protection requirements of any industry. PCI-DSS Requirement 3 mandates that Primary Account Numbers (PANs) are rendered unreadable anywhere they are stored. Requirement 4 mandates strong cryptography over open networks. GDPR requires appropriate technical measures for personal data. Financial supervisors (the FCA in the UK, and DORA's ICT risk-management rules in the EU) expect firms to protect sensitive customer information.
 
 This lesson builds the technical foundation: encryption levels, AES-256-GCM implementation, TLS 1.3 configuration, field-level encryption via HashiCorp Vault, envelope encryption, HSMs, and key rotation — without downtime.
 
@@ -46,7 +46,7 @@ graph TD
     E --> F[Physical Disk]
 ```
 
-For PAN and sensitive authentication data (SAD), PCI-DSS requires application-level or column-level encryption because TDE alone does not protect against a compromised DBA or database admin credential.
+For stored PAN, PCI DSS v4.0 (Requirement 3.5.1.2) no longer accepts disk- or partition-level encryption on its own for non-removable media: the PAN must also be made unreadable by another method — tokenisation, truncation, a keyed hash, or field-level (application/column) encryption. TDE has the same weakness: it does not protect against a compromised DBA or database admin credential. Sensitive authentication data (SAD: full track data, CVV2, PIN blocks) is different again — it must not be stored at all after authorisation (3.3.1), encrypted or not.
 
 ---
 
@@ -56,7 +56,7 @@ AES-256-GCM (Galois/Counter Mode) is the standard for financial data encryption.
 
 **Key components:**
 - **Key**: 256-bit (32 bytes), generated from a cryptographically secure source
-- **IV (Initialization Vector)**: 96-bit (12 bytes), unique per encryption operation — never reuse
+- **IV (Initialization Vector)**: 96-bit (12 bytes), unique per encryption operation — never reuse (reusing an IV with the same key breaks GCM's confidentiality *and* integrity). With random IVs, NIST SP 800-38D limits one key to 2³² encryptions — another reason to rotate keys or use per-record keys (envelope encryption)
 - **AAD (Additional Authenticated Data)**: contextual data that is authenticated but not encrypted (e.g., account ID, timestamp)
 - **Authentication Tag**: 128-bit tag appended to ciphertext — verifies integrity on decryption
 
@@ -74,6 +74,7 @@ public class PanEncryptionService {
     private static final String ALGORITHM = "AES/GCM/NoPadding";
     private static final int GCM_IV_LENGTH = 12;   // 96 bits
     private static final int GCM_TAG_LENGTH = 128;  // bits
+    private static final SecureRandom RANDOM = new SecureRandom();  // thread-safe, reuse it
 
     private final SecretKey encryptionKey;
 
@@ -130,7 +131,7 @@ public class PanEncryptionService {
 
     private byte[] generateIv() {
         byte[] iv = new byte[GCM_IV_LENGTH];
-        new SecureRandom().nextBytes(iv);
+        RANDOM.nextBytes(iv);
         return iv;
     }
 }
@@ -158,7 +159,7 @@ void decryptShouldFailWhenCiphertextTampered() throws Exception {
 
 ## TLS 1.3 Configuration for Spring Boot
 
-TLS 1.3 eliminates weak cipher suites, reduces the handshake to one round trip, and enforces perfect forward secrecy. All financial APIs must use TLS 1.3; TLS 1.2 may be permitted as a fallback only where legacy clients require it.
+TLS 1.3 eliminates weak cipher suites, reduces the handshake to one round trip, and enforces perfect forward secrecy. Prefer TLS 1.3 everywhere; allow TLS 1.2 (with strong AEAD/ECDHE suites only) where partners or devices still need it — PCI DSS requires "strong cryptography", which TLS 1.2 with good suites still meets. TLS 1.0/1.1 must be disabled.
 
 ```yaml
 # application.yml
@@ -166,7 +167,7 @@ server:
   port: 8443
   ssl:
     enabled: true
-    key-store: classpath:keystore/payments-api.p12
+    key-store: file:/etc/tls/payments-api.p12   # mounted Secret -- never bake keys into the jar
     key-store-password: ${SSL_KEYSTORE_PASSWORD}
     key-store-type: PKCS12
     key-alias: payments-api
@@ -182,6 +183,7 @@ server:
       # TLS 1.2 cipher suites (AES-GCM only, no CBC, no RC4, no 3DES)
       - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
       - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+      # (with an ECDSA certificate use the TLS_ECDHE_ECDSA_* equivalents)
 ```
 
 **HSTS configuration** — force browsers and HTTP clients to always use HTTPS:
@@ -193,16 +195,16 @@ public class SecurityConfig {
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        // The app listens only on 8443 (no plain-HTTP connector), so no
+        // HTTP->HTTPS redirect is needed; HSTS keeps clients on HTTPS
         http
-            .requiresChannel(channel ->
-                channel.anyRequest().requiresSecure()
-            )
             .headers(headers ->
                 headers.httpStrictTransportSecurity(hsts ->
                     hsts
                         .includeSubDomains(true)
                         .maxAgeInSeconds(31536000)  // 1 year
-                        .preload(true)
+                        .preload(true)  // only once EVERY subdomain serves HTTPS --
+                                        // removal from browser preload lists takes months
                 )
             );
         return http.build();
@@ -216,6 +218,9 @@ public class SecurityConfig {
 # Check supported protocols and cipher suites
 openssl s_client -connect api.payments.example:8443 \
   -tls1_3 -ciphersuites TLS_AES_256_GCM_SHA384
+
+# Old protocols must FAIL to connect
+openssl s_client -connect api.payments.example:8443 -tls1_1
 
 # Check certificate chain and HSTS header
 curl -v --tlsv1.3 https://api.payments.example:8443/actuator/health 2>&1 \
@@ -253,7 +258,6 @@ sequenceDiagram
 public class VaultFieldEncryptionService {
 
     private final VaultTemplate vaultTemplate;
-    private static final String TRANSIT_PATH = "transit/";
     private static final String KEY_NAME = "pan-key";
 
     public VaultFieldEncryptionService(VaultTemplate vaultTemplate) {
@@ -261,27 +265,16 @@ public class VaultFieldEncryptionService {
     }
 
     public String encryptPan(String plainPan) {
-        String base64Plaintext = Base64.getEncoder()
-            .encodeToString(plainPan.getBytes(StandardCharsets.UTF_8));
-
-        VaultTransitContext context = VaultTransitContext.builder()
-            .context(Base64.getEncoder().encode("pan-encryption".getBytes()))
-            .build();
-
-        return vaultTemplate.opsForTransit()
-            .encrypt(KEY_NAME, VaultTransitOperations.Plaintext.of(base64Plaintext, context));
+        // Spring Vault base64-encodes the plaintext for the transit API itself
+        // and returns the ciphertext string, e.g. "vault:v2:AbCdEf..."
+        return vaultTemplate.opsForTransit().encrypt(KEY_NAME, plainPan);
     }
 
     public String decryptPan(String ciphertext) {
-        VaultTransitContext context = VaultTransitContext.builder()
-            .context(Base64.getEncoder().encode("pan-encryption".getBytes()))
-            .build();
-
-        String base64Plaintext = vaultTemplate.opsForTransit()
-            .decrypt(KEY_NAME, VaultTransitOperations.Ciphertext.of(ciphertext, context));
-
-        return new String(Base64.getDecoder().decode(base64Plaintext), StandardCharsets.UTF_8);
+        return vaultTemplate.opsForTransit().decrypt(KEY_NAME, ciphertext);
     }
+    // (An encryption "context" -- Plaintext.of(...).with(VaultTransitContext) --
+    // only applies to keys created with derived=true.)
 
     /**
      * Rewrap re-encrypts ciphertext under the latest key version without
@@ -335,6 +328,7 @@ graph LR
 - **KEK (Key Encryption Key)**: long-lived, stored in Vault or HSM, used only to protect DEKs
 - Rotating the KEK requires re-encrypting DEKs, not re-encrypting data
 - If a DEK is compromised, only that record's data is exposed
+- Vault can generate DEKs for you: `transit/datakey/plaintext/<key>` returns a new DEK both in plaintext (use it, then discard it) and wrapped by the KEK (store it)
 
 ```java
 public class EnvelopeEncryptionService {
@@ -383,12 +377,12 @@ A Hardware Security Module (HSM) is a tamper-resistant device that stores crypto
 
 **Key ceremony** — the process of generating and loading a master key into an HSM:
 
-1. At least two key custodians are required (M-of-N split knowledge)
-2. The ceremony is conducted in a physically secure room with no recording devices
-3. Each custodian holds one component of the key on a smart card
-4. All components are entered simultaneously into the HSM
-5. The HSM generates the master key internally — it never leaves the device in plaintext
-6. The ceremony is documented and signed by all custodians and a witness
+1. Split knowledge and dual control: no single person ever knows or controls the whole key — at least two key custodians are required (often M-of-N, e.g. 3 of 5 smart cards)
+2. The ceremony is conducted in a physically secure room with no recording devices, following a pre-approved script
+3. Either the HSM generates the master key internally (preferred — it never leaves the device in plaintext; backups leave only as encrypted components on custodian smart cards), or an existing key is loaded as separate components, each entered by its own custodian
+4. Each custodian holds only their component or card, stored in a personal tamper-evident safe
+5. The key check value (KCV) is recorded to confirm the right key was loaded
+6. The ceremony is documented and signed by all custodians and an independent witness
 
 **DUKPT (Derived Unique Key Per Transaction)** — PIN block encryption:
 
@@ -404,7 +398,7 @@ PIN Block → encrypted with the per-transaction key
 Transmitted to HSM for decryption
 ```
 
-DUKPT ensures that compromising one transaction key does not expose any other transaction's PIN.
+DUKPT ensures that compromising one transaction key does not expose any other transaction's PIN (past keys cannot be derived from the device's current state). The original TDES-based DUKPT is being replaced by AES DUKPT (ANSI X9.24-3).
 
 ---
 
@@ -431,7 +425,7 @@ sequenceDiagram
     Vault->>Vault: set min_decryption_version = 2\nv1 can no longer decrypt
 ```
 
-**Spring Batch job for key rotation:**
+**Batch job for key rotation:**
 
 ```java
 @Component
@@ -439,32 +433,39 @@ public class PanKeyRotationJob {
 
     private final CardRepository cardRepository;
     private final VaultFieldEncryptionService vaultService;
+    private final TransactionTemplate tx;
 
-    @Transactional
-    public KeyRotationResult rotateInBatches(int batchSize) {
-        int totalProcessed = 0;
-        int totalErrors = 0;
+    // ... constructor
 
+    public KeyRotationResult rotate(int targetVersion, int batchSize) {
+        int processed = 0, errors = 0;
+        long lastId = 0;
         List<CardEntity> batch;
         do {
-            batch = cardRepository.findByKeyVersionNot(CURRENT_KEY_VERSION,
-                PageRequest.of(0, batchSize));
+            // Keyset pagination: a record that fails is skipped instead of
+            // being read again forever, and no transaction spans the whole run
+            batch = cardRepository.findByIdGreaterThanAndKeyVersionLessThanOrderById(
+                lastId, targetVersion, PageRequest.of(0, batchSize));
 
             for (CardEntity card : batch) {
+                lastId = card.getId();
                 try {
                     String rewrapped = vaultService.rewrap(card.getEncryptedPan());
-                    card.setEncryptedPan(rewrapped);
-                    card.setKeyVersion(CURRENT_KEY_VERSION);
-                    cardRepository.save(card);
-                    totalProcessed++;
+                    int version = parseVersion(rewrapped);   // "vault:v3:..." -> 3
+                    // Conditional UPDATE ... WHERE id = ? AND encrypted_pan = ?old
+                    // so a concurrent change by the application is not overwritten
+                    tx.executeWithoutResult(status -> cardRepository.updateCiphertext(
+                        card.getId(), card.getEncryptedPan(), rewrapped, version));
+                    processed++;
                 } catch (Exception e) {
-                    log.error("Key rotation failed for card {}: {}", card.getId(), e.getMessage());
-                    totalErrors++;
+                    log.error("Key rotation failed for card {}", card.getId(), e);
+                    errors++;
                 }
             }
         } while (!batch.isEmpty());
 
-        return new KeyRotationResult(totalProcessed, totalErrors);
+        // errors > 0: fix and re-run BEFORE raising min_decryption_version
+        return new KeyRotationResult(processed, errors);
     }
 }
 ```
@@ -477,11 +478,11 @@ The `rewrap` operation re-encrypts under the latest key version without decrypti
 
 | PCI-DSS Requirement | Technical Control | Implementation |
 |--------------------|-------------------|----------------|
-| Req 3.4: Render PAN unreadable | Application-level AES-256-GCM | Vault transit engine + envelope encryption |
-| Req 3.5: Protect keys | Key encryption key in HSM | HSM for master key, Vault for DEK/KEK |
-| Req 3.6: Key management procedures | Key rotation, split knowledge | Vault rotation + key ceremony documentation |
-| Req 4.1: TLS over open networks | TLS 1.3 | Spring Boot SSL config, cipher suite allowlist |
-| Req 4.2: Never send PAN in messaging | PAN masking in logs and messages | Structured logging with field masking |
+| Req 3.5.1: Render PAN unreadable wherever stored | Application-level AES-256-GCM or tokenisation | Vault transit engine + envelope encryption |
+| Req 3.6: Protect cryptographic keys | Key encryption key in HSM | HSM for master key, Vault for DEK/KEK |
+| Req 3.7: Key management procedures | Cryptoperiods, rotation, split knowledge and dual control | Vault rotation + key ceremony documentation |
+| Req 4.2.1: Strong cryptography over open networks | TLS 1.3 (1.2 with strong suites) | Spring Boot SSL config, cipher suite allowlist |
+| Req 4.2.2: PAN secured when sent via end-user messaging | Never send full PAN by email/chat; mask it | Field masking in messages and logs |
 
 ---
 
@@ -522,17 +523,19 @@ return new EncryptedRecord(ciphertext, encryptedDek);
 
 **Problem:** A key is generated at system inception, written into a configuration file, and never rotated. After 5 years, the key has been seen by 40 different developers, stored in multiple CI/CD systems, and backed up in S3 without envelope encryption on the backup.
 
-PCI-DSS Requirement 3.6.4 requires cryptographic key changes at least annually. Many firms have no rotation process because building one was deferred indefinitely.
+PCI DSS Requirement 3.7.4 requires keys to be changed at the end of their defined cryptoperiod (set using guidance such as NIST SP 800-57 — commonly a year or less for data-encryption keys). Many firms have no rotation process because building one was deferred indefinitely.
 
 **Prevention:** Design key rotation as a first-class operational procedure from day one:
 
-```yaml
-# Vault transit key configuration — enforce rotation policy
-vault write transit/keys/pan-key \
-  type=aes256-gcm96 \
-  auto_rotate_period=8760h    # 365 days automatic rotation
-  min_decryption_version=1    # updated after migration completes
-  deletion_allowed=false
+```bash
+# Vault transit key with automatic rotation every 365 days
+vault write transit/keys/pan-key type=aes256-gcm96 auto_rotate_period=8760h
+
+# Key settings are changed via the /config endpoint
+vault write transit/keys/pan-key/config deletion_allowed=false
+
+# After the rewrap job has migrated every record to v2:
+vault write transit/keys/pan-key/config min_decryption_version=2
 ```
 
 Include key rotation in your production runbook with estimated duration and rollback procedure. Test the rotation job in a staging environment under production-like data volumes monthly.
@@ -550,7 +553,7 @@ cipher.init(Cipher.ENCRYPT_MODE, key);
 byte[] ciphertext = cipher.doFinal(plaintext);
 ```
 
-For financial data, this is catastrophic. PANs that share prefixes (all Visa cards start with 4) will produce ciphertext with common prefixes, enabling statistical analysis and pattern matching across encrypted values.
+For financial data, this is catastrophic. A 16-digit PAN fits in exactly one AES block, so the same card number always produces the same ciphertext: anyone with database access can see which records share a card, count how often each card appears, and match ciphertexts against values they already know — all without the key. ECB also provides no integrity protection.
 
 ```java
 // CORRECT: GCM mode — probabilistic, authenticated
@@ -568,9 +571,10 @@ Add a code review checklist item and a Semgrep rule to catch `Cipher.getInstance
 # .semgrep/aes-mode.yml
 rules:
   - id: aes-without-mode
-    patterns:
+    pattern-either:
       - pattern: Cipher.getInstance("AES")
-    message: "AES without mode defaults to ECB — use AES/GCM/NoPadding"
+      - pattern-regex: Cipher\.getInstance\("AES/ECB/
+    message: "AES without a mode (or with ECB) is insecure — use AES/GCM/NoPadding"
     severity: ERROR
     languages: [java]
 ```
@@ -585,7 +589,7 @@ rules:
 - [ ] You can describe envelope encryption: DEK encrypted by KEK, both stored with ciphertext
 - [ ] You can configure HashiCorp Vault Transit Secrets Engine for field-level PAN encryption
 - [ ] You can design a key rotation process that re-encrypts data using Vault's rewrap operation without downtime
-- [ ] You know the PCI-DSS requirements Req 3 (render PAN unreadable) and Req 4 (TLS everywhere) and can map them to technical controls
+- [ ] You know the PCI DSS requirements Req 3 (render PAN unreadable, protect and manage keys) and Req 4 (strong cryptography in transit) and can map them to technical controls
 - [ ] You can explain why AES-ECB is dangerous for financial data and enforce GCM mode via static analysis
 
 ---

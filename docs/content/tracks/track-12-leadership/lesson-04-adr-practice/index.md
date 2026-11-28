@@ -66,7 +66,7 @@ Not every decision warrants an ADR. Use this matrix to decide when to write one:
 - Temporary decisions with a clear expiry (< 90 days)
 - Patch version library upgrades
 
-**Heuristic (Nygard's rule)**: If you would want to explain the decision in a code review comment that will outlast the PR, it belongs in an ADR.
+**Heuristic**: If you would want to explain the decision in a code review comment that will outlast the PR, it belongs in an ADR.
 
 ---
 
@@ -78,7 +78,7 @@ MADR (Markdown Architecture Decision Records) is the most practical ADR format f
 - Version-controlled alongside code (not in a wiki that drifts from reality)
 
 ```markdown
-# ADR-003: Use PostgreSQL as the Primary Database for the Payments Ledger
+# ADR-001: Use PostgreSQL as the Primary Database for the Payments Ledger
 
 **Status**: Accepted
 **Date**: 2026-10-15
@@ -104,14 +104,14 @@ must handle:
 
 ## Considered Options
 
-1. **PostgreSQL 15** (chosen)
-2. **MongoDB 6**
-3. **CockroachDB 23**
+1. **PostgreSQL 17** (chosen)
+2. **MongoDB 8**
+3. **CockroachDB 25**
 4. **Amazon Aurora Serverless v2**
 
 ## Decision Outcome
 
-Chosen option: **PostgreSQL 15**, because:
+Chosen option: **PostgreSQL 17**, because:
 - Strong ACID guarantees with mature transaction semantics
 - Best SQL support of the options considered (window functions, CTEs for accounting queries)
 - Team already has operational expertise with PostgreSQL
@@ -125,21 +125,24 @@ Negative consequences:
 
 ## Options Analysis
 
-### PostgreSQL 15
+### PostgreSQL 17
 - Pros: ACID, mature, SQL, operational expertise, no vendor lock-in
 - Cons: Manual sharding; not horizontally scalable for writes
 - Risk: Partitioning migration in ~18 months
 
-### MongoDB 6
+### MongoDB 8
 - Pros: Horizontal scale, flexible schema
-- Cons: Limited ACID for multi-document operations; team unfamiliar;
+- Cons: Multi-document ACID transactions exist (since 4.0) but have performance
+  and size limits and are not the primary design model; team unfamiliar;
   flexible schema is a liability for accounting (strict schema required)
-- **Verdict: Eliminated** — ACID requirements are non-negotiable for a ledger
+- **Verdict: Eliminated** — a strictly-schemed, relational double-entry model
+  with heavy multi-row transactions fits a SQL database better
 
-### CockroachDB 23
+### CockroachDB 25
 - Pros: ACID, horizontal scale, SQL-compatible
-- Cons: Higher cost; less operational maturity in team; Postgres wire protocol
-  but not fully compatible (some query plans behave differently)
+- Cons: Higher cost (no longer open source since the 2024 licence change);
+  less operational maturity in team; Postgres wire protocol but not fully
+  compatible (some features and query plans behave differently)
 - **Verdict**: Keep as future option if sharding becomes operationally complex
 
 ### Amazon Aurora Serverless v2
@@ -199,7 +202,7 @@ payments-service/
 └── README.md
 ```
 
-**Not in Confluence** (avoid): Confluence becomes outdated, is not version-controlled with code, and is usually difficult to search. Engineers stop checking it. The 2024 Thoughtworks Technology Radar explicitly recommends against wiki-only ADR storage.
+**Not in Confluence** (avoid): Confluence becomes outdated, is not version-controlled with code, and is usually difficult to search. Engineers stop checking it. The Thoughtworks Technology Radar's "Lightweight Architecture Decision Records" entry likewise recommends keeping ADRs in source control, next to the code.
 
 **For multi-service organisations**: Use Backstage to aggregate ADRs across all repositories into a searchable index.
 
@@ -218,7 +221,8 @@ adr init docs/adr
 # Create new ADR (auto-numbered)
 adr new "Use Kafka for payment events"
 # Creates: docs/adr/0004-use-kafka-for-payment-events.md
-# with MADR template pre-filled
+# (adr-tools uses Nygard's original template; for MADR, use a custom
+#  template or a MADR-based tool such as log4brains)
 
 # Supersede an existing ADR
 adr new -s 3 "Use Resilience4j v2 for circuit breaking"
@@ -262,6 +266,8 @@ on:
   pull_request:
     paths:
       - 'docs/adr/**'
+  schedule:
+    - cron: '0 6 * * 1'   # weekly, so stale PROPOSED ADRs are caught without a PR
 
 jobs:
   adr-lint:
@@ -269,28 +275,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install log4brains
-        run: npm install -g log4brains
-
-      - name: Validate ADR format
+      - name: Every ADR has a Status field
         run: |
-          log4brains adr list --format json | jq '.[] | select(.status == null) | .slug' |
-          while read slug; do
-            echo "ERROR: ADR $slug is missing a status field"
-            exit 1
+          fail=0
+          for f in docs/adr/[0-9]*.md; do
+            grep -qiE '^\*\*Status\*\*:' "$f" || { echo "ERROR: $f has no Status field"; fail=1; }
           done
+          exit $fail
 
-      - name: Check no PROPOSED ADR older than 14 days
+      - name: No ADR PROPOSED for more than 14 days
         run: |
-          log4brains adr list --format json |
-          jq -r '.[] | select(.status == "proposed") | .date + " " + .slug' |
-          while read date slug; do
-            age=$(( ($(date +%s) - $(date -d "$date" +%s)) / 86400 ))
+          fail=0
+          for f in $(grep -liE '^\*\*Status\*\*: *proposed' docs/adr/[0-9]*.md); do
+            d=$(grep -oE '^\*\*Date\*\*: *[0-9]{4}-[0-9]{2}-[0-9]{2}' "$f" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
+            if [ -z "$d" ]; then echo "ERROR: $f has no Date field"; fail=1; continue; fi
+            age=$(( ( $(date +%s) - $(date -d "$d" +%s) ) / 86400 ))
             if [ "$age" -gt 14 ]; then
-              echo "ERROR: ADR $slug has been PROPOSED for $age days — resolve the decision"
-              exit 1
+              echo "ERROR: $f has been PROPOSED for $age days — resolve the decision"
+              fail=1
             fi
           done
+          exit $fail
 ```
 
 This CI check prevents stalled decisions from silently ageing in the repository.
@@ -313,6 +318,8 @@ public class PaymentLedgerService {
      * Note: Double-entry accounting requires ACID guarantees.
      * MongoDB was considered and rejected; see ADR-001 for details.
      * CockroachDB is tracked as a future option — see ADR-001 §Consequences.
+     * SERIALIZABLE transactions can fail with serialization errors under
+     * contention — callers retry (see the retry policy in LedgerConfig).
      */
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public LedgerEntry recordPayment(Payment payment) {
@@ -350,9 +357,11 @@ Payment flow must include a fraud check. Options:
 
 Chosen: **Synchronous, in-path fraud check**
 
-Reason: Reversing a settled payment requires a recall message to correspondent banks.
-Under UK Faster Payments rules, recall success rate is ~65%. Accepting a fraudulent payment
-and reversing it means 35% of fraudulent payments result in firm loss.
+Reason: Faster Payments are irrevocable once sent. Getting money back means asking
+the receiving bank to return it, which is slow and often fails — in our own data
+only ~65% of fund-recovery requests succeed (illustrative figure). Since October 2024
+UK payment firms must also reimburse most APP-fraud victims (PSR rules), so a
+fraudulent payment that goes out is very likely a direct firm loss.
 The 50ms latency impact is acceptable under our SLA (p99 < 300ms).
 
 Negative consequences:
@@ -362,7 +371,8 @@ Negative consequences:
 
 ## Rejected Option: Asynchronous Post-Authorisation
 
-Rejected because: 35% irrecoverable loss rate on caught fraud is unacceptable.
+Rejected because: a large share of detected fraud would still become an
+irrecoverable loss, which is unacceptable.
 Revisit if fraud service p95 latency exceeds 200ms (breach of our SLA).
 ```
 

@@ -105,7 +105,7 @@ FROM generate_series(1, 10000000) AS n;
 
 ### Script 1: Balance Lookup (Read-Heavy)
 
-```bash
+```sql
 -- File: balance_lookup.sql
 \set account_id random(1, 10000000)
 
@@ -133,7 +133,7 @@ pgbench \
 
 ### Script 2: Transaction Debit (Write-Heavy)
 
-```bash
+```sql
 -- File: debit_transaction.sql
 \set account_id random(1, 10000000)
 \set amount random(100, 10000)
@@ -178,7 +178,7 @@ COMMIT;
 
 ### Script 3: Concurrent Transfer (Highest Contention)
 
-```bash
+```sql
 -- File: transfer.sql
 \set source_account random(1, 10000000)
 \set target_account random(1, 10000000)

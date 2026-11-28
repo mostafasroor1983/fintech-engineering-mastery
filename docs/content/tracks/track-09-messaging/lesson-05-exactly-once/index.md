@@ -481,8 +481,8 @@ catch (ProducerFencedException | OutOfOrderSequenceException e) {
 
 **Fix:** Always set `isolation.level=read_committed` on consumers that read from topics written to by transactional producers.
 
-```java
-// In application.properties for Spring Boot consumers:
+```properties
+# In application.properties for Spring Boot consumers:
 spring.kafka.consumer.properties.isolation.level=read_committed
 ```
 

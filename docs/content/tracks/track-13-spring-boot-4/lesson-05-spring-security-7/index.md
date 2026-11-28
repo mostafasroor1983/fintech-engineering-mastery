@@ -45,7 +45,7 @@ references:
 
 # Spring Security 7 — OAuth2, JWT, and Authorization Server
 
-Spring Security 7 ships with Spring Framework 7 and Spring Boot 4. If you have been running a fintech service on Spring Boot 3.x with Spring Security 6.x, the migration surface is smaller than the 5→6 jump — but several APIs that were deprecated in SS6 are now **removed**, and the lambda DSL is no longer optional. This lesson covers exactly what changed and why, then builds toward a production-grade OAuth2 setup that you would use at Revolut-scale.
+Spring Security 7 ships with Spring Framework 7 and Spring Boot 4. If you have been running a fintech service on Spring Boot 3.x with Spring Security 6.x, the migration surface is smaller than the 5→6 jump — but several APIs that were deprecated in SS6 are now **removed**, the lambda DSL is no longer optional, and Spring Authorization Server has moved into Spring Security itself. This lesson covers exactly what changed and why, then builds toward a production-grade OAuth2 setup for a high-volume payment platform.
 
 ---
 
@@ -53,21 +53,23 @@ Spring Security 7 ships with Spring Framework 7 and Spring Boot 4. If you have b
 
 ### Removed APIs
 
-The following were deprecated in SS6 and are **compilation errors** in SS7:
+Some of these were already removed in SS 6.0; the rest were deprecated in 6.x and are **compilation errors** in SS7:
 
-| Removed | Replacement |
-|---|---|
-| `WebSecurityConfigurerAdapter` | `SecurityFilterChain` bean |
-| `antMatchers()` / `mvcMatchers()` / `regexMatchers()` | `requestMatchers()` |
-| `authorizeRequests()` | `authorizeHttpRequests()` |
-| `HttpSecurity.apply(AbstractHttpConfigurer)` | `HttpSecurity.with(AbstractHttpConfigurer, ...)` |
-| Method chaining DSL (non-lambda form) | Lambda DSL exclusively |
-| `csrf().disable()` (bare) | `csrf(AbstractHttpConfigurer::disable)` |
-| `oauth2ResourceServer().jwt()` (bare) | `oauth2ResourceServer(r -> r.jwt(...))` |
+| Removed | Removed in | Replacement |
+|---|---|---|
+| `WebSecurityConfigurerAdapter` | 6.0 | `SecurityFilterChain` bean |
+| `antMatchers()` / `mvcMatchers()` / `regexMatchers()` | 6.0 | `requestMatchers()` |
+| `authorizeRequests()` | 7.0 | `authorizeHttpRequests()` |
+| `HttpSecurity.apply(AbstractHttpConfigurer)` | 7.0 | `HttpSecurity.with(AbstractHttpConfigurer, ...)` |
+| Method chaining DSL with `.and()` (non-lambda form) | 7.0 | Lambda DSL exclusively |
+| `csrf().disable()` (bare) | 7.0 | `csrf(AbstractHttpConfigurer::disable)` |
+| `oauth2ResourceServer().jwt()` (bare) | 7.0 | `oauth2ResourceServer(r -> r.jwt(...))` |
+| `AntPathRequestMatcher` / `MvcRequestMatcher` | 7.0 | `PathPatternRequestMatcher` |
+| `@EnableGlobalMethodSecurity` | 7.0 | `@EnableMethodSecurity` |
 
 ### `@EnableWebSecurity` changes
 
-In SS6, `@EnableWebSecurity(debug = true)` was common for diagnostics. In SS7 the `debug` attribute is still present but the annotation itself is **optional** — `SecurityFilterChain` beans are picked up via `@Bean` without it. You still need it to override `WebSecurityCustomizer`. In practice, fintech services should drop it unless they actively customise `WebSecurity`.
+With Spring Boot, `@EnableWebSecurity` is applied for you by auto-configuration as soon as Spring Security is on the classpath, and your `SecurityFilterChain` (and `WebSecurityCustomizer`) beans are picked up automatically. Adding the annotation to your own configuration is harmless and documents intent; it is only required outside Spring Boot. Never ship `@EnableWebSecurity(debug = true)` to production — the debug output logs request details, including headers.
 
 ### `SecurityFilterChain` is the only approach
 
@@ -138,7 +140,7 @@ public class PaymentApiSecurityConfig {
 }
 ```
 
-Key points: `@Order` controls which chain matches first; `securityMatcher` scopes the chain so it does not apply globally; `STATELESS` session policy is mandatory for JWT-based APIs — you do not want server-side session state at Revolut scale.
+Key points: `@Order` controls which chain matches first; `securityMatcher` scopes the chain so it does not apply globally; `STATELESS` session policy is the norm for JWT-based APIs — server-side session state does not scale horizontally and is not needed when every request carries a token.
 
 ---
 
@@ -221,9 +223,9 @@ The `account_tier` and `payment_limit` claims are available on the `Jwt` princip
 
 ---
 
-## 4. Spring Authorization Server 2.0 — Embedded for Internal Microservices
+## 4. Spring Authorization Server — Embedded for Internal Microservices
 
-A common fintech pattern: an internal Authorization Server issues tokens consumed by multiple microservices (payment service, account service, notification service). Spring Authorization Server 2.0 (compatible with Spring Boot 4) supports this.
+A common fintech pattern: an internal Authorization Server issues tokens consumed by multiple microservices (payment service, account service, notification service). Spring Authorization Server supports this — and with Spring Security 7 it is no longer a separate project: it is part of Spring Security and released with it (Spring Boot 4 offers `spring-boot-starter-oauth2-authorization-server`).
 
 ### Dependency
 
@@ -231,7 +233,7 @@ A common fintech pattern: an internal Authorization Server issues tokens consume
 <dependency>
     <groupId>org.springframework.security</groupId>
     <artifactId>spring-security-oauth2-authorization-server</artifactId>
-    <!-- version managed by Spring Boot 4 BOM -->
+    <!-- part of Spring Security 7; version managed by the Spring Boot 4 BOM -->
 </dependency>
 ```
 
@@ -244,9 +246,12 @@ public class AuthorizationServerConfig {
     @Bean
     @Order(Ordered.HIGHEST_PRECEDENCE)
     SecurityFilterChain authServerSecurity(HttpSecurity http) throws Exception {
-        OAuth2AuthorizationServerConfiguration.applyDefaultSecurity(http);
-        http.getConfigurer(OAuth2AuthorizationServerConfigurer.class)
-            .oidc(Customizer.withDefaults());
+        // applyDefaultSecurity(http) is deprecated — configure via with(...)
+        var authorizationServer = OAuth2AuthorizationServerConfigurer.authorizationServer();
+        http
+            .securityMatcher(authorizationServer.getEndpointsMatcher())
+            .with(authorizationServer, as -> as.oidc(Customizer.withDefaults()))
+            .authorizeHttpRequests(auth -> auth.anyRequest().authenticated());
         http.exceptionHandling(ex -> ex
             .defaultAuthenticationEntryPointFor(
                 new LoginUrlAuthenticationEntryPoint("/login"),
@@ -261,6 +266,8 @@ public class AuthorizationServerConfig {
         RegisteredClient paymentGatewayClient = RegisteredClient
             .withId(UUID.randomUUID().toString())
             .clientId("payment-gateway")
+            // Demo only: in production load clients from a database-backed
+            // RegisteredClientRepository and the secret from Vault
             .clientSecret("{bcrypt}" + new BCryptPasswordEncoder().encode("secret"))
             .clientAuthenticationMethod(ClientAuthenticationMethod.CLIENT_SECRET_BASIC)
             .authorizationGrantType(AuthorizationGrantType.CLIENT_CREDENTIALS)
@@ -273,6 +280,10 @@ public class AuthorizationServerConfig {
         return new InMemoryRegisteredClientRepository(paymentGatewayClient);
     }
 
+    // Demo only: a key generated at startup changes on every restart (all issued
+    // tokens become invalid) and differs between instances. In production, load
+    // the signing key from a KMS/HSM-backed keystore and publish old and new
+    // keys in the JWKS during rotation.
     @Bean
     JWKSource<SecurityContext> jwkSource() {
         RSAKey rsaKey = generateRsa();
@@ -331,7 +342,7 @@ This keeps authorization logic in one place — the Authorization Server — rat
 ```mermaid
 sequenceDiagram
     participant C as Payment Gateway Client
-    participant AS as Authorization Server<br/>(SAS 2.0)
+    participant AS as Authorization Server<br/>(Spring Security 7)
     participant RS as Payment API<br/>(Resource Server)
     participant DB as PostgreSQL
 
@@ -415,7 +426,7 @@ SpEL `@beanName` syntax lets you call arbitrary beans inside security expression
 
 ## 7. Security Testing with `@MockitoBean`
 
-Spring Boot 4 / Spring Framework 7 replaces `@MockBean` with `@MockitoBean` (backed by Mockito 5). The two annotations are API-compatible in most cases, but `@MockitoBean` is now a first-class Spring Framework annotation rather than a Boot-only add-on.
+Spring Boot 4 removes `@MockBean`; use Spring Framework's `@MockitoBean` (available since Framework 6.2). The two annotations behave the same in most cases, but `@MockitoBean` is a Spring Framework annotation rather than a Boot-only add-on. (In Boot 4, `@WebMvcTest` lives in the `spring-boot-webmvc-test` module.)
 
 ```java
 @WebMvcTest(PaymentController.class)
@@ -432,7 +443,8 @@ class PaymentControllerSecurityTest {
     JwtClaimsExtractor jwtClaimsExtractor;
 
     @Test
-    @WithMockUser(roles = "PAYMENT_INITIATOR", authorities = "SCOPE_payment:initiate")
+    // roles and authorities cannot be combined in @WithMockUser — list both as authorities
+    @WithMockUser(authorities = { "ROLE_PAYMENT_INITIATOR", "SCOPE_payment:initiate" })
     void initiatePayment_withValidAuthority_returns201() throws Exception {
         var request = new PaymentRequest("acc-123", new BigDecimal("100.00"), "GBP");
         var result  = new PaymentResult("pay-456", "PENDING");
@@ -482,9 +494,14 @@ void initiatePayment_withJwtBelow_limit_returns201() throws Exception {
                 .jwt(j -> j
                     .claim("financial_roles", List.of("PAYMENT_INITIATOR"))
                     .claim("payment_limit", 50000)
-                    .claim("scope", "payment:initiate")))
+                    .claim("scope", "payment:initiate"))
+                // jwt() maps only "scope" by default — apply our converter so
+                // financial_roles become ROLE_ authorities too
+                .authorities(new JwtConverterConfig.FinancialPermissionsConverter()))
             .contentType(APPLICATION_JSON)
-            .content("""{"accountId":"acc-1","amount":100.00,"currency":"GBP"}"""))
+            .content("""
+                {"accountId":"acc-1","amount":100.00,"currency":"GBP"}
+                """))
         .andExpect(status().isCreated());
 }
 ```
@@ -495,10 +512,10 @@ void initiatePayment_withJwtBelow_limit_returns201() throws Exception {
 
 ## Summary
 
-- **SS7 removes** `WebSecurityConfigurerAdapter`, `antMatchers`, `authorizeRequests`, and all non-lambda DSL forms. If your SB3 service uses any of these, they will not compile.
+- **SS7 removes** `authorizeRequests`, `apply()`, `AntPathRequestMatcher`, `@EnableGlobalMethodSecurity`, and all non-lambda DSL forms (`WebSecurityConfigurerAdapter` and `antMatchers` were already gone in 6.0). If your SB3 service uses any of these, it will not compile.
 - **Lambda DSL** is now the only form; multiple `@Order`ed `SecurityFilterChain` beans cleanly separate actuator, public, and authenticated API surfaces.
 - **OAuth2 Resource Server** configuration is two YAML lines + a custom `JwtAuthenticationConverter` for financial role mapping.
-- **Spring Authorization Server 2.0** enables internal token issuance with business-domain claims via `OAuth2TokenCustomizer`.
+- **Spring Authorization Server**, now part of Spring Security 7, enables internal token issuance with business-domain claims via `OAuth2TokenCustomizer`.
 - **`@EnableMethodSecurity`** (not `@EnableGlobalMethodSecurity`) enables `@PreAuthorize` / `@PostAuthorize`; SpEL expressions can reference Spring beans for complex authorization rules.
 - **`@MockitoBean`** replaces `@MockBean` in test classes; `SecurityMockMvcRequestPostProcessors.jwt()` lets you inject JWT claims without a live Authorization Server.
 
@@ -511,12 +528,12 @@ void initiatePayment_withJwtBelow_limit_returns201() throws Exception {
     "question": "In Spring Security 7, which of the following will cause a compilation error that compiled successfully under Spring Security 6?",
     "options": [
       "Using @EnableWebSecurity on a configuration class",
-      "Calling http.authorizeRequests().antMatchers(\"/health\").permitAll()",
+      "Calling http.authorizeRequests(auth -> auth.requestMatchers(\"/health\").permitAll())",
       "Defining a SecurityFilterChain bean with @Order(1)",
       "Using @PreAuthorize(\"hasRole('ADMIN')\")"
     ],
     "correct": 1,
-    "explanation": "Both authorizeRequests() and antMatchers() were deprecated in SS6 and removed in SS7. The replacement is authorizeHttpRequests() with requestMatchers(). The other options are all valid in SS7."
+    "explanation": "authorizeRequests() was deprecated in Spring Security 6 (in favour of authorizeHttpRequests()) and removed in Spring Security 7, so this code — which compiled with warnings on SS6 — fails on SS7. (antMatchers() was already removed in SS 6.0.) @EnableWebSecurity, ordered SecurityFilterChain beans and @PreAuthorize all remain valid."
   },
   {
     "id": "kc-05-02",
@@ -532,7 +549,7 @@ void initiatePayment_withJwtBelow_limit_returns201() throws Exception {
   },
   {
     "id": "kc-05-03",
-    "question": "You need to add a payment_limit claim to every JWT issued by Spring Authorization Server 2.0. Which bean type should you implement?",
+    "question": "You need to add a payment_limit claim to every JWT issued by Spring Authorization Server (now part of Spring Security 7). Which bean type should you implement?",
     "options": [
       "OAuth2TokenIntrospectionAuthenticationProvider",
       "OAuth2TokenCustomizer<JwtEncodingContext>",
@@ -548,11 +565,11 @@ void initiatePayment_withJwtBelow_limit_returns201() throws Exception {
     "options": [
       "@MockBean (from spring-boot-test)",
       "@Mock (from Mockito)",
-      "@MockitoBean (from Spring Framework 7)",
+      "@MockitoBean (from Spring Framework, since 6.2)",
       "@Spy (from Mockito)"
     ],
     "correct": 2,
-    "explanation": "@MockitoBean is the Spring Framework 7 / Spring Boot 4 replacement for @MockBean. It registers a Mockito mock in the Spring ApplicationContext for the duration of the test. @Mock creates a bare Mockito mock with no Spring context integration."
+    "explanation": "@MockitoBean (org.springframework.test.context.bean.override.mockito) replaces Spring Boot's @MockBean, which was deprecated in 3.4 and removed in Spring Boot 4. It registers a Mockito mock in the Spring ApplicationContext for the duration of the test. @Mock creates a bare Mockito mock with no Spring context integration."
   }
 ]
 -->

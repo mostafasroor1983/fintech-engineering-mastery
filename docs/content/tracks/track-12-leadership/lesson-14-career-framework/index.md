@@ -19,7 +19,7 @@ prerequisites: [track-12-lesson-13]
 
 ## The Individual Contributor Ladder
 
-Most engineering organisations have an IC (Individual Contributor) ladder that runs parallel to the management track:
+Most engineering organisations have an IC (Individual Contributor) ladder that runs parallel to the management track (level numbers differ between companies — some call Staff L5, others L6):
 
 ```
 IC Track                        Management Track
@@ -119,7 +119,7 @@ The principal engineer path requires visibility. This is not self-promotion — 
 
 **Written artefacts**: RFCs, ADRs, design documents, post-mortems, technical strategy memos. These persist, can be shared, and demonstrate your reasoning process. At principal level, your written output becomes an organisational asset.
 
-```java
+```text
 // Treat technical writing as production code
 // - Clear problem statement
 // - Evidence-based options analysis
@@ -131,7 +131,7 @@ The principal engineer path requires visibility. This is not self-promotion — 
 // "We should migrate from MySQL to PostgreSQL because PostgreSQL is better."
 
 // Good RFC:
-// Context: We are hitting MySQL's row-level locking limitations at 5,000 TPS peak.
+// Context: Lock contention on hot account rows in MySQL limits us to 5,000 TPS at peak.
 // Options analysed: (1) MySQL tuning, (2) PostgreSQL migration, (3) sharding
 // Recommendation: PostgreSQL migration over 18 months using expand-contract pattern
 // Success criteria: p99 write latency < 10ms at 10,000 TPS; zero data loss migration

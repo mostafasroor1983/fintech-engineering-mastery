@@ -198,7 +198,7 @@ public class FraudCheckClient {
 
 ### تسجيل خدمة في Consul
 
-```json
+```jsonc
 // consul-service-definition.json — payment-processor service
 {
   "service": {

@@ -49,7 +49,8 @@ prerequisites: [track-11-lesson-01]
         <includeMdcKeyName>trace_id</includeMdcKeyName>
         <includeMdcKeyName>span_id</includeMdcKeyName>
 
-        <!-- Mask sensitive fields before they hit the log -->
+        <!-- Field names in the JSON output (renaming only - masking of
+             sensitive values needs a converter or the LogScrubber below) -->
         <fieldNames>
           <timestamp>@timestamp</timestamp>
           <message>message</message>
@@ -135,7 +136,9 @@ public class MdcLoggingFilter extends OncePerRequestFilter {
                                     FilterChain filterChain) throws ServletException, IOException {
 
         String correlationId = request.getHeader(CORRELATION_ID_HEADER);
-        if (correlationId == null || correlationId.isBlank()) {
+        // The header comes from the client: accept it only if it looks like
+        // an ID (no newlines/control chars for log injection, bounded length)
+        if (correlationId == null || !correlationId.matches("[A-Za-z0-9._-]{1,64}")) {
             correlationId = "auto-" + UUID.randomUUID().toString().replace("-", "");
         }
 
@@ -172,7 +175,7 @@ public class PaymentProcessingService {
         MDC.put("payment_id", request.getPaymentId());
         MDC.put("payment_type", request.getType().name());
         MDC.put("payment_currency", request.getCurrency());
-        // NEVER put amount in MDC if it appears in logs — PII risk in some jurisdictions
+        // Amounts: fine in audit logs, keep them out of general debug logging
         // NEVER put account numbers, card numbers, or names
 
         try {
@@ -199,8 +202,11 @@ public class PaymentProcessingService {
             return PaymentResult.success(entry.getId());
 
         } catch (Exception e) {
-            log.error("Payment processing failed", e,
-                net.logstash.logback.argument.StructuredArguments.keyValue("error_type", e.getClass().getSimpleName()));
+            // The exception must be the LAST argument -- SLF4J only treats a
+            // trailing Throwable as the exception (with stack trace)
+            log.error("Payment processing failed",
+                net.logstash.logback.argument.StructuredArguments.keyValue("error_type", e.getClass().getSimpleName()),
+                e);
             throw e;
         } finally {
             // Remove payment-specific keys; correlation_id stays (set by filter)
@@ -214,7 +220,7 @@ public class PaymentProcessingService {
 
 ### 2.3 MDC Propagation Across Async Boundaries
 
-MDC is thread-local. When you use `@Async`, `CompletableFuture`, or virtual threads, MDC is **not** automatically propagated:
+MDC is thread-local. When you use `@Async`, `CompletableFuture`, or virtual threads, MDC is **not** automatically propagated (Micrometer's context-propagation library can automate this; the manual pattern below shows what it does):
 
 ```java
 package com.bank.payments.async;
@@ -305,11 +311,11 @@ public class AsyncConfig {
 
 ## 3. What Never Goes in Logs — PII and Financial Data
 
-In financial services, logging sensitive data is a regulatory violation (GDPR Article 25, PCI DSS Requirement 3):
+In financial services, logging sensitive data is a regulatory violation (GDPR data minimisation and Article 25, PCI DSS Requirement 3):
 
 | Field | Log? | Alternative |
 |-------|------|-------------|
-| Card number (PAN) | NEVER | Log masked reference (last 4 digits only) |
+| Card number (PAN) | NEVER | Log a token, or the truncated last 4 digits only |
 | CVV | NEVER | Log nothing — no token |
 | Account number | NEVER | Log internal UUID reference |
 | Sort code + account | NEVER | Log internal account ID |
@@ -332,8 +338,12 @@ import java.util.regex.Pattern;
  */
 public class LogScrubber {
 
+    // Patterns over-match (any 16-digit number starting with 4...): in a
+    // real scrubber, confirm candidates with a Luhn check before redacting
     private static final Pattern VISA_CARD = Pattern.compile("4[0-9]{12}(?:[0-9]{3})?");
-    private static final Pattern MASTERCARD = Pattern.compile("5[1-5][0-9]{14}");
+    // Mastercard: 51-55 and the 2221-2720 range
+    private static final Pattern MASTERCARD =
+        Pattern.compile("(?:5[1-5][0-9]{2}|222[1-9]|22[3-9][0-9]|2[3-6][0-9]{2}|27[01][0-9]|2720)[0-9]{12}");
     private static final Pattern IBAN = Pattern.compile("[A-Z]{2}[0-9]{2}[A-Z0-9]{4}[0-9]{7}([A-Z0-9]?){0,16}");
     private static final Pattern UK_SORT_CODE = Pattern.compile("\\d{2}-\\d{2}-\\d{2}");
 
@@ -381,7 +391,9 @@ data:
     [INPUT]
         Name              tail
         Path              /var/log/containers/payment-service*.log
-        Parser            docker
+        # containerd/CRI-O (all current Kubernetes) write the CRI log
+        # format, not Docker JSON
+        multiline.parser  cri
         Tag               payment.*
         Refresh_Interval  5
         Mem_Buf_Limit     50MB
@@ -406,8 +418,7 @@ data:
         Match           payment.*
         Host            elasticsearch.logging.svc.cluster.local
         Port            9200
-        Index           payment-logs
-        Type            _doc
+        Suppress_Type_Name On      # Elasticsearch 8 has no mapping types
         Logstash_Format On
         Logstash_Prefix payment-logs
         tls             On
@@ -457,6 +468,8 @@ Fluent Bit / Promtail (agent)
 
 ### 5.2 Promtail Configuration for Payment Services
 
+Promtail is deprecated (end of life in 2026); its successor is **Grafana Alloy**, which can convert Promtail configs (`alloy convert`). The pipeline concepts below — relabelling, JSON parsing, low-cardinality labels, dropping noise — are the same in Alloy.
+
 ```yaml
 # promtail-config.yaml
 server:
@@ -490,8 +503,8 @@ scrape_configs:
             payment_id: payment_id
             trace_id: trace_id
       - labels:
-          level:
-          service:
+          level:            # low-cardinality only; never payment_id or trace_id
+                            # (service is already a label from relabel_configs)
       - drop:
           expression: ".*actuator/health.*"
           drop_counter_reason: health_check_filtered
@@ -528,20 +541,24 @@ sum(rate({service="payment-service"}[5m]))
 
 ## 6. Log Retention Policies for Financial Compliance
 
-UK FCA COBS 11.8 and PCI DSS Requirement 10 mandate specific log retention periods:
+Regulations set minimum retention periods. Examples for a UK payment firm: the Money Laundering Regulations 2017 require transaction records for 5 years; PCI DSS 10.5.1 requires 12 months of audit log history with the last 3 months immediately available. (FCA COBS 11.8, often quoted here, is about recording calls and electronic communications in investment business.) Check the rules for your own jurisdiction and licence.
 
 | Log category | Minimum retention | Recommended |
 |-------------|------------------|-------------|
-| Payment transaction logs | 5 years (FCA) | 7 years |
-| Access control logs | 1 year (PCI DSS) | 2 years |
+| Payment transaction records | 5 years (UK MLR) | 7 years |
+| Access control / audit logs | 1 year (PCI DSS 10.5.1) | 2 years |
 | Security incident logs | 1 year (PCI DSS) | 2 years |
 | Application debug logs | No mandate | 30 days |
-| Audit trail logs | 5 years | 7 years |
+| Audit trail records | 5 years | 7 years |
+
+Keep the long-retention records (transactions, audit trail) in an immutable store — a database or WORM object storage — rather than keeping all application logs in the search cluster for 7 years. The search cluster then needs only weeks to months.
 
 ### 6.1 Index Lifecycle Management (Elasticsearch)
 
-```json
+```jsonc
 // PUT _ilm/policy/payment-logs-policy
+// (the old "freeze" action no longer exists in Elasticsearch 8 -- cold data
+//  goes to searchable snapshots instead; long-term records live elsewhere)
 {
   "policy": {
     "phases": {
@@ -564,14 +581,14 @@ UK FCA COBS 11.8 and PCI DSS Requirement 10 mandate specific log retention perio
         }
       },
       "cold": {
-        "min_age": "90d",
+        "min_age": "30d",
         "actions": {
           "set_priority": {"priority": 0},
-          "freeze": {}
+          "searchable_snapshot": {"snapshot_repository": "s3-log-archive"}
         }
       },
       "delete": {
-        "min_age": "2555d",
+        "min_age": "365d",
         "actions": {
           "delete": {}
         }
@@ -635,21 +652,36 @@ The ELK stack is a proven, flexible choice with higher operational overhead. Gra
   "questions": [
     {
       "text": "What is the minimum set of fields that every log line in a payment microservice must include to enable cross-service transaction correlation?",
-      "options": ["timestamp, service, level", "timestamp, service, level, correlation_id, payment_id, trace_id", "timestamp, message, exception", "service, level, user_id"],
+      "options": [
+        "timestamp, service, level",
+        "timestamp, service, level, correlation_id, payment_id, trace_id",
+        "timestamp, message, exception",
+        "service, level, user_id"
+      ],
       "correct": 1,
       "explanation": "Cross-service correlation requires a correlation_id (request-scoped identifier passed across all services), payment_id (business domain identifier), and trace_id (links to distributed traces). Without these, you cannot reconstruct the journey of a specific payment across multiple services."
     },
     {
-      "text": "Under UK FCA COBS 11.8, what is the minimum retention period for payment transaction logs?",
-      "options": ["1 year", "2 years", "5 years", "7 years"],
+      "text": "Under the UK Money Laundering Regulations 2017, what is the minimum retention period for payment transaction records?",
+      "options": [
+        "1 year",
+        "2 years",
+        "5 years",
+        "7 years"
+      ],
       "correct": 2,
-      "explanation": "FCA COBS 11.8 mandates a minimum 5-year retention for payment transaction logs. The recommended practice is 7 years to align with common audit and legal discovery windows. Elasticsearch Index Lifecycle Management (ILM) can be configured to automatically manage retention through hot/warm/cold/delete phases."
+      "explanation": "The UK Money Laundering Regulations require customer due diligence and transaction records to be kept for 5 years (after the end of the business relationship / the transaction). Many firms keep 7 years to align with audit and legal discovery windows. Elasticsearch ILM and object-storage lifecycle rules can enforce retention automatically — ideally with the long-term records in immutable storage rather than the log search cluster. (FCA COBS 11.8 is often quoted for this, but it covers recording of communications in investment business.)"
     },
     {
-      "text": "Why should card numbers (PAN) and other PII never appear in application logs even in a masked form?",
-      "options": ["Log files are too large to store such data", "Logging systems (Elasticsearch, Loki) are not PCI-scoped systems, so any PAN in logs brings the entire logging infrastructure into PCI DSS scope and creates GDPR compliance obligations", "Masking makes the data unusable for debugging anyway", "Log aggregation systems cannot handle encrypted fields"],
+      "text": "Why must full card numbers (PAN) never appear in application logs?",
+      "options": [
+        "Log files are too large to store such data",
+        "Logging systems (Elasticsearch, Loki) are not PCI-scoped systems, so any full PAN in logs brings the entire logging infrastructure into PCI DSS scope and creates GDPR compliance obligations",
+        "Masking makes the data unusable for debugging anyway",
+        "Log aggregation systems cannot handle encrypted fields"
+      ],
       "correct": 1,
-      "explanation": "PCI DSS scope follows the data. Any system that stores, processes, or transmits cardholder data must meet full PCI DSS requirements. Including masked PAN in logs that flow to Elasticsearch or Loki brings those systems into PCI scope, dramatically increasing compliance burden and audit costs."
+      "explanation": "PCI DSS scope follows the data. Any system that stores, processes, or transmits cardholder data must meet full PCI DSS requirements. A full PAN in logs that flow to Elasticsearch or Loki brings those systems into PCI scope, dramatically increasing compliance burden and audit costs. A token or the truncated last four digits is fine — truncated PAN is not cardholder data."
     }
   ]
 }

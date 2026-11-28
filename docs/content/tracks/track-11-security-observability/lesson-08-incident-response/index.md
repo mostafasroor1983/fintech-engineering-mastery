@@ -75,7 +75,7 @@ This runbook is triggered when:
 ## Impact
 - Customers cannot submit payments
 - Standing orders and direct debits may fail to process
-- Potential regulatory notification required if duration > 15 minutes
+- May be reportable to regulators — assess against the firm's incident classification criteria (impact, duration, customers affected)
 
 ## Diagnosis Steps
 
@@ -86,7 +86,7 @@ This runbook is triggered when:
 4. Check: when did it start? (look for correlated deploy, config change, infrastructure event)
 
 ### Step 2: Check database connectivity (3 minutes)
-```bash
+~~~bash
 # From payment-service pod
 kubectl exec -n payments deployment/payment-service -- \
   curl -s http://localhost:8080/actuator/health | jq '.components.db'
@@ -97,10 +97,10 @@ kubectl exec -n payments deployment/payment-service -- \
 # If database is DOWN:
 # → Check PostgreSQL pod: kubectl get pods -n data -l app=postgresql
 # → Check connection pool: GET /actuator/metrics/hikaricp.connections.active
-```
+~~~
 
 ### Step 3: Check downstream dependencies (3 minutes)
-```bash
+~~~bash
 # Fraud service health
 curl -s http://fraud-service/actuator/health | jq '.status'
 
@@ -109,30 +109,31 @@ curl -s http://notification-service/actuator/health | jq '.status'
 
 # External payment gateway (check status page: https://status.paymentgateway.com)
 curl -s http://payment-service/actuator/health | jq '.components.paymentGateway'
-```
+~~~
 
 ### Step 4: Check Kafka consumer lag (2 minutes)
-```bash
+~~~bash
 # If payment events are backed up, lag will be growing
 kubectl exec -n kafka kafka-0 -- kafka-consumer-groups.sh \
   --bootstrap-server localhost:9092 \
   --group payment-processor \
-  --describe | awk 'NR>1 {print $1, $5, $6}'
-# Column 5 = LAG, Column 6 = LAG-MAX
+  --describe | awk '$1=="payment-processor" {print $2, $3, $6}'
+# Columns: GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG ...
+# printed: topic, partition, LAG
 # LAG > 10,000 and growing = Kafka consumer is overwhelmed
-```
+~~~
 
 ### Step 5: Check recent deployments
-```bash
+~~~bash
 # Recent rollouts in the last 2 hours
 kubectl rollout history deployment/payment-service -n payments
 # If recent deploy correlates with incident start time → rollback (Step 6a)
-```
+~~~
 
 ## Mitigation Options
 
 ### 6a: Rollback deployment (if deploy caused the issue)
-```bash
+~~~bash
 # Rollback to previous version
 kubectl rollout undo deployment/payment-service -n payments
 
@@ -141,43 +142,47 @@ kubectl rollout status deployment/payment-service -n payments --timeout=5m
 
 # Verify error rate drops within 2 minutes
 # Dashboard: https://grafana.example.com/d/payment-overview
-```
+~~~
 
 ### 6b: Restart pods (if memory/thread issue)
-```bash
+~~~bash
 # Rolling restart — does not cause downtime with 3+ replicas
 kubectl rollout restart deployment/payment-service -n payments
-```
+~~~
 
 ### 6c: Scale up (if traffic spike)
-```bash
-# Increase replica count
-kubectl scale deployment payment-service --replicas=10 -n payments
-
-# Check HPA is not fighting you
+~~~bash
+# With an HPA, "kubectl scale" is overridden at the next evaluation --
+# raise the HPA's minimum instead
+kubectl patch hpa payment-service -n payments \
+  --type=merge -p '{"spec":{"minReplicas":10}}'
 kubectl get hpa -n payments
-```
+# (GitOps: commit the change afterwards, or self-heal will revert it)
+~~~
 
-### 6d: Enable circuit breaker to downstream (if downstream is degraded)
-```bash
-# Force circuit breaker open to fraud service (payments proceed without fraud check)
-kubectl set env deployment/payment-service \
-  FRAUD_CHECK_ENABLED=false \
-  -n payments
+### 6d: Fall back on the fraud check (if the fraud service is degraded)
+ONLY with a fallback that the fraud/risk owner has approved IN ADVANCE --
+e.g. local rules: approve low-value payments from known devices, queue or
+decline the rest. Letting all payments through unchecked is a risk and
+scheme-rule decision, not an on-call decision.
+~~~bash
+# Switch the pre-approved fallback on via the feature-flag service
+# (instant, audited, no restart). "kubectl set env" would restart all pods
+# and drift from Git -- avoid it for runtime switches
+flagctl set fraud-check-mode=fallback-rules --env production \
+  --reason "INC-2026-11-08-001"
 
-# IMPORTANT: notify compliance team immediately if fraud checks are disabled
-# Regulatory risk: document with timestamp in incident channel
-```
+# Notify the fraud/risk and compliance owners immediately;
+# document the time in the incident channel
+~~~
 
 ### 6e: Enable maintenance mode (last resort)
-```bash
-# Returns 503 with retry-after header to all payment endpoints
+~~~bash
+# Returns 503 with Retry-After to all payment endpoints
 # Prevents partial failures and confusing error states
-kubectl set env deployment/payment-service \
-  MAINTENANCE_MODE=true \
-  -n payments
+flagctl set maintenance-mode=on --env production --reason "INC-2026-11-08-001"
 # Update status page: https://status.example.com/admin
-```
+~~~
 
 ## Escalation
 
@@ -205,7 +210,9 @@ kubectl set env deployment/payment-service \
 receivers:
   - name: 'pagerduty-payments-p1'
     pagerduty_configs:
-      - routing_key: '${PAGERDUTY_PAYMENTS_KEY}'
+      # Alertmanager does not expand environment variables in its config:
+      # read the key from a mounted secret file instead
+      - routing_key_file: /etc/alertmanager/secrets/pagerduty-payments-key
         severity: critical
         description: '{{ .CommonAnnotations.summary }}'
         details:
@@ -235,8 +242,7 @@ public class PaymentService {
     public PaymentResult processPayment(PaymentRequest request) {
         String txId = generateTransactionId();
         MDC.put("transactionId", txId);
-        MDC.put("customerId", request.getCustomerId());
-        MDC.put("amount", request.getAmount().toString());
+        MDC.put("customerId", request.getCustomerId());   // internal ID, not a name
         MDC.put("currency", request.getCurrency());
 
         try {
@@ -334,19 +340,19 @@ Incident channel: #incident-payments-2026-11-08-001
 
 ## Regulatory Notification Requirements
 
-Regulated financial services have mandatory notification timelines for significant incidents. Failing to notify regulators in time is a separate regulatory breach.
+Regulated financial services have mandatory notification timelines for significant incidents. Failing to notify regulators in time is a separate regulatory breach. The table is a simplified overview — the exact rules depend on licence, entity size and incident type, and change over time:
 
-| Regulator | Jurisdiction | Notification Trigger | Timeline |
+| Regulator / rule | Jurisdiction | Notification Trigger | Timeline |
 |-----------|-------------|---------------------|----------|
-| FCA (Financial Conduct Authority) | UK | Operational incident causing significant impact to customers or market integrity | ASAP; written report within reasonable time |
-| PRA (Prudential Regulation Authority) | UK | Operational disruption affecting critical functions | Immediate notification; details within 24h |
-| OCC (Office of the Comptroller of the Currency) | US | Computer security incident | 36 hours |
-| FDIC | US | Computer security incident | 36 hours |
-| RBI (Reserve Bank of India) | India | Cyber security incident or IT failure affecting services | 2-6 hours depending on severity |
-| ECB / EBA | EU | Major operational incident under DORA | 4 hours (initial), 24 hours (intermediate) |
+| FCA / PRA (SUP 15, Fundamental Rules) | UK | Matters the regulator would reasonably expect notice of, e.g. serious operational incidents | Promptly — informal first contact, written details to follow |
+| OCC / FDIC / Federal Reserve | US | "Notification incident" (computer-security incident with material impact) | As soon as possible, no later than 36 hours after determination |
+| RBI / CERT-In | India | Cyber security incidents | Within 6 hours |
+| DORA (national competent authority; ECB for significant banks) | EU | Major ICT-related incident | Initial: 4 hours after classification as major, at most 24 hours after awareness; intermediate: 72 hours; final: 1 month |
+| GDPR (data protection authority) | EU / UK | Personal data breach with risk to individuals | 72 hours after awareness |
+| Card schemes / acquirer (PCI context) | Global | Suspected cardholder data compromise | Immediately, per scheme rules |
 
 > [!WARNING]
-> These timelines start from when you become aware of the incident, not when the incident started. Document the timestamp when you declared awareness. Consult your Chief Risk Officer or Head of Compliance before making regulatory notifications—do not self-notify without guidance.
+> Most timelines start from when you become aware of (or classify) the incident, not when the incident started. Document the timestamps of awareness, classification and declaration. Consult your Chief Risk Officer or Head of Compliance before making regulatory notifications—do not self-notify without guidance.
 
 ```java
 // Incident tracking with regulatory notification flag
@@ -385,6 +391,8 @@ Postmortems in financial services sometimes have legal and regulatory dimensions
 
 ### Postmortem Template
 
+*Illustrative example postmortem:*
+
 ```markdown
 # Postmortem: Payment Processing Degradation 2026-11-08
 
@@ -398,7 +406,7 @@ Postmortems in financial services sometimes have legal and regulatory dimensions
 - 15% of payment submissions failed for 32 minutes
 - ~4,800 failed payment attempts (estimated)
 - 0 payments lost (failed requests retried successfully by clients)
-- Regulatory notification assessed: not required (< 15 min of complete outage)
+- Regulatory notification assessed against the firm's criteria: not reportable (partial degradation, no data compromise)
 
 ## Timeline (UTC)
 | Time | Event |
@@ -453,7 +461,7 @@ for 15-30 seconds each, exhausting HikariCP's 20-connection pool.
 
 - Structure every runbook with the same sections: triggers, diagnosis steps, mitigation options, escalation paths—engineers must be able to execute at 2am without reading documentation
 - Severity classification drives escalation: P1 must have immediate response, P2/P3 can wait for business hours
-- Regulatory notification timelines start from awareness, not incident start—document when you declared the incident
+- Regulatory notification timelines generally start from awareness (or classification), not incident start—document when you became aware and declared the incident
 - Communication templates prevent panic and ensure consistent messaging to customers and stakeholders
 - Blameless postmortems with specific action items are the primary mechanism for reliability improvement in payment systems
 - The most valuable investment in incident response is writing runbooks before incidents happen, not after
@@ -462,20 +470,35 @@ for 15-30 seconds each, exhausting HikariCP's 20-connection pool.
 {
   "questions": [
     {
-      "text": "Under PCI DSS and typical UK FCA breach notification requirements, from which point does the regulatory notification clock typically start running?",
-      "options": ["When the incident is fully resolved", "When the security team completes their investigation", "From the point of awareness — when the organisation first knew or should have known about the incident", "When the incident is publicly disclosed"],
+      "text": "Under most incident and breach notification rules (e.g. GDPR's 72 hours, the US 36-hour rule, DORA), from which point does the notification clock typically start running?",
+      "options": [
+        "When the incident is fully resolved",
+        "When the security team completes their investigation",
+        "From the point of awareness — when the organisation first knew or should have known about the incident",
+        "When the incident is publicly disclosed"
+      ],
       "correct": 2,
-      "explanation": "Regulatory notification timelines (e.g., GDPR 72 hours, FCA requirements) run from the point of awareness, not from incident resolution. This is why incident commanders must immediately document when the incident was declared — to ensure notification deadlines are not missed during the chaos of response."
+      "explanation": "Notification timelines run from the point of awareness (or, under DORA, from classifying the incident as major — and no later than 24 hours after awareness), not from incident resolution. GDPR allows 72 hours after awareness of a personal data breach; US banking regulators expect notice within 36 hours of determining a notification incident. This is why incident commanders must immediately document when the incident was detected, classified and declared — so deadlines are not missed during the chaos of response."
     },
     {
       "text": "What is the primary purpose of a blameless postmortem in a financial services engineering team?",
-      "options": ["To identify and punish the engineer who caused the incident", "To create a written record for regulatory purposes", "To identify systemic factors and actionable improvements without creating a culture of fear that discourages future transparency", "To satisfy the SRE team's documentation requirements"],
+      "options": [
+        "To identify and punish the engineer who caused the incident",
+        "To create a written record for regulatory purposes",
+        "To identify systemic factors and actionable improvements without creating a culture of fear that discourages future transparency",
+        "To satisfy the SRE team's documentation requirements"
+      ],
       "correct": 2,
       "explanation": "Blameless postmortems focus on systemic causes — processes, tooling, monitoring gaps — rather than individual blame. When engineers fear being blamed, they withhold information during incidents (making resolution slower) and avoid reporting near-misses (missing learning opportunities). Blameless culture is a reliability prerequisite."
     },
     {
       "text": "In the incident from the lesson, what was the root cause of the HikariCP connection pool exhaustion that took 9 minutes to identify?",
-      "options": ["A database server failure", "A marketing service deployment that called a payment-service endpoint on every payment event, triggering a full table scan that held connections for 15-30 seconds", "A Kafka consumer lag spike", "An expired TLS certificate"],
+      "options": [
+        "A database server failure",
+        "A marketing service deployment that called a payment-service endpoint on every payment event, triggering a full table scan that held connections for 15-30 seconds",
+        "A Kafka consumer lag spike",
+        "An expired TLS certificate"
+      ],
       "correct": 1,
       "explanation": "The marketing service deployed at 01:48 UTC began calling the payment-service /customer-segment endpoint on every payment event. This triggered a full table scan on the transactions table, holding JDBC connections for 15-30 seconds each and exhausting HikariCP's 20-connection pool. The HikariCP leak detection alert had no runbook and was ignored at 02:12."
     }

@@ -23,7 +23,7 @@ prerequisites:
 
 # mTLS in Practice — Certificate Rotation and SPIFFE
 
-An expired certificate in a payment service is not a theoretical risk — it is a production outage. In 2021 a major payments processor suffered a 90-minute outage because a TLS certificate expired without automated renewal. This lesson covers the mechanics of mutual TLS, automated certificate rotation using SPIRE and cert-manager, Vault PKI integration, and monitoring for certificate expiry before it becomes an incident.
+An expired certificate in a payment service is not a theoretical risk — it is a production outage. Well-documented examples include the December 2018 Ericsson software-certificate expiry that took down mobile data for O2 and other operators, and the February 2020 Microsoft Teams outage caused by an expired authentication certificate. This lesson covers the mechanics of mutual TLS, automated certificate rotation using SPIRE and cert-manager, Vault PKI integration, and monitoring for certificate expiry before it becomes an incident.
 
 ---
 
@@ -50,10 +50,12 @@ Client (payment-service)              Server (account-service)
             Encrypted Application Data
 ```
 
+(The diagram shows the TLS 1.2 message flow. In TLS 1.3 there is no ChangeCipherSpec/ClientKeyExchange, and the certificates — including the client certificate, sent after the server's Finished — travel encrypted.)
+
 Both certificates are signed by a trusted CA. Each side verifies:
 1. The certificate is signed by the trusted CA (or intermediate CA in the chain).
 2. The certificate has not expired (`notAfter` in the future).
-3. The certificate has not been revoked (CRL / OCSP check).
+3. The certificate has not been revoked (CRL / OCSP check) — for very short-lived certificates (≤ 1 hour) many meshes skip revocation and rely on expiry instead.
 4. The Subject Alternative Name matches the expected workload identity.
 
 ---
@@ -80,7 +82,7 @@ Certificate Details:
 
 ### Why SPIFFE Uses URI SAN Not CN
 
-The Common Name (CN) field is deprecated for identity verification (RFC 2818). URI SANs are unambiguous, hierarchical, and machine-parseable. The SPIFFE trust bundle maps trust domains to their root CAs, enabling cross-domain federation between organisations.
+Using the Common Name (CN) for identity verification is deprecated (RFC 6125, now RFC 9525: verify against the SAN). URI SANs are unambiguous, hierarchical, and machine-parseable. The SPIFFE trust bundle maps trust domains to their root CAs, enabling cross-domain federation between organisations.
 
 ---
 
@@ -161,9 +163,11 @@ SPIRE rotates SVIDs before expiry to ensure zero-downtime. The rotation timeline
 
 ```
 t=0h    SVID issued (valid 0h → 1h)
-t=0h30  SPIRE rotates at 50% TTL — new SVID issued (valid 0h30 → 1h30)
+t=0h30  SPIRE agent rotates at 50% TTL — new SVID issued (valid 0h30 → 1h30)
+        and pushed to the workload (Workload API watch); new handshakes
+        use it immediately
 t=0h30  Both old and new SVIDs valid simultaneously
-t=0h45  Application hot-reloads new SVID (graceful drain)
+        → connections opened with the old SVID keep working
 t=1h00  Old SVID expires — new SVID is the only valid credential
 ```
 
@@ -172,66 +176,39 @@ The overlap window ensures in-flight connections using the old SVID complete gra
 ### Java — Listening for SVID Updates
 
 ```java
-import io.spiffe.workloadapi.WorkloadApiClient;
-import io.spiffe.workloadapi.Watcher;
-import io.spiffe.bundle.x509bundle.X509Bundle;
-import io.spiffe.svid.x509svid.X509Svid;
+// java-spiffe-provider: an X509Source keeps the current SVID and trust
+// bundle up to date by watching the SPIRE agent. The SSLContext built from
+// it asks the source for the CURRENT SVID on every handshake -- so rotation
+// needs no manual reload, and existing connections are not dropped.
+import io.spiffe.workloadapi.DefaultX509Source;
+import io.spiffe.workloadapi.X509Source;
+import io.spiffe.provider.SpiffeSslContextFactory;
+import io.spiffe.provider.SpiffeSslContextFactory.SslContextOptions;
+import io.spiffe.spiffeid.SpiffeId;
 
-@Component
-public class SpiffeIdentityManager implements InitializingBean, DisposableBean {
+@Configuration
+public class SpiffeTlsConfig {
 
-    private volatile X509Svid currentSvid;
-    private volatile X509Bundle trustBundle;
-    private WorkloadApiClient workloadApiClient;
-
-    @Override
-    public void afterPropertiesSet() {
-        // Connect to SPIRE Agent via Unix socket
-        workloadApiClient = WorkloadApiClient.newClient(
-            WorkloadApiClient.ClientOptions.builder()
-                .spiffeSocketPath("unix:///run/spire/sockets/agent.sock")
-                .build()
-        );
-
-        // Watch for SVID updates — callback fires on initial fetch and rotation
-        workloadApiClient.watchX509Context(new Watcher<>() {
-            @Override
-            public void onUpdate(X509Context update) {
-                currentSvid  = update.getDefaultSvid();
-                trustBundle  = update.getX509BundleSet()
-                                     .getBundleForTrustDomain(TrustDomain.parse("fintech.example.com"));
-
-                log.info("SVID rotated. New SPIFFE ID: {}, expires: {}",
-                    currentSvid.getSpiffeId(),
-                    currentSvid.getLeafCertificate().getNotAfter());
-
-                // Hot-reload the SSLContext used by the HTTP client
-                reloadSslContext();
-            }
-
-            @Override
-            public void onError(Throwable error) {
-                log.error("SPIRE Workload API error — SVID rotation failed", error);
-                // Alert Prometheus
-                Metrics.counter("spire.svid.rotation.error").increment();
-            }
-        });
+    @Bean(destroyMethod = "close")
+    public X509Source x509Source() throws Exception {
+        // Socket from SPIFFE_ENDPOINT_SOCKET, e.g. unix:/run/spire/sockets/agent.sock
+        return DefaultX509Source.newSource();
     }
 
-    private void reloadSslContext() {
-        // Replace the SSLContext in the HTTP client pool without dropping existing connections
-        SSLContext newCtx = SSLContextBuilder.create()
-            .loadKeyMaterial(currentSvid.getKeyPair(), currentSvid.getLeafCertificate())
-            .loadTrustMaterial(trustBundle.getX509Authorities())
+    @Bean
+    public SSLContext spiffeSslContext(X509Source source) throws Exception {
+        SslContextOptions options = SslContextOptions.builder()
+            .x509Source(source)
+            // Authorise peers by SPIFFE ID, not just "signed by our CA"
+            .acceptedSpiffeIdsSupplier(() -> Set.of(
+                SpiffeId.parse("spiffe://fintech.example.com/ns/core/sa/account-service")))
             .build();
-        httpClientPool.reloadSslContext(newCtx);
-    }
-
-    @Override
-    public void destroy() {
-        workloadApiClient.close();
+        return SpiffeSslContextFactory.getSslContext(options);
     }
 }
+// Monitor rotation: export the current SVID's notAfter as a gauge and
+// alert if it gets close (e.g. < 15 min left) -- a stalled rotation
+// shows there long before connections fail
 ```
 
 ---
@@ -250,15 +227,16 @@ metadata:
 spec:
   vault:
     server: https://vault.vault.svc.cluster.local:8200
-    path: pki/intermediate/sign/payment-service  # Vault PKI role path
+    path: pki_int/sign/payment-service  # Vault PKI role path
     caBundle: <base64-encoded-vault-ca-cert>
     auth:
       kubernetes:
         mountPath: /v1/auth/kubernetes
         role: cert-manager
-        secretRef:
-          name: cert-manager-vault-token
-          key: token
+        # Short-lived token requested by cert-manager for this service
+        # account (no long-lived token Secret needed)
+        serviceAccountRef:
+          name: cert-manager-vault
 ```
 
 ### Certificate CRD for Payment Service
@@ -298,32 +276,36 @@ spec:
 ### Vault PKI Secrets Engine Setup
 
 ```bash
-# Enable PKI at a custom path
+# Root CA mount. (In production keep the root OFFLINE -- e.g. an HSM or an
+# air-gapped CA -- and let Vault hold only the intermediate.)
 vault secrets enable -path=pki pki
+vault secrets tune -max-lease-ttl=87600h pki        # default max is 32 days
 
 # Configure root CA (or import an external root)
 vault write pki/root/generate/internal \
   common_name="fintech.example.com Root CA" \
   ttl="87600h"   # 10 years
 
-# Enable intermediate CA
-vault secrets enable -path=pki/intermediate pki
+# Intermediate CA on its OWN mount (Vault cannot mount pki/intermediate
+# below the existing pki/ mount)
+vault secrets enable -path=pki_int pki
+vault secrets tune -max-lease-ttl=43800h pki_int
 
 # Generate intermediate CSR
-vault write -format=json pki/intermediate/generate/internal \
+vault write -format=json pki_int/intermediate/generate/internal \
   common_name="fintech.example.com Intermediate CA" \
   | jq -r '.data.csr' > intermediate.csr
 
 # Sign intermediate with root
-vault write -format=json pki/root/root/sign-intermediate \
+vault write -format=json pki/root/sign-intermediate \
   csr=@intermediate.csr format=pem_bundle ttl="43800h" \
   | jq -r '.data.certificate' > intermediate.pem
 
 # Import signed intermediate
-vault write pki/intermediate/intermediate/set-signed certificate=@intermediate.pem
+vault write pki_int/intermediate/set-signed certificate=@intermediate.pem
 
 # Create role for payment-service
-vault write pki/intermediate/roles/payment-service \
+vault write pki_int/roles/payment-service \
   allowed_domains="payments.svc.cluster.local" \
   allow_subdomains=true \
   allowed_uri_sans="spiffe://fintech.example.com/ns/payments/*" \
@@ -354,15 +336,19 @@ vault write pki/intermediate/roles/payment-service \
 ### cert-manager Prometheus Metrics
 
 ```promql
-# Certificates expiring within 7 days
-certmanager_certificate_expiration_timestamp_seconds
-  - time() < 7 * 24 * 3600
+# Renewal overdue: cert-manager should have renewed 10+ minutes ago.
+# Works for 1-hour mesh certificates AND 90-day public ones -- a fixed
+# "expires within 7 days" threshold would fire permanently for 1h certs
+time() > certmanager_certificate_renewal_timestamp_seconds + 600
+
+# Long-lived certificates expiring within 7 days
+(certmanager_certificate_expiration_timestamp_seconds - time()) < 7 * 24 * 3600
 
 # Certificates that have already expired
 certmanager_certificate_expiration_timestamp_seconds < time()
 
-# Ready certificates (1 = ready, 0 = not ready)
-certmanager_certificate_ready_status == 0
+# Not-ready certificates: one series per condition value (True/False/Unknown)
+certmanager_certificate_ready_status{condition="False"} == 1
 ```
 
 ### PrometheusRule: Certificate Expiry Alert
@@ -377,21 +363,19 @@ spec:
   groups:
     - name: certificate.expiry
       rules:
-        - alert: CertificateExpiryWarning
+        - alert: CertificateRenewalOverdue
           expr: |
-            (certmanager_certificate_expiration_timestamp_seconds - time())
-            / (24 * 3600) < 7
-          for: 1h
+            time() > certmanager_certificate_renewal_timestamp_seconds + 600
+          for: 5m
           labels:
             severity: warning
             team: platform
           annotations:
-            summary: "Certificate {{ $labels.name }} in {{ $labels.namespace }} expires in {{ $value | humanizeDuration }}"
+            summary: "Certificate {{ $labels.name }} in {{ $labels.namespace }} was not renewed on time"
             description: >
-              Certificate {{ $labels.namespace }}/{{ $labels.name }} will expire in
-              {{ printf \"%.1f\" $value }} days. If cert-manager renewal is working
-              correctly this should resolve automatically. Check CertificateRequest
-              objects and Vault PKI connectivity if the alert persists.
+              Renewal of {{ $labels.namespace }}/{{ $labels.name }} is overdue.
+              Check CertificateRequest objects and Vault PKI connectivity
+              before the certificate expires.
 
         - alert: CertificateExpired
           expr: |
@@ -478,13 +462,13 @@ echo "=== Done. Verify service connectivity ==="
 
 ### Pitfall 1: Waiting for Certificate Expiry Before Rotating
 
-A team relies on a monitoring alert at 3 days to trigger manual rotation. The Vault PKI role has `max_ttl=2h` but the cert-manager `Certificate` resource was misconfigured with `duration: 24h` — Vault rejects the request and cert-manager silently retries with exponential backoff. The alert fires 3 days before expiry, but the cert has already been failing to renew for 21 days.
+A team relies on an expiry alert at 3 days. A gateway certificate has `duration: 2160h` (90 days) and `renewBefore: 720h` (30 days), but the Vault PKI role was changed to `max_ttl=720h` — Vault rejects every renewal and cert-manager silently retries with exponential backoff. The alert fires 3 days before expiry, but renewal has already been failing for 27 days.
 
-**Fix**: alert at 7 days expiry (not 3 days) and add a second alert for `certmanager_certificate_ready_status == 0` that fires when any certificate transitions to NotReady. The `ready_status == 0` alert catches renewal failures before the 7-day threshold.
+**Fix**: alert on *renewal failure*, not on remaining lifetime: a "renewal overdue" alert (above) and a not-ready alert fire as soon as the first renewal attempt fails — days or weeks before expiry. Also validate in CI that every `Certificate.duration` fits within the issuing Vault role's `max_ttl`.
 
 ```yaml
 - alert: CertificateNotReady
-  expr: certmanager_certificate_ready_status{condition="Ready"} == 0
+  expr: certmanager_certificate_ready_status{condition="False"} == 1
   for: 15m
   labels:
     severity: warning
@@ -523,12 +507,15 @@ The first certificate rotation test happens in production at 11 PM on a Tuesday.
 ```bash
 #!/bin/bash
 # cert-rotation-test.sh — run in staging weekly
-# 1. Force SVID rotation by reducing TTL to 5 minutes
-kubectl patch configmap spire-server-config -n spire \
-  --type=json -p '[{"op":"replace","path":"/data/default_svid_ttl","value":"5m"}]'
+# 1. Shorten the SVID TTL of the staging entries to 5 minutes (per entry --
+#    the server's default TTL lives in server.conf and needs a restart)
+for id in $(spire-server entry show -selector k8s:ns:payments -output json \
+            | jq -r '.entries[].id'); do
+  spire-server entry update -entryID "$id" -x509SVIDTTL 300
+done
 
-# 2. Wait 3 minutes
-sleep 180
+# 2. Wait for at least two rotations
+sleep 600
 
 # 3. Verify all services are still responding
 for svc in payment-service account-service fraud-detection; do
@@ -540,9 +527,11 @@ for svc in payment-service account-service fraud-detection; do
   fi
 done
 
-# 4. Restore TTL
-kubectl patch configmap spire-server-config -n spire \
-  --type=json -p '[{"op":"replace","path":"/data/default_svid_ttl","value":"1h"}]'
+# 4. Restore TTL (in practice: re-apply the entries from Git / ClusterSPIFFEID)
+for id in $(spire-server entry show -selector k8s:ns:payments -output json \
+            | jq -r '.entries[].id'); do
+  spire-server entry update -entryID "$id" -x509SVIDTTL 3600
+done
 
 echo "Certificate rotation test PASSED"
 ```
@@ -555,8 +544,8 @@ In a multi-cluster or multi-cloud fintech deployment, services in cluster A must
 
 ### SPIRE Federation Configuration
 
-```yaml
-# spire-server.conf — federate with DR cluster
+```hcl
+# spire-server.conf (HCL) — federate with DR cluster
 federation {
   bundle_endpoint {
     address = "0.0.0.0"
@@ -575,12 +564,14 @@ federation {
 ### Verifying Trust Bundle Synchronisation
 
 ```bash
-# Check which trust domains the SPIRE server knows about
-spire-server bundle show -id spiffe://fintech.example.com
-spire-server bundle show -id spiffe://fintech-dr.example.com
+# Own trust bundle
+spire-server bundle show
 
-# View federated bundle expiry
-spire-server bundle show -format spiffe | \
+# Federated bundles received from other trust domains
+spire-server bundle list -id spiffe://fintech-dr.example.com
+
+# Inspect the keys of a bundle in SPIFFE (JWKS) format
+spire-server bundle list -id spiffe://fintech-dr.example.com -format spiffe | \
   python3 -c "import sys,json; b=json.load(sys.stdin); \
   [print(x['use'], x.get('x5c','NO CERT')) for x in b.get('keys',[])]"
 ```
@@ -652,9 +643,9 @@ istioctl proxy-config listener payment-service-abc123 \
 - [ ] cert-manager Certificate CRD `renewBefore` is set to at least 20 minutes
 - [ ] cert-manager uses Vault PKI as the issuer (not self-signed ClusterIssuer)
 - [ ] Vault PKI role `max_ttl` aligns with cert-manager `duration`
-- [ ] Alert: certificate expiry < 7 days (warning)
-- [ ] Alert: certificate expiry < 1 day (critical)
-- [ ] Alert: `certmanager_certificate_ready_status == 0` (not-ready alert)
+- [ ] Alert: renewal overdue (`time() > certmanager_certificate_renewal_timestamp_seconds + 600`)
+- [ ] Alert: long-lived certificates expiring < 7 days (warning) and already expired (critical)
+- [ ] Alert: `certmanager_certificate_ready_status{condition="False"} == 1` (not-ready alert)
 - [ ] Mobile apps pin to intermediate CA, not leaf certificate
 - [ ] Certificate rotation test runs weekly in staging
 - [ ] Expired certificate incident runbook is documented and tested
@@ -663,4 +654,4 @@ istioctl proxy-config listener payment-service-abc123 \
 
 <!-- KNOWLEDGE-CHECK {"questions":[{"text":"A SPIFFE X.509 SVID has a TTL of 1 hour. SPIRE is configured to rotate SVIDs at 50% of TTL. A new SVID is issued at t=0. At what time will the new SVID be ready, and when does the original SVID expire?","options":["New SVID ready at t=30min; original expires at t=1h. Both are valid simultaneously from t=30min to t=1h.","New SVID ready at t=1h; original expires at t=1h. No overlap window.","New SVID ready at t=45min; original expires at t=1h. 15-minute overlap.","New SVID ready at t=30min; original expires at t=30min. No overlap."],"correct":0,"explanation":"SPIRE rotates at 50% of TTL, meaning rotation occurs at t=30min for a 1-hour TTL. The new SVID is issued at t=30min with its own 1-hour TTL (valid t=30min to t=1h30min). The original SVID remains valid until t=1h. This creates a 30-minute overlap window from t=30min to t=1h where both SVIDs are simultaneously valid, allowing in-flight connections to drain gracefully without any downtime."},{"text":"A cert-manager Certificate resource is configured with duration: 1h and renewBefore: 20m. The certificate was last issued at 10:00 UTC. When will cert-manager attempt to renew it?","options":["At 11:00 UTC when the certificate expires.","At 10:40 UTC — 20 minutes before the 11:00 expiry.","At 10:30 UTC — halfway through the certificate lifetime.","At 10:20 UTC — 20 minutes after issuance."],"correct":1,"explanation":"cert-manager calculates the renewal time as: expiry_time - renewBefore = 11:00 - 20min = 10:40 UTC. The renewBefore field specifies how far before expiry to start renewal, not how long after issuance. This gives a 20-minute window for Vault PKI to issue the new certificate and for the Secret to be updated before the old certificate expires."},{"text":"A mobile banking app uses SSL pinning. The backend payment API is migrating from a 2-year leaf certificate to a new 1-hour SPIFFE SVID. The old leaf certificate SHA-256 hash was pinned in the mobile app. What will happen when the SVID rotates for the first time?","options":["The mobile app will transparently accept the new certificate because SPIFFE SVIDs use the same CA.","All mobile clients will experience SSL handshake failures because the pinned leaf certificate hash no longer matches.","The mobile app will cache the old certificate and continue working for 7 days.","The SPIRE agent will detect the pinned hash and pause rotation."],"correct":1,"explanation":"Leaf certificate pinning matches the exact SHA-256 fingerprint of a specific certificate. When the SVID rotates (which happens every hour with SPIFFE), the new certificate has a completely different fingerprint. All clients with the old hash pinned will reject the new certificate with an SSL handshake failure. The fix is to pin to the intermediate CA certificate, which remains stable across many leaf certificate rotations, and to include both the current and next intermediate CA hashes to support intermediate CA rotation."}]} -->
 
-<!-- PRACTICAL-CHALLENGE {"title":"Implement Automated Certificate Rotation with SPIRE and cert-manager","difficulty":"advanced","estimatedMinutes":105,"tasks":[{"id":"1","description":"Deploy SPIRE in a kind cluster with a 5-minute SVID TTL for testing. Configure Kubernetes PSAT attestation. Register a payment-service workload entry with SPIFFE ID spiffe://fintech.example.com/ns/payments/sa/payment-service. Write a Java Spring Boot service that implements the SPIFFE Workload API Watcher, logs the SVID fingerprint on each rotation, and exposes a /identity endpoint returning the current SPIFFE ID and certificate expiry time."},{"id":"2","description":"Set up Vault PKI with a root CA and an intermediate CA for fintech.example.com. Create a PKI role for payment-service allowing URI SAN spiffe://fintech.example.com/ns/payments/* with max_ttl=2h. Deploy cert-manager with a ClusterIssuer pointing to Vault. Create a Certificate CRD for payment-service with duration=1h and renewBefore=20m. Verify that cert-manager automatically renews the certificate and that the Kubernetes Secret is updated with no service downtime."},{"id":"3","description":"Write a PrometheusRule with three alert rules: CertificateNotReady (certmanager_certificate_ready_status == 0, 15 minutes), CertificateExpiryWarning (< 7 days, warning), and CertificateExpired (already expired, critical). Create a Grafana dashboard panel showing all certificate expiry timestamps, sorted ascending. Write a runbook script that forces cert-manager to renew a named certificate and validates the new expiry date."},{"id":"4","description":"Write an automated certificate rotation test script that: (1) reduces SPIRE SVID TTL to 5 minutes, (2) waits for one rotation cycle, (3) verifies the payment-service is still healthy via HTTP health check, (4) verifies the SVID fingerprint has changed, (5) restores the original TTL. Additionally, write a test proving that leaf certificate pinning breaks rotation and intermediate CA pinning survives rotation, using OkHttp's CertificatePinner with both configurations against a local test server."}]} -->
+<!-- PRACTICAL-CHALLENGE {"title": "Implement Automated Certificate Rotation with SPIRE and cert-manager", "difficulty": "advanced", "estimatedMinutes": 105, "tasks": [{"id": "1", "description": "Deploy SPIRE in a kind cluster with a 5-minute SVID TTL for testing. Configure Kubernetes PSAT attestation. Register a payment-service workload entry with SPIFFE ID spiffe://fintech.example.com/ns/payments/sa/payment-service. Write a Java Spring Boot service that implements the SPIFFE Workload API Watcher, logs the SVID fingerprint on each rotation, and exposes a /identity endpoint returning the current SPIFFE ID and certificate expiry time."}, {"id": "2", "description": "Set up Vault PKI with a root CA and an intermediate CA for fintech.example.com. Create a PKI role for payment-service allowing URI SAN spiffe://fintech.example.com/ns/payments/* with max_ttl=2h. Deploy cert-manager with a ClusterIssuer pointing to Vault. Create a Certificate CRD for payment-service with duration=1h and renewBefore=20m. Verify that cert-manager automatically renews the certificate and that the Kubernetes Secret is updated with no service downtime."}, {"id": "3", "description": "Write a PrometheusRule with three alert rules: CertificateNotReady (certmanager_certificate_ready_status{condition=\"False\"} == 1 for 15 minutes), CertificateRenewalOverdue (renewal timestamp passed by 10 minutes, warning), and CertificateExpired (already expired, critical). Create a Grafana dashboard panel showing all certificate expiry timestamps, sorted ascending. Write a runbook script that forces cert-manager to renew a named certificate and validates the new expiry date."}, {"id": "4", "description": "Write an automated certificate rotation test script that: (1) reduces the SVID TTL of the test registration entries to 5 minutes, (2) waits for one rotation cycle, (3) verifies the payment-service is still healthy via HTTP health check, (4) verifies the SVID fingerprint has changed, (5) restores the original TTL. Additionally, write a test proving that leaf certificate pinning breaks rotation and intermediate CA pinning survives rotation, using OkHttp's CertificatePinner with both configurations against a local test server."}]} -->

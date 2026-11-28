@@ -35,7 +35,7 @@ Internet
     ▼
 ┌─────────────────────────────────────────────────────┐
 │  API Gateway (Kong / AWS API Gateway / Nginx)        │
-│  → TLS termination (TLS 1.3 only)                   │
+│  → TLS termination (TLS 1.2+, 1.3 preferred)        │
 │  → JWT validation at gateway level                  │
 │  → Rate limiting per client/API key                 │
 │  → Request/response logging                         │
@@ -215,6 +215,8 @@ SQL injection in payment systems is catastrophic: attackers can read all transac
 
 ```java
 // NEVER do this — SQL injection via string concatenation
+// (Spring Data interface methods and JdbcTemplate code shown side by side
+//  for comparison -- in a real project they live in separate classes)
 @Repository
 public class TransactionRepository {
 
@@ -244,10 +246,8 @@ public class TransactionRepository {
     // CORRECT — JdbcTemplate with parameterised query
     public List<Transaction> searchWithJdbc(String accountId, String status) {
         String sql = "SELECT * FROM transactions WHERE account_id = ? AND status = ?";
-        return jdbcTemplate.query(sql,
-            new Object[]{accountId, status},  // Parameters bound separately — never concatenated
-            transactionRowMapper
-        );
+        // Parameters bound separately — never concatenated
+        return jdbcTemplate.query(sql, transactionRowMapper, accountId, status);
     }
 
     // CORRECT — Criteria API for dynamic queries
@@ -270,6 +270,9 @@ public class TransactionRepository {
         query.where(predicates.toArray(new Predicate[0]));
         return entityManager.createQuery(query).getResultList();
     }
+    // Column names, sort fields and sort directions CANNOT be bound as
+    // parameters: map user input to an allowlist ("date" -> createdAt,
+    // "amount" -> amountMinorUnits) instead of inserting it into SQL
 }
 ```
 
@@ -334,11 +337,23 @@ public ResponseEntity<AccountResponse> updateAccount(
 Rate limiting prevents: credential stuffing (brute-forcing passwords), card testing (trying stolen card numbers), account enumeration, and API scraping.
 
 ```java
-// Token bucket rate limiter using Redis
+// Fixed-window rate limiter using Redis (simple; it allows up to 2x the
+// limit across a window boundary -- use a sliding window or token bucket,
+// e.g. Bucket4j with Redis, where that matters)
 @Component
 public class PaymentApiRateLimiter {
 
-    private final RedisTemplate<String, String> redis;
+    // Lua script: increment and set the expiry atomically
+    private static final RedisScript<Long> INCREMENT_WITH_EXPIRY = RedisScript.of("""
+        local current = redis.call('INCR', KEYS[1])
+        if current == 1 then
+            redis.call('EXPIRE', KEYS[1], ARGV[1])
+        end
+        return current
+        """, Long.class);
+
+    private final StringRedisTemplate redis;
+    private final MeterRegistry meterRegistry;
 
     // Rate limit definitions for payment API endpoints
     private static final Map<String, RateLimit> LIMITS = Map.of(
@@ -349,64 +364,64 @@ public class PaymentApiRateLimiter {
         "card:number:view", new RateLimit(2,  Duration.ofHours(1))      // 2 card views/hour
     );
 
+    public PaymentApiRateLimiter(StringRedisTemplate redis, MeterRegistry meterRegistry) {
+        this.redis = redis;
+        this.meterRegistry = meterRegistry;
+    }
+
     /**
+     * @param subject the customer ID for authenticated calls; for login/OTP
+     *                the username or the client IP (there is no customer yet)
      * @return true if the request is allowed; false if rate limit exceeded
      */
-    public boolean isAllowed(String customerId, String operation) {
+    public boolean isAllowed(String subject, String operation) {
         RateLimit limit = LIMITS.get(operation);
         if (limit == null) return true;
 
-        String key = "ratelimit:" + operation + ":" + customerId;
+        String key = "ratelimit:" + operation + ":" + subject;
+        Long count = redis.execute(INCREMENT_WITH_EXPIRY,
+            List.of(key), String.valueOf(limit.getWindow().getSeconds()));
 
-        // Atomic increment with expiry (using Lua script for atomicity)
-        Long count = redis.execute(
-            incrementWithExpiry,
-            Collections.singletonList(key),
-            String.valueOf(limit.getMaxRequests()),
-            String.valueOf(limit.getWindow().getSeconds())
-        );
-
+        // count == null (Redis unavailable): fail CLOSED for payment writes --
+        // decide this deliberately per operation
         if (count == null || count > limit.getMaxRequests()) {
-            log.warn("Rate limit exceeded: customerId={} operation={} count={}",
-                customerId, operation, count);
-            rateLimitExceededCounter.increment(Tags.of("operation", operation));
+            log.warn("Rate limit exceeded: subject={} operation={} count={}",
+                subject, operation, count);
+            meterRegistry.counter("ratelimit.exceeded", "operation", operation).increment();
             return false;
         }
-
         return true;
     }
 }
 
-// Lua script for atomic increment + set expiry
-// This ensures the counter and expiry are set atomically
-private static final RedisScript<Long> incrementWithExpiry = RedisScript.of("""
-    local current = redis.call('INCR', KEYS[1])
-    if current == 1 then
-        redis.call('EXPIRE', KEYS[1], ARGV[2])
-    end
-    return current
-    """, Long.class);
-
-// Spring MVC filter applying rate limits
-@Component
-@Order(Ordered.HIGHEST_PRECEDENCE + 10)
+// Rate-limit filter. It must run AFTER Spring Security has authenticated the
+// request -- a servlet filter ordered before the security chain would never
+// see a JwtAuthenticationToken. Register it inside the security chain:
+//   http.addFilterAfter(rateLimitFilter, BearerTokenAuthenticationFilter.class);
+// (and do NOT also register it as a plain @Component servlet filter)
 public class RateLimitFilter extends OncePerRequestFilter {
+
+    private final PaymentApiRateLimiter rateLimiter;
+
+    public RateLimitFilter(PaymentApiRateLimiter rateLimiter) {
+        this.rateLimiter = rateLimiter;
+    }
 
     @Override
     protected void doFilterInternal(HttpServletRequest request,
                                     HttpServletResponse response,
                                     FilterChain chain) throws IOException, ServletException {
 
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        if (!(auth instanceof JwtAuthenticationToken)) {
-            chain.doFilter(request, response);
-            return;
-        }
-
-        String customerId = ((JwtAuthenticationToken) auth).getName();
         String operation = resolveOperation(request);
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
 
-        if (operation != null && !rateLimiter.isAllowed(customerId, operation)) {
+        // Authenticated calls: limit per customer. Unauthenticated calls such
+        // as login: limit per client IP (and per username in the login code)
+        String subject = (auth instanceof JwtAuthenticationToken jwt)
+            ? jwt.getName()
+            : request.getRemoteAddr();   // behind a proxy: the trusted X-Forwarded-For value
+
+        if (operation != null && !rateLimiter.isAllowed(subject, operation)) {
             response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
             response.setHeader("Retry-After", "60");
             response.setContentType("application/json");
@@ -430,7 +445,8 @@ A Web Application Firewall sits at the edge, before requests reach your applicat
 
 ```yaml
 # AWS WAF Web ACL for payment API
-# (CDK/CloudFormation representation)
+# (CloudFormation, shortened: every rule also needs a full VisibilityConfig
+#  with SampledRequestsEnabled, CloudWatchMetricsEnabled and MetricName)
 PaymentApiWebAcl:
   Type: AWS::WAFv2::WebACL
   Properties:
@@ -479,9 +495,12 @@ PaymentApiWebAcl:
           ManagedRuleGroupStatement:
             VendorName: AWS
             Name: AWSManagedRulesCommonRuleSet
-            ExcludedRules:
-              # Exclude rules that cause false positives for JSON payloads
-              - Name: SizeRestrictions_BODY
+            # Override single rules that cause false positives (the older
+            # "ExcludedRules" setting is deprecated)
+            RuleActionOverrides:
+              - Name: SizeRestrictions_BODY   # bodies > 8 KB
+                ActionToUse:
+                  Count: {}
 
       # Rate limit by IP — catches automated attacks
       - Name: IPRateLimitRule
@@ -495,7 +514,10 @@ PaymentApiWebAcl:
         VisibilityConfig:
           MetricName: IPRateLimitBlocked
 
-      # Block access from high-risk countries (adjust per your compliance requirements)
+      # Block traffic from sanctioned jurisdictions (adjust to the sanctions
+      # regimes that apply to you: OFAC, UK, EU, UN). Geo-IP blocking is only
+      # a supplementary control -- VPNs bypass it; sanctions compliance rests
+      # on screening customers, counterparties and transactions
       - Name: GeoBlockHighRisk
         Priority: 5
         Action:
@@ -559,7 +581,9 @@ public class CorsConfig {
 
 ---
 
-## TLS 1.3 Enforcement
+## TLS Configuration
+
+Prefer TLS 1.3 and allow TLS 1.2 only with strong (AEAD, forward-secret) cipher suites. TLS 1.3-only is fine for internal traffic and modern clients, but public payment APIs often still have partners and devices that need TLS 1.2 — PCI DSS requires "strong cryptography", which TLS 1.2 with good ciphers satisfies. TLS 1.0/1.1 must be off.
 
 ```yaml
 # application.yml — TLS configuration for Spring Boot
@@ -570,12 +594,15 @@ server:
     key-store: classpath:keystore.p12
     key-store-type: PKCS12
     key-store-password: ${SSL_KEYSTORE_PASSWORD}
-    enabled-protocols: TLSv1.3    # Only TLS 1.3 — reject TLS 1.2 and below
+    enabled-protocols: TLSv1.3,TLSv1.2   # nothing older
     ciphers:
-      # TLS 1.3 cipher suites (automatically negotiated by JVM 11+)
+      # TLS 1.3 suites
       - TLS_AES_256_GCM_SHA384
       - TLS_AES_128_GCM_SHA256
       - TLS_CHACHA20_POLY1305_SHA256
+      # TLS 1.2: ECDHE (forward secrecy) + AES-GCM only
+      - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+      - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
 ```
 
 ```java
@@ -587,14 +614,14 @@ public TomcatServletWebServerFactory servletContainer() {
         AbstractHttp11Protocol<?> protocol =
             (AbstractHttp11Protocol<?>) connector.getProtocolHandler();
 
-        // Enforce TLS 1.3 only
+        // Internal service: TLS 1.3 only
         protocol.setSslEnabledProtocols("TLSv1.3");
 
-        // Disable weak cipher suites explicitly
+        // Restrict cipher suites explicitly
         protocol.setCiphers("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256");
 
-        // Enable HSTS (HTTP Strict Transport Security)
-        // Browser will refuse HTTP connections for 1 year
+        // Prefer the server's cipher order over the client's
+        // (HSTS is an HTTP response header -- see Security Headers below)
         protocol.setUseServerCipherSuitesOrder(true);
     });
     return factory;
@@ -605,12 +632,15 @@ public TomcatServletWebServerFactory servletContainer() {
 
 ## Security Headers
 
+Configure the headers in the application's ONE main `SecurityFilterChain` (shown here on its own for readability). A second chain bean without a `securityMatcher` would match every request just like the first, and Spring Security refuses to start with two catch-all chains. CSP mainly matters for the HTML/JS of the banking portal; JSON API responses mostly need `nosniff` and HSTS.
+
 ```java
 @Configuration
 public class SecurityHeadersConfig {
 
+    // Part of the main security configuration
     @Bean
-    public SecurityFilterChain headerFilterChain(HttpSecurity http) throws Exception {
+    public SecurityFilterChain apiFilterChain(HttpSecurity http) throws Exception {
         http.headers(headers -> headers
             // Prevents clickjacking
             .frameOptions(frame -> frame.deny())
@@ -653,9 +683,9 @@ public class SecurityHeadersConfig {
 - API security requires defense-in-depth: WAF → API gateway → Spring Security → application validation; each layer catches different attack classes
 - Input validation must be exhaustive and use whitelists (allow known-good patterns) not blacklists (block known-bad)—for financial data like IBANs, implement full checksum validation, not just format checks
 - SQL injection prevention requires consistent use of parameterised queries via JPA, Criteria API, or named parameters—never string concatenation
-- Rate limiting must use Redis for distributed counters (in-memory per-pod limits are useless with multiple replicas)
+- Rate limiting must use a shared store such as Redis for distributed counters (per-pod in-memory limits are bypassed by spreading requests over replicas), and it must run after authentication — or key on IP/username for unauthenticated endpoints like login
 - CORS configuration must be an explicit allowlist of origins—never wildcard for financial APIs
-- Enforce TLS 1.3 at the application layer even if the load balancer terminates TLS—defence in depth
+- Encrypt end to end with TLS 1.2+ (1.3 preferred, strong ciphers only), also behind the load balancer—defence in depth
 - Mass assignment prevention requires dedicated DTOs for every API endpoint—the entity class should never be directly deserialized from request bodies
 
 <!-- KNOWLEDGE-CHECK
@@ -663,21 +693,36 @@ public class SecurityHeadersConfig {
   "questions": [
     {
       "text": "Why must rate limiting for a payment API use Redis (or another distributed store) rather than an in-memory counter per pod?",
-      "options": ["Redis is faster than in-memory operations", "With multiple pod replicas, an in-memory counter per pod tracks only that pod's requests — a client sending 100 requests across 10 pods sees only 10 requests per pod counter, completely defeating the rate limit", "Redis provides built-in rate limiting algorithms", "In-memory rate limiting does not persist across restarts"],
+      "options": [
+        "Redis is faster than in-memory operations",
+        "With multiple pod replicas, an in-memory counter per pod tracks only that pod's requests — a client sending 100 requests across 10 pods sees only 10 requests per pod counter, completely defeating the rate limit",
+        "Redis provides built-in rate limiting algorithms",
+        "In-memory rate limiting does not persist across restarts"
+      ],
       "correct": 1,
       "explanation": "If rate limiting uses per-pod in-memory counters, an attacker or a misbehaving client can distribute their requests across all pods to avoid any single pod's limit. Redis provides a single shared counter that accurately reflects the total request rate from a customer across the entire cluster."
     },
     {
       "text": "What is mass assignment, and why is it particularly dangerous in a payment API?",
-      "options": ["Assigning variables in bulk for performance", "Automatically binding all JSON request fields to entity properties, potentially allowing callers to set internal fields like accountBalance, adminFlag, or paymentStatus that should never be client-controlled", "A type of SQL injection attack", "Sending multiple payments in a single request"],
+      "options": [
+        "Assigning variables in bulk for performance",
+        "Automatically binding all JSON request fields to entity properties, potentially allowing callers to set internal fields like accountBalance, adminFlag, or paymentStatus that should never be client-controlled",
+        "A type of SQL injection attack",
+        "Sending multiple payments in a single request"
+      ],
       "correct": 1,
       "explanation": "Mass assignment occurs when entity classes are used directly as deserialization targets. A caller can include any field that exists on the entity, including internal fields like account balance, admin status, or payment processing status. Using dedicated DTOs with only the fields the API should accept prevents this."
     },
     {
-      "text": "What is the purpose of OFAC-sanctioned country blocking in a payment API WAF configuration?",
-      "options": ["To improve API performance by reducing traffic", "To comply with US OFAC sanctions regulations that prohibit financial transactions with sanctioned countries like North Korea, Iran, Cuba, and Syria", "To prevent SQL injection from foreign IP addresses", "To satisfy PCI DSS geographic data requirements"],
+      "text": "What is the purpose of blocking OFAC-sanctioned countries in a payment API WAF configuration?",
+      "options": [
+        "To improve API performance by reducing traffic",
+        "To support compliance with sanctions regulations (e.g. US OFAC) that prohibit dealings with sanctioned jurisdictions such as North Korea, Iran, Cuba, and Syria — as a supplementary control next to customer and transaction screening",
+        "To prevent SQL injection from foreign IP addresses",
+        "To satisfy PCI DSS geographic data requirements"
+      ],
       "correct": 1,
-      "explanation": "OFAC (Office of Foreign Assets Control) sanctions regulations prohibit US persons and financial institutions from processing transactions involving sanctioned countries. Blocking at the WAF layer provides a first line of compliance control, though application-level controls for party screening are also required for complete OFAC compliance."
+      "explanation": "OFAC (Office of Foreign Assets Control) sanctions prohibit US persons and financial institutions from dealing with sanctioned countries and parties; UK, EU and UN regimes apply similar rules. Blocking traffic from sanctioned regions at the WAF reduces exposure, but it is easily bypassed with VPNs — real compliance comes from screening customers, counterparties and payments against sanctions lists in the application."
     }
   ]
 }
@@ -689,10 +734,22 @@ public class SecurityHeadersConfig {
   "difficulty": "advanced",
   "estimatedMinutes": 65,
   "tasks": [
-    {"id": "1", "description": "Implement comprehensive input validation for a payment submission endpoint: IBAN checksum validation (Modulo-97), amount range validation (positive, max 2 decimal places, below configurable limit), payment reference whitelist regex, and a dedicated PaymentRequest DTO that cannot bind internal entity fields."},
-    {"id": "2", "description": "Build a Redis-backed sliding window rate limiter as a Spring filter: 100 requests per minute per customer for GET endpoints, 10 payment submissions per minute per customer for POST /payments, with Retry-After headers on 429 responses and a Prometheus counter tracking rate limit events by customer tier."},
-    {"id": "3", "description": "Configure Spring Security to enforce TLS 1.3 only, set HSTS with 1-year max-age including subdomains, configure Content-Security-Policy for a payment portal SPA, restrict CORS to explicit production domains only, and add X-Frame-Options: DENY."},
-    {"id": "4", "description": "Write AWS WAF rules (as CDK or CloudFormation) that block SQLi and XSS on all query parameters and request body, rate-limit by IP to 2000 requests per 5 minutes, block OFAC-sanctioned countries, and apply the AWS Managed Rules Common Rule Set — then write a CloudWatch metric filter that alerts when WAF-blocked requests exceed 100 per minute."}
+    {
+      "id": "1",
+      "description": "Implement comprehensive input validation for a payment submission endpoint: IBAN checksum validation (Modulo-97), amount range validation (positive, max 2 decimal places, below configurable limit), payment reference whitelist regex, and a dedicated PaymentRequest DTO that cannot bind internal entity fields."
+    },
+    {
+      "id": "2",
+      "description": "Build a Redis-backed sliding window rate limiter as a Spring filter: 100 requests per minute per customer for GET endpoints, 10 payment submissions per minute per customer for POST /payments, with Retry-After headers on 429 responses and a Prometheus counter tracking rate limit events by customer tier."
+    },
+    {
+      "id": "3",
+      "description": "Configure Spring Security with TLS 1.2+ (TLS 1.3 preferred, strong cipher suites only), HSTS with 1-year max-age including subdomains, a Content-Security-Policy for the payment portal SPA, CORS restricted to explicit production domains only, and X-Frame-Options: DENY — all in one SecurityFilterChain."
+    },
+    {
+      "id": "4",
+      "description": "Write AWS WAF rules (as CDK or CloudFormation) that block SQLi and XSS on all query parameters and request body, rate-limit by IP to 2000 requests per 5 minutes, block OFAC-sanctioned countries, and apply the AWS Managed Rules Common Rule Set — then write a CloudWatch metric filter that alerts when WAF-blocked requests exceed 100 per minute."
+    }
   ]
 }
 -->

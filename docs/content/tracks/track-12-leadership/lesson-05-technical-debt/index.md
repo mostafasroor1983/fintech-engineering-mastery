@@ -17,9 +17,9 @@ prerequisites: [track-12-lesson-04]
 > [!NOTE]
 > Technical debt in financial services has a unique property: some of it is literally non-negotiable. Compliance debt (outdated encryption, missing audit logs, non-compliant data retention) is not a prioritisation question—it is a legal obligation. Understanding which debt is optional and which is mandatory changes how you have the conversation with product.
 
-## Debt Taxonomy: Cunningham's Quadrant
+## Debt Taxonomy: The Technical Debt Quadrant
 
-Ward Cunningham, who coined the term "technical debt," described two independent dimensions:
+Ward Cunningham coined the "technical debt" metaphor in 1992. Martin Fowler's Technical Debt Quadrant (2009) then classified debt along two independent dimensions:
 
 **Reckless vs Prudent**: Did you know you were taking on debt?
 - Reckless: "We don't have time to do this properly" (chosen without awareness of consequences)
@@ -50,9 +50,9 @@ You cannot prioritise what you have not inventoried. Build a debt register.
 | ID | Description | Category | Impact | Frequency | Risk | Score | Owner | Ticket |
 |----|-------------|----------|--------|-----------|------|-------|-------|--------|
 | TD-001 | Settlement service uses synchronous DB polling instead of events | Architecture | 4 (causes daily incidents) | 5 (every peak period) | 3 (latency, not data loss) | 60 | @engineer-a | PAY-100 |
-| TD-002 | Payment history queries use SELECT * (N+1 problem) | Performance | 3 (p99 impact) | 4 (every history page load) | 2 | 24 | @engineer-b | PAY-101 |
+| TD-002 | Payment history page runs one query per payment (N+1 problem) | Performance | 3 (p99 impact) | 4 (every history page load) | 2 | 24 | @engineer-b | PAY-101 |
 | TD-003 | No idempotency keys on payment submission API | Reliability | 5 (double charges possible) | 2 (rare but catastrophic) | 5 (financial loss, reg breach) | 50 | @engineer-c | PAY-102 |
-| TD-004 | Encryption uses AES/CBC instead of AES/GCM | Security | 5 (non-compliant) | N/A (compliance) | 5 (PCI DSS Req 4.2) | MANDATORY | @engineer-d | PAY-103 |
+| TD-004 | Card API still accepts TLS 1.0/1.1 | Security | 5 (non-compliant) | N/A (compliance) | 5 (PCI DSS Req 4.2.1) | MANDATORY | @engineer-d | PAY-103 |
 | TD-005 | Test coverage: fraud module 23% | Quality | 2 (slow to change safely) | 3 (every fraud service sprint) | 2 | 12 | @engineer-e | PAY-104 |
 ```
 
@@ -112,7 +112,7 @@ RIGHT: "Every change to the fraud module takes 2 days of manual testing because 
 ### Frame 3: Compliance debt as non-negotiable
 
 ```
-"TD-004 (CBC encryption) is not a prioritisation question — it is a PCI DSS requirement.
+"TD-004 (TLS 1.0/1.1 still enabled) is not a prioritisation question — it is a PCI DSS requirement.
  If we do not remediate it before our next QSA assessment (March 2027), we will fail
  our PCI audit. Failure means we cannot process card payments legally.
  This must be in Q1 planning regardless of feature roadmap."
@@ -136,9 +136,10 @@ Arguments for this approach:
 Sort your debt register by Score (descending). Handle MANDATORY items first regardless of score.
 
 For scored items:
-- Score > 50: address in current quarter
-- Score 25-50: address in next quarter
+- Score >= 50: address in current quarter
+- Score 25-49: address in next quarter
 - Score < 25: backlog; re-score quarterly
+- Any item with Impact = 5 or Risk = 5 is reviewed for the current quarter regardless of score
 
 ### Framework 2: Boy Scout Rule
 
@@ -164,8 +165,7 @@ public interface SettlementService {
     CompletableFuture<SettlementResult> settle(Payment payment);
 }
 
-// Step 2: Old implementation — still used by default
-@Primary
+// Step 2: Old implementation — unchanged behaviour
 @Service
 public class SynchronousSettlementService implements SettlementService {
     @Override
@@ -174,9 +174,8 @@ public class SynchronousSettlementService implements SettlementService {
     }
 }
 
-// Step 3: New implementation — activated via feature flag
+// Step 3: New implementation, built and deployed alongside the old one
 @Service
-@ConditionalOnProperty(name = "feature.event-driven-settlement", havingValue = "true")
 public class EventDrivenSettlementService implements SettlementService {
     @Override
     public CompletableFuture<SettlementResult> settle(Payment payment) {
@@ -184,10 +183,32 @@ public class EventDrivenSettlementService implements SettlementService {
     }
 }
 
-// Step 4: Deploy with feature flag OFF for most traffic
-// Step 5: Gradually increase percentage via feature flag (1% → 10% → 50% → 100%)
-// Step 6: Delete old implementation once confident in new one
-// Step 7: Remove the abstraction if no longer needed
+// Step 4: A router is what callers get injected. The feature flag is checked
+// per payment at RUNTIME (stable per payment ID), which enables a percentage
+// rollout and instant rollback. (@ConditionalOnProperty could not do this:
+// it switches the whole application at start-up.)
+@Primary
+@Service
+public class RoutingSettlementService implements SettlementService {
+
+    private final SynchronousSettlementService legacy;
+    private final EventDrivenSettlementService eventDriven;
+    private final FeatureFlags flags;   // e.g. Unleash, LaunchDarkly, OpenFeature
+
+    // ... constructor
+
+    @Override
+    public CompletableFuture<SettlementResult> settle(Payment payment) {
+        return flags.isEnabled("event-driven-settlement", payment.getId())
+            ? eventDriven.settle(payment)
+            : legacy.settle(payment);
+    }
+}
+
+// Step 5: Gradually increase the flag percentage (1% → 10% → 50% → 100%),
+//         comparing error rates and latency of both paths
+// Step 6: Delete the old implementation and the router once confident
+// Step 7: Remove the interface too if it is no longer needed
 ```
 
 ---
@@ -230,15 +251,17 @@ The compliance dimension of technical debt deserves special treatment. Unlike te
 
 ```
 NEVER DEFER:
-  - Encryption standards below minimum requirement (PCI DSS Req 3.4, 4.2)
+  - Encryption below the minimum requirement (PCI DSS Req 3.5.1 for stored PAN, 4.2.1 in transit)
   - Missing audit logs for cardholder data operations
   - Unpatched critical CVEs in systems touching card data
   - Data retained beyond the mandated retention period
 
 DEFER WITHIN DEFINED WINDOW:
-  - New compliance requirements with implementation periods (DORA: 12-24 month transition)
+  - New compliance requirements with implementation periods (e.g. DORA had a
+    two-year implementation period before it applied from January 2025)
   - Regulatory guidance updates (usually 6-12 months to implement)
-  - Annual penetration test findings: Critical = 24h, High = 7 days
+  - Penetration test findings, per your policy SLAs (e.g. Critical = 24h,
+    High = 7 days — PCI DSS requires them to be fixed and retested)
 
 TRACK AND REPORT:
   - Medium-severity compliance findings: document, assign owner, 30-day SLA
@@ -250,7 +273,7 @@ TRACK AND REPORT:
 
 ## Key Takeaways
 
-- Use Cunningham's Quadrant to classify debt: reckless deliberate debt indicates a team culture problem; prudent deliberate debt is normal and manageable
+- Use Fowler's Technical Debt Quadrant to classify debt: reckless deliberate debt indicates a team culture problem; prudent deliberate debt is normal and manageable
 - Score debt by Impact × Frequency × Risk to have objective prioritisation conversations with product—intuition is not persuasive at planning meetings
 - Frame debt reduction in product terms: customer impact, support cost, delivery velocity drag—not technical purity
 - Compliance debt is not optional: encryption standards, audit logs, and regulatory patches have mandated timelines that cannot be treated as normal backlog items
@@ -261,20 +284,35 @@ TRACK AND REPORT:
 {
   "questions": [
     {
-      "text": "A payment service team deploys an encryption change because PCI DSS requires AES/GCM instead of AES/CBC. What type of technical debt is this?",
-      "options": ["Prudent deliberate debt — a known trade-off made for speed", "Reckless inadvertent debt — the team didn't know they were doing it wrong", "Compliance debt — it must be fixed regardless of product prioritisation", "Low-scoring debt — it can be deferred to the next quarter"],
+      "text": "A payment service team discovers that its card API still accepts TLS 1.0 and 1.1, which PCI DSS does not consider strong cryptography. What type of technical debt is this?",
+      "options": [
+        "Prudent deliberate debt — a known trade-off made for speed",
+        "Reckless inadvertent debt — the team didn't know they were doing it wrong",
+        "Compliance debt — it must be fixed regardless of product prioritisation",
+        "Low-scoring debt — it can be deferred to the next quarter"
+      ],
       "correct": 2,
-      "explanation": "Encryption below the PCI DSS minimum standard is compliance debt — it has a mandated remediation timeline tied to legal obligations. It is categorized as MANDATORY in the debt register and cannot be treated as a normal backlog item subject to product prioritisation. Failure to remediate can cause PCI DSS audit failure and loss of ability to process card payments."
+      "explanation": "Transport encryption below the PCI DSS minimum (Requirement 4.2.1) is compliance debt — it has a mandated remediation timeline tied to legal and contractual obligations. It is categorised as MANDATORY in the debt register and cannot be treated as a normal backlog item subject to product prioritisation. Failure to remediate can cause a failed PCI DSS assessment and loss of the ability to process card payments."
     },
     {
       "text": "A team calculates a debt score using Impact × Frequency × Risk. Item TD-003 (no idempotency keys) scores: Impact=5 (double charges), Frequency=2 (rare), Risk=5. What is the score and what priority does it warrant?",
-      "options": ["Score=12, low priority (backlog)", "Score=50, address in next quarter", "Score=50, address in current quarter", "Score=25, address in next quarter"],
+      "options": [
+        "Score=12, low priority (backlog)",
+        "Score=50, address in next quarter",
+        "Score=50, address in current quarter",
+        "Score=25, address in next quarter"
+      ],
       "correct": 2,
-      "explanation": "Score = 5 × 2 × 5 = 50. The scoring framework classifies scores > 50 as 'address in current quarter' and 25-50 as 'address in next quarter.' A score of exactly 50 falls in the 'next quarter' range, but the Risk=5 (financial loss, regulatory breach) means this warrants urgent attention regardless of the numeric score."
+      "explanation": "Score = 5 × 2 × 5 = 50. The framework puts scores of 50 or more in 'address in current quarter' (25–49 is next quarter). On top of that, Impact = 5 and Risk = 5 (double charges, financial loss, regulatory breach) would trigger a current-quarter review even if the score were lower."
     },
     {
       "text": "Why is 'Branch by Abstraction' preferred over a 'big bang' refactor for migrating from synchronous to event-driven settlement?",
-      "options": ["Big bang refactors require more code review approvals", "Branch by Abstraction allows incremental migration behind a feature flag, enabling gradual rollout, quick rollback, and continuous production deployment", "Big bang refactors cannot be tested in staging environments", "Branch by Abstraction generates less git diff per PR"],
+      "options": [
+        "Big bang refactors require more code review approvals",
+        "Branch by Abstraction allows incremental migration behind a feature flag, enabling gradual rollout, quick rollback, and continuous production deployment",
+        "Big bang refactors cannot be tested in staging environments",
+        "Branch by Abstraction generates less git diff per PR"
+      ],
       "correct": 1,
       "explanation": "Big bang refactors are risky (all-or-nothing deployment), hard to review (massive PR), and difficult to roll back. Branch by Abstraction introduces an interface, builds both implementations, and migrates traffic gradually via feature flag. Each step is independently deployable, testable, and reversible. This reduces the blast radius of migration errors significantly."
     }
@@ -288,10 +326,22 @@ TRACK AND REPORT:
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Build a Technical Debt Register for a payment service with at least 8 items covering architecture, security, performance, reliability, and compliance categories. Score each item using Impact × Frequency × Risk (1-5 each), mark compliance items as MANDATORY, and sort by score. At least 2 items must be MANDATORY compliance debt."},
-    {"id": "2", "description": "Write three product-facing justifications for the top 3 scored debt items. Each justification must include: specific customer impact (not technical description), quantified cost (support hours × rate, failed payments × value, or engineering-days lost), and ROI calculation for the remediation investment."},
-    {"id": "3", "description": "Implement a Branch by Abstraction migration plan for replacing a synchronous payment status polling service with an event-driven one: define the interface, create both implementations, add @ConditionalOnProperty switching, and write a Prometheus metric that tracks what percentage of traffic is using the new implementation."},
-    {"id": "4", "description": "Design a debt tracking dashboard using three DORA metrics (deployment frequency, change failure rate, MTTR) and three codebase health metrics (test coverage %, TODO count, cyclomatic complexity). Specify alert thresholds for each metric that would indicate the debt register needs immediate re-prioritization."}
+    {
+      "id": "1",
+      "description": "Build a Technical Debt Register for a payment service with at least 8 items covering architecture, security, performance, reliability, and compliance categories. Score each item using Impact × Frequency × Risk (1-5 each), mark compliance items as MANDATORY, and sort by score. At least 2 items must be MANDATORY compliance debt."
+    },
+    {
+      "id": "2",
+      "description": "Write three product-facing justifications for the top 3 scored debt items. Each justification must include: specific customer impact (not technical description), quantified cost (support hours × rate, failed payments × value, or engineering-days lost), and ROI calculation for the remediation investment."
+    },
+    {
+      "id": "3",
+      "description": "Implement a Branch by Abstraction migration plan for replacing a synchronous payment status polling service with an event-driven one: define the interface, create both implementations, add a router that chooses the implementation per request via a runtime feature flag (percentage rollout), and write a Prometheus metric that tracks what percentage of traffic is using the new implementation."
+    },
+    {
+      "id": "4",
+      "description": "Design a debt tracking dashboard using three DORA metrics (deployment frequency, change failure rate, MTTR) and three codebase health metrics (test coverage %, TODO count, cyclomatic complexity). Specify alert thresholds for each metric that would indicate the debt register needs immediate re-prioritization."
+    }
   ]
 }
 -->

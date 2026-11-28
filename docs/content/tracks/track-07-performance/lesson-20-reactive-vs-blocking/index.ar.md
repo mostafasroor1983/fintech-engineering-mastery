@@ -42,23 +42,23 @@ Thread A released to pool     (total: ~100ms, thread held 100ms)
 
 ### 1.1 تحجيم مجمع الخيوط وسقف التزامن
 
-```java
-// Typical Spring MVC thread pool configuration
+```yaml
+# Typical Spring MVC thread pool configuration
 server:
   tomcat:
     threads:
       max: 200          # Max concurrent requests
       min-spare: 10
 
-// With 200 threads and 100ms average response time:
-// Max theoretical throughput = 200 / 0.1s = 2,000 requests/second
-// At 2,001 req/s, the 201st request waits for a thread
+# With 200 threads and 100ms average response time:
+# Max theoretical throughput = 200 / 0.1s = 2,000 requests/second
+# At 2,001 req/s, the 201st request waits for a thread
 
-// Reality check: a payment service under Black Friday load
-// 10,000 requests in flight at once (e.g. 100,000 req/s × 100ms)
-// = 10,000 platform threads required
-// Each reserves a stack (~1MB by default, committed lazily) plus kernel
-// resources -- and the OS must schedule them all
+# Reality check: a payment service under Black Friday load
+# 10,000 requests in flight at once (e.g. 100,000 req/s × 100ms)
+# = 10,000 platform threads required
+# Each reserves a stack (~1MB by default, committed lazily) plus kernel
+# resources -- and the OS must schedule them all
 ```
 
 الافتراضي البالغ 200 خيط مجرد قيمة بداية معقولة — وكثير من الخدمات تعمل بأكثر. والحدود الحقيقية هي الذاكرة، وحمل الجدولة، وقبل كل شيء الموارد اللاحقة التي تنتظرها تلك الخيوط. و**الخيوط الافتراضية** في Java 21 (الدرس 15) تزيل حد الخيوط مع الإبقاء على هذا الأسلوب الحاجب البسيط — فقارنها بالتفاعلي قبل الاختيار.
@@ -191,8 +191,8 @@ public class PaymentControllerWebFlux {
 </dependency>
 ```
 
-```java
-// application.yml
+```yaml
+# application.yml
 spring:
   r2dbc:
     url: r2dbc:postgresql://localhost:5432/payments
@@ -205,7 +205,9 @@ spring:
       # not: 20 connections with 50ms queries = at most ~400 queries/s.
       # Reactive saves THREADS, not database connections -- size the pool
       # for the concurrent queries the database can handle well.
+```
 
+```java
 // ReactivePaymentRepository.java
 public interface ReactivePaymentRepository extends R2dbcRepository<Payment, UUID> {
 

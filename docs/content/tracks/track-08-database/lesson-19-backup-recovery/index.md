@@ -231,7 +231,7 @@ tail -f /var/log/postgresql/postgresql-16-main.log
 
 ### Recovery Target Options
 
-```bash
+```ini
 # Recover to a specific time (most useful for accidental data corruption)
 recovery_target_time = '2024-01-15 14:32:00 UTC'
 
@@ -241,10 +241,9 @@ recovery_target_lsn = '1/2345678'
 # Recover to a named restore point (best practice: create restore points before risky operations)
 recovery_target_name = 'before_migration_v45'
 
-# Create restore point before running risky DDL
-SELECT pg_create_restore_point('before_migration_v45');
--- Then run the migration
--- If migration fails: recover to 'before_migration_v45'
+# Before running risky DDL, create the restore point in psql:
+#   SELECT pg_create_restore_point('before_migration_v45');
+# Then run the migration. If it fails: recover to 'before_migration_v45'
 ```
 
 ## 5. pgBackRest — Enterprise-Grade Backup Management

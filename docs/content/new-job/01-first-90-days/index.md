@@ -173,3 +173,78 @@ and conditions, follow one request end to end, and read the migrations."
 - [Production safety: first PR, on-call, migrations](#/tracks/track-16/lessons/track-16-lesson-02)
 - [Track 06: Health checks and probes](#/tracks/track-06/lessons/track-06-lesson-10)
 - [Track 11: Production readiness checklist](#/tracks/track-11/lessons/track-11-lesson-19)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1601-01",
+    "question": "What is the right order for your first 90 days?",
+    "options": [
+      "Propose improvements in week 1, then learn the system",
+      "Learn (people, systems, money flow) → contribute small safe changes and join on-call → own a component end to end",
+      "Rewrite the weakest component first to show impact",
+      "Wait for tickets to be assigned"
+    ],
+    "correct": 1,
+    "explanation": "Agree written 90-day goals with your manager in week 1 and review them at day 30 and day 60. Changes come after trust."
+  },
+  {
+    "id": "kc-1601-02",
+    "question": "Which Actuator endpoint answers \"why is there no KafkaTemplate bean?\" in seconds?",
+    "options": [
+      "/actuator/health",
+      "/actuator/loggers",
+      "/actuator/conditions",
+      "/actuator/metrics"
+    ],
+    "correct": 2,
+    "explanation": "/actuator/conditions lists which auto-configurations matched and why, or why not. /beans shows the real wiring and /mappings every HTTP route."
+  },
+  {
+    "id": "kc-1601-03",
+    "question": "Where should endpoints like /actuator/env, /beans or /heapdump be exposed?",
+    "options": [
+      "Locally, or on a separate management port reachable only internally and with authentication; in production expose only health and the metrics monitoring needs",
+      "Publicly, because they are read-only",
+      "Only on the public API port, for convenience",
+      "Everywhere, as long as the service is behind a load balancer"
+    ],
+    "correct": 0,
+    "explanation": "They leak configuration and internals and enlarge the attack surface; a heap dump can contain secrets."
+  },
+  {
+    "id": "kc-1601-04",
+    "question": "You think a core component is badly designed. What do you do in your first quarter?",
+    "options": [
+      "Rewrite it quickly before anyone depends on it more",
+      "Complain in the team channel",
+      "Ignore it",
+      "Learn why it is that way (Chesterton's fence), collect evidence, write a short design doc with options and a migration path, and get buy-in"
+    ],
+    "correct": 3,
+    "explanation": "The \"ugly\" part may handle a scheme rule or an old incident fix. Understanding the history first avoids reintroducing old bugs."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1601",
+  "title": "Your onboarding plan",
+  "description": "Practise the first-30-days activities on a real codebase (a capstone works).",
+  "tasks": [
+    {
+      "id": "pc-1601-01",
+      "description": "Run a Spring Boot service locally with a local-only profile that exposes beans, mappings, conditions and configprops. Use the endpoints to list every HTTP route and the timeouts and pool sizes in effect."
+    },
+    {
+      "id": "pc-1601-02",
+      "description": "Trace one payment from controller to service, repository, outgoing calls and published events. Write the path with file names and draw the money flow."
+    },
+    {
+      "id": "pc-1601-03",
+      "description": "Write a 30/60/90 plan for your next job: goals per window and the evidence you will show your manager at day 30, 60 and 90."
+    }
+  ]
+}
+-->

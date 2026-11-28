@@ -5,7 +5,9 @@
 /* ------------------------------------------------------------
    Google Fonts
    ------------------------------------------------------------ */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap');
+/* Loaded with <link> in index.html (faster than @import): Google Sans for English text,
+   IBM Plex Sans Arabic for Arabic (weights 400-700), JetBrains Mono for code. If Google Fonts is
+   blocked, the stacks below fall back to good system fonts for each script. */
 
 /* ------------------------------------------------------------
    Design Tokens
@@ -41,8 +43,10 @@
   --radius-xl: var(--r-xl);
 
   /* Typography */
-  --font-sans: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
-  --font-arabic: 'IBM Plex Sans Arabic', 'Noto Sans Arabic', 'Segoe UI', Tahoma, sans-serif;
+  --font-sans: 'Google Sans', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+               'Noto Sans Arabic', 'Geeza Pro', Tahoma, sans-serif;
+  --font-arabic: 'IBM Plex Sans Arabic', 'Noto Sans Arabic', 'Geeza Pro', 'Segoe UI', Tahoma,
+                 system-ui, -apple-system, sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
 
   --text-xs:   0.875rem;   /* 14px  (+1pt) */
@@ -51,9 +55,10 @@
   --text-md:   1.0625rem;  /* 17px  (+1pt) */
   --text-lg:   1.1875rem;  /* 19px  (+1pt) */
   --text-xl:   1.3125rem;  /* 21px  (+1pt) */
-  --text-2xl:  1.5625rem;  /* 25px  (+1pt) */
-  --text-3xl:  1.9375rem;  /* 31px  (+1pt) */
-  --text-4xl:  2.3125rem;  /* 37px  (+1pt) */
+  /* Display sizes scale fluidly with the viewport (phone -> desktop) */
+  --text-2xl:  clamp(1.3125rem, 1.15rem + 0.7vw,  1.5625rem);  /* 21 -> 25px */
+  --text-3xl:  clamp(1.5rem,    1.2rem  + 1.4vw,  1.9375rem);  /* 24 -> 31px */
+  --text-4xl:  clamp(1.75rem,   1.3rem  + 2vw,    2.3125rem);  /* 28 -> 37px */
 
   /* Transitions */
   --ease:      150ms ease;
@@ -69,6 +74,8 @@
    ------------------------------------------------------------ */
 :root,
 [data-theme="dark"] {
+  /* Text and accent colours meet WCAG AA (4.5:1) on every surface, including the tinted
+     badge backgrounds; checked with tools/responsive_check.py */
   --bg-base:     #0d1117;
   --bg-surface:  #161b22;
   --bg-elevated: #1c2128;
@@ -80,11 +87,12 @@
   --border-subtle:#1c2128;
 
   --text-primary:   #e6edf3;
-  --text-secondary: #8b949e;
-  --text-muted:     #6e7681;
+  --text-secondary: #99a1aa;
+  --text-muted:     #969da5;
   --text-link:      #58a6ff;
 
-  --accent:        #f97316;
+  --accent:        #f97d27;
+  --on-accent:     #0d1117;   /* text on an accent background: dark on the light orange */
   --accent-hover:  #ea6a00;
   --accent-muted:  rgba(249, 115, 22, 0.12);
   --accent-border: rgba(249, 115, 22, 0.35);
@@ -93,11 +101,11 @@
   --green-muted: rgba(63, 185, 80, 0.12);
   --yellow:      #d29922;
   --yellow-muted:rgba(210, 153, 34, 0.12);
-  --red:         #f85149;
+  --red:         #f9726b;
   --red-muted:   rgba(248, 81, 73, 0.12);
   --blue:        #58a6ff;
   --blue-muted:  rgba(88, 166, 255, 0.12);
-  --purple:      #a855f7;
+  --purple:      #be81f9;
   --purple-muted:rgba(168, 85, 247, 0.12);
 
   --shadow-sm: 0 1px 3px rgba(0,0,0,0.5);
@@ -126,24 +134,25 @@
   --border-subtle:#f0f3f6;
 
   --text-primary:   #1f2328;
-  --text-secondary: #656d76;
-  --text-muted:     #9198a1;
-  --text-link:      #0969da;
+  --text-secondary: #596068;
+  --text-muted:     #5c626b;
+  --text-link:      #085cbf;
 
-  --accent:        #d4580a;
+  --accent:        #a14308;
+  --on-accent:     #ffffff;   /* white on the dark orange */
   --accent-hover:  #b84d09;
   --accent-muted:  rgba(212, 88, 10, 0.08);
   --accent-border: rgba(212, 88, 10, 0.3);
 
-  --green:       #1a7f37;
+  --green:       #176e30;
   --green-muted: rgba(26, 127, 55, 0.1);
-  --yellow:      #9a6700;
+  --yellow:      #805600;
   --yellow-muted:rgba(154, 103, 0, 0.1);
-  --red:         #d1242f;
+  --red:         #b51f29;
   --red-muted:   rgba(209, 36, 47, 0.1);
-  --blue:        #0969da;
+  --blue:        #085cbf;
   --blue-muted:  rgba(9, 105, 218, 0.1);
-  --purple:      #8250df;
+  --purple:      #7138db;
   --purple-muted:rgba(130, 80, 223, 0.1);
 
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.08);
@@ -222,7 +231,7 @@ img, svg { display: block; }
   z-index: 9999;
   padding: var(--sp-2) var(--sp-4);
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-weight: 600;
   font-size: var(--text-sm);
   border-radius: 0 0 var(--r-md) var(--r-md);
@@ -255,7 +264,8 @@ img, svg { display: block; }
 #app-shell {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100vh;    /* fallback for browsers without dynamic viewport units */
+  height: 100dvh;   /* follows mobile browser toolbars as they show and hide */
   overflow: hidden;
 }
 
@@ -285,7 +295,8 @@ img, svg { display: block; }
   align-items: center;
   gap: var(--sp-3);
   text-decoration: none;
-  flex-shrink: 0;
+  flex-shrink: 1;
+  min-width: 0;     /* let the name truncate so the action buttons always fit */
 }
 
 .logo-mark {
@@ -299,7 +310,7 @@ img, svg { display: block; }
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   font-weight: 600;
-  color: #fff;
+  color: var(--on-accent);
   letter-spacing: -0.02em;
   flex-shrink: 0;
 }
@@ -308,7 +319,9 @@ img, svg { display: block; }
   display: flex;
   flex-direction: column;
   line-height: 1.2;
+  min-width: 0;
 }
+.logo-name, .logo-tagline { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .logo-name {
   font-size: var(--text-sm);
@@ -449,7 +462,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 }
 
 .sidebar-label {
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -514,7 +527,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 
 .nav-badge {
   margin-inline-start: auto;
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 600;
   padding: 1px 6px;
   border-radius: var(--r-full);
@@ -585,7 +598,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 
 .sidebar-track-num {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   color: var(--text-muted);
   min-width: 22px;
   flex-shrink: 0;
@@ -605,6 +618,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
    ------------------------------------------------------------ */
 #main-content {
   flex: 1;
+  min-width: 0;     /* flex child: don't grow to the width of wide content */
   overflow-y: auto;
   overflow-x: hidden;
   background: var(--bg-base);
@@ -811,7 +825,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 }
 
 .track-num {
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-family: var(--font-mono);
   font-weight: 600;
   letter-spacing: 0.08em;
@@ -907,7 +921,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 600;
   padding: 2px 8px;
   border-radius: var(--r-full);
@@ -1003,7 +1017,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 
 .btn-primary {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border-color: var(--accent);
 }
 .btn-primary:hover {
@@ -1166,7 +1180,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   margin-bottom: var(--sp-2);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
 }
 
 .roadmap-item {
@@ -1267,7 +1281,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 }
 
 .tag-chip {
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-family: var(--font-mono);
   padding: 2px 7px;
   background: var(--bg-elevated);
@@ -1513,7 +1527,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 /* ------------------------------------------------------------
    Mobile / Responsive
    ------------------------------------------------------------ */
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-height: 500px) and (pointer: coarse) {  /* narrow screens, and phones in landscape: navigation becomes a drawer */
   :root { --sidebar-w: 272px; }
 
   #menu-btn { display: flex; }
@@ -1540,6 +1554,14 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   #sidebar.open {
     transform: translateX(0);
   }
+
+  /* A closed drawer is off-screen: hide it from keyboard focus and screen readers too.
+     visibility switches after the slide-out finishes, and immediately on open. */
+  #sidebar:not(.open) {
+    visibility: hidden;
+    transition: transform var(--ease-slow), visibility 0s linear 280ms;
+  }
+  #sidebar.open { visibility: visible; transition: transform var(--ease-slow), visibility 0s; }
 
   .sidebar-overlay {
     display: block;
@@ -1712,7 +1734,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 .search-filter-btn.active {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-weight: 600;
 }
 
@@ -1779,7 +1801,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   display: inline-flex;
   align-items: center;
   gap: var(--sp-2);
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1996,7 +2018,9 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  /* the project colour blended toward the theme's text colour: >= 4.5:1 in both themes */
   color: var(--cs-color, var(--accent));
+  color: color-mix(in srgb, var(--cs-color, var(--accent)) 55%, var(--text-primary));
 }
 
 .cs-card-title {
@@ -2066,7 +2090,7 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
   background: var(--bg-code);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-family: var(--font-mono);
   color: var(--text-secondary);
   white-space: nowrap;
@@ -2181,13 +2205,13 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 .cs-status-btn-active {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .cs-status-btn-active:hover {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 @media (max-width: 768px) {
@@ -2221,4 +2245,95 @@ body.sidebar-collapsed .sidebar-toggle-btn svg {
 code, pre, kbd, samp, .lab-code, .constraint-chip {
   font-variant-ligatures: none;
   font-feature-settings: "liga" 0, "calt" 0;
+}
+
+/* ------------------------------------------------------------
+   Responsive foundations
+   ------------------------------------------------------------ */
+/* Media scale with their container and keep their aspect ratio */
+img, video, canvas, iframe { max-width: 100%; height: auto; }
+svg { max-width: 100%; }
+
+/* Touch screens: every control is at least 44x44 CSS px (WCAG 2.5.5 / Apple HIG) */
+@media (pointer: coarse) {
+  button, [role="button"], select, summary, a.btn { min-height: 44px; }
+  .topbar-btn, .lang-switch, #menu-btn, .dz-btn, .copy-btn, .code-tab-btn, .sidebar-collapse-btn,
+  .prereq-link, .cs-track-link, .lesson-nav-btn, .search-clear, .kc-submit {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .nav-item, .track-nav-item, .kc-option, .challenge-task, .result-item {
+    min-height: 44px;
+  }
+  /* short breadcrumb words (e.g. Arabic "المنهج") still get a full-size target */
+  .lesson-breadcrumb a, .lesson-breadcrumb button {
+    min-width: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+}
+
+/* Narrow phones: compact top bar so every action stays on screen */
+@media (max-width: 480px) {
+  #top-bar { padding: 0 var(--sp-2); gap: var(--sp-2); }
+  .lang-switch .lang-switch-label { display: none; }   /* globe icon only; aria-label keeps the name */
+  .lang-switch { padding: 0; justify-content: center; }
+  .logo-mark { flex-shrink: 0; }
+}
+
+/* Curriculum rows wrap whenever their content doesn't fit (any width, with or without the
+   sidebar): the title keeps at least ~16rem, and badges/progress move to the next line */
+.curriculum-row { flex-wrap: wrap; }
+.curriculum-row-info { flex: 1 1 16rem; }
+.curriculum-row-actions { flex-wrap: wrap; flex-shrink: 1; min-width: 0; margin-inline-start: auto; }
+@media (max-width: 600px) {
+  .curriculum-row { padding: var(--sp-4); gap: var(--sp-3); }
+  .curriculum-row-actions { flex: 1 1 100%; }
+}
+/* Phones: the dashboard stats become an auto-fit grid instead of a fixed-width column */
+@media (max-width: 768px) {
+  .dashboard-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 6.5rem), 1fr));
+    min-width: 0;
+  }
+  .stat-card { min-width: 0; padding: var(--sp-3) var(--sp-4); }
+}
+
+/* Long unbreakable words (Java class names, file paths, resource names) wrap instead of
+   pushing past the edge of narrow screens. break-word only breaks a word that can't fit;
+   flex children also need "anywhere" + min-width: 0, or they refuse to shrink. */
+body { overflow-wrap: break-word; }
+.kc-option > *, .kc-question-text, .practical-challenge-title, .practical-challenge-label,
+.lab-code, .option-label, .clab-card-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------
+   Auto-hiding top bar (mouse and trackpad only)
+   The bar slides up out of view, leaving a thin strip at the top edge; hovering the strip
+   brings it back, and it hides again shortly after the pointer leaves. It stays visible
+   while a control inside it has keyboard focus or the navigation drawer is open.
+   Touch screens have no hover, so there the bar is always shown.
+   ------------------------------------------------------------ */
+@media (hover: hover) and (pointer: fine) {
+  #app-shell { position: relative; }
+
+  #top-bar {
+    position: absolute;
+    inset-inline: 0;
+    top: 0;
+    transform: translateY(calc(-100% + 6px));   /* 6px strip stays on screen as the hover zone */
+    transition: transform 220ms ease 300ms, box-shadow 220ms ease 300ms;  /* short delay before hiding */
+  }
+
+  #top-bar:hover,
+  #top-bar:focus-within,
+  body:has(#sidebar.open) #top-bar {
+    transform: translateY(0);
+    box-shadow: var(--shadow-lg);
+    transition-delay: 0s;                         /* show immediately */
+  }
 }

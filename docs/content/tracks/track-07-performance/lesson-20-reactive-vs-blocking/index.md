@@ -44,23 +44,23 @@ The critical observation: a thread holding for 100ms, 80ms of which was spent sl
 
 ### 1.1 Thread Pool Sizing and the Concurrency Ceiling
 
-```java
-// Typical Spring MVC thread pool configuration
+```yaml
+# Typical Spring MVC thread pool configuration
 server:
   tomcat:
     threads:
       max: 200          # Max concurrent requests
       min-spare: 10
 
-// With 200 threads and 100ms average response time:
-// Max theoretical throughput = 200 / 0.1s = 2,000 requests/second
-// At 2,001 req/s, the 201st request waits for a thread
+# With 200 threads and 100ms average response time:
+# Max theoretical throughput = 200 / 0.1s = 2,000 requests/second
+# At 2,001 req/s, the 201st request waits for a thread
 
-// Reality check: a payment service under Black Friday load
-// 10,000 requests in flight at once (e.g. 100,000 req/s × 100ms)
-// = 10,000 platform threads required
-// Each reserves a stack (~1MB by default, committed lazily) plus kernel
-// resources -- and the OS must schedule them all
+# Reality check: a payment service under Black Friday load
+# 10,000 requests in flight at once (e.g. 100,000 req/s × 100ms)
+# = 10,000 platform threads required
+# Each reserves a stack (~1MB by default, committed lazily) plus kernel
+# resources -- and the OS must schedule them all
 ```
 
 The 200-thread default is just a sensible starting value — many services run with more. The real limits are memory, scheduling overhead and, above all, the downstream resources those threads wait on. Java 21 **virtual threads** (lesson 15) remove the thread limit while keeping this simple blocking style — compare them with reactive before choosing.
@@ -203,8 +203,8 @@ JDBC is fundamentally blocking — it cannot work in an event-loop model. R2DBC 
 </dependency>
 ```
 
-```java
-// application.yml
+```yaml
+# application.yml
 spring:
   r2dbc:
     url: r2dbc:postgresql://localhost:5432/payments
@@ -217,7 +217,9 @@ spring:
       # not: 20 connections with 50ms queries = at most ~400 queries/s.
       # Reactive saves THREADS, not database connections -- size the pool
       # for the concurrent queries the database can handle well.
+```
 
+```java
 // ReactivePaymentRepository.java
 public interface ReactivePaymentRepository extends R2dbcRepository<Payment, UUID> {
 

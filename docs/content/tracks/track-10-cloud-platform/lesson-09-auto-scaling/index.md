@@ -752,7 +752,7 @@ spec:
 
 ## Monitoring Auto-Scaling
 
-```yaml
+```promql
 # Grafana dashboard queries for auto-scaling observability
 
 # HPA desired vs current replicas
@@ -769,8 +769,9 @@ count(kube_node_status_condition{condition="Ready",status="true"})
 # Pod startup time (how fast are we scaling?)
 histogram_quantile(0.99, rate(kubelet_pod_start_duration_seconds_bucket[5m]))
 
-# Scaling events (alerts when scale-up takes too long)
-increase(kube_horizontalpodautoscaler_status_condition{condition="ScalingActive",status="True"}[5m])
+# Scaling decisions in the last 5 minutes (changes() counts how often a gauge changed;
+# increase() is only for counters)
+changes(kube_horizontalpodautoscaler_status_desired_replicas{namespace="payments"}[5m])
 ```
 
 ```yaml

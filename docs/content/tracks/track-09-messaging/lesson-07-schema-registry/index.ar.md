@@ -9,7 +9,7 @@ difficulty: advanced
 estimatedMinutes: 75
 status: published
 tags: [schema-registry, Avro, Protobuf, schema-evolution, compatibility]
-prerequisites: [kafka-architecture, kafka-producer, kafka-consumer]
+prerequisites: ["track-09-lesson-01", "track-09-lesson-02", "track-09-lesson-03"]
 ---
 
 # ‏Schema Registry — ‏Avro وProtobuf وتطور المخططات
@@ -173,7 +173,7 @@ Old producers write:                   New consumer reads:
 
 **القاعدة:** يمكنك إضافة حقول **ذات** قيم افتراضية وحذف حقول (يتجاهلها القارئ الجديد ببساطة). ورقِّ **المستهلكين أولًا**، ثم المنتجين.
 
-```json
+```jsonc
 // V1 — Original schema
 {
     "name": "PaymentCreated",
@@ -207,7 +207,7 @@ Old producers write:                   New consumer reads:
 
 **القاعدة:** يمكنك إضافة حقول (يتخطى القراء القدامى الحقول المجهولة، فلا تلزم قيمة افتراضية) وحذف الحقول التي **لها** قيمة افتراضية في المخطط القديم فقط (يملؤها القراء القدامى). ورقِّ **المنتجين أولًا**، ثم المستهلكين.
 
-```json
+```jsonc
 // V2 — FORWARD compatible: old consumer reads V2 data, ignores new field
 {
     "name": "PaymentCreated",
@@ -241,7 +241,7 @@ Default: FULL_TRANSITIVE
 
 ### آمن: إضافة حقل اختياري
 
-```json
+```jsonc
 // V1
 {"name": "paymentId", "type": "string"},
 {"name": "amountMinor", "type": "long"}
@@ -257,7 +257,7 @@ Default: FULL_TRANSITIVE
 
 ### آمن: توسيع نوع الاتحاد
 
-```json
+```jsonc
 // V1
 {"name": "region", "type": "string"}
 
@@ -267,7 +267,7 @@ Default: FULL_TRANSITIVE
 
 ### كاسر للمستهلكين القدامى: حذف حقل بلا قيمة افتراضية
 
-```json
+```jsonc
 // V1
 {"name": "paymentId", "type": "string"},
 {"name": "accountId", "type": "string"},
@@ -283,7 +283,7 @@ Default: FULL_TRANSITIVE
 
 ### كاسر: إعادة تسمية حقل
 
-```json
+```jsonc
 // V1
 {"name": "accountId", "type": "string"}
 
@@ -535,8 +535,10 @@ curl -X PUT http://schema-registry:8081/config/payments.events-value \
   run: |
     mvn schema-registry:test-compatibility \
       -Dschema.registry.url=http://schema-registry:8081
+```
 
-# Maven plugin configuration (pom.xml)
+```xml
+<!-- Maven plugin configuration (pom.xml) -->
 <plugin>
     <groupId>io.confluent</groupId>
     <artifactId>kafka-schema-registry-maven-plugin</artifactId>

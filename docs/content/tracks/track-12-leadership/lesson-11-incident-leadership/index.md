@@ -136,15 +136,15 @@ T+15 min (first update):    "Payment API: 15% error rate since 02:17.
                               Next update: T+30 min or on significant finding."
 
 T+30 min (if unresolved):   "Payment API: still investigating. No root cause yet.
-                              We've ruled out: database, Kafka, recent deployments.
+                              We've ruled out: database, Kafka, recent payment-service deployments.
                               Now investigating: upstream fraud service performance.
                               Have rolled back deployment as precaution (error rate unchanged).
                               Next update: T+45 min.
-                              @compliance-officer: incident duration approaching 15 minutes.
-                              Preparing regulatory assessment."
+                              @compliance-officer: customer impact has exceeded 15 minutes —
+                              regulatory classification assessment in progress."
 
 T+45 min (if resolved):     "Payment API: resolved at 03:02 UTC. 45 minutes total duration.
-                              Root cause: slow SQL query introduced in fraud service 02:48 deploy.
+                              Root cause: slow SQL query introduced in fraud service 02:12 deploy.
                               Fix: rolled back fraud service deployment.
                               Impact: ~6,750 failed payment attempts (reconciliation running).
                               Postmortem scheduled: [date]. Timeline and PIR to follow."
@@ -196,7 +196,7 @@ even if the update is "still investigating, no new information."
 
 For payment system incidents, regulatory notification may be legally required. This is not optional.
 
-**Key principle**: Regulatory notification obligation is triggered by awareness, not by impact assessment. Once you are aware of a significant incident, the notification clock starts.
+**Key principle**: Regulatory clocks run from awareness and classification — not from the end of the root cause analysis. Under DORA, for example, the initial report is due within 4 hours of classifying an incident as major, and no later than 24 hours after becoming aware of it. Engineering must therefore inform Compliance as soon as an incident might qualify.
 
 ```
 Decision tree for regulatory notification:
@@ -211,11 +211,14 @@ Is customer data potentially at risk (breach scenario)?
 Has the incident lasted more than 15 minutes of meaningful customer impact?
   YES → Notify Head of Operations and Compliance Officer immediately
 
-Is this a "major operational incident" (complete payment processing unavailability)?
-  YES → FCA/PRA notification may be required (UK)
-        OCC/FDIC notification within 36 hours (US)
-        ECB/EBA notification within 4 hours (EU, DORA)
-        RBI notification within 2-6 hours (India)
+Could this be a "major" incident (e.g. complete payment processing unavailability)?
+  YES → UK: FCA/PRA notification under their incident-reporting rules
+        US: bank regulators (OCC/Fed/FDIC) — as soon as possible and within
+            36 hours of determining a notification incident occurred
+        EU (DORA): initial report to the competent authority within 4 hours of
+            classifying it as major (max 24 hours after awareness); intermediate
+            report within 72 hours; final report within 1 month
+        India: RBI / CERT-In — within hours (CERT-In: 6 hours for cyber incidents)
   
 RULE: When in doubt, notify. Failure to notify is a separate regulatory breach.
       Your Compliance Officer makes the notification decision, not engineering.
@@ -298,19 +301,34 @@ As a principal engineer, the most powerful signal you can send is sharing your o
   "questions": [
     {
       "text": "During a P1 payment outage, the incident commander (IC) starts running database queries and writing rollback scripts while also trying to coordinate three investigation threads. What is wrong with this and what should the IC do instead?",
-      "options": ["Nothing is wrong — the most senior person should do the most critical technical work", "The IC is performing the tech lead role simultaneously; this causes the IC to lose situational awareness of parallel investigation threads and stakeholder communication; the IC should delegate technical execution to a tech lead and focus on coordination, communication, and decision-making", "The IC should delegate communication to another engineer and focus entirely on technical investigation", "The IC should stop coordinating threads and let engineers self-organise"],
+      "options": [
+        "Nothing is wrong — the most senior person should do the most critical technical work",
+        "The IC is performing the tech lead role simultaneously; this causes the IC to lose situational awareness of parallel investigation threads and stakeholder communication; the IC should delegate technical execution to a tech lead and focus on coordination, communication, and decision-making",
+        "The IC should delegate communication to another engineer and focus entirely on technical investigation",
+        "The IC should stop coordinating threads and let engineers self-organise"
+      ],
       "correct": 1,
       "explanation": "The IC role and tech lead role must be separated. When the same person debugs and coordinates, they inevitably drop coordination responsibilities — parallel threads go unmonitored, stakeholder communication lapses, and the 15-minute checkpoint discipline breaks down. The IC's job is to maintain situational awareness, coordinate parallel investigation threads, communicate to stakeholders, and make decisions when the team is stuck — not to run commands or write code."
     },
     {
       "text": "An EU-regulated payment processor experiences a complete payment processing outage lasting 20 minutes. At what point does regulatory notification become a consideration, and who makes the notification decision?",
-      "options": ["After full root cause analysis is complete; the principal engineer makes the decision", "After 4 hours of outage, automatically; the incident commander notifies regulators", "Within 4 hours of becoming aware of a major operational incident (EBA/DORA); the Compliance Officer makes the notification decision, not engineering", "Only if customer data was breached; the CISO makes the decision"],
+      "options": [
+        "After full root cause analysis is complete; the principal engineer makes the decision",
+        "After 4 hours of outage, automatically; the incident commander notifies regulators",
+        "Within 4 hours of classifying it as a major ICT-related incident (and no later than 24 hours after becoming aware of it) under DORA; the Compliance Officer makes the notification decision, not engineering",
+        "Only if customer data was breached; the CISO makes the decision"
+      ],
       "correct": 2,
-      "explanation": "Under EBA operational resilience guidelines and the EU DORA regulation, major operational incidents (including payment processing unavailability) require notification within 4 hours of awareness. The notification obligation is triggered by awareness, not by impact assessment — once you know about a significant incident, the clock starts. Critically, the Compliance Officer makes the notification decision, not engineering. Engineering's role is to inform compliance immediately so they can assess the obligation."
+      "explanation": "Under DORA, which since January 2025 has replaced the earlier EBA/PSD2 incident-reporting guidelines for EU financial entities, the initial report for a major ICT-related incident is due within 4 hours of classifying it as major and no later than 24 hours after becoming aware of it, followed by an intermediate report (72 hours) and a final report (1 month). The clocks do not wait for root cause analysis. Critically, the Compliance Officer makes the notification decision, not engineering — engineering's role is to inform Compliance immediately so they can classify the incident."
     },
     {
       "text": "In a postmortem, the action items list includes: 'The on-call engineer should double-check deployment checklists before releasing to production.' What is wrong with this action item?",
-      "options": ["It is too vague — it needs a specific deadline and owner", "It is an individual behaviour change action item, which is a signal of non-blameless culture; effective postmortem action items are systemic (improve the CI pipeline, add automated checks, update runbooks) not individual (retrain engineer X)", "It is too broad — it should specify which checklists", "Nothing is wrong — human vigilance is a valid mitigation for deployment risks"],
+      "options": [
+        "It is too vague — it needs a specific deadline and owner",
+        "It is an individual behaviour change action item, which is a signal of non-blameless culture; effective postmortem action items are systemic (improve the CI pipeline, add automated checks, update runbooks) not individual (retrain engineer X)",
+        "It is too broad — it should specify which checklists",
+        "Nothing is wrong — human vigilance is a valid mitigation for deployment risks"
+      ],
       "correct": 1,
       "explanation": "Action items that target individual behaviour ('engineer X should be more careful') indicate non-blameless culture and are ineffective — humans are fallible and will make the same error again under pressure. Systemic action items address the conditions that allowed the error: 'Add automated deployment gate that validates checklist items in CI/CD' is systemic, testable, and does not rely on individual vigilance. Blameless postmortems produce system improvements, not individual performance targets."
     }
@@ -324,10 +342,22 @@ As a principal engineer, the most powerful signal you can send is sharing your o
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Design a complete incident response playbook for a P1 payment processing outage at an EU-regulated payment processor. The playbook must cover: IC/TL role definitions and hand-off procedure, investigation thread delegation template (with thread owner, scope, and checkpoint time), stakeholder communication cadence (T+0 through T+45 with specific message templates), regulatory notification decision tree (EBA 4-hour threshold, CISO breach protocol), and escalation matrix with named roles and trigger conditions."},
-    {"id": "2", "description": "Write a complete incident response simulation script for a GameDay exercise: a payment authorisation service experiencing 15% error rate starting at 02:17 UTC. The script must include: the initial alert condition, three parallel investigation threads (database, recent deployments, external dependencies), two misleading indicators that lead threads astray before the root cause (a slow query in the fraud service deployed at 02:48), and a timeline of events for the facilitator. Include specific IC communication messages at T+5, T+15, T+30, and T+45."},
-    {"id": "3", "description": "Create a blameless postmortem template and completed example for the scenario in task 2 (45-minute payment outage caused by fraud service slow query). The template must include: timeline section, contributing factor analysis using five whys (stopping at systemic factors not individual errors), 'what went well' section, and action items table with SMART criteria. The completed example must include at least 4 contributing factors and 3 High-priority action items that are systemic rather than individual."},
-    {"id": "4", "description": "Design a PagerDuty escalation policy and on-call rotation for a 12-engineer payment platform team covering 24/7 P1 response. Specify: primary/secondary on-call structure, acknowledgement SLA for P1 (target: 5 minutes), escalation steps if primary does not acknowledge, out-of-hours escalation path to VP Engineering, and the 'regulatory notification ready' checklist that fires automatically for incidents exceeding 15 minutes of customer impact."}
+    {
+      "id": "1",
+      "description": "Design a complete incident response playbook for a P1 payment processing outage at an EU-regulated payment processor. The playbook must cover: IC/TL role definitions and hand-off procedure, investigation thread delegation template (with thread owner, scope, and checkpoint time), stakeholder communication cadence (T+0 through T+45 with specific message templates), regulatory notification decision tree (DORA: initial report within 4 hours of classification as major and at most 24 hours after awareness; CISO breach protocol), and escalation matrix with named roles and trigger conditions."
+    },
+    {
+      "id": "2",
+      "description": "Write a complete incident response simulation script for a GameDay exercise: a payment authorisation service experiencing 15% error rate starting at 02:17 UTC. The script must include: the initial alert condition, three parallel investigation threads (database, recent deployments, external dependencies), two misleading indicators that lead threads astray before the root cause (a slow query in the fraud service deployed at 02:12), and a timeline of events for the facilitator. Include specific IC communication messages at T+5, T+15, T+30, and T+45."
+    },
+    {
+      "id": "3",
+      "description": "Create a blameless postmortem template and completed example for the scenario in task 2 (45-minute payment outage caused by fraud service slow query). The template must include: timeline section, contributing factor analysis using five whys (stopping at systemic factors not individual errors), 'what went well' section, and action items table with SMART criteria. The completed example must include at least 4 contributing factors and 3 High-priority action items that are systemic rather than individual."
+    },
+    {
+      "id": "4",
+      "description": "Design a PagerDuty escalation policy and on-call rotation for a 12-engineer payment platform team covering 24/7 P1 response. Specify: primary/secondary on-call structure, acknowledgement SLA for P1 (target: 5 minutes), escalation steps if primary does not acknowledge, out-of-hours escalation path to VP Engineering, and the 'regulatory notification ready' checklist that fires automatically for incidents exceeding 15 minutes of customer impact."
+    }
   ]
 }
 -->

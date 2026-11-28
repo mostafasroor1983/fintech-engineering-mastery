@@ -138,9 +138,11 @@ Engineers trust leaders who update on evidence.
 
 ```
 Weak: "We need to migrate off the legacy payment gateway"
-Strong: "Our legacy payment gateway cannot support PSD2 SCA requirements arriving in Q2.
-        Migration cost is £2M over 6 months. Non-compliance fine risk is £50M.
+Strong: "Our legacy payment gateway cannot produce the ISO 20022 messages our payment
+        scheme requires from Q2. Migration cost is £2M over 6 months. Missing the
+        deadline means losing direct access to the scheme for all payment flows.
         We need to decide by November to meet the Q2 deadline."
+(Illustrative figures.)
 ```
 
 **Coalition building** — Major architectural decisions affect multiple teams. Build the coalition before the decision — not to manipulate, but to surface concerns early and design something everyone can commit to.
@@ -159,7 +161,7 @@ This is the most common confusion. Principal engineers produce:
 **Reviews** (architecture reviews, senior engineer promotions, interview calibration)
 **Relationships** (cross-team, with management, with external vendors/regulators)
 
-The ratio changes with seniority:
+The ratio changes with seniority (a rough guide — it varies by company and by archetype):
 
 | Level | Code % | Docs/Decisions % | Relationships % |
 |---|---|---|---|
@@ -292,25 +294,25 @@ A Principal engineer's impact statement describes capability changes: "12 teams 
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "The Staff & Principal Engineer Operating Model \u2014 Production Implementation",
+  "title": "The Staff & Principal Engineer Operating Model — Production Implementation",
   "difficulty": "principal",
   "estimatedMinutes": 85,
   "tasks": [
     {
       "id": "1",
-      "description": "Write your 90-day plan"
+      "description": "Write your 90-day plan for a new Staff or Principal role: what you will learn in days 1–30 (systems, people, pain points), which small high-visibility problem you will solve in days 31–60, and which organisation-level initiative you will propose in days 61–90. List the people you will meet and the questions you will ask them."
     },
     {
       "id": "2",
-      "description": "Identify your archetype"
+      "description": "Identify your archetype (Tech Lead, Architect, Solver, Right Hand): map your last six months of work to the four archetypes, estimate the share of time in each, and decide which archetype your organisation most needs from you next — with evidence."
     },
     {
       "id": "3",
-      "description": "Write your 6-month impact statement"
+      "description": "Write your 6-month impact statement using the template in this lesson. Make the outcomes measurable at organisation level (e.g. 'N teams can…'), and include a concrete failure counterfactual."
     },
     {
       "id": "4",
-      "description": "Design a decision-making framework"
+      "description": "Design a decision-making framework for your area: which decisions need an ADR, which need an RFC, who must be consulted, how disagreements are escalated, and how decisions are recorded and revisited. Apply it to one real decision you face now."
     }
   ]
 }

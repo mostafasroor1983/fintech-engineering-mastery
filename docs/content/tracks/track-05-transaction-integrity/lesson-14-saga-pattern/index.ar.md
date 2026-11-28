@@ -280,7 +280,7 @@ public class PaymentSagaOrchestrator {
 public void compensateProcessor(UUID paymentId) {
     // This fails if the processor submit never returned a response
     String authCode = processorResponseCache.get(paymentId);
-    processorClient.void(authCode);
+    processorClient.voidAuthorization(authCode);  // "void" is a reserved word in Java
 }
 
 // GOOD: compensation uses data persisted before the external call

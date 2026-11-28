@@ -230,3 +230,82 @@ then deep dives on where money can be lost, a failure table with SLOs, and a 60-
 - [Running the 45-minute round (run-sheet)](#/tracks/track-15/lessons/track-15-lesson-02)
 - [Reference: patterns, estimation, database choice](#/tracks/track-14/lessons/track-14-lesson-08)
 - [Track 05: Idempotency patterns](#/tracks/track-05/lessons/track-05-lesson-12)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1401-01",
+    "question": "In RESHADED, what does the E that comes right after Requirements stand for, and why does it come before the diagram?",
+    "options": [
+      "Evaluate: you review failure modes before committing to a design",
+      "Estimation: the numbers decide whether one database is enough or the design must scale out",
+      "Encryption: security requirements shape every later box",
+      "Events: you list the domain events before the schema"
+    ],
+    "correct": 1,
+    "explanation": "The second step is Estimation. A few lines of arithmetic (requests per second at peak, storage per year) tell you whether a single PostgreSQL primary is enough. Drawing first often leads to an over-built design."
+  },
+  {
+    "id": "kc-1401-02",
+    "question": "A candidate says: \"It's exactly-once because we use Kafka.\" Which statement would score better?",
+    "options": [
+      "\"We use Kafka transactions, so the database write is exactly-once too.\"",
+      "\"We retry until the call succeeds, so every payment happens once.\"",
+      "\"An idempotency key at the side effect, a unique constraint and a stored response make retries safe; delivery itself is at-least-once.\"",
+      "\"We use a distributed lock around the whole request.\""
+    ],
+    "correct": 2,
+    "explanation": "A guarantee must be stated as a mechanism. Delivery across a network is at-least-once; exactly-once *effects* come from an idempotency key claimed under a unique constraint, with the stored response replayed on retries."
+  },
+  {
+    "id": "kc-1401-03",
+    "question": "Which part of the design should you pick for the deep dive?",
+    "options": [
+      "The riskiest part: where money can be lost, duplicated or left in an unknown state",
+      "The part with the most boxes in the diagram",
+      "The part you know best, whatever the risk",
+      "The front-end, because the interviewer can see it"
+    ],
+    "correct": 0,
+    "explanation": "In fintech, depth means correctness under failure. Pick the step where a retry, crash or race could charge twice or lose money, or ask the interviewer which part they want."
+  },
+  {
+    "id": "kc-1401-04",
+    "question": "What does an If-Match header add to a cancel endpoint?",
+    "options": [
+      "It makes the request idempotent, so no idempotency key is needed",
+      "It encrypts the request body",
+      "It lets the server cache the response",
+      "Optimistic concurrency: if the resource changed since the client read its ETag, the server returns 412 instead of cancelling blindly"
+    ],
+    "correct": 3,
+    "explanation": "If-Match carries the ETag the client saw. If the transfer has moved on (for example it started executing), the version no longer matches, and the server answers 412 Precondition Failed instead of applying a stale decision."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1401",
+  "title": "Run RESHADED on a small design",
+  "description": "Apply the eight steps to an internal transfer service (move money between two accounts of the same customer) and practise the timing.",
+  "tasks": [
+    {
+      "id": "pc-1401-01",
+      "description": "Write the Requirements (functional, non-functional, out of scope) and three clarifying questions, then an Estimation with the arithmetic shown: users, transfers per second at average and at peak (state the peak factor), and storage per year."
+    },
+    {
+      "id": "pc-1401-02",
+      "description": "Write the Schema (accounts, transfers with a unique idempotency key, ledger postings) and the API: POST /v1/transfers with Idempotency-Key, GET by id, and a cancel endpoint protected with If-Match/ETag."
+    },
+    {
+      "id": "pc-1401-03",
+      "description": "Deep dive: explain in writing why two executor instances can't run the same transfer twice (claim with a conditional update or unique constraint), then add a four-row failure table: failure, detection, mitigation, blast radius."
+    },
+    {
+      "id": "pc-1401-04",
+      "description": "Record yourself giving the 60-second Deliver pitch and check it names the remaining risks."
+    }
+  ]
+}
+-->

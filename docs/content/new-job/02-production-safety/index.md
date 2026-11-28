@@ -98,7 +98,9 @@ WHERE id IN (SELECT id FROM payment WHERE channel IS NULL ORDER BY id LIMIT 5000
 
 Only after all versions read and write the new column: add `NOT NULL` in a later release.
 In PostgreSQL, adding a `CHECK (channel IS NOT NULL) NOT VALID` constraint and then running
-`VALIDATE CONSTRAINT` avoids a long exclusive lock while the existing rows are checked.
+`VALIDATE CONSTRAINT` avoids a long exclusive lock while the existing rows are checked. From PostgreSQL 12,
+a following `ALTER COLUMN channel SET NOT NULL` uses that validated constraint and skips the full-table scan;
+you can then drop the `CHECK`.
 
 Set a lock timeout for migrations, so a migration waiting behind a long transaction fails fast instead of
 queueing every other query behind it:
@@ -175,3 +177,78 @@ separately, with a lock timeout."
 - [Track 06: Incident management](#/tracks/track-06/lessons/track-06-lesson-15)
 - [Track 06: Post-incident reviews](#/tracks/track-06/lessons/track-06-lesson-16)
 - [First 90 days](#/tracks/track-16/lessons/track-16-lesson-01)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1602-01",
+    "question": "How do you rename a column with zero downtime?",
+    "options": [
+      "ALTER TABLE … RENAME COLUMN in the same release as the code change",
+      "Add the new column, dual-write, backfill in batches, switch reads, stop writing the old column, and drop it in a later release",
+      "Take the service down for a short maintenance window",
+      "Create a view with the new name and drop the table"
+    ],
+    "correct": 1,
+    "explanation": "During a rolling deploy, old instances still use the old name. Expand/contract keeps old and new code working at every step."
+  },
+  {
+    "id": "kc-1602-02",
+    "question": "Why can CREATE INDEX on a busy table cause an outage, and what is the fix?",
+    "options": [
+      "It deletes rows while building",
+      "It needs Flyway to be restarted",
+      "A plain CREATE INDEX blocks writes until it finishes; use CREATE INDEX CONCURRENTLY in its own migration, outside a transaction",
+      "It changes the primary key"
+    ],
+    "correct": 2,
+    "explanation": "CONCURRENTLY can't run inside a transaction block, so it goes alone in its own migration with Flyway told not to wrap it (executeInTransaction=false)."
+  },
+  {
+    "id": "kc-1602-03",
+    "question": "A migration took 2 seconds in staging but caused a 2-minute outage in production. What is the most likely cause?",
+    "options": [
+      "It needed an exclusive lock and waited behind a long-running transaction; every new query on the table queued behind it. A lock_timeout and off-peak scheduling prevent this",
+      "Production has more rows, so the ALTER was slower",
+      "The staging database is faster hardware",
+      "Flyway runs migrations twice in production"
+    ],
+    "correct": 0,
+    "explanation": "The lock queue, not data size, is what causes the outage. SET lock_timeout = '5s' makes the migration fail fast instead."
+  },
+  {
+    "id": "kc-1602-04",
+    "question": "It's your first on-call shift and payments are stuck. What comes first?",
+    "options": [
+      "Debug the code to find the root cause",
+      "Wait for a senior engineer to wake up",
+      "Restart every service",
+      "Acknowledge, follow the runbook's first checks (consumer lag, DB pool, PSP status), mitigate (for example roll back a correlated deploy), escalate early and post status updates; investigate afterwards"
+    ],
+    "correct": 3,
+    "explanation": "Customers are affected now, so mitigation comes before root-cause analysis."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1602",
+  "title": "Safe changes in practice",
+  "description": "Practise a zero-downtime migration and a first-PR checklist on a real PostgreSQL.",
+  "tasks": [
+    {
+      "id": "pc-1602-01",
+      "description": "Write Flyway migrations that add a nullable column, build its index with CREATE INDEX CONCURRENTLY in a separate non-transactional migration, and backfill in batches of 5,000. Run them against PostgreSQL in Testcontainers."
+    },
+    {
+      "id": "pc-1602-02",
+      "description": "Add NOT NULL safely: a CHECK (col IS NOT NULL) NOT VALID constraint, then VALIDATE CONSTRAINT, then SET NOT NULL. While a load test runs, query pg_locks to see which locks each step takes."
+    },
+    {
+      "id": "pc-1602-03",
+      "description": "Write the description of your next pull request using the first-PR checklist: purpose, tests, rolling-deploy compatibility, feature flag, observability and a rollback plan (\"revert is safe because …\")."
+    }
+  ]
+}
+-->

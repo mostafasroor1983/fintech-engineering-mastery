@@ -319,8 +319,10 @@ eu.bootstrap.servers = kafka-eu-west-1:9092
 us.bootstrap.servers = kafka-us-east-1:9092
 
 eu->us.enabled = true
-eu->us.topics = payment_volume_aggregates      # aggregated, no personal data
-eu->us.topics.exclude = payment_events.*       # (tokenised) personal data stays in the EU
+# aggregated, no personal data
+eu->us.topics = payment_volume_aggregates
+# (tokenised) personal data stays in the EU
+eu->us.topics.exclude = payment_events.*
 us->eu.enabled = false
 ```
 

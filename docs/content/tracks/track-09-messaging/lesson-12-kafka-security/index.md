@@ -9,7 +9,7 @@ difficulty: advanced
 estimatedMinutes: 75
 status: published
 tags: [Kafka, TLS, SASL, ACL, mTLS]
-prerequisites: [kafka-architecture, kafka-producer, kafka-consumer]
+prerequisites: ["track-09-lesson-01", "track-09-lesson-02", "track-09-lesson-03"]
 ---
 
 # Kafka Security — TLS, SASL, and ACLs
@@ -145,11 +145,12 @@ Mutual TLS (mTLS) means both the broker and the client present certificates. The
 
 ```properties
 # Broker: require client certificates
-ssl.client.auth=required   # required | requested | none
+# required | requested | none
+ssl.client.auth=required
 ```
 
-```java
-// Spring Boot application.properties for mTLS
+```properties
+# Spring Boot application.properties for mTLS
 spring.kafka.bootstrap-servers=broker1:9093
 spring.kafka.security.protocol=SSL
 spring.kafka.ssl.trust-store-location=classpath:ssl/ca.truststore.jks

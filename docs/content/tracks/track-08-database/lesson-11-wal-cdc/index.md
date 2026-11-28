@@ -170,7 +170,7 @@ ALTER TABLE ledger_entries REPLICA IDENTITY FULL;
 
 Each Debezium event contains the before and after state of the row. The examples below show the full change-event envelope, i.e. *without* the `ExtractNewRecordState` ("unwrap") transform; with the unwrap transform from the configuration above, consumers receive only the flattened `after` state (plus a `__deleted` field for deletes).
 
-```json
+```jsonc
 // INSERT event for a new transaction
 {
   "schema": { "..." },
@@ -299,7 +299,7 @@ public class TransactionService {
 
 ### Debezium Outbox Event Router SMT
 
-```json
+```jsonc
 // Kafka Connect connector with Outbox Event Router SMT
 {
   "name": "payments-outbox-connector",
@@ -492,7 +492,7 @@ curl -X POST \
 
 When Debezium first connects to a database, it performs an initial snapshot to load existing data before switching to streaming.
 
-```json
+```jsonc
 // Snapshot configuration options
 {
   "snapshot.mode": "initial",

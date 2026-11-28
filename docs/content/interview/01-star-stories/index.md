@@ -162,3 +162,78 @@ a test or an alert."
 - [Track 06: Post-incident reviews](#/tracks/track-06/lessons/track-06-lesson-16)
 - [Track 06: Incident management](#/tracks/track-06/lessons/track-06-lesson-15)
 - [Mock interviews with rubrics](#/tracks/track-15/lessons/track-15-lesson-05)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1501-01",
+    "question": "In a two-minute STAR answer, where should most of the time go?",
+    "options": [
+      "Situation: the more context, the better",
+      "Action: three or four concrete steps that *you* took, with technical detail",
+      "Result: a long list of numbers",
+      "Task: explaining the team's goals"
+    ],
+    "correct": 1,
+    "explanation": "Action is about 60–70 seconds of the two minutes. Situation and Task are one or two sentences; Result names the outcome and a lasting change."
+  },
+  {
+    "id": "kc-1501-02",
+    "question": "Your story says: \"We noticed latency, we scaled up, we fixed it.\" What is the problem?",
+    "options": [
+      "It is too short",
+      "It has no numbers",
+      "The interviewer can't tell what you did, so it scores as an unclear contribution. Rewrite each action with \"I\" and a verb",
+      "It should start with the result"
+    ],
+    "correct": 2,
+    "explanation": "Rewrite: \"I took the thread dump\", \"I proposed capping the pool\", \"I wrote the runbook\". Credit the team in one sentence at the end."
+  },
+  {
+    "id": "kc-1501-03",
+    "question": "Asked about a production incident, what should you describe first after detection?",
+    "options": [
+      "Mitigation (roll back, fail over, shed load), then the root cause, then the lasting fix",
+      "The root-cause investigation, step by step",
+      "Who caused the incident",
+      "The post-incident meeting"
+    ],
+    "correct": 0,
+    "explanation": "Seniors stop the bleeding first. Investigating while customers are still failing shows the wrong priority."
+  },
+  {
+    "id": "kc-1501-04",
+    "question": "You lack a big story for one of the six themes. What should you do?",
+    "options": [
+      "Invent one; nobody checks",
+      "Combine details from two colleagues' stories",
+      "Skip the theme and hope it isn't asked",
+      "Use a smaller true story; follow-up questions expose invented detail quickly"
+    ],
+    "correct": 3,
+    "explanation": "Only true stories survive follow-up questions. A smaller true story, told with real technical detail, scores better than an invented big one."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1501",
+  "title": "Build your story bank",
+  "description": "Prepare the six stories this lesson describes and rehearse them.",
+  "tasks": [
+    {
+      "id": "pc-1501-01",
+      "description": "Write six STAR cards (incident, correctness bug, disagreement, ambiguity, mentoring, mistake) in the one-card format: S, T, A in 3–4 numbered steps, R with a lasting change, and one prepared follow-up answer."
+    },
+    {
+      "id": "pc-1501-02",
+      "description": "Count the \"I + verb\" phrases in each Action section. Rewrite any card with fewer than three."
+    },
+    {
+      "id": "pc-1501-03",
+      "description": "Record each story on your phone. Check that each is under 2:15, has one technical detail per action step, and ends with a lasting change (test, alert, runbook or process)."
+    }
+  ]
+}
+-->

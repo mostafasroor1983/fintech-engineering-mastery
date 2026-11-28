@@ -21,11 +21,11 @@ prerequisites: [track-11-lesson-18]
 
 Standard PRR practices from Google SRE and other engineering orgs cover observability and reliability. Financial services add three non-negotiable dimensions:
 
-**Compliance**: The service must satisfy regulatory requirements (PCI DSS, GDPR, FCA, etc.) before it handles real customer data or money.
+**Compliance**: The service must satisfy regulatory requirements (PCI DSS, GDPR, DORA, FCA rules, etc.) before it handles real customer data or money.
 
 **Audit trail**: Every transaction, authentication event, and configuration change must be logged to a tamper-evident audit system.
 
-**Incident notification obligations**: If the service has an outage, there may be regulatory notification requirements with hard deadlines.
+**Incident notification obligations**: If the service has an outage or breach, there are regulatory notification requirements with hard deadlines — for example a DORA initial report within 4 hours of classifying an incident as major (and no later than 24 hours after becoming aware of it), or a GDPR personal-data-breach notification within 72 hours.
 
 ---
 
@@ -74,7 +74,10 @@ POST-LAUNCH: 2-week hypercare
 ### Health Checks
 
 ```java
-// Spring Boot — comprehensive health checks
+// Spring Boot — health indicator for an external dependency.
+// Report it on /actuator/health for dashboards, but keep it OUT of the
+// liveness and readiness groups: if the gateway goes down, every pod would
+// fail its probes at once -- restarting or removing the whole service
 @Configuration
 public class HealthCheckConfig {
 
@@ -116,13 +119,23 @@ management:
       show-details: when-authorized  # Not 'always' — avoids leaking topology
       probes:
         enabled: true  # Kubernetes liveness + readiness probes
+      group:
+        readiness:
+          include: readinessState,db   # only what THIS pod needs to serve traffic
+        # liveness: livenessState only (the default) — never external systems
 
 # kubernetes/deployment.yaml — health probe configuration
+startupProbe:              # protects slow JVM start-up instead of a long initialDelay
+  httpGet:
+    path: /actuator/health/liveness
+    port: 8080
+  periodSeconds: 5
+  failureThreshold: 30     # up to 150 s to start
+
 livenessProbe:
   httpGet:
     path: /actuator/health/liveness
     port: 8080
-  initialDelaySeconds: 30
   periodSeconds: 10
   failureThreshold: 3
 
@@ -174,15 +187,18 @@ public class CorrelationFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request,
                                     HttpServletResponse response,
                                     FilterChain chain) throws IOException, ServletException {
-        String correlationId = Optional
-            .ofNullable(request.getHeader("X-Correlation-ID"))
-            .orElse(UUID.randomUUID().toString());
+        // Accept the caller's ID only if it looks like one -- a raw header
+        // value in every log line invites log injection
+        String header = request.getHeader("X-Correlation-ID");
+        String correlationId = (header != null && header.matches("[A-Za-z0-9-]{8,64}"))
+            ? header
+            : UUID.randomUUID().toString();
 
         MDC.put("correlationId", correlationId);
         MDC.put("httpMethod", request.getMethod());
         MDC.put("httpPath", request.getRequestURI());
         MDC.put("service", "payment-service");
-        MDC.put("environment", environment.getActiveProfiles()[0]);
+        MDC.put("environment", environmentName);   // from a property, e.g. ${app.environment}
 
         response.addHeader("X-Correlation-ID", correlationId);
         try {
@@ -205,9 +221,10 @@ Required alerts (minimum):
   [ ] Database connection pool: > 90% utilised for 5 minutes
   [ ] Kafka consumer lag: > 10,000 messages for 5 minutes
   [ ] JVM heap: > 85% for 5 minutes
-  [ ] Certificate expiry: < 30 days
-  [ ] SLO burn rate: 14x for 2 minutes (page immediately)
-  [ ] SLO burn rate: 6x for 15 minutes (high priority)
+  [ ] Certificates: long-lived certs expiring < 30 days; short-lived certs: renewal failing
+  [ ] SLO burn rate: 14.4x over 1h, confirmed over 5m (page immediately)
+  [ ] SLO burn rate: 6x over 6h, confirmed over 30m (page)
+  [ ] SLO burn rate: 1x over 3 days (ticket)
 
 Each alert must have:
   [ ] Runbook URL in annotations
@@ -244,18 +261,21 @@ public class ResilienceConfig {
     public CircuitBreakerConfig paymentGatewayCircuitBreaker() {
         return CircuitBreakerConfig.custom()
             .slidingWindowSize(10)
+            .minimumNumberOfCalls(10)
             .failureRateThreshold(50)
             .waitDurationInOpenState(Duration.ofSeconds(30))
             .permittedNumberOfCallsInHalfOpenState(3)
             .build();
     }
 
-    // Retry policy — only for idempotent operations
+    // Retry policy — only for idempotent operations (payment submissions are
+    // idempotent only when they carry an idempotency key the gateway honours)
     @Bean
     public RetryConfig idempotentRetryConfig() {
         return RetryConfig.custom()
             .maxAttempts(3)
-            .waitDuration(Duration.ofMillis(500))
+            // Exponential backoff with jitter: 500 ms, ~1 s, ~2 s (randomised)
+            .intervalFunction(IntervalFunction.ofExponentialRandomBackoff(500, 2.0, 0.5))
             .retryOnException(e -> e instanceof TransientPaymentException)
             // NEVER retry on:
             // - Duplicate payment (idempotency violation)
@@ -268,35 +288,38 @@ public class ResilienceConfig {
 
 ### Graceful Shutdown
 
-```java
-// Spring Boot — graceful shutdown allows in-flight requests to complete
-// application.yml
+```yaml
+# application.yml — graceful shutdown lets in-flight requests complete
 server:
-  shutdown: graceful  # Waits for active requests before stopping
+  shutdown: graceful  # Stop accepting new requests, finish active ones
 spring:
   lifecycle:
-    timeout-per-shutdown-phase: 30s  # Maximum wait time
+    timeout-per-shutdown-phase: 30s  # Maximum wait per shutdown phase
 
-// Also handle Kafka consumer shutdown gracefully
-@Component
-public class PaymentConsumer implements DisposableBean {
+# kubernetes/deployment.yaml — give the pod enough time, and a short
+# preStop pause so the endpoint is removed from Services first
+terminationGracePeriodSeconds: 45
+lifecycle:
+  preStop:
+    sleep:
+      seconds: 5
+```
 
-    private final AtomicBoolean shutdown = new AtomicBoolean(false);
-
-    @KafkaListener(topics = "payment-events")
-    public void processPayment(PaymentEvent event) {
-        if (shutdown.get()) {
-            // Stop consuming during shutdown — let rebalance happen
-            return;
-        }
-        paymentService.process(event);
-    }
-
-    @Override
-    public void destroy() {
-        shutdown.set(true);
-        // Kafka consumer container pauses, commits offsets, and closes cleanly
-    }
+```java
+// Kafka listeners need no custom shutdown flag: on context close, Spring Kafka
+// stops the listener containers -- the records already polled are processed,
+// offsets are committed, and the consumer leaves the group cleanly.
+// (Returning early from the listener during shutdown would be WRONG: the
+// record counts as processed and its offset is committed -- the payment is
+// silently skipped.)
+@Bean
+public ConcurrentKafkaListenerContainerFactory<String, PaymentEvent> kafkaListenerContainerFactory(
+        ConsumerFactory<String, PaymentEvent> consumerFactory) {
+    var factory = new ConcurrentKafkaListenerContainerFactory<String, PaymentEvent>();
+    factory.setConsumerFactory(consumerFactory);
+    // Must fit inside terminationGracePeriodSeconds
+    factory.getContainerProperties().setShutdownTimeout(25_000);
+    return factory;
 }
 ```
 
@@ -314,7 +337,9 @@ DR Test Procedure:
 
 Required targets for payment services:
   RTO (Recovery Time Objective): < 15 minutes
-  RPO (Recovery Point Objective): < 1 minute (zero transaction loss)
+  RPO (Recovery Point Objective): zero for committed payments (synchronous
+      replication), or a small documented bound (e.g. < 1 minute) plus
+      reconciliation of anything in flight
   
 Document failures (and fix them before launch):
   - Pods not starting in secondary region (image pull policy, resource quotas)
@@ -343,7 +368,7 @@ SECRETS MANAGEMENT
 
 ENCRYPTION
   [ ] PAN and sensitive PII encrypted at application layer (not just disk encryption)
-  [ ] TLS 1.3 enforced for all inbound connections
+  [ ] TLS 1.2+ enforced for all inbound connections (TLS 1.3 preferred, strong suites only)
   [ ] mTLS configured for all service-to-service communication
   [ ] Encryption keys stored in KMS/Vault, not in application config
 
@@ -469,7 +494,7 @@ HYPERCARE PLAN:
 - Financial services PRRs require four non-negotiable sections: Observability (can you see problems?), Reliability (can the service recover?), Security (is customer data protected?), and Compliance (are regulatory obligations met?)
 - Every alert must have a runbook URL—test runbooks with engineers who did not write them before launch, not during an incident at 2am
 - Disaster recovery tests must demonstrate actual RTO and RPO—targets written in a document mean nothing if they have never been validated
-- PCI DSS and GDPR add compliance checkpoints to the PRR that cannot be waived: scope document review, DPIA, pen test, audit log verification
+- PCI DSS and GDPR add compliance checkpoints to the PRR that cannot be waived where they apply: scope document review, DPIA (for high-risk processing), pen test, audit log verification
 - The most valuable investment in production readiness is load testing to 2x expected peak before launch—discovering thread pool exhaustion or database connection limits in production during a traffic spike is avoidable
 
 <!-- KNOWLEDGE-CHECK
@@ -503,10 +528,22 @@ HYPERCARE PLAN:
   "difficulty": "advanced",
   "estimatedMinutes": 60,
   "tasks": [
-    {"id": "1", "description": "Complete the Observability section of a PRR for a new payment submission service: define what metrics will confirm the service is healthy (with specific alert thresholds), write the runbook for the two most likely failure scenarios, and verify that distributed traces connect to log lines via correlation IDs."},
-    {"id": "2", "description": "Design and execute a chaos engineering experiment for the payment service: inject a 500ms latency on fraud-service calls and verify the circuit breaker opens after 5 failures, the payment API degrades gracefully (returns 503 with Retry-After), and the alert fires within 2 minutes; document the experiment results."},
-    {"id": "3", "description": "Conduct a load test using Gatling or k6: ramp to 2x expected peak traffic (define peak as 1000 TPS), verify P99 latency stays under 500ms, verify no connection pool exhaustion, and verify that the HPA scales pods appropriately; produce a load test report suitable for the PRR sign-off document."},
-    {"id": "4", "description": "Complete the Compliance section of the PRR: verify audit logs are generated for every payment submission, verify PAN is masked in all log outputs, verify the service scope is documented in the PCI DSS scope document, and confirm the incident notification procedure aligns with FCA breach reporting timelines."}
+    {
+      "id": "1",
+      "description": "Complete the Observability section of a PRR for a new payment submission service: define what metrics will confirm the service is healthy (with specific alert thresholds), write the runbook for the two most likely failure scenarios, and verify that distributed traces connect to log lines via correlation IDs."
+    },
+    {
+      "id": "2",
+      "description": "Design and execute a chaos engineering experiment for the payment service: inject a 500ms latency on fraud-service calls and verify the circuit breaker opens after 5 failures, the payment API degrades gracefully (returns 503 with Retry-After), and the alert fires within 2 minutes; document the experiment results."
+    },
+    {
+      "id": "3",
+      "description": "Conduct a load test using Gatling or k6: ramp to 2x expected peak traffic (define peak as 1000 TPS), verify P99 latency stays under 500ms, verify no connection pool exhaustion, and verify that the HPA scales pods appropriately; produce a load test report suitable for the PRR sign-off document."
+    },
+    {
+      "id": "4",
+      "description": "Complete the Compliance section of the PRR: verify audit logs are generated for every payment submission, verify PAN is masked in all log outputs, verify the service scope is documented in the PCI DSS scope document, and confirm the incident notification procedure meets regulatory reporting timelines (DORA major-incident reports, GDPR 72-hour breach notification, and any FCA notification rules that apply)."
+    }
   ]
 }
 -->

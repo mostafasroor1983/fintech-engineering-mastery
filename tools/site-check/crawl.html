@@ -1,0 +1,92 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>site check</title>
+<!-- Used by tools/site_check.py: loads the site in a frame, visits every route and reports problems. -->
+<body>
+<pre id="out">RUNNING</pre>
+<iframe id="f" style="width:1280px;height:900px"></iframe>
+<script>
+(async function () {
+  var lang = new URLSearchParams(location.search).get('lang') || 'en';
+  var only = new URLSearchParams(location.search).get('only');
+  localStorage.setItem('em_lang', lang);
+  var routes = await (await fetch('routes.json')).json();
+  if (only) routes = routes.slice(0, +only);
+  var f = document.getElementById('f');
+  var results = [], cur = null;
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+
+  function hook(w) {
+    ['error', 'warn'].forEach(function (k) {
+      var orig = w.console[k];
+      w.console[k] = function () {
+        var msg = Array.prototype.map.call(arguments, function (a) {
+          try { return a && a.stack ? a.stack.split('\n')[0] : (typeof a === 'string' ? a : JSON.stringify(a)); } catch (e) { return String(a); }
+        }).join(' ');
+        (cur ? cur.console : early).push(k + ': ' + msg.slice(0, 300));
+        return orig.apply(w.console, arguments);
+      };
+    });
+    w.addEventListener('error', function (e) {
+      if (e.target && e.target !== w && (e.target.src || e.target.href)) {
+        (cur ? cur.console : early).push('resource-error: ' + (e.target.src || e.target.href));
+      } else {
+        (cur ? cur.console : early).push('uncaught: ' + (e.message || e) + ' @' + (e.filename || '') + ':' + (e.lineno || ''));
+      }
+    }, true);
+    w.addEventListener('unhandledrejection', function (e) {
+      (cur ? cur.console : early).push('unhandledrejection: ' + (e.reason && (e.reason.message || e.reason)));
+    });
+  }
+  var early = [];
+  await new Promise(function (res) {
+    f.onload = res;
+    f.src = 'site/index.html';
+    // hook as early as possible
+    var t = setInterval(function () {
+      try { if (f.contentWindow && f.contentWindow.document && !f.contentWindow.__hooked) { f.contentWindow.__hooked = 1; hook(f.contentWindow); } } catch (e) {}
+    }, 1);
+    setTimeout(function () { clearInterval(t); }, 3000);
+  });
+  await sleep(1500);
+  var w = f.contentWindow, d = w.document;
+
+  var seenRes = 0;
+  for (var i = 0; i < routes.length; i++) {
+    cur = { route: routes[i], console: [] };
+    w.location.hash = '#' + routes[i];
+    var t0 = Date.now();
+    await sleep(250);
+    // wait until rendered: main has content, no spinner, every mermaid processed
+    for (var n = 0; n < 100; n++) {
+      var main = d.getElementById('main-content');
+      var html = main ? main.innerHTML : '';
+      var loading = /class="[^"]*(loading-|spinner|skeleton)/.test(html.slice(0, 3000));
+      var pend = Array.prototype.filter.call(d.querySelectorAll('pre.mermaid'), function (p) { return !p.querySelector('svg') && p.getAttribute('data-processed') !== 'true'; }).length;
+      if (html.length > 200 && !loading && pend === 0) break;
+      await sleep(200);
+    }
+    await sleep(400);
+    var res = w.performance.getEntriesByType('resource');
+    for (; seenRes < res.length; seenRes++) {
+      var r = res[seenRes];
+      if (r.responseStatus && r.responseStatus >= 400) cur.console.push('http ' + r.responseStatus + ': ' + r.name);
+    }
+    var main = d.getElementById('main-content');
+    cur.ms = Date.now() - t0;
+    cur.mermaid = d.querySelectorAll('pre.mermaid').length;
+    cur.mermaidSvg = d.querySelectorAll('pre.mermaid svg').length;
+    cur.mermaidErr = Array.prototype.filter.call(d.querySelectorAll('pre.mermaid svg, #main-content svg'), function (s) { return /Syntax error|Parse error/i.test(s.textContent); }).length;
+    cur.kc = d.querySelectorAll('.kc-question').length;
+    cur.pc = d.querySelectorAll('.challenge-task').length;
+    cur.fallback = d.querySelectorAll('.i18n-fallback-note').length;
+    cur.title = (main && (main.querySelector('h1') || {}).textContent || '').trim().slice(0, 60);
+    cur.errText = main && main.querySelector('p.error-text') ? 1 : 0;
+    cur.dir = d.documentElement.getAttribute('dir');
+    cur.font = w.getComputedStyle(d.body).fontFamily.slice(0, 20);
+    results.push(cur);
+  }
+  var fontsOk = Array.from(d.fonts).map(function (x) { return x.family + ":" + x.weight + ":" + x.status; });
+  document.getElementById('out').textContent = 'DONE' + JSON.stringify({ lang: lang, early: early, fonts: Array.from(new Set(fontsOk)), results: results });
+})();
+</script>

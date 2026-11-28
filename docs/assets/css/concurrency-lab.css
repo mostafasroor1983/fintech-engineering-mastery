@@ -165,7 +165,7 @@
 .clab-card-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: var(--sp-1); }
 
 .clab-tag {
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   padding: 2px 8px;
   border-radius: var(--r-full);
   background: var(--bg-elevated);
@@ -190,7 +190,7 @@
 }
 .clab-card-btn:hover {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 /* ----------------------------------------------------------
@@ -387,7 +387,7 @@
 }
 .clab-sim-btn:hover { background: var(--bg-hover); border-color: var(--accent); }
 .clab-sim-play-btn  { background: var(--accent-muted); border-color: var(--accent-border); color: var(--accent); }
-.clab-sim-play-btn:hover { background: var(--accent); color: #fff; }
+.clab-sim-play-btn:hover { background: var(--accent); color: var(--on-accent); }
 
 .clab-sim-step-info {
   font-size: var(--text-xs);
@@ -432,7 +432,7 @@
   font-weight: 600;
   padding: 6px 8px;
   text-align: center;
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   transition: background 0.2s, color 0.2s;
 }
 .clab-tl-header-active {
@@ -445,7 +445,7 @@
 .clab-tl-thread {
   background: var(--bg-inset);
   font-weight: 600;
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   color: var(--text-secondary);
   padding: 8px 10px;
   display: flex;
@@ -455,7 +455,7 @@
 .clab-tl-cell {
   background: var(--bg-surface);
   padding: 7px 4px;
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   color: var(--text-secondary);
   display: flex;
   align-items: center;
@@ -555,7 +555,7 @@
   stroke-width: 1.5;
 }
 .clab-lg-label {
-  font-size: 11px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   fill: var(--text-primary);
   font-family: var(--font-mono);
 }
@@ -709,7 +709,7 @@
   border-bottom: 1px solid var(--border);
 }
 .clab-framework-badge {
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 700;
   letter-spacing: 0.05em;
   text-transform: uppercase;
@@ -780,7 +780,7 @@
 }
 .clab-related-lessons a:hover { color: var(--accent); }
 .clab-related-num {
-  font-family: var(--font-mono); font-size: 11px; font-weight: 700;
+  font-family: var(--font-mono); font-size: 0.75rem;  /* 12px minimum for legibility */ font-weight: 700;
   color: var(--accent); background: var(--accent-muted);
   border-radius: var(--r-sm); padding: 1px 6px; flex-shrink: 0;
 }

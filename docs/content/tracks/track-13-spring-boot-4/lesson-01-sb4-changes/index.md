@@ -28,9 +28,9 @@ references:
 
 ## Overview
 
-Spring Boot 4.0 is the most disruptive major release since the 2.x-to-3.x jump. It raises the Java baseline from 17 to 21, moves entirely onto Spring Framework 7, and adopts Jakarta EE 11 as its servlet and persistence baseline. For fintech engineering teams running payment processors, ledger services, or risk engines on Spring Boot 3.x, the upgrade path requires deliberate planning: the namespace changes are mechanical, but the shifts in auto-configuration loading, AOT compilation requirements, and GraalVM Native Image constraints have architectural implications.
+Spring Boot 4.0 (released November 2025) is the biggest major release since the 2.x-to-3.x jump. It keeps Java 17 as the minimum (Java 21 or the current LTS, Java 25, is recommended), moves onto Spring Framework 7, and adopts Jakarta EE 11 (Servlet 6.1, Jakarta Persistence 3.2, Bean Validation 3.1). For fintech engineering teams running payment processors, ledger services, or risk engines on Spring Boot 3.x, the upgrade requires deliberate planning: most changes are mechanical, but the modularised auto-configuration, the move to Jackson 3, and AOT/GraalVM Native Image constraints have architectural implications.
 
-The driving motivation behind the version bump is not feature accumulation — it is permanent retirement of legacy abstractions. `spring.factories`-based auto-configuration loading is gone, replaced exclusively by the `AutoConfiguration.imports` file introduced as an opt-in migration in SB3. Dynamic proxies without explicit runtime hints will silently fail in native images. `RestTemplate` reaches end-of-life status in the Spring Framework 7 BOM. Financial services teams that have accumulated shared platform libraries, custom starters, and framework extensions over several years will find the upgrade surface larger than it appears from the release notes alone.
+The driving motivation is not feature accumulation — it is retiring legacy abstractions and splitting the framework into smaller pieces. The single, monolithic `spring-boot-autoconfigure` jar is replaced by technology-specific modules (`spring-boot-webmvc`, `spring-boot-data-jpa`, `spring-boot-flyway`, …) with matching starters, and many auto-configuration classes moved to new packages. Jackson 3 (package `tools.jackson`) becomes the default JSON library. JSpecify annotations make the whole portfolio null-safe. Long-deprecated APIs such as `@MockBean` are gone. Financial services teams that have accumulated shared platform libraries, custom starters, and framework extensions over several years will find the upgrade surface larger than it appears from the release notes alone.
 
 This lesson maps the full surface area of breaking changes, with particular attention to patterns common in regulated financial services: custom auto-configuration for compliance libraries, AOT hints for reflection-heavy serialization (ISO-20022, FIX protocol payloads), and GraalVM Native Image for latency-sensitive payment services where JVM warm-up cost matters. We cover virtual threads only at the configuration layer here — Lesson 3 goes deep on that topic.
 
@@ -39,36 +39,39 @@ This lesson maps the full surface area of breaking changes, with particular atte
 - Identify every Java/Jakarta baseline change in Spring Boot 4 and their effect on existing fintech codebases
 - Explain how `AutoConfiguration.imports` replaces `spring.factories` and write a custom SB4-compatible starter
 - Register `RuntimeHints` for reflection, serialization, and JNI required by payment protocol libraries
-- Annotate a GraalVM Native Image build with `@NativeHint` and configure the Maven native profile
+- Register binding hints with `@RegisterReflectionForBinding` and configure the Maven native profile
 - Understand which SB3 features have been removed, relocated, or deprecated in SB4
 - Configure the virtual thread toggle and understand its auto-configuration surface
 - Diagnose AOT-generated source issues that surface during native compilation of a payment service
 
-## SB4 Baseline Shifts: Java 21, Jakarta EE 11, Spring Framework 7
+## SB4 Baseline Shifts: Java 17+, Jakarta EE 11, Spring Framework 7
 
-Spring Boot 4 sets three hard floors simultaneously. Any component in your dependency graph that does not meet all three will prevent the application from starting.
+Spring Boot 4 sets three floors simultaneously. Any component in your dependency graph that does not meet them will break the build or the startup.
 
-**Java 21** is the new minimum. Java 17 and 19 are unsupported. This matters because Java 21 ships several finalized features that Spring Boot 4 uses internally: virtual threads (Project Loom), record patterns, sealed interfaces, and sequenced collections. The Spring container itself uses `SequencedCollection` for ordering bean definitions, so attempting to run on Java 17 produces a `NoClassDefFoundError` at startup, not a warning.
+**Java 17** remains the minimum, as in Spring Boot 3 — but Java 21+ is strongly recommended (virtual threads), and Java 25, the current LTS, is fully supported. Most fintech teams use the upgrade to move to Java 21 or 25 at the same time.
 
-**Jakarta EE 11** means the minimum servlet container version is Servlet 6.1 (Tomcat 11.x, Jetty 12.x, Undertow 3.x). The `javax.*` namespace was already replaced by `jakarta.*` in SB3. What SB4 adds is a dependency on new EE 11 APIs: `jakarta.data` for repository abstraction, `jakarta.validation` 3.1 with record support, and `jakarta.persistence` 3.2 which adds the `find` and `query` typed methods directly on `EntityManager`. Any transitive dependency still importing `javax.persistence` or `javax.servlet` will fail at compile time under SB4's enforced BOM.
+**Jakarta EE 11** means the servlet baseline is Servlet 6.1: Tomcat 11 or Jetty 12.1. **Undertow is no longer supported** — it has no Servlet 6.1 release — so services using `spring-boot-starter-undertow` must switch containers. The `javax.*` → `jakarta.*` namespace move already happened in SB3; SB4 moves to the newer API versions: Jakarta Persistence 3.2 (Hibernate ORM 7), Jakarta Validation 3.1 (Hibernate Validator 9), and Jakarta Servlet 6.1. Libraries that only support the older Jakarta EE 10 APIs need upgrades.
 
-**Spring Framework 7** brings changes covered in depth in Lesson 2. The critical callout for this lesson: SF7 drops `LocalVariableTableParameterNameDiscoverer`, which affects any code using implicit parameter name binding in JPA `@Query` annotations or Spring MVC controller methods. We examine this in detail in Section 4.
+**Spring Framework 7** brings changes covered in depth in Lesson 2: JSpecify null-safety, built-in API versioning, HTTP service client improvements, and core resilience annotations (`@Retryable`, `@ConcurrencyLimit`). One reminder: parameter names for `@PathVariable`, `@RequestParam` and Spring Data `@Param` binding come from the `-parameters` compiler flag (the bytecode-scanning fallback was removed back in Framework 6.1) — the Spring Boot parent POM sets this flag for you.
 
 ```java
-// SB3 — still compiles but emits deprecation warning
-import javax.persistence.Entity;         // WRONG in SB4
-import javax.servlet.http.HttpServletRequest; // WRONG in SB4
+// Spring Boot 2.x style — does not compile on Boot 3 or 4
+import javax.persistence.Entity;
+import javax.servlet.http.HttpServletRequest;
 
-// SB4 — required
+// Boot 3 and 4
 import jakarta.persistence.Entity;
 import jakarta.servlet.http.HttpServletRequest;
+
+// New in Boot 4: Jackson 3 uses new packages (annotations stay in com.fasterxml)
+import tools.jackson.databind.ObjectMapper;         // was com.fasterxml.jackson.databind
+import com.fasterxml.jackson.annotation.JsonProperty; // unchanged
 ```
 
-```java
-// pom.xml — SB4 requires Java 21
+```xml
+<!-- pom.xml — Java 17 is the minimum; 21 or 25 recommended -->
 <properties>
     <java.version>21</java.version>
-    <spring-boot.version>4.0.0</spring-boot.version>
 </properties>
 
 <parent>
@@ -80,24 +83,26 @@ import jakarta.servlet.http.HttpServletRequest;
 
 ## Auto-Configuration: From `spring.factories` to `AutoConfiguration.imports`
 
-Spring Boot has used `META-INF/spring.factories` for auto-configuration registration since version 1.0. The file allowed any JAR on the classpath to register `EnableAutoConfiguration` implementations, which the framework would load, filter by conditions, and apply. SB3 introduced `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` as an alternative and printed a deprecation warning for `spring.factories`. In SB4, the `spring.factories` loading path for auto-configurations has been completely removed. The `SpringFactoriesLoader` class still exists but no longer processes `EnableAutoConfiguration` keys.
+Spring Boot used `META-INF/spring.factories` for auto-configuration registration from version 1.0. Spring Boot 2.7 introduced `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` and deprecated the `spring.factories` route; **Spring Boot 3.0 removed it**. `SpringFactoriesLoader` still exists for other extension points, but it no longer registers `EnableAutoConfiguration` entries. If an internal library still relies on `spring.factories` for auto-configuration, it was never properly migrated to Boot 3 — the Boot 4 upgrade is the moment to fix it.
 
-For fintech platform teams, this change affects every internal shared library that provides auto-configuration: compliance audit loggers, rate limiters, distributed transaction managers, payment gateway clients, and feature flag integrations. Each needs its `spring.factories` entry replaced.
+What is new in Boot 4 is **modularisation**: auto-configuration classes moved from the single `spring-boot-autoconfigure` jar into technology-specific modules with new package names (for example `org.springframework.boot.restclient.autoconfigure`). Internal starters that reference Boot's own auto-configuration classes — in `@AutoConfiguration(after = …)`, `@ImportAutoConfiguration`, or exclusions — must be updated. (Boot 4 also ships "classic" starters that pull in everything, to ease the transition.)
+
+For fintech platform teams, this affects every internal shared library that provides auto-configuration: compliance audit loggers, rate limiters, payment gateway clients, and feature flag integrations.
 
 ```
-# OLD: META-INF/spring.factories (SB3 and earlier)
+# OLD: META-INF/spring.factories (Spring Boot 2.x; ignored since 3.0)
 org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
   com.acme.payments.autoconfigure.PaymentGatewayAutoConfiguration,\
   com.acme.payments.autoconfigure.FraudEngineAutoConfiguration
 ```
 
 ```
-# NEW: META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports (SB4 required)
+# NEW: META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports (Boot 2.7+)
 com.acme.payments.autoconfigure.PaymentGatewayAutoConfiguration
 com.acme.payments.autoconfigure.FraudEngineAutoConfiguration
 ```
 
-The auto-configuration class itself must now be annotated with `@AutoConfiguration` rather than `@Configuration` (this was optional in SB3, mandatory in SB4 to trigger the new loading path). `@AutoConfiguration` supports `before`, `after`, `beforeName`, and `afterName` ordering attributes.
+Annotate the class with `@AutoConfiguration` (available since 2.7) rather than plain `@Configuration`: it marks the class as an auto-configuration, disables bean-method proxying, and supports the `before`, `after`, `beforeName`, and `afterName` ordering attributes. Use the `*Name` variants when the referenced class lives in an optional module — and check the new Boot 4 package names.
 
 ```java
 package com.acme.payments.autoconfigure;
@@ -108,7 +113,8 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 
-@AutoConfiguration(after = org.springframework.boot.autoconfigure.web.client.RestClientAutoConfiguration.class)
+// Boot 4 moved RestClientAutoConfiguration into the spring-boot-restclient module
+@AutoConfiguration(afterName = "org.springframework.boot.restclient.autoconfigure.RestClientAutoConfiguration")
 @ConditionalOnProperty(prefix = "acme.payment-gateway", name = "enabled", havingValue = "true", matchIfMissing = true)
 @EnableConfigurationProperties(PaymentGatewayProperties.class)
 public class PaymentGatewayAutoConfiguration {
@@ -163,23 +169,23 @@ public record PaymentGatewayProperties(
 
 AOT (Ahead-of-Time) compilation in Spring Boot generates Java source code at build time that pre-computes bean definitions, condition evaluations, and proxy creation. This output is placed under `target/spring-aot/main/sources/` and compiled into the final artifact. When you build a GraalVM Native Image, the AOT output replaces the runtime reflection-based container initialization entirely.
 
-The `spring-boot-maven-plugin` process-aot goal runs before `compile`:
+The `spring-boot-maven-plugin` `process-aot` goal generates this code (it binds to the `prepare-package` phase). With `spring-boot-starter-parent`, the `native` profile configures it for you; for AOT on the JVM you can add it explicitly:
 
 ```xml
-<!-- pom.xml — AOT processing is automatic when using spring-boot-maven-plugin 4.x -->
+<!-- pom.xml — explicit AOT processing (the native profile of the parent does this for you) -->
 <plugin>
     <groupId>org.springframework.boot</groupId>
     <artifactId>spring-boot-maven-plugin</artifactId>
-    <version>4.0.0</version>
     <executions>
         <execution>
+            <id>process-aot</id>
             <goals>
-                <goal>process-aot</goal>  <!-- runs at generate-sources phase -->
-                <goal>repackage</goal>
+                <goal>process-aot</goal>
             </goals>
         </execution>
     </executions>
 </plugin>
+<!-- run the AOT-optimised app on the JVM with -Dspring.aot.enabled=true -->
 ```
 
 AOT-generated code eliminates most reflective access at startup. However, any code that uses reflection at *runtime* — after the application has started — must register `RuntimeHints`. Payment services frequently need this for:
@@ -187,7 +193,7 @@ AOT-generated code eliminates most reflective access at startup. However, any co
 - ISO-20022 message classes loaded by name from a registry
 - FIX protocol tag-to-field mappings via `Class.forName()`
 - Dynamic proxy generation for compliance audit interceptors
-- Jackson serialization of sealed interface hierarchies
+- Jackson (de)serialisation of types it discovers at runtime (e.g. sealed interface hierarchies)
 
 ```java
 package com.acme.payments.hints;
@@ -233,7 +239,9 @@ public class PaymentRuntimeHints implements RuntimeHintsRegistrar {
                 )
         );
 
-        // Serialization hints — Jackson uses Java serialization metadata
+        // Java serialization hints — ONLY needed if these types go through
+        // java.io serialization (e.g. a Serializable cache entry). Jackson does
+        // not use them; it needs the reflection hints above.
         hints.serialization().registerType(TypeReference.of(CreditTransferMessage.class));
         hints.serialization().registerType(TypeReference.of(PaymentStatusReport.class));
 
@@ -289,15 +297,14 @@ Spring Boot 4 provides a `native` Maven profile that activates the GraalVM Nativ
                 <plugin>
                     <groupId>org.graalvm.buildtools</groupId>
                     <artifactId>native-maven-plugin</artifactId>
-                    <version>0.10.3</version>
+                    <!-- version managed by spring-boot-starter-parent -->
                     <configuration>
                         <imageName>payment-service</imageName>
                         <buildArgs>
-                            <!-- Fail on missing reflection hints rather than silently degrading -->
-                            <buildArg>--strict-image-heap</buildArg>
-                            <!-- Payment service has deterministic startup; no need for JIT fallback -->
+                            <!-- Never produce a JVM "fallback" image: fail the build instead -->
                             <buildArg>--no-fallback</buildArg>
-                            <!-- Enable G1 GC in the native image for large heap payment services -->
+                            <!-- G1 in native images requires Oracle GraalVM
+                                 (GraalVM Community offers Serial GC only) -->
                             <buildArg>--gc=G1</buildArg>
                             <!-- Initialize Bouncy Castle crypto library at build time -->
                             <buildArg>--initialize-at-build-time=org.bouncycastle</buildArg>
@@ -321,7 +328,7 @@ Spring Boot 4 provides a `native` Maven profile that activates the GraalVM Nativ
 </profiles>
 ```
 
-The `@NativeHint` annotation provides a declarative alternative to `RuntimeHintsRegistrar` for simpler cases:
+For simple data-binding cases, `@RegisterReflectionForBinding` is a declarative alternative to a `RuntimeHintsRegistrar`. (The older `@NativeHint` annotation belonged to the experimental Spring Native project and does not exist in Spring Boot 3 or 4.)
 
 ```java
 package com.acme.payments;
@@ -349,16 +356,16 @@ public class PaymentServiceApplication {
 **Native Image limitations to plan for in fintech:**
 
 1. **No runtime classpath scanning**: `@ComponentScan` works because it is processed at AOT time. `Class.forName()` with a string computed at runtime (e.g., from a database or config file) will fail unless the target is in a reflection hint.
-2. **No dynamic proxy without hints**: `@Transactional`, `@Cacheable`, and similar Spring proxies are handled automatically by the AOT processor. Third-party libraries that generate proxies at runtime (some older compliance SDKs) require `--enable-url-protocols=https` and proxy hints.
+2. **No dynamic proxy without hints**: `@Transactional`, `@Cacheable`, and similar Spring proxies are handled automatically by the AOT processor. Third-party libraries that generate JDK proxies at runtime (some older compliance SDKs) need proxy hints; libraries that generate *bytecode* at runtime (classic CGLIB/ByteBuddy usage) do not work in a native image at all.
 3. **Static initialization order**: `--initialize-at-build-time` moves class initialization to build time. Any class that reads a system property or opens a socket during static initialization must be moved to `--initialize-at-run-time`.
 
-## Auto-Configuration Loading Sequence: SB3 vs SB4
+## Auto-Configuration Loading: Then and Now
 
-The diagram below shows how Spring Boot loads auto-configurations in SB3 (left) versus SB4 (right). The key change is the removal of `spring.factories` as a source, the introduction of a dedicated `AutoConfigurationLoader` backed by `AutoConfiguration.imports`, and the earlier integration of AOT-generated bean definitions.
+The diagram below compares the Spring Boot 2.7 transition release (left) with Spring Boot 3.x/4.x (right). Since 3.0, `AutoConfiguration.imports` (read via `ImportCandidates`) is the only source of auto-configurations, and when AOT is active the pre-computed bean definitions replace condition evaluation at startup.
 
 ```mermaid
 flowchart TD
-    subgraph SB3["Spring Boot 3.x Loading Sequence"]
+    subgraph SB3["Spring Boot 2.7 (transition release)"]
         A3[SpringApplication.run] --> B3[SpringFactoriesLoader]
         B3 --> C3{Source?}
         C3 -->|spring.factories| D3[EnableAutoConfiguration entries]
@@ -369,10 +376,10 @@ flowchart TD
         G3 --> H3[Instantiate Beans]
     end
 
-    subgraph SB4["Spring Boot 4.x Loading Sequence"]
+    subgraph SB4["Spring Boot 3.x / 4.x"]
         A4[SpringApplication.run] --> B4{AOT active?}
         B4 -->|Yes - Native or AOT JVM| C4[Load AOT-generated ApplicationContextInitializer]
-        B4 -->|No - standard JVM| D4[AutoConfigurationLoader]
+        B4 -->|No - standard JVM| D4[ImportCandidates]
         C4 --> E4[Pre-computed BeanDefinitions — no reflection]
         D4 -->|AutoConfiguration.imports ONLY| F4[Filter: @Conditional evaluation]
         F4 --> G4[Register BeanDefinitions at runtime]
@@ -386,17 +393,20 @@ flowchart TD
 
 ## Removed and Deprecated Features in SB4
 
-**Removed (compilation will fail):**
+**Removed or changed (the build or startup will fail):**
 
 | Feature | SB3 status | SB4 status | Replacement |
 |---|---|---|---|
-| `spring.factories` for `EnableAutoConfiguration` | Deprecated | Removed | `AutoConfiguration.imports` |
-| `RestTemplate` auto-configuration | Deprecated | Removed | `RestClient` auto-configuration |
-| `spring-boot-starter-log4j2` | Available | Removed | Add Log4j2 BOM manually |
-| `SpringBootServletInitializer` for WAR | Available | Removed | Embedded container only |
-| `@SpringBootApplication(scanBasePackages)` class-level scan | Deprecated | Removed | Use `@ComponentScan` explicitly |
-| `Flyway` < 10.x | Supported | Unsupported | Flyway 10.x required |
-| `Liquibase` < 4.26 | Supported | Unsupported | Liquibase 4.26+ required |
+| Undertow embedded server | Supported | Removed (no Servlet 6.1 release) | Tomcat 11 or Jetty 12.1 |
+| `@MockBean` / `@SpyBean` | Deprecated (3.4) | Removed | `@MockitoBean` / `@MockitoSpyBean` |
+| Jackson 2 as default JSON library | Default | Deprecated support | Jackson 3 (`tools.jackson` packages) |
+| Monolithic `spring-boot-autoconfigure` | Single jar | Split into modules | Technology starters (or the "classic" starters during migration) |
+| Flyway / Liquibase auto-config via core starter | Automatic | Needs its own starter | `spring-boot-starter-flyway`, `spring-boot-starter-liquibase` |
+| Spock test integration | Supported | Removed | JUnit Jupiter |
+| Fully executable "launch script" jars | Supported | Removed | `java -jar`, containers, or systemd unit files |
+| `spring.factories` for `EnableAutoConfiguration` | Already removed in 3.0 | Removed | `AutoConfiguration.imports` |
+
+**Still available, but on the way out:** `RestTemplate` and its auto-configured `RestTemplateBuilder` (now in the `spring-boot-restclient` module) still work in Boot 4, but the Spring team plans to deprecate `RestTemplate` in a 7.x release — write new code against `RestClient` or HTTP service interfaces. WAR deployment with `SpringBootServletInitializer` is still supported.
 
 **Virtual thread auto-configuration toggle** (covered in depth in Lesson 3):
 
@@ -405,7 +415,7 @@ flowchart TD
 spring:
   threads:
     virtual:
-      enabled: true   # Configures Tomcat, @Async, @Scheduled, @EventListener
+      enabled: true   # Tomcat/Jetty, the @Async executor, @Scheduled, Kafka/RabbitMQ listeners
 
 server:
   tomcat:
@@ -429,24 +439,25 @@ public TomcatProtocolHandlerCustomizer<?> virtualThreadTomcatProtocolHandlerCust
 
 ## Summary
 
-- Spring Boot 4 sets hard minimums: Java 21, Jakarta EE 11, Spring Framework 7. Any transitive dependency failing these floors causes startup failure, not a warning.
-- `spring.factories` auto-configuration loading is permanently removed. All custom starters must migrate to `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` and use `@AutoConfiguration` on the configuration class.
+- Spring Boot 4 sets the floors: Java 17+ (21 or 25 recommended), Jakarta EE 11 (Servlet 6.1 — Undertow is gone), Spring Framework 7. Dependencies that only support older Jakarta EE APIs break the build or startup.
+- Auto-configuration is modularised: Boot's own auto-configuration classes moved to new modules and packages, so custom starters must update their ordering references. Registration is via `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` (the `spring.factories` route was already removed in 3.0), with `@AutoConfiguration` on the class.
+- Jackson 3 is the new default (`tools.jackson` packages), and long-deprecated APIs such as `@MockBean` are removed.
 - AOT processing generates pre-computed bean definitions at build time. Reflection-heavy payment protocol code (ISO-20022, FIX) requires explicit `RuntimeHints` registration via `RuntimeHintsRegistrar` or `@RegisterReflectionForBinding`.
-- GraalVM Native Image builds under SB4 use `--no-fallback` and `--strict-image-heap` to surface missing hints at build time rather than runtime — critical for production payment services.
+- GraalVM Native Image builds should use `--no-fallback` (and the GraalVM reachability metadata repository) so that build problems fail the build — but missing reflection hints still only show up at *runtime*, so native images need their own integration test run before production.
 - Virtual threads are enabled with a single property (`spring.threads.virtual.enabled=true`) but require carrier-thread pinning audits before enabling in services that call `synchronized` legacy libraries; Lesson 3 covers this in full.
 
 <!-- KNOWLEDGE-CHECK [
   {
     "id": "kc-sb401-01",
-    "question": "A fintech team has a shared compliance library that registers its auto-configuration via META-INF/spring.factories. After upgrading the application to Spring Boot 4, the library's auto-configuration no longer activates. What is the root cause?",
+    "question": "A fintech team upgrading straight from Spring Boot 2.7 to 4.0 has a shared compliance library that registers its auto-configuration via META-INF/spring.factories. After the upgrade, the library's auto-configuration no longer activates. What is the root cause?",
     "options": [
       "The @AutoConfiguration annotation is missing from the configuration class",
-      "Spring Boot 4 removed spring.factories as a source for EnableAutoConfiguration entries",
-      "The library must be rebuilt with Java 21 before its auto-configuration will load",
+      "Since Spring Boot 3.0, spring.factories is no longer a source for EnableAutoConfiguration entries",
+      "The library must be rebuilt with Java 25 before its auto-configuration will load",
       "spring.factories is still supported but requires a compatibility flag in application.properties"
     ],
     "correct": 1,
-    "explanation": "Spring Boot 4 completely removed the spring.factories loading path for EnableAutoConfiguration entries. The library must migrate to META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports. The @AutoConfiguration annotation and Java 21 rebuild are also needed but are not the root cause of the activation failure."
+    "explanation": "Spring Boot 2.7 deprecated and Spring Boot 3.0 removed the spring.factories route for EnableAutoConfiguration entries; Boot 4 continues without it. The library must list its classes in META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports (and should use @AutoConfiguration). Java version is not the cause — Boot 4 runs on Java 17+."
   },
   {
     "id": "kc-sb401-02",
@@ -462,7 +473,7 @@ public TomcatProtocolHandlerCustomizer<?> virtualThreadTomcatProtocolHandlerCust
   },
   {
     "id": "kc-sb401-03",
-    "question": "Which Spring Boot 4 property enables virtual thread support across Tomcat, @Async, @Scheduled, and @EventListener simultaneously?",
+    "question": "Which Spring Boot property switches Tomcat's request handling, the @Async executor and @Scheduled tasks to virtual threads at once?",
     "options": [
       "server.tomcat.threads.virtual=true",
       "spring.mvc.async.virtual-threads=true",
@@ -470,19 +481,19 @@ public TomcatProtocolHandlerCustomizer<?> virtualThreadTomcatProtocolHandlerCust
       "spring.task.execution.pool.virtual=true"
     ],
     "correct": 2,
-    "explanation": "spring.threads.virtual.enabled=true is the single toggle in Spring Boot 4 that activates virtual thread executors for all four subsystems: Tomcat's protocol handler executor, the default @Async task executor, the @Scheduled thread pool, and the @EventListener executor. Each subsystem has its own auto-configuration customizer that is conditional on this property."
+    "explanation": "spring.threads.virtual.enabled=true (introduced in Spring Boot 3.2 and still the switch in Boot 4) makes the embedded web server, the auto-configured applicationTaskExecutor (@Async, MVC async), the task scheduler (@Scheduled) and supported messaging listener containers use virtual threads. It requires Java 21+."
   },
   {
     "id": "kc-sb401-04",
-    "question": "A team migrating from Spring Boot 3.x to 4.x discovers that their WAR deployment to an external Tomcat server stopped working. What is the cause?",
+    "question": "After upgrading to Spring Boot 4, a team's integration tests no longer compile: the compiler cannot find @MockBean. What is the cause and the fix?",
     "options": [
-      "Spring Boot 4 requires Tomcat 11.x which has a different deployment descriptor format",
-      "SpringBootServletInitializer has been removed in Spring Boot 4; WAR deployment is no longer supported",
-      "The application needs to add spring-boot-starter-tomcat as a provided dependency",
-      "WAR packaging requires the native Maven profile to be disabled"
+      "@MockBean moved to a new package in Spring Boot 4; only the import must change",
+      "@MockBean and @SpyBean (deprecated since 3.4) were removed in Spring Boot 4; use @MockitoBean and @MockitoSpyBean from Spring Framework's test support",
+      "Mockito is no longer supported in Spring Boot 4 tests",
+      "The tests must be migrated from JUnit 5 to Spock"
     ],
     "correct": 1,
-    "explanation": "Spring Boot 4 removed SpringBootServletInitializer and no longer supports WAR deployment to external servlet containers. The embedded container model is the only supported deployment mode. Teams requiring external Tomcat deployment must remain on Spring Boot 3.x or refactor to embedded container deployment (JAR with embedded Tomcat 11)."
+    "explanation": "Spring Boot 3.4 deprecated @MockBean and @SpyBean in favour of Spring Framework's @MockitoBean and @MockitoSpyBean (org.springframework.test.context.bean.override.mockito), and Spring Boot 4 removed the old annotations. Mockito remains fully supported; Spock integration, in fact, was removed in Boot 4."
   }
 ] -->
 
@@ -491,8 +502,17 @@ public TomcatProtocolHandlerCustomizer<?> virtualThreadTomcatProtocolHandlerCust
   "title": "Migrate a Fintech Platform Starter to Spring Boot 4",
   "description": "Migrate an existing Spring Boot 3.x shared platform starter (providing audit logging and payment gateway client auto-configuration) to full Spring Boot 4 compatibility.",
   "tasks": [
-    { "id": "pc-sb401-01", "description": "Create a new Maven module named acme-payments-spring-boot-starter with Java 21 baseline, Spring Boot 4.0.0 parent, and migrate the existing META-INF/spring.factories entry to META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports. Annotate the configuration class with @AutoConfiguration(after = RestClientAutoConfiguration.class)." },
-    { "id": "pc-sb401-02", "description": "Write a RuntimeHintsRegistrar for the starter that registers reflection hints for all ISO-20022 message record types (at least 3 types), a serialization hint for the payment event record used with Jackson, and a resource hint for the payments/message-registry.properties file on the classpath." },
-    { "id": "pc-sb401-03", "description": "Add a native Maven profile to a sample payment-service application that uses the starter. Configure the GraalVM native-maven-plugin 0.10.3 with --no-fallback, --strict-image-heap, and build the native image. Document any missing hints that surface during the build and add them to the RuntimeHintsRegistrar." }
+    {
+      "id": "pc-sb401-01",
+      "description": "Create a new Maven module named acme-payments-spring-boot-starter with a Java 21 baseline and the Spring Boot 4 parent. Make sure the auto-configuration is registered in META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports (remove any leftover spring.factories entry), annotate the class with @AutoConfiguration, and order it after Boot 4's relocated RestClientAutoConfiguration using afterName."
+    },
+    {
+      "id": "pc-sb401-02",
+      "description": "Write a RuntimeHintsRegistrar for the starter that registers reflection hints for all ISO-20022 message record types (at least 3 types), binding hints (e.g. via @RegisterReflectionForBinding) for the payment event record used with Jackson, and a resource hint for the payments/message-registry.properties file on the classpath."
+    },
+    {
+      "id": "pc-sb401-03",
+      "description": "Add a native Maven profile to a sample payment-service application that uses the starter. Configure the GraalVM native-maven-plugin (version managed by the Spring Boot parent) with --no-fallback and build the native image. Run the integration tests against the native executable, document any missing hints that surface at runtime, and add them to the RuntimeHintsRegistrar."
+    }
   ]
 } -->

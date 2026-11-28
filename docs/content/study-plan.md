@@ -22,7 +22,7 @@ below that on purpose: the spare time is your slack for missed sessions.
 
 **How to use it:** do the lessons in order inside a week. Each lesson's minutes already include reading,
 running the code, the exercises and answering the interview questions aloud. Track progress in the site.
-If you fall behind, see the falling-behind plan below below.
+If you fall behind, see the falling-behind plan below.
 
 **Track 05 (transaction integrity)** is weeks 3–6: four full weeks, early, because the Spring,
 messaging, capstone and system-design work all build on it.

@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "lastBuilt": "2026-11-11",
+  "lastBuilt": "2026-11-27",
   "totalDocs": 338,
   "documents": [
     {
@@ -3914,7 +3914,7 @@
         "schema-evolution",
         "compatibility"
       ],
-      "body": "--- id: track-09-lesson-07 title: \"سجل المخططات — Avro وProtobuf وتطور المخطط\" slug: schema-registry track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 7 difficulty: advanced estimatedMinutes: 75 status: published tags: [schema-registry, Avro, Protobuf, schema-evolution, compatibility] prerequisites: [kafka-architecture, kafka-producer, kafka-consumer] --- ‏Schema Registry — ‏Avro وProtobuf وتطور المخططات المخططات عقود. ففي الأنظمة المالية حيث تنتج فرق متعددة أحداث الدف"
+      "body": "--- id: track-09-lesson-07 title: \"سجل المخططات — Avro وProtobuf وتطور المخطط\" slug: schema-registry track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 7 difficulty: advanced estimatedMinutes: 75 status: published tags: [schema-registry, Avro, Protobuf, schema-evolution, compatibility] prerequisites: [\"track-09-lesson-01\", \"track-09-lesson-02\", \"track-09-lesson-03\"] --- ‏Schema Registry — ‏Avro وProtobuf وتطور المخططات المخططات عقود. ففي الأنظمة المالية حيث تنتج فرق متع"
     },
     {
       "id": "track-09-lesson-08",
@@ -3935,7 +3935,7 @@
         "SMT",
         "worker"
       ],
-      "body": "--- id: track-09-lesson-08 title: \"Kafka Connect — بنية موصلات المصدر والوجهة\" slug: kafka-connect track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 8 difficulty: advanced estimatedMinutes: 75 status: published tags: [Kafka-Connect, source-connector, sink-connector, SMT, worker] prerequisites: [kafka-architecture, outbox-cdc-debezium] --- ‏Kafka Connect — بنية موصّلات المصدر والمصب ‏Kafka Connect هي طبقة التكامل في منظومة Kafka. فبدل كتابة شيفرة منتج/مستهلك مخصصة لكل م"
+      "body": "--- id: track-09-lesson-08 title: \"Kafka Connect — بنية موصلات المصدر والوجهة\" slug: kafka-connect track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 8 difficulty: advanced estimatedMinutes: 75 status: published tags: [Kafka-Connect, source-connector, sink-connector, SMT, worker] prerequisites: [\"track-09-lesson-01\", \"track-09-lesson-06\"] --- ‏Kafka Connect — بنية موصّلات المصدر والمصب ‏Kafka Connect هي طبقة التكامل في منظومة Kafka. فبدل كتابة شيفرة منتج/مستهلك مخصصة لك"
     },
     {
       "id": "track-09-lesson-09",
@@ -4001,7 +4001,7 @@
         "ACL",
         "mTLS"
       ],
-      "body": "--- id: track-09-lesson-12 title: \"أمان Kafka — TLS وSASL وقوائم التحكم بالوصول\" slug: kafka-security track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 12 difficulty: advanced estimatedMinutes: 75 status: published tags: [Kafka, TLS, SASL, ACL, mTLS] prerequisites: [kafka-architecture, kafka-producer, kafka-consumer] --- أمن Kafka — ‏TLS وSASL وACL تعالج Kafka بيانات الدفع، وأحداث الحسابات، وتدفقات المعاملات — وكلها فئات تتطلب تحكمًا صارمًا في الوصول بموجب PCI DSS، وGD"
+      "body": "--- id: track-09-lesson-12 title: \"أمان Kafka — TLS وSASL وقوائم التحكم بالوصول\" slug: kafka-security track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 12 difficulty: advanced estimatedMinutes: 75 status: published tags: [Kafka, TLS, SASL, ACL, mTLS] prerequisites: [\"track-09-lesson-01\", \"track-09-lesson-02\", \"track-09-lesson-03\"] --- أمن Kafka — ‏TLS وSASL وACL تعالج Kafka بيانات الدفع، وأحداث الحسابات، وتدفقات المعاملات — وكلها فئات تتطلب تحكمًا صارمًا في الوصول بموج"
     },
     {
       "id": "track-09-lesson-13",
@@ -4022,7 +4022,7 @@
         "latency",
         "compression"
       ],
-      "body": "--- id: track-09-lesson-13 title: \"ضبط أداء Kafka — الإنتاجية مقابل الكمون\" slug: kafka-performance track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 13 difficulty: advanced estimatedMinutes: 80 status: published tags: [Kafka, performance, throughput, latency, compression] prerequisites: [kafka-architecture, kafka-producer, kafka-consumer] --- ضبط أداء Kafka — الإنتاجية مقابل زمن الاستجابة يتطلب ضبط أداء Kafka فهم مفاضلة جوهرية: الإنتاجية وزمن الاستجابة في توتر مباشر. "
+      "body": "--- id: track-09-lesson-13 title: \"ضبط أداء Kafka — الإنتاجية مقابل الكمون\" slug: kafka-performance track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 13 difficulty: advanced estimatedMinutes: 80 status: published tags: [Kafka, performance, throughput, latency, compression] prerequisites: [\"track-09-lesson-01\", \"track-09-lesson-02\", \"track-09-lesson-03\"] --- ضبط أداء Kafka — الإنتاجية مقابل زمن الاستجابة يتطلب ضبط أداء Kafka فهم مفاضلة جوهرية: الإنتاجية وزمن الاستجابة ف"
     },
     {
       "id": "track-09-lesson-14",
@@ -4043,7 +4043,7 @@
         "failover",
         "Kafka"
       ],
-      "body": "--- id: track-09-lesson-14 title: \"Kafka متعدد المناطق — MirrorMaker 2 والنسخ المتماثل\" slug: multi-region-kafka track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 14 difficulty: principal estimatedMinutes: 85 status: published tags: [MirrorMaker, multi-region, geo-replication, failover, Kafka] prerequisites: [kafka-architecture, kafka-connect] --- ‏Kafka متعدد المناطق — MirrorMaker 2 والنسخ عنقود Kafka في منطقة واحدة نقطة فشل واحدة لكل معالجة المدفوعات. وتحتاج المؤسسات"
+      "body": "--- id: track-09-lesson-14 title: \"Kafka متعدد المناطق — MirrorMaker 2 والنسخ المتماثل\" slug: multi-region-kafka track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 14 difficulty: principal estimatedMinutes: 85 status: published tags: [MirrorMaker, multi-region, geo-replication, failover, Kafka] prerequisites: [\"track-09-lesson-01\", \"track-09-lesson-08\"] --- ‏Kafka متعدد المناطق — MirrorMaker 2 والنسخ عنقود Kafka في منطقة واحدة نقطة فشل واحدة لكل معالجة المدفوعات. وتحتاج"
     },
     {
       "id": "track-09-lesson-15",
@@ -4079,7 +4079,7 @@
         "choreography",
         "decoupling"
       ],
-      "body": "--- id: track-09-lesson-16 title: \"الخدمات المصغّرة القائمة على الأحداث — أنماط التكامل\" slug: event-driven-microservices track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 16 difficulty: advanced estimatedMinutes: 85 status: published tags: [event-driven, microservices, event-mesh, choreography, decoupling] prerequisites: [kafka-architecture, outbox-cdc-debezium, saga-pattern] --- الخدمات المصغّرة المدفوعة بالأحداث — أنماط التكامل التكامل المدفوع بالأحداث ليس مجرد نمط "
+      "body": "--- id: track-09-lesson-16 title: \"الخدمات المصغّرة القائمة على الأحداث — أنماط التكامل\" slug: event-driven-microservices track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 16 difficulty: advanced estimatedMinutes: 85 status: published tags: [event-driven, microservices, event-mesh, choreography, decoupling] prerequisites: [\"track-09-lesson-01\", \"track-09-lesson-06\", \"track-09-lesson-15\"] --- الخدمات المصغّرة المدفوعة بالأحداث — أنماط التكامل التكامل المدفوع بالأحداث لي"
     },
     {
       "id": "track-09-lesson-17",
@@ -4100,7 +4100,7 @@
         "JMX",
         "Prometheus"
       ],
-      "body": "--- id: track-09-lesson-17 title: \"مراقبة Kafka — تأخر المستهلكين ومقاييس الوسطاء\" slug: kafka-monitoring track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 17 difficulty: advanced estimatedMinutes: 70 status: published tags: [Kafka, monitoring, consumer-lag, JMX, Prometheus] prerequisites: [kafka-architecture, kafka-consumer] --- مراقبة Kafka — تأخر المستهلكين ومقاييس الوسطاء الصحة التشغيلية لـ Kafka غير مرئية دون مراقبة فعالة. فمجموعة المستهلكين التي تتأخر — تعالج الم"
+      "body": "--- id: track-09-lesson-17 title: \"مراقبة Kafka — تأخر المستهلكين ومقاييس الوسطاء\" slug: kafka-monitoring track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 17 difficulty: advanced estimatedMinutes: 70 status: published tags: [Kafka, monitoring, consumer-lag, JMX, Prometheus] prerequisites: [\"track-09-lesson-01\", \"track-09-lesson-03\"] --- مراقبة Kafka — تأخر المستهلكين ومقاييس الوسطاء الصحة التشغيلية لـ Kafka غير مرئية دون مراقبة فعالة. فمجموعة المستهلكين التي تتأخر — ت"
     },
     {
       "id": "track-09-lesson-18",
@@ -4120,7 +4120,7 @@
         "global-order",
         "sequence-number"
       ],
-      "body": "--- id: track-09-lesson-18 title: \"ترتيب الرسائل — الضمانات الشاملة مقابل ضمانات القسم\" slug: message-ordering track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 18 difficulty: advanced estimatedMinutes: 75 status: published tags: [message-ordering, partition-key, global-order, sequence-number] prerequisites: [kafka-architecture, kafka-producer, kafka-consumer] --- ترتيب الرسائل — الضمانات الشاملة مقابل ضمانات مستوى القسم تضمن Kafka ترتيبًا صارمًا داخل القسم، لكن ليس عب"
+      "body": "--- id: track-09-lesson-18 title: \"ترتيب الرسائل — الضمانات الشاملة مقابل ضمانات القسم\" slug: message-ordering track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 18 difficulty: advanced estimatedMinutes: 75 status: published tags: [message-ordering, partition-key, global-order, sequence-number] prerequisites: [\"track-09-lesson-01\", \"track-09-lesson-02\", \"track-09-lesson-03\"] --- ترتيب الرسائل — الضمانات الشاملة مقابل ضمانات مستوى القسم تضمن Kafka ترتيبًا صارمًا داخل الق"
     },
     {
       "id": "track-09-lesson-19",
@@ -4141,7 +4141,7 @@
         "queue",
         "log"
       ],
-      "body": "--- id: track-09-lesson-19 title: \"RabbitMQ أم Kafka — اختيار الوسيط المناسب\" slug: rabbitmq-vs-kafka track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 19 difficulty: advanced estimatedMinutes: 75 status: published tags: [RabbitMQ, Kafka, comparison, queue, log] prerequisites: [kafka-architecture] --- ‏RabbitMQ مقابل Kafka — اختيار الوسيط الصحيح ‏Kafka وRabbitMQ كلاهما وسيط رسائل ممتاز، لكنهما يحلان مشكلات مختلفة. والاختيار الخاطئ يسبب احتكاكًا معماريًا لسنوات. واستخدا"
+      "body": "--- id: track-09-lesson-19 title: \"RabbitMQ أم Kafka — اختيار الوسيط المناسب\" slug: rabbitmq-vs-kafka track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 19 difficulty: advanced estimatedMinutes: 75 status: published tags: [RabbitMQ, Kafka, comparison, queue, log] prerequisites: [\"track-09-lesson-01\"] --- ‏RabbitMQ مقابل Kafka — اختيار الوسيط الصحيح ‏Kafka وRabbitMQ كلاهما وسيط رسائل ممتاز، لكنهما يحلان مشكلات مختلفة. والاختيار الخاطئ يسبب احتكاكًا معماريًا لسنوات. واستخ"
     },
     {
       "id": "track-09-lesson-20",
@@ -4162,7 +4162,7 @@
         "staff-engineer",
         "broker"
       ],
-      "body": "--- id: track-09-lesson-20 title: \"إطار المهندس الرئيسي لقرارات أنظمة الرسائل\" slug: messaging-decision-framework track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 20 difficulty: principal estimatedMinutes: 65 status: published tags: [decision-framework, messaging, trade-offs, staff-engineer, broker] prerequisites: [kafka-architecture, rabbitmq-vs-kafka, kafka-security, kafka-performance] --- إطار قرارات المراسلة للمهندس الرئيسي بصفتك مهندسًا رئيسيًا أو مهندس طاقم (sta"
+      "body": "--- id: track-09-lesson-20 title: \"إطار المهندس الرئيسي لقرارات أنظمة الرسائل\" slug: messaging-decision-framework track: track-09 trackName: \"الرسائل وتدفق البيانات وتكامل الأنظمة\" sequence: 20 difficulty: principal estimatedMinutes: 65 status: published tags: [decision-framework, messaging, trade-offs, staff-engineer, broker] prerequisites: [\"track-09-lesson-01\", \"track-09-lesson-19\", \"track-09-lesson-12\", \"track-09-lesson-13\"] --- إطار قرارات المراسلة للمهندس الرئيسي بصفتك مهندسًا رئيسيًا أو م"
     },
     {
       "id": "track-10-lesson-01",
@@ -4441,7 +4441,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Disaster Recovery on Kubernetes — Backup and Restore A Kubernetes cluster without a tested disaster recovery plan is an operational liability. For financial services regulated under PCI-DSS Requirement 12.3.3, backup testing is not optional — it must be performed regularly and results documented. This lesson covers what must be backed up, how to back it up, and how to verify that recovery actually works before you need it. DR Objectives for Kubernetes 1.1 RTO and RPO Definitions Recovery Time Ob"
+      "body": "--- id: track-10-lesson-15 title: \"التعافي من الكوارث على Kubernetes — النسخ الاحتياطي والاستعادة\" slug: k8s-disaster-recovery track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 15 difficulty: advanced estimatedMinutes: 75 status: published tags: - disaster-recovery - Velero - backup - RTO - RPO - etcd - Kubernetes --- التعافي من الكوارث على Kubernetes — النسخ الاحتياطي والاستعادة عنقود Kubernetes دون خطة تعافٍ من الكوارث مختبرة عبء تشغيلي. وللخدمات المالية الخاضعة للت"
     },
     {
       "id": "track-10-lesson-16",
@@ -4462,7 +4462,7 @@
         "staff-engineer",
         "platform"
       ],
-      "body": "Principal Engineer's Cloud Architecture Decision Framework > [!NOTE] > The most dangerous phrase in cloud architecture is \"we'll use the managed service because it's simpler.\" Sometimes this is correct. Sometimes it trades one set of problems for another that is harder to debug at 3am, more expensive at scale, or introduces a compliance gap that only surfaces during an audit. A principal engineer's value is in making these trade-offs visible and deliberate — not defaulting to the latest AWS anno"
+      "body": "--- id: track-10-lesson-16 title: \"إطار المهندس الرئيسي لقرارات البنية السحابية\" slug: cloud-decision-framework track: track-10 trackName: \"السحابة والبنية التحتية وهندسة المنصات\" sequence: 16 difficulty: principal estimatedMinutes: 65 status: published tags: [decision-framework, cloud, trade-offs, staff-engineer, platform] prerequisites: [] --- إطار قرارات البنية السحابية للمهندس الرئيسي أخطر عبارة في البنية السحابية هي \"سنستخدم الخدمة المُدارة لأنها أبسط\". أحيانًا يكون هذا صحيحًا. وأحيانًا يست"
     },
     {
       "id": "track-11-lesson-01",
@@ -4483,7 +4483,7 @@
         "metrics",
         "logs"
       ],
-      "body": "OpenTelemetry — Instrumentation for Financial Services > [!NOTE] > OpenTelemetry is the CNCF standard for observability instrumentation. For financial services, it provides the unified telemetry foundation for understanding distributed payment flows, meeting audit requirements, and diagnosing production incidents. The Three Pillars of Observability Observability is the ability to understand a system's internal state from its external outputs. | Pillar | What It Answers | OTEL Signal | |---|---|-"
+      "body": "--- id: track-11-lesson-01 title: \"OpenTelemetry — القياس والتتبّع للخدمات المالية\" slug: opentelemetry track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 1 difficulty: advanced estimatedMinutes: 85 status: published tags: [OpenTelemetry, OTEL, traces, metrics, logs] prerequisites: [] --- ‏OpenTelemetry — التجهيز للرصد في الخدمات المالية ‏OpenTelemetry معيار CNCF لتجهيز الأنظمة للرصد (instrumentation). وللخدمات المالية، يوفر أساس القياس عن بُعد الموحد لفهم تدفقات الدفع ا"
     },
     {
       "id": "track-11-lesson-02",
@@ -4504,7 +4504,7 @@
         "sampling",
         "correlation-id"
       ],
-      "body": "Distributed Tracing — Causality, Sampling, and Analysis > [!NOTE] > Distributed tracing is the difference between guessing where latency lives and knowing exactly which service, database call, or external dependency added 400 ms to your P99 payment response time. At principal-engineer level you must own not just the instrumentation but the sampling strategy, storage cost, and the analysis workflow your team uses during incidents. The OpenTelemetry Tracing Model A trace represents the full journe"
+      "body": "--- id: track-11-lesson-02 title: \"التتبع الموزع — السببية وأخذ العينات والتحليل\" slug: distributed-tracing track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 2 difficulty: advanced estimatedMinutes: 80 status: published tags: [distributed-tracing, Jaeger, Zipkin, sampling, correlation-id] prerequisites: [track-11-lesson-01] --- التتبع الموزع — السببية، وأخذ العينات، والتحليل التتبع الموزع هو الفرق بين تخمين مكان الزمن الضائع ومعرفة أي خدمة، أو استدعاء قاعدة بيانات، أو ا"
     },
     {
       "id": "track-11-lesson-03",
@@ -4519,7 +4519,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Prometheus and PromQL — Metrics for Financial Systems Prometheus is the de-facto standard for metrics in cloud-native financial systems. Its pull-based scraping model, multi-dimensional data model, and powerful query language (PromQL) make it indispensable for observing payment pipelines, detecting SLA breaches, and driving automated alerting. This lesson covers everything from metric type selection to production-grade alerting rules for real financial workloads. Why Prometheus for Fintech? Fina"
+      "body": "--- id: track-11-lesson-03 title: \"Prometheus وPromQL — مقاييس الأنظمة المالية\" slug: prometheus-promql track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 3 difficulty: advanced estimatedMinutes: 75 status: published tags: - Prometheus - PromQL - metrics - counter - gauge - histogram - alerting prerequisites: - track-11-lesson-02 --- ‏Prometheus وPromQL — المقاييس للأنظمة المالية ‏Prometheus المعيار الفعلي للمقاييس في الأنظمة المالية السحابية الأصلية. ونموذج الجمع بالسحب"
     },
     {
       "id": "track-11-lesson-04",
@@ -4534,7 +4534,7 @@
       "estimatedMinutes": 65,
       "status": "published",
       "tags": "",
-      "body": "Grafana Dashboards — Visualising Financial System Health Prometheus gives you the data. Grafana gives you the story. For a payment platform, that story must answer three questions at a glance: how fast is money moving, how much is failing, and how slow is it getting? This lesson builds production-grade Grafana dashboards using the RED method, implements SLO burn-rate alerting, correlates logs via Loki, and codifies dashboards as infrastructure. The RED Method for Financial Services The RED metho"
+      "body": "--- id: track-11-lesson-04 title: \"لوحات Grafana — تصوير سلامة الأنظمة المالية\" slug: grafana-dashboards track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 4 difficulty: advanced estimatedMinutes: 65 status: published tags: - Grafana - dashboard - SLO - RED-method - alerting - Loki prerequisites: - track-11-lesson-03 --- لوحات Grafana — تصوّر صحة النظام المالي يعطيك Prometheus البيانات. ويعطيك Grafana القصة. ولمنصة دفع، يجب أن تجيب هذه القصة بلمحة عن ثلاثة أسئلة: ما سرعة"
     },
     {
       "id": "track-11-lesson-05",
@@ -4555,7 +4555,7 @@
         "ELK",
         "Loki"
       ],
-      "body": "Structured Logging — Correlation and Search at Scale > [!NOTE] > In a financial system processing 50,000 transactions per second, unstructured logs are useless. The engineer investigating a failed wire transfer should be able to run one query and see every log line across all services that touched that transaction, in order, with full context. That capability requires structured logging, consistent correlation IDs, and a log platform that can search a billion log lines in under 5 seconds. Struct"
+      "body": "--- id: track-11-lesson-05 title: \"السجلات المنظّمة — الربط والبحث على نطاق واسع\" slug: structured-logging track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 5 difficulty: advanced estimatedMinutes: 75 status: published tags: [structured-logging, JSON, correlation-id, ELK, Loki] prerequisites: [track-11-lesson-01] --- التسجيل المنظم — الربط والبحث على نطاق واسع في نظام مالي يعالج 50,000 معاملة في الثانية، السجلات غير المنظمة عديمة الفائدة. ويجب أن يستطيع المهندس الذي يحق"
     },
     {
       "id": "track-11-lesson-06",
@@ -4576,7 +4576,7 @@
         "JFR",
         "jcmd"
       ],
-      "body": "JVM Diagnostics — Thread Dumps and Heap Analysis in Production > [!NOTE] > When a payment service starts responding slowly or leaking memory in production, you have minutes—not hours—to diagnose the problem without restarting the JVM and losing the evidence. Mastering JVM diagnostics tools is the difference between a 15-minute resolution and a multi-hour outage. Why JVM Diagnostics Matter in Fintech Production JVM issues in payment systems are uniquely high-stakes. A thread pool exhausted by slo"
+      "body": "--- id: track-11-lesson-06 title: \"تشخيص JVM — تفريغ الخيوط وتحليل الكومة في بيئة الإنتاج\" slug: jvm-diagnostics track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 6 difficulty: advanced estimatedMinutes: 80 status: published tags: [JVM-diagnostics, thread-dump, heap-dump, JFR, jcmd] prerequisites: [track-11-lesson-05] --- تشخيص JVM — تفريغات الخيوط وتحليل الكومة في الإنتاج حين تبدأ خدمة دفع في الاستجابة ببطء أو تسريب الذاكرة في الإنتاج، يكون لديك دقائق — لا ساعات — لتشخ"
     },
     {
       "id": "track-11-lesson-07",
@@ -4597,7 +4597,7 @@
         "multi-window",
         "alert-fatigue"
       ],
-      "body": "SLO-Based Alerting — Burn Rate and Alert Fatigue > [!NOTE] > Threshold-based alerts (\"error rate > 1%\") fire independently of your SLO, causing alert fatigue when the threshold is irrelevant and silence when it matters. Burn rate alerting fires precisely when your error budget is being consumed faster than sustainable—giving you advance warning proportional to business impact. The Problem with Threshold-Based Alerting Traditional alerting asks: \"Is this metric above a threshold right now?\" This "
+      "body": "--- id: track-11-lesson-07 title: \"التنبيه القائم على SLO — معدل الاستهلاك وإرهاق التنبيهات\" slug: slo-alerting track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 7 difficulty: advanced estimatedMinutes: 75 status: published tags: [SLO, alerting, burn-rate, multi-window, alert-fatigue] prerequisites: [track-11-lesson-06] --- التنبيه القائم على أهداف مستوى الخدمة — معدل الحرق وإرهاق التنبيهات تنطلق التنبيهات القائمة على العتبات (\"معدل الأخطاء 1%\") باستقلال عن هدف مستوى ال"
     },
     {
       "id": "track-11-lesson-08",
@@ -4618,7 +4618,7 @@
         "P1",
         "escalation"
       ],
-      "body": "Incident Response — On-Call Playbooks and Runbooks > [!NOTE] > A payment system incident at 2am is not the time to improvise. The difference between a 15-minute resolution and a 3-hour outage is almost always preparation: runbooks written in advance, escalation paths documented, communication templates ready, and regulatory obligations understood before the pressure is on. The Incident Response Lifecycle Every payment system incident follows the same lifecycle, regardless of cause or severity: |"
+      "body": "--- id: track-11-lesson-08 title: \"الاستجابة للحوادث — أدلة المناوبة وكتيّبات التشغيل\" slug: incident-response track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 8 difficulty: advanced estimatedMinutes: 75 status: published tags: [incident-response, runbook, playbook, P1, escalation] prerequisites: [track-11-lesson-07] --- الاستجابة للحوادث — أدلة المناوبة وأدلة التشغيل حادث في نظام دفع عند الثانية فجرًا ليس وقت الارتجال. والفرق بين حل في 15 دقيقة وانقطاع 3 ساعات يكاد يك"
     },
     {
       "id": "track-11-lesson-09",
@@ -4633,7 +4633,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "Zero-Trust Security — Identity-Based Access for Microservices Traditional network security draws a perimeter around the data center and assumes everything inside is trusted. For modern fintech microservices distributed across cloud regions, that assumption is fatal. A single compromised service can laterally move across the entire internal network. Zero-trust replaces perimeter faith with continuous verification of identity, context, and intent — every request, every time. Zero-Trust Principles "
+      "body": "--- id: track-11-lesson-09 title: \"أمان انعدام الثقة — الوصول القائم على الهوية للخدمات المصغّرة\" slug: zero-trust-security track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 9 difficulty: advanced estimatedMinutes: 80 status: published tags: - zero-trust - SPIFFE - SPIRE - mTLS - Vault - NetworkPolicy - identity prerequisites: - track-11-lesson-08 --- أمان الثقة الصفرية — وصول قائم على الهوية للخدمات المصغّرة يرسم أمان الشبكات التقليدي محيطًا حول مركز البيانات ويفترض أن"
     },
     {
       "id": "track-11-lesson-10",
@@ -4654,7 +4654,7 @@
         "token-validation",
         "PKCE"
       ],
-      "body": "OAuth2 and JWT — Token-Based Authentication Patterns > [!NOTE] > OAuth2 and JWT are ubiquitous in fintech APIs, but most implementations get the security-critical details wrong: tokens too long-lived, audience validation missing, JWK cache misconfigured. For payment operations, a compromised or replayed token is a direct financial risk. OAuth2 Grant Types for Financial Services Different scenarios in fintech require different OAuth2 grant types. Using the wrong one is a security vulnerability. A"
+      "body": "--- id: track-11-lesson-10 title: \"OAuth2 وJWT — أنماط المصادقة بالرموز\" slug: oauth2-jwt track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 10 difficulty: advanced estimatedMinutes: 80 status: published tags: [OAuth2, JWT, OIDC, token-validation, PKCE] prerequisites: [track-11-lesson-09] --- ‏OAuth2 وJWT — أنماط المصادقة القائمة على الرموز ‏OAuth2 وJWT منتشران في كل مكان في واجهات التقنية المالية، لكن معظم التنفيذات تخطئ في التفاصيل الحرجة أمنيًا: رموز طويلة العمر جدًا،"
     },
     {
       "id": "track-11-lesson-11",
@@ -4675,7 +4675,7 @@
         "rate-limiting",
         "OWASP"
       ],
-      "body": "API Security — Rate Limiting, Input Validation, and WAF > [!NOTE] > Payment APIs are high-value targets. A single unvalidated input field can expose the entire transaction database. A missing rate limit can enable credential stuffing or card testing at scale. Defense-in-depth across WAF, API gateway, and application layers is not over-engineering—it is the minimum bar for a financial service API. API Security Layers Security for financial APIs must be applied at multiple independent layers. Each"
+      "body": "--- id: track-11-lesson-11 title: \"أمان الواجهات البرمجية — تحديد المعدّل والتحقق من المدخلات وWAF\" slug: api-security track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 11 difficulty: advanced estimatedMinutes: 80 status: published tags: [API-security, WAF, input-validation, rate-limiting, OWASP] prerequisites: [track-11-lesson-10] --- أمان الواجهات — تحديد المعدل، والتحقق من المدخلات، وجدار حماية تطبيقات الويب واجهات الدفع أهداف عالية القيمة. فحقل إدخال واحد غير متحقق "
     },
     {
       "id": "track-11-lesson-12",
@@ -4690,7 +4690,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "mTLS in Practice — Certificate Rotation and SPIFFE An expired certificate in a payment service is not a theoretical risk — it is a production outage. In 2021 a major payments processor suffered a 90-minute outage because a TLS certificate expired without automated renewal. This lesson covers the mechanics of mutual TLS, automated certificate rotation using SPIRE and cert-manager, Vault PKI integration, and monitoring for certificate expiry before it becomes an incident. mTLS Mechanics Standard T"
+      "body": "--- id: track-11-lesson-12 title: \"mTLS عمليًا — تدوير الشهادات وSPIFFE\" slug: mtls-certificate-rotation track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 12 difficulty: advanced estimatedMinutes: 75 status: published tags: - mTLS - certificate - SPIFFE - SPIRE - cert-manager - rotation - PKI prerequisites: - track-11-lesson-09 - track-11-lesson-11 --- ‏mTLS عمليًا — تدوير الشهادات وSPIFFE الشهادة المنتهية في خدمة دفع ليست خطرًا نظريًا — بل انقطاع إنتاجي. ومن الأمثلة ال"
     },
     {
       "id": "track-11-lesson-13",
@@ -4705,7 +4705,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "OWASP Top 10 — Financial Services Threat Landscape The OWASP Top 10 is not a list of theoretical vulnerabilities — in fintech, every category has caused real financial losses. Broken access control exposes customer payment histories. SQL injection exfiltrates account credentials. SSRF allows attackers to pivot into internal systems from a webhook handler. This lesson maps every OWASP Top 10 category to concrete fintech attack scenarios, shows the vulnerable Java code, and provides the production"
+      "body": "--- id: track-11-lesson-13 title: \"OWASP Top 10 — مشهد التهديدات في الخدمات المالية\" slug: owasp-top-10-fintech track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 13 difficulty: advanced estimatedMinutes: 70 status: published tags: - OWASP - SQL-injection - broken-access-control - SSRF - cryptographic-failures - fintech prerequisites: - track-11-lesson-12 --- ‏OWASP Top 10 — مشهد التهديدات في الخدمات المالية قائمة OWASP Top 10 ليست قائمة ثغرات نظرية — ففي التقنية المالية"
     },
     {
       "id": "track-11-lesson-14",
@@ -4720,7 +4720,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Penetration Testing — Financial API Security Assessment Penetration testing (pentesting) is the practice of simulating adversarial attacks against your own systems to discover vulnerabilities before malicious actors do. In financial services, where the cost of a breach can be regulatory fines, customer compensation, and permanent reputation damage, structured pentesting is not optional — it is a compliance requirement under PCI-DSS, FCA, and most national cyber-resilience frameworks. This lesson"
+      "body": "--- id: track-11-lesson-14 title: \"اختبار الاختراق — تقييم أمان الواجهات البرمجية المالية\" slug: penetration-testing-fintech track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 14 difficulty: advanced estimatedMinutes: 70 status: published tags: - penetration-testing - API-security - OWASP-API-Top-10 - DAST - burp-suite - BOLA --- اختبار الاختراق — تقييم أمان الواجهات المالية اختبار الاختراق (pentesting) هو ممارسة محاكاة هجمات عدائية ضد أنظمتك لاكتشاف الثغرات قبل أن يكتشف"
     },
     {
       "id": "track-11-lesson-15",
@@ -4741,7 +4741,7 @@
         "Splunk",
         "detection"
       ],
-      "body": "SIEM and Security Events — Correlating Financial Logs > [!NOTE] > Individual security events are noise. A single failed login attempt is unremarkable. Five failed logins for 200 different accounts from one IP in 60 seconds is a credential stuffing attack. SIEM systems exist to find these patterns across millions of events that no human could review manually. SIEM Architecture for Financial Services A SIEM is effective only if the events flowing into it are structured, consistent, and contain the"
+      "body": "--- id: track-11-lesson-15 title: \"SIEM والأحداث الأمنية — ربط السجلات المالية\" slug: siem track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 15 difficulty: advanced estimatedMinutes: 75 status: published tags: [SIEM, security-events, correlation, Splunk, detection] prerequisites: [track-11-lesson-14] --- ‏SIEM والأحداث الأمنية — ربط السجلات المالية الأحداث الأمنية المنفردة ضجيج. فمحاولة تسجيل دخول فاشلة واحدة أمر عادي. أما خمس محاولات فاشلة لـ 200 حساب مختلف من IP واحد "
     },
     {
       "id": "track-11-lesson-16",
@@ -4756,7 +4756,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Data Encryption — At-Rest and In-Transit for Finance Financial data at rest and in transit is subject to the most stringent protection requirements of any industry. PCI-DSS Requirement 3 mandates that Primary Account Numbers (PANs) are rendered unreadable anywhere they are stored. Requirement 4 mandates strong cryptography over open networks. GDPR requires appropriate technical measures for personal data. The FCA expects firms to protect sensitive customer information as a condition of authorisa"
+      "body": "--- id: track-11-lesson-16 title: \"تشفير البيانات — أثناء التخزين وأثناء النقل في القطاع المالي\" slug: data-encryption-finance track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 16 difficulty: advanced estimatedMinutes: 75 status: published tags: - encryption - AES-256 - TLS - HSM - key-management - Vault - field-encryption --- تشفير البيانات — أثناء التخزين وأثناء النقل في القطاع المالي تخضع البيانات المالية أثناء التخزين والنقل لأشد متطلبات الحماية صرامة بين كل القطاعا"
     },
     {
       "id": "track-11-lesson-17",
@@ -4777,7 +4777,7 @@
         "key-rotation",
         "AWS-KMS"
       ],
-      "body": "Key Management — HSM, KMS, and Envelope Encryption > [!NOTE] > Encryption is only as secure as your key management. A perfect AES-256-GCM implementation means nothing if the key is stored next to the data it protects. Key management is the hardest part of cryptography: getting keys to the right services without exposing them, rotating them without outages, and protecting them from insider threats. The Key Management Problem The fundamental challenge: your payment service needs an encryption key "
+      "body": "--- id: track-11-lesson-17 title: \"إدارة المفاتيح — HSM وKMS والتشفير المغلّف\" slug: key-management track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 17 difficulty: advanced estimatedMinutes: 75 status: published tags: [KMS, HSM, envelope-encryption, key-rotation, AWS-KMS] prerequisites: [track-11-lesson-16] --- إدارة المفاتيح — HSM وKMS والتشفير المغلّف لا يكون التشفير أكثر أمانًا من إدارة مفاتيحك. فتنفيذ AES-256-GCM مثالي لا يعني شيئًا إن خُزن المفتاح بجوار البيانات ا"
     },
     {
       "id": "track-11-lesson-18",
@@ -4798,7 +4798,7 @@
         "XXE",
         "Java"
       ],
-      "body": "Secure Coding Practices — Java Security Anti-Patterns > [!NOTE] > Security vulnerabilities are code quality issues. The same rigour applied to correctness and performance must be applied to security. This lesson maps the most dangerous Java anti-patterns to their financial impact, with before/after code examples for each. Anti-Pattern 1: String Concatenation SQL Risk: Complete database exposure. An attacker can read any table, modify balances, or drop tables. Anti-Pattern 2: Java Deserialization"
+      "body": "--- id: track-11-lesson-18 title: \"ممارسات البرمجة الآمنة — أنماط Java الأمنية الخاطئة\" slug: secure-coding track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 18 difficulty: advanced estimatedMinutes: 75 status: published tags: [secure-coding, SQL-injection, deserialization, XXE, Java] prerequisites: [track-11-lesson-17] --- ممارسات البرمجة الآمنة — أنماط Java الأمنية المضادة الثغرات الأمنية مشكلات في جودة الكود. فالصرامة نفسها المطبقة على الصحة والأداء يجب أن تُطبق على "
     },
     {
       "id": "track-11-lesson-19",
@@ -4819,7 +4819,7 @@
         "runbook",
         "DR-test"
       ],
-      "body": "Production Readiness Checklist — Launching Financial Services > [!NOTE] > A Production Readiness Review (PRR) is not a bureaucratic gate—it is an engineering quality gate that asks: \"Have we thought through every dimension of running this service in production?\" In financial services, the cost of launching unready is catastrophic: data loss, regulatory breach, customer harm. The checklist is cheap insurance. Why Financial Services Need Formal PRR Standard PRR practices from Google SRE and other "
+      "body": "--- id: track-11-lesson-19 title: \"قائمة الجاهزية لبيئة الإنتاج — إطلاق الخدمات المالية\" slug: production-readiness track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 19 difficulty: advanced estimatedMinutes: 75 status: published tags: [production-readiness, PRR, launch-checklist, runbook, DR-test] prerequisites: [track-11-lesson-18] --- قائمة تحقق الجاهزية للإنتاج — إطلاق الخدمات المالية مراجعة الجاهزية للإنتاج (PRR) ليست بوابة بيروقراطية — بل بوابة جودة هندسية تسأل: \"ه"
     },
     {
       "id": "track-11-lesson-20",
@@ -4834,7 +4834,7 @@
       "estimatedMinutes": 60,
       "status": "published",
       "tags": "",
-      "body": "Principal Engineer's Security & Observability Decision Framework A principal engineer operating in financial services is not primarily an implementer of security controls — they are the architect of a risk management system. The decisions they make determine which threats the organisation can detect and respond to, which vulnerabilities are acceptable for now, and how resources are allocated across preventive, detective, and corrective measures. This lesson provides frameworks for making those d"
+      "body": "--- id: track-11-lesson-20 title: \"إطار المهندس الرئيسي لقرارات الأمان والمراقبة\" slug: security-observability-decision-framework track: track-11 trackName: \"الأمان والمراقبة وهندسة بيئة الإنتاج\" sequence: 20 difficulty: principal estimatedMinutes: 60 status: published tags: - decision-framework - security - observability - threat-model - risk-assessment - STRIDE --- إطار قرارات الأمان وقابلية المراقبة للمهندس الرئيسي المهندس الرئيسي العامل في الخدمات المالية ليس أساسًا منفذًا للضوابط الأمنية — "
     },
     {
       "id": "track-12-lesson-01",
@@ -4855,7 +4855,7 @@
         "scope",
         "impact"
       ],
-      "body": "The Staff & Principal Engineer Operating Model > [!NOTE] > The transition to Staff and Principal engineer is not a promotion — it is a role change. The skills that made you a great Senior Engineer are necessary but not sufficient. This lesson defines the operating model: what you do, how you create impact, and how success is measured. The Levelling Gap Most engineers plateau at Senior level because the path forward requires a different kind of work. At Senior level, you: Solve technically comple"
+      "body": "--- id: track-12-lesson-01 title: \"نموذج عمل مهندس Staff وPrincipal\" slug: principal-operating-model track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 1 difficulty: principal estimatedMinutes: 85 status: published tags: [staff-engineer, principal-engineer, operating-model, scope, impact] prerequisites: [] --- نموذج عمل مهندس Staff ومهندس Principal الانتقال إلى مستوى مهندس Staff أو Principal ليس ترقية — بل تغيير في الدور. فالمهارات التي جعلتك مهندسًا أول (Senior) "
     },
     {
       "id": "track-12-lesson-02",
@@ -4876,7 +4876,7 @@
         "vision",
         "alignment"
       ],
-      "body": "Technical Strategy — Defining a 2-Year Engineering Roadmap > [!NOTE] > A technical strategy is not a list of projects. It is a coherent argument: given where the business is going, here is how our engineering organisation will evolve to support — and in some cases enable — that direction. Principal engineers own this argument. Why Technical Strategy Is a Principal Engineer Responsibility Most engineers think of strategy as something executives own. At the principal level, that assumption is wron"
+      "body": "--- id: track-12-lesson-02 title: \"الاستراتيجية التقنية — تحديد خارطة طريق هندسية لعامين\" slug: technical-strategy track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 2 difficulty: principal estimatedMinutes: 85 status: published tags: [technical-strategy, roadmap, OKR, vision, alignment] prerequisites: [] --- الاستراتيجية التقنية — وضع خارطة طريق هندسية لسنتين الاستراتيجية التقنية ليست قائمة مشاريع. بل حجة متماسكة: بالنظر إلى اتجاه الأعمال، هكذا ستتطور مؤسستنا اله"
     },
     {
       "id": "track-12-lesson-03",
@@ -4897,7 +4897,7 @@
         "review",
         "consensus"
       ],
-      "body": "The RFC Process — Driving Technical Decisions at Scale > [!NOTE] > An RFC (Request for Comments) is not a bureaucratic hurdle—it is the mechanism by which a principal engineer drives major technical decisions at scale without needing to be in every meeting. A well-written RFC creates alignment, surfaces concerns before implementation, and produces a durable record of why a decision was made. Why RFCs at the Principal Level As an individual contributor without direct reports, your influence over "
+      "body": "--- id: track-12-lesson-03 title: \"عملية RFC — قيادة القرارات التقنية على نطاق واسع\" slug: rfc-process track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 3 difficulty: principal estimatedMinutes: 80 status: published tags: [RFC, technical-decision, proposal, review, consensus] prerequisites: [track-12-lesson-02] --- عملية RFC — قيادة القرارات التقنية على نطاق واسع طلب التعليقات (RFC) ليس عقبة بيروقراطية — بل الآلية التي يقود بها المهندس الرئيسي القرارات التقنية ال"
     },
     {
       "id": "track-12-lesson-04",
@@ -4920,7 +4920,7 @@
         "RFC",
         "governance"
       ],
-      "body": "ADRs in Practice — Building an Architecture Decision Culture > [!NOTE] > Architecture Decision Records are the archaeology of your codebase. Without them, every new engineer—and every returning engineer who has forgotten—makes the same costly explorations, reaches the same conclusions, and sometimes makes the same expensive mistakes that you already paid for once. At principal level, your ability to create and sustain a decision-recording culture is as important as the technical quality of your "
+      "body": "--- id: track-12-lesson-04 title: \"سجلات ADR عمليًا — بناء ثقافة القرارات المعمارية\" slug: adr-practice track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 4 difficulty: principal estimatedMinutes: 75 status: published tags: [ADR, architecture-decision, culture, documentation, MADR, RFC, governance] prerequisites: [track-12-lesson-03] --- سجلات القرارات المعمارية عمليًا — بناء ثقافة لتوثيق القرارات المعمارية سجلات القرارات المعمارية (ADRs) هي علم آثار قاعدة الكود ل"
     },
     {
       "id": "track-12-lesson-05",
@@ -4941,7 +4941,7 @@
         "cruft",
         "refactoring"
       ],
-      "body": "Managing Technical Debt — Prioritisation and Paydown > [!NOTE] > Technical debt in financial services has a unique property: some of it is literally non-negotiable. Compliance debt (outdated encryption, missing audit logs, non-compliant data retention) is not a prioritisation question—it is a legal obligation. Understanding which debt is optional and which is mandatory changes how you have the conversation with product. Debt Taxonomy: Cunningham's Quadrant Ward Cunningham, who coined the term \"t"
+      "body": "--- id: track-12-lesson-05 title: \"إدارة الدَّين التقني — تحديد الأولويات والسداد\" slug: technical-debt track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 5 difficulty: principal estimatedMinutes: 75 status: published tags: [technical-debt, prioritisation, paydown, cruft, refactoring] prerequisites: [track-12-lesson-04] --- إدارة الدين التقني — ترتيب الأولويات والسداد للدين التقني في الخدمات المالية خاصية فريدة: بعضه غير قابل للتفاوض حرفيًا. فدين الامتثال (تشفير ق"
     },
     {
       "id": "track-12-lesson-06",
@@ -4962,7 +4962,7 @@
         "deployment-frequency",
         "lead-time"
       ],
-      "body": "Engineering Metrics — DORA, SPACE, and DevEx > [!NOTE] > Measuring engineering performance is genuinely hard. The wrong metrics destroy morale and incentivise gaming. The right metrics create a shared language for improvement. Principal engineers shape which metrics their organisation uses—and that choice has long-term consequences. Why Engineering Metrics Matter at Principal Level As a principal engineer, you are often in conversations about engineering effectiveness with: Engineering managers "
+      "body": "--- id: track-12-lesson-06 title: \"المقاييس الهندسية — DORA وSPACE وتجربة المطوّر\" slug: engineering-metrics track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 6 difficulty: principal estimatedMinutes: 75 status: published tags: [DORA, SPACE, DevEx, deployment-frequency, lead-time] prerequisites: [track-12-lesson-05] --- المقاييس الهندسية — DORA وSPACE وDevEx قياس الأداء الهندسي صعب حقًا. فالمقاييس الخاطئة تدمر المعنويات وتحفّز التلاعب. والمقاييس الصحيحة تخلق لغة "
     },
     {
       "id": "track-12-lesson-07",
@@ -4983,7 +4983,7 @@
         "feedback",
         "1:1"
       ],
-      "body": "Mentoring Senior Engineers — Growing Technical Talent > [!NOTE] > Mentoring senior engineers is the highest-leverage activity available to a principal engineer. Each senior engineer you help grow to staff level multiplies your impact across the entire organisation. It is also among the most difficult—senior engineers have strong opinions, established habits, and clear ideas about their own trajectory. Mentoring vs Coaching: Know Which Mode You're In These terms are often used interchangeably but"
+      "body": "--- id: track-12-lesson-07 title: \"توجيه المهندسين الكبار — تنمية المواهب التقنية\" slug: mentoring track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 7 difficulty: principal estimatedMinutes: 70 status: published tags: [mentoring, coaching, growth, feedback, 1:1] prerequisites: [track-12-lesson-06] --- توجيه المهندسين الأوائل — تنمية المواهب التقنية توجيه المهندسين الأوائل (Senior) هو أعلى الأنشطة أثرًا المتاحة للمهندس الرئيسي. فكل مهندس أول تساعده على النمو إلى م"
     },
     {
       "id": "track-12-lesson-08",
@@ -4998,7 +4998,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Cross-Team Influence — Driving Change Without Authority The principal engineer's most common misconception is that technical correctness creates organisational change. It does not. You can be completely right about the best technical approach and still fail to change anything, because organisations do not make decisions based on technical merit alone. They make decisions based on trust, relationships, priorities, and politics. This lesson is about the operational reality of driving technical cha"
+      "body": "--- id: track-12-lesson-08 title: \"التأثير عبر الفرق — قيادة التغيير بدون سلطة مباشرة\" slug: cross-team-influence track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 8 difficulty: principal estimatedMinutes: 70 status: published tags: - influence - cross-team - stakeholder-management - RFC - alignment - change-management --- التأثير بين الفرق — قيادة التغيير دون سلطة أكثر المفاهيم الخاطئة شيوعًا لدى المهندس الرئيسي أن الصحة التقنية تصنع التغيير المؤسسي. وهي لا تفعل"
     },
     {
       "id": "track-12-lesson-09",
@@ -5019,7 +5019,7 @@
         "feedback",
         "standards"
       ],
-      "body": "Technical Reviews — Code, Design, and Architecture Reviews > [!NOTE] > A principal engineer's review carries disproportionate weight. Engineers look to your comments to understand what good looks like. When you flag something, teams pay attention. When you approve something with reservations, teams remember that too. The quality of your reviews shapes your organisation's technical standards more than any document you can write. The Principal Engineer's Role in Reviews There is a spectrum of revi"
+      "body": "--- id: track-12-lesson-09 title: \"المراجعات التقنية — مراجعة الشيفرة والتصميم والبنية\" slug: technical-reviews track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 9 difficulty: principal estimatedMinutes: 70 status: published tags: [code-review, design-review, architecture-review, feedback, standards] prerequisites: [track-12-lesson-08] --- المراجعات التقنية — مراجعات الكود والتصميم والبنية لمراجعة المهندس الرئيسي وزن غير متناسب. فالمهندسون ينظرون إلى تعليقاتك ليف"
     },
     {
       "id": "track-12-lesson-10",
@@ -5040,7 +5040,7 @@
         "adopt",
         "hold"
       ],
-      "body": "Technology Radar — Assess, Trial, Adopt, Hold > [!NOTE] > Without a technology radar, technology decisions are made individually by each team, producing fragmentation: 12 teams using 8 different HTTP clients, 4 different testing frameworks, and 3 different approaches to secrets management. The radar is the principal engineer's instrument for creating coherence without uniformity. The ThoughtWorks Technology Radar Model ThoughtWorks publishes a Technology Radar biannually. The model is worth adop"
+      "body": "--- id: track-12-lesson-10 title: \"رادار التقنيات — التقييم والتجربة والاعتماد والتعليق\" slug: technology-radar track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 10 difficulty: principal estimatedMinutes: 70 status: published tags: [technology-radar, ThoughtWorks, assess, adopt, hold] prerequisites: [track-12-lesson-09] --- رادار التقنيات — قيّم، جرّب، اعتمد، أوقف دون رادار للتقنيات، يتخذ كل فريق قرارات التقنية بمفرده، فينتج التشتت: 12 فريقًا يستخدمون 8 عملاء HTT"
     },
     {
       "id": "track-12-lesson-11",
@@ -5061,7 +5061,7 @@
         "postmortem",
         "blameless"
       ],
-      "body": "Incident Leadership — Command and Communication > [!NOTE] > The difference between a 15-minute resolution and a 3-hour outage in a payment system is usually not technical capability—the engineers in the room have the skills. It is leadership: clear roles, structured communication, calm decision-making under pressure. These are learnable skills that principal engineers must develop. The Incident Commander Role The incident commander (IC) is not the person who fixes the problem. The IC is the pers"
+      "body": "--- id: track-12-lesson-11 title: \"قيادة الحوادث — القيادة والتواصل\" slug: incident-leadership track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 11 difficulty: principal estimatedMinutes: 75 status: published tags: [incident-leadership, incident-commander, communication, postmortem, blameless] prerequisites: [track-12-lesson-10] --- قيادة الحوادث — القيادة والتواصل الفرق بين حل في 15 دقيقة وانقطاع لثلاث ساعات في نظام دفع عادة ليس القدرة التقنية — فالمهندسون في ال"
     },
     {
       "id": "track-12-lesson-12",
@@ -5082,7 +5082,7 @@
         "vendor",
         "total-cost"
       ],
-      "body": "Build vs Buy vs Open Source — The Principal Decision > [!NOTE] > The build vs buy decision is one of the most consequential a principal engineer makes. Build the wrong thing and you spend years maintaining it instead of shipping features. Buy the wrong thing and you have vendor lock-in, compliance problems, or a capability gap that the vendor will never fill. The framework in this lesson does not give you the answer—it gives you the questions to ask. The Three-Way Decision Most framing of this d"
+      "body": "--- id: track-12-lesson-12 title: \"البناء أم الشراء أم المصدر المفتوح — قرار المهندس الرئيسي\" slug: build-vs-buy track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 12 difficulty: principal estimatedMinutes: 70 status: published tags: [build-vs-buy, open-source, make-or-buy, vendor, total-cost] prerequisites: [track-12-lesson-11] --- البناء مقابل الشراء مقابل المصدر المفتوح — قرار المهندس الرئيسي قرار البناء مقابل الشراء من أكثر القرارات التي يتخذها المهندس الرئيسي"
     },
     {
       "id": "track-12-lesson-13",
@@ -5097,7 +5097,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Technical Interviewing — Hiring for Principal-Level Roles Hiring a principal engineer is one of the highest-leverage decisions an engineering organisation makes. A strong principal engineer elevates the technical quality, decision-making, and culture of multiple teams simultaneously. A weak hire — particularly one who is technically strong but organisationally ineffective, or one who sets a low bar for quality — can damage an organisation for years. The challenge is that principal-level hiring r"
+      "body": "--- id: track-12-lesson-13 title: \"المقابلات التقنية — التوظيف لأدوار المهندس الرئيسي\" slug: technical-interviewing track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 13 difficulty: principal estimatedMinutes: 70 status: published tags: - interviewing - system-design - hiring - evaluation - bar-raiser - calibration --- المقابلات التقنية — التوظيف لأدوار المستوى الرئيسي توظيف مهندس رئيسي من أعلى القرارات أثرًا التي تتخذها مؤسسة هندسية. فالمهندس الرئيسي القوي يرفع ا"
     },
     {
       "id": "track-12-lesson-14",
@@ -5118,7 +5118,7 @@
         "IC-track",
         "scope"
       ],
-      "body": "Career Framework — Navigating the Principal Engineer Path > [!NOTE] > The principal engineer career path is defined by ambiguity. Unlike the transition from junior to senior — where the criteria are relatively clear — moving from senior to staff to principal requires a different kind of visibility, a different relationship with risk, and a willingness to work at scope that has no clear owner. This lesson covers how to understand, navigate, and accelerate that path. The Individual Contributor Lad"
+      "body": "--- id: track-12-lesson-14 title: \"إطار المسار المهني — التقدّم في مسار المهندس الرئيسي\" slug: career-framework track: track-12 trackName: \"القيادة الهندسية على مستوى Staff وPrincipal\" sequence: 14 difficulty: principal estimatedMinutes: 75 status: published tags: [career, levelling, promotion, IC-track, scope] prerequisites: [track-12-lesson-13] --- إطار المسار المهني — التنقل في مسار المهندس الرئيسي يتسم مسار المهندس الرئيسي بالغموض. فعلى خلاف الانتقال من مبتدئ إلى أول (Senior) — حيث المعايير "
     },
     {
       "id": "track-13-lesson-01",
@@ -5133,7 +5133,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Overview Spring Boot 4.0 is the most disruptive major release since the 2.x-to-3.x jump. It raises the Java baseline from 17 to 21, moves entirely onto Spring Framework 7, and adopts Jakarta EE 11 as its servlet and persistence baseline. For fintech engineering teams running payment processors, ledger services, or risk engines on Spring Boot 3.x, the upgrade path requires deliberate planning: the namespace changes are mechanical, but the shifts in auto-configuration loading, AOT compilation requ"
+      "body": "--- id: \"track-13-lesson-01\" title: \"Spring Boot 4 — ما الذي تغيّر منذ 3.x\" track: \"track-13\" track-name: \"Spring Boot 4 لمهندسي التقنية المالية\" sequence: 1 slug: \"sb4-changes\" difficulty: \"advanced\" estimated-minutes: 75 status: \"published\" last-updated: \"2026-11-12\" prerequisites: [] tags: - \"spring-boot-4\" - \"graalvm\" - \"aot\" - \"jakarta-ee\" - \"migration\" components: mermaid: true prism: true knowledge-check: true practical-challenge: true references: - \"Spring Boot 4.0 Release Notes\" - \"Spri"
     },
     {
       "id": "track-13-lesson-02",
@@ -5148,7 +5148,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Spring Framework 7 — New Baseline Features Spring Framework 7 is the foundation of Spring Boot 4. Most of the user-visible changes live at the SF7 layer: a production-ready declarative HTTP client, a new blocking that supersedes , a significantly improved AOT metadata pipeline, the first-class API, and test annotation renames. This lesson covers each in depth with fintech-grade code examples. HTTP Interfaces ( ) — Production-Ready Declarative HTTP Before SF7, teams writing microservice clients f"
+      "body": "--- id: \"track-13-lesson-02\" title: \"Spring Framework 7 — ميزات الأساس الجديد\" track: \"track-13\" trackName: \"Spring Boot 4 لمهندسي التقنية المالية\" sequence: 2 slug: \"spring-framework-7\" difficulty: \"advanced\" estimatedMinutes: 70 status: \"published\" lastUpdated: \"2026-11-12\" prerequisites: - \"track-13-lesson-01\" tags: - \"spring-framework-7\" - \"http-interfaces\" - \"rfc9110\" - \"jakarta-ee11\" - \"observability\" - \"aot\" topics: - \"HTTP Interfaces (@HttpExchange) production-ready\" - \"RestClient — the "
     },
     {
       "id": "track-13-lesson-03",
@@ -5163,7 +5163,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Overview Virtual threads (Project Loom, finalized in Java 21 via JEP 444) change the fundamental cost model for I/O-bound concurrent Java applications. A platform thread consumes approximately 1 MB of OS stack memory and requires an OS context switch on blocking — meaning a service handling 10,000 concurrent requests needs 10,000 platform threads and 10 GB of stack memory, plus enormous scheduling overhead. A virtual thread is a JVM-managed construct scheduled on a small pool of carrier platform"
+      "body": "--- id: \"track-13-lesson-03\" title: \"دمج الخيوط الافتراضية في Spring Boot 4\" track: \"track-13\" track-name: \"Spring Boot 4 لمهندسي التقنية المالية\" sequence: 3 slug: \"virtual-threads-sb4\" difficulty: \"advanced\" estimated-minutes: 75 status: \"published\" last-updated: \"2026-11-12\" prerequisites: [] tags: - \"virtual-threads\" - \"java-21\" - \"spring-boot-4\" - \"loom\" - \"tomcat\" - \"async\" components: mermaid: true prism: true knowledge-check: true practical-challenge: true references: - \"Spring Boot 4.0 "
     },
     {
       "id": "track-13-lesson-04",
@@ -5178,7 +5178,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Spring Data 4 — JDBC, JPA, and Redis Spring Data 4 ships with Spring Boot 4 and brings three significant changes: Hibernate 7 as the JPA provider (with virtual-thread safety and record entity support), revised repository hierarchy recommendations, and Spring Data Redis 4 backed by Lettuce 6 (which eliminates Netty pinning issues with virtual threads). This lesson covers each module with production fintech examples. Spring Data JPA 4 + Hibernate 7 Hibernate 7 is the first Hibernate release that i"
+      "body": "--- id: \"track-13-lesson-04\" title: \"Spring Data 4 — JDBC وJPA وRedis\" track: \"track-13\" trackName: \"Spring Boot 4 لمهندسي التقنية المالية\" sequence: 4 slug: \"spring-data-4\" difficulty: \"advanced\" estimatedMinutes: 70 status: \"published\" lastUpdated: \"2026-11-12\" prerequisites: - \"track-13-lesson-01\" tags: - \"spring-data-4\" - \"spring-data-jpa\" - \"spring-data-jdbc\" - \"spring-data-redis\" - \"repositories\" - \"hibernate-7\" - \"lettuce-6\" topics: - \"Spring Data JPA 4 + Hibernate 7 migration\" - \"Records"
     },
     {
       "id": "track-13-lesson-05",
@@ -5193,7 +5193,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Spring Security 7 — OAuth2, JWT, and Authorization Server Spring Security 7 ships with Spring Framework 7 and Spring Boot 4. If you have been running a fintech service on Spring Boot 3.x with Spring Security 6.x, the migration surface is smaller than the 5→6 jump — but several APIs that were deprecated in SS6 are now removed, and the lambda DSL is no longer optional. This lesson covers exactly what changed and why, then builds toward a production-grade OAuth2 setup that you would use at Revolut-"
+      "body": "--- id: \"track-13-lesson-05\" title: \"Spring Security 7 — OAuth2 وJWT\" track: \"track-13\" trackName: \"Spring Boot 4 لمهندسي التقنية المالية\" sequence: 5 slug: \"spring-security-7\" difficulty: \"advanced\" estimatedMinutes: 75 status: \"published\" lastUpdated: \"2026-11-12\" prerequisites: - \"track-13-lesson-01\" tags: - \"spring-security-7\" - \"oauth2\" - \"jwt\" - \"resource-server\" - \"authorization-server\" - \"method-security\" topics: - \"Spring Security 7 changes from 6.x\" - \"SecurityFilterChain configuration"
     },
     {
       "id": "track-13-lesson-06",
@@ -5208,7 +5208,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Spring Kafka 4 — Configuration and Exactly-Once Semantics Apache Kafka 4.0 completes the KRaft (Kafka Raft Metadata) transition — ZooKeeper is not just deprecated, it is gone. Spring Kafka 4 (SK4) aligns with this and ships several API cleanups that matter for fintech services processing millions of payment events daily. This lesson focuses on what broke, what improved, and how to implement exactly-once semantics across a PostgreSQL write and a Kafka publish. KRaft — ZooKeeper Is Gone What Disap"
+      "body": "--- id: \"track-13-lesson-06\" title: \"Spring Kafka 4 — الإعداد والمعالجة مرة واحدة فقط\" track: \"track-13\" trackName: \"Spring Boot 4 لمهندسي التقنية المالية\" sequence: 6 slug: \"spring-kafka-4\" difficulty: \"advanced\" estimatedMinutes: 70 status: \"published\" lastUpdated: \"2026-11-12\" prerequisites: - \"track-13-lesson-01\" tags: - \"spring-kafka-4\" - \"kafka-4\" - \"eos\" - \"transactions\" - \"exactly-once\" - \"kraft\" - \"consumer-group\" - \"dead-letter\" topics: - \"KRaft mode — ZooKeeper removed\" - \"KafkaTempla"
     },
     {
       "id": "track-13-lesson-07",
@@ -5223,7 +5223,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Migrating a Spring Boot 3.x Payment Service to 4.x This lesson is a step-by-step migration walkthrough, not a conceptual overview. The target is a production payment service running Spring Boot 3.3.x that processes FPS (Faster Payments) transactions, stores to PostgreSQL, publishes to Kafka, and uses Spring Security with JWT. By the end, every class compiles and all tests pass under Spring Boot 4. Pre-Migration State of the Service Step 1: Pre-Migration Checklist Before touching : 1.1 Verify Jav"
+      "body": "--- id: \"track-13-lesson-07\" title: \"الترحيل من Spring Boot 3.x إلى 4.x\" track: \"track-13\" trackName: \"Spring Boot 4 لمهندسي التقنية المالية\" sequence: 7 slug: \"migration-guide\" difficulty: \"advanced\" estimatedMinutes: 75 status: \"published\" lastUpdated: \"2026-11-12\" prerequisites: - \"track-13-lesson-01\" - \"track-13-lesson-02\" - \"track-13-lesson-03\" tags: - \"migration\" - \"spring-boot-4\" - \"breaking-changes\" - \"deprecation\" - \"upgrade\" - \"pom\" topics: - \"Pre-migration checklist\" - \"POM/Gradle ver"
     },
     {
       "id": "track-13-lesson-08",
@@ -5238,7 +5238,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Spring Boot 4 Testing — Slices, Testcontainers, and Observability Effective testing is the difference between a service you can refactor confidently and one you are afraid to touch. Spring Boot 4 ships with a testing story that is meaningfully better than SB3: replaces the Boot-specific , eliminates manual container property wiring, and lets you assert on observability signals. This lesson covers everything needed to write a production-quality test suite for a fintech payment service. and Spring"
+      "body": "--- id: \"track-13-lesson-08\" title: \"الاختبار في Spring Boot 4 — اختبارات الشرائح وTestcontainers\" track: \"track-13\" trackName: \"Spring Boot 4 لمهندسي التقنية المالية\" sequence: 8 slug: \"testing\" difficulty: \"advanced\" estimatedMinutes: 70 status: \"published\" lastUpdated: \"2026-11-12\" prerequisites: - \"track-13-lesson-01\" tags: - \"testing\" - \"spring-boot-4\" - \"testcontainers\" - \"slices\" - \"mockito-5\" - \"wiremock\" - \"observability-testing\" topics: - \"@MockitoBean and @MockitoSpyBean\" - \"Test slic"
     },
     {
       "id": "track-14-lesson-01",
@@ -5260,7 +5260,7 @@
         "trade-offs",
         "fintech"
       ],
-      "body": "In one minute Every design problem in this track uses the same eight steps, RESHADED: Requirements, Estimation, Schema, High-level design, API, Deep dive, Evaluate, Deliver. The steps keep you from the two classic failures: designing before you know the problem, and running out of time before showing depth. In fintech, depth almost always means correctness under failure: no double charges, no lost money, every movement provable. This lesson teaches each step on one small example. The problem les"
+      "body": "--- id: \"track-14-lesson-01\" title: \"إطار تصميم الأنظمة لمقابلات التقنية المالية (RESHADED)\" track: \"track-14\" trackName: \"تصميم الأنظمة لمقابلات التقنية المالية\" sequence: 1 slug: \"system-design-framework\" difficulty: \"senior\" estimatedMinutes: 60 status: \"published\" lastUpdated: \"2026-11-13\" prerequisites: [] tags: [\"system-design\", \"interviews\", \"framework\", \"reshaded\", \"trade-offs\", \"fintech\"] references: - \"Martin Kleppmann, Designing Data-Intensive Applications (O'Reilly, 2017)\" - \"Alex Xu"
     },
     {
       "id": "track-14-lesson-02",
@@ -5282,7 +5282,7 @@
         "estimation",
         "schema"
       ],
-      "body": "In one minute \"Design a payment service that lets merchants charge customers through an external payment provider (PSP).\" Part 1 covers the first 24 minutes: requirements, estimates, schema, the high-level design with the happy path, and the API. The design hinges on one fact you should say early: a call to a PSP can end in an unknown outcome, so every step must be safe to retry and every payment must be traceable to a final state. Part 2 does the deep dives and failure handling. The runnable ve"
+      "body": "--- id: \"track-14-lesson-02\" title: \"تصميم خدمة معالجة مدفوعات، الجزء 1: من المتطلبات إلى الواجهة البرمجية\" track: \"track-14\" trackName: \"تصميم الأنظمة لمقابلات التقنية المالية\" sequence: 2 slug: \"payment-service-part1\" difficulty: \"senior\" estimatedMinutes: 70 status: \"published\" lastUpdated: \"2026-11-13\" prerequisites: [\"track-14-lesson-01\"] tags: [\"system-design\", \"payments\", \"idempotency\", \"api-design\", \"estimation\", \"schema\"] references: - \"RFC 9457: Problem Details for HTTP APIs (IETF, 202"
     },
     {
       "id": "track-14-lesson-03",
@@ -5304,7 +5304,7 @@
         "failure-modes",
         "slo"
       ],
-      "body": "In one minute Minutes 24–45 of the payment-service round. Two deep dives: (1) exactly-once effects (idempotency key claim, outbox, idempotent consumers) and (2) unknown PSP outcomes (timeouts, the state, inquiry, reconciliation). Then a failure-mode table, consistency and security notes, SLIs/SLOs and the 60-second pitch. The rule underneath it all: an outcome you don't know is not a failure; it is a state you must resolve. Analogy If you post a cheque and hear nothing, you don't write a second "
+      "body": "--- id: \"track-14-lesson-03\" title: \"تصميم خدمة معالجة مدفوعات، الجزء 2: التعمق والأعطال وأهداف مستوى الخدمة\" track: \"track-14\" trackName: \"تصميم الأنظمة لمقابلات التقنية المالية\" sequence: 3 slug: \"payment-service-part2\" difficulty: \"senior\" estimatedMinutes: 75 status: \"published\" lastUpdated: \"2026-11-13\" prerequisites: [\"track-14-lesson-02\"] tags: [\"system-design\", \"payments\", \"outbox\", \"idempotency\", \"failure-modes\", \"slo\"] references: - \"Martin Kleppmann, Designing Data-Intensive Applicati"
     },
     {
       "id": "track-14-lesson-04",
@@ -5326,7 +5326,7 @@
         "feature-store",
         "fallback"
       ],
-      "body": "In one minute \"Design a system that scores every card payment for fraud before it is approved.\" Two paths: a synchronous scoring path inside the authorisation latency budget (rules + model on pre-computed features, tens of milliseconds), and an asynchronous path that computes features from the event stream, monitors after the fact and feeds labels (chargebacks, confirmed fraud) back into training. The interview is won on three things: the latency budget, what happens when scoring is slow or down"
+      "body": "--- id: \"track-14-lesson-04\" title: \"تصميم منظومة لكشف الاحتيال في الوقت الفعلي\" track: \"track-14\" trackName: \"تصميم الأنظمة لمقابلات التقنية المالية\" sequence: 4 slug: \"fraud-detection-pipeline\" difficulty: \"senior\" estimatedMinutes: 75 status: \"published\" lastUpdated: \"2026-11-13\" prerequisites: [\"track-14-lesson-01\"] tags: [\"system-design\", \"fraud\", \"streaming\", \"latency-budget\", \"feature-store\", \"fallback\"] references: - \"Apache Kafka documentation: Kafka Streams windowing (kafka.apache.org/"
     },
     {
       "id": "track-14-lesson-05",
@@ -5348,7 +5348,7 @@
         "event-sourcing",
         "hot-accounts"
       ],
-      "body": "In one minute \"Design the ledger that records every money movement for a bank-like app.\" The core is double-entry: every entry's postings sum to zero per currency, balances derive from postings, and nothing is ever updated or deleted. At scale the hard parts are concurrency on hot accounts, sharding without losing atomicity, and reads (balances and statements) that don't slow the write path. The fundamentals are taught in Track 05; this lesson is how you present and scale them in 45 minutes. Cap"
+      "body": "--- id: \"track-14-lesson-05\" title: \"تصميم دفتر أستاذ مالي على نطاق واسع\" track: \"track-14\" trackName: \"تصميم الأنظمة لمقابلات التقنية المالية\" sequence: 5 slug: \"financial-ledger-at-scale\" difficulty: \"senior\" estimatedMinutes: 75 status: \"published\" lastUpdated: \"2026-11-13\" prerequisites: [\"track-14-lesson-01\", \"track-05-lesson-01\"] tags: [\"system-design\", \"ledger\", \"double-entry\", \"sharding\", \"event-sourcing\", \"hot-accounts\"] references: - \"Martin Kleppmann, Designing Data-Intensive Applicat"
     },
     {
       "id": "track-14-lesson-06",
@@ -5370,7 +5370,7 @@
         "multi-tenant",
         "429"
       ],
-      "body": "In one minute \"Design rate limiting for a public payments API used by many tenants.\" Limits protect the platform and make sharing fair: one tenant's burst or retry bug must not hurt the others. Use a token bucket per tenant (bursts allowed up to a capacity, steady refill rate), with the state in a shared store (Redis) and the read-refill-take step made atomic by a Lua script. Then decide, explicitly, what happens when the limiter itself fails. Capstone 5 is the tested implementation. Analogy A t"
+      "body": "--- id: \"track-14-lesson-06\" title: \"تصميم محدِّد معدّل موزع لواجهة مدفوعات\" track: \"track-14\" trackName: \"تصميم الأنظمة لمقابلات التقنية المالية\" sequence: 6 slug: \"rate-limiter-payment-api\" difficulty: \"senior\" estimatedMinutes: 70 status: \"published\" lastUpdated: \"2026-11-13\" prerequisites: [\"track-14-lesson-01\"] tags: [\"system-design\", \"rate-limiting\", \"token-bucket\", \"redis\", \"multi-tenant\", \"429\"] references: - \"RFC 6585: Additional HTTP Status Codes, section 4 (429 Too Many Requests) (IET"
     },
     {
       "id": "track-14-lesson-07",
@@ -5394,7 +5394,7 @@
         "cards",
         "p2p"
       ],
-      "body": "In one minute Six frequently asked problems, each as a compact RESHADED answer you can expand to 45 minutes: requirements, one estimate line, key schema, a diagram, the API, the two hardest points, a short failure table and a pitch. Four of them have a full, tested implementation in the capstones. Use those for depth and this lesson for breadth. Spend about 10 minutes per problem: read it, then say the pitch aloud without notes. Analogy Chess openings: you don't memorise whole games, but you kno"
+      "body": "--- id: \"track-14-lesson-07\" title: \"ست مسائل تصميم إضافية مختصرة (المحفظة، التسوية، Webhooks، الصرف الأجنبي، الأقفال، البطاقات وP2P)\" track: \"track-14\" trackName: \"تصميم الأنظمة لمقابلات التقنية المالية\" sequence: 7 slug: \"common-fintech-system-design-problems\" difficulty: \"senior\" estimatedMinutes: 75 status: \"published\" lastUpdated: \"2026-11-13\" prerequisites: [\"track-14-lesson-01\", \"track-14-lesson-03\"] tags: [\"system-design\", \"wallet\", \"reconciliation\", \"webhooks\", \"fx\", \"distributed-lock\","
     },
     {
       "id": "track-14-lesson-08",
@@ -5416,7 +5416,7 @@
         "database-choice",
         "cheat-sheet"
       ],
-      "body": "In one minute Three one-page references for every design round: a patterns catalogue (problem → pattern → cost → where it's taught), an estimation cheat sheet (the arithmetic and the orders of magnitude), and a database choice guide (which store for which job, and why PostgreSQL is the default for money). Mock interviews and rubrics live in Track 15 L5. This lesson no longer duplicates them. Analogy A pilot's quick-reference handbook: not for learning to fly, but for not forgetting a step under "
+      "body": "--- id: \"track-14-lesson-08\" title: \"مرجع: فهرس الأنماط، وورقة التقديرات السريعة، ودليل اختيار قاعدة البيانات\" track: \"track-14\" trackName: \"تصميم الأنظمة لمقابلات التقنية المالية\" sequence: 8 slug: \"system-design-reference\" difficulty: \"senior\" estimatedMinutes: 45 status: \"published\" lastUpdated: \"2026-11-13\" prerequisites: [\"track-14-lesson-01\"] tags: [\"system-design\", \"reference\", \"patterns\", \"estimation\", \"database-choice\", \"cheat-sheet\"] references: - \"Jeff Dean, 'Numbers Everyone Should K"
     },
     {
       "id": "track-15-lesson-01",
@@ -5437,7 +5437,7 @@
         "incident",
         "ownership"
       ],
-      "body": "In one minute Behavioural rounds test whether you behave like a senior engineer when things are hard: an incident, a disagreement, an unclear requirement, a junior who is stuck. You answer with short, true stories in the STAR shape (Situation, Task, Action, Result). Prepare six stories in advance, each told in two minutes. Most questions can be answered with one of them. The output of this lesson is a one-page story bank you rehearse aloud. Analogy A story bank is like a well-indexed code librar"
+      "body": "--- id: \"track-15-lesson-01\" title: \"قصص STAR لمقابلات مهندسي الأنظمة الخلفية\" track: \"track-15\" trackName: \"دليل المقابلات\" sequence: 1 slug: \"star-stories\" difficulty: \"senior\" estimatedMinutes: 50 status: \"published\" lastUpdated: \"2026-11-13\" tier: \"core\" prerequisites: [] tags: [\"behavioural\", \"star\", \"interview\", \"incident\", \"ownership\"] --- في دقيقة واحدة تختبر الجولات السلوكية ما إذا كنت تتصرف كمهندس أول حين تصعب الأمور: حادث، أو خلاف، أو متطلب غير واضح، أو مهندس مبتدئ متعثر. وتجيب بقصص ق"
     },
     {
       "id": "track-15-lesson-02",
@@ -5458,7 +5458,7 @@
         "trade-offs",
         "time-management"
       ],
-      "body": "In one minute A design round is a 45-minute conversation where you drive. Interviewers score structure, trade-offs and depth, not a \"correct\" diagram. Use a fixed time plan (RESHADED), say your assumptions aloud, do the arithmetic, and spend the second half on one or two deep dives where money can be lost (idempotency, consistency, failure handling). This lesson is the how to run the round checklist. The design patterns themselves are taught in Tracks 06 and 16. Analogy It is like a pilot's chec"
+      "body": "--- id: \"track-15-lesson-02\" title: \"إدارة جولة تصميم الأنظمة في 45 دقيقة\" track: \"track-15\" trackName: \"دليل المقابلات\" sequence: 2 slug: \"design-round\" difficulty: \"senior\" estimatedMinutes: 45 status: \"published\" lastUpdated: \"2026-11-13\" tier: \"core\" prerequisites: [\"track-14-lesson-01\"] tags: [\"system-design\", \"interview\", \"reshaded\", \"trade-offs\", \"time-management\"] --- في دقيقة واحدة جولة التصميم محادثة مدتها 45 دقيقة تقودها أنت . ويقيّم المُقابِلون البنية، والمقايضات، والعمق، لا مخططًا \""
     },
     {
       "id": "track-15-lesson-03",
@@ -5480,7 +5480,7 @@
         "jpa",
         "questions"
       ],
-      "body": "In one minute Thirty Java and Spring questions that come up again and again in senior backend interviews, each with a one-line answer you can expand, a level (W warm-up, S standard, D deep), and a ⚠ gotcha where candidates often slip. Use it for spaced revision: cover the answer column, say your answer aloud, then check. Every answer links to the lesson that teaches it properly. Analogy Flash cards for an exam you have already studied for: they don't teach, they find gaps fast. Diagram Build it "
+      "body": "--- id: \"track-15-lesson-03\" title: \"أهم 60 سؤالًا، الجزء 1: Java وSpring (30 سؤالًا)\" track: \"track-15\" trackName: \"دليل المقابلات\" sequence: 3 slug: \"top-questions-java-spring\" difficulty: \"senior\" estimatedMinutes: 60 status: \"published\" lastUpdated: \"2026-11-13\" tier: \"core\" prerequisites: [] tags: [\"interview\", \"java\", \"spring\", \"concurrency\", \"jpa\", \"questions\"] --- في دقيقة واحدة ثلاثون سؤالًا في Java وSpring تتكرر مرارًا في مقابلات مهندسي الأنظمة الخلفية الأوائل، لكل منها إجابة من سطر وا"
     },
     {
       "id": "track-15-lesson-04",
@@ -5502,7 +5502,7 @@
         "payments",
         "questions"
       ],
-      "body": "In one minute The second thirty: databases, Kafka, distributed systems, and payments domain questions. Same format: level (W/S/D), one-line answer, ⚠ gotcha, and a link to the lesson that teaches it. Fintech rounds return to the same core idea in many forms: money must move exactly once, and you must be able to prove it. Many answers here are variations of that. Analogy A pilot's emergency card: short, practised responses to the situations that recur. Diagram Build it step by step: the questions"
+      "body": "--- id: \"track-15-lesson-04\" title: \"أهم 60 سؤالًا، الجزء 2: البيانات والأنظمة الموزعة والتقنية المالية (30 سؤالًا)\" track: \"track-15\" trackName: \"دليل المقابلات\" sequence: 4 slug: \"top-questions-fintech-systems\" difficulty: \"senior\" estimatedMinutes: 60 status: \"published\" lastUpdated: \"2026-11-13\" tier: \"core\" prerequisites: [\"track-15-lesson-03\"] tags: [\"interview\", \"kafka\", \"postgresql\", \"distributed-systems\", \"payments\", \"questions\"] --- في دقيقة واحدة الثلاثون الثانية: قواعد البيانات، وKaf"
     },
     {
       "id": "track-15-lesson-05",
@@ -5524,7 +5524,7 @@
         "coding",
         "behavioural"
       ],
-      "body": "In one minute Ten mocks that mirror a senior fintech loop: four system design, two coding, two deep-dive, one behavioural, one project presentation. Reading this page takes about 35 minutes. Doing the mocks takes about 10 hours and is scheduled in weeks 27–30 of the study plan (the reserved mock/review time, not the lesson budget). Each mock has a fixed time, a prompt, the points a strong answer covers, and a 1–4 rubric. Record yourself or practise with a peer, score honestly, and redo any mock "
+      "body": "--- id: \"track-15-lesson-05\" title: \"عشر مقابلات تجريبية مؤقّتة مع معايير التقييم\" track: \"track-15\" trackName: \"دليل المقابلات\" sequence: 5 slug: \"mock-interviews\" difficulty: \"senior\" estimatedMinutes: 35 status: \"published\" lastUpdated: \"2026-11-13\" tier: \"core\" prerequisites: [\"track-15-lesson-01\", \"track-15-lesson-02\"] tags: [\"mock-interview\", \"rubric\", \"practice\", \"system-design\", \"coding\", \"behavioural\"] --- في دقيقة واحدة عشر مقابلات تجريبية تحاكي سلسلة مقابلات لمهندس أول في التقنية الما"
     },
     {
       "id": "track-16-lesson-01",
@@ -5545,7 +5545,7 @@
         "senior",
         "new-job"
       ],
-      "body": "In one minute A new senior engineer is judged early on two things: how fast they become useful, and whether they are safe to trust with production. Spend days 1–30 learning (people, systems, the money flow), days 31–60 delivering small safe changes and joining on-call, and days 61–90 owning something end to end. For the code itself, let the running application tell you what it is: Spring Boot Actuator's , and endpoints show the real wiring faster than reading packages. Analogy A new pilot on an "
+      "body": "--- id: \"track-16-lesson-01\" title: \"أول 90 يومًا لك وقراءة شيفرة Spring غير مألوفة\" track: \"track-16\" trackName: \"أول 90 يومًا\" sequence: 1 slug: \"first-90-days\" difficulty: \"senior\" estimatedMinutes: 50 status: \"published\" lastUpdated: \"2026-11-13\" tier: \"supporting\" prerequisites: [] tags: [\"onboarding\", \"spring-boot\", \"actuator\", \"senior\", \"new-job\"] --- في دقيقة واحدة يُحكم على المهندس الأول الجديد مبكرًا من خلال أمرين: مدى سرعة أن يصبح مفيدًا، وما إذا كان من الآمن الوثوق به في الإنتاج. فاق"
     },
     {
       "id": "track-16-lesson-02",
@@ -5567,7 +5567,7 @@
         "code-review",
         "senior"
       ],
-      "body": "In one minute Three habits make a new engineer safe in a payments codebase. Small, reversible PRs with tests and a rollback plan. On-call readiness: know the dashboards, alerts and runbooks before your first shift. Expand/contract database migrations, so schema changes never need downtime and never lock a hot table. Analogy Changing a running payment system is like changing a tyre on a moving car: you do it in small steps, each one safe on its own, and you never remove the old wheel before the n"
+      "body": "--- id: \"track-16-lesson-02\" title: \"السلامة في بيئة الإنتاج: أول طلب دمج، والاستعداد للمناوبة، والترحيل الآمن\" track: \"track-16\" trackName: \"أول 90 يومًا\" sequence: 2 slug: \"production-safety\" difficulty: \"senior\" estimatedMinutes: 45 status: \"published\" lastUpdated: \"2026-11-13\" tier: \"supporting\" prerequisites: [\"track-16-lesson-01\"] tags: [\"onboarding\", \"on-call\", \"flyway\", \"migrations\", \"code-review\", \"senior\"] --- في دقيقة واحدة ثلاث عادات تجعل المهندس الجديد آمنًا في قاعدة كود للمدفوعات. "
     },
     {
       "id": "lab-01",

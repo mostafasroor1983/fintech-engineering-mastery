@@ -327,8 +327,8 @@ ROI Framework (illustrative numbers):
    - Index approach wins: one-time cost, sustainable improvement
 ```
 
-```java
-// Document performance work with before/after measurements (illustrative)
+```sql
+-- Document performance work with before/after measurements (illustrative)
 /**
  * Performance optimization: Composite index on transactions(account_id, created_at)
  *

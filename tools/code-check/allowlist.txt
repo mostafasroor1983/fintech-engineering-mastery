@@ -1,0 +1,52 @@
+# Code blocks that are intentionally not valid on their own. Format: <lesson> <sha1>  # reason
+# Regenerate with: python3 tools/check_code_blocks.py --update-allowlist (then review the diff)
+track-01-lesson-13 2135787f54261929  # java L267: fragment mixing imports, members and statements (illustrative excerpt)
+track-02-lesson-10 f214afc001d19d99  # java L912: fragment mixing imports, members and statements (illustrative excerpt)
+track-02-lesson-12 b86a9545f13d52fc  # sql L562: Cassandra CQL, not PostgreSQL
+track-02-lesson-12 38734215d8622011  # sql L781: Cassandra CQL, not PostgreSQL
+track-02-lesson-15 a59790c3532fcbc6  # java L708: fragment mixing imports, members and statements (illustrative excerpt)
+track-02-lesson-18 53e96cb7a63cbc77  # sql L121: CockroachDB multi-region SQL
+track-03-lesson-01 6973f4f335e185e6  # java L284: fragment mixing imports, members and statements (illustrative excerpt)
+track-03-lesson-08 803894104c790b07  # java17 L334: fragment mixing imports, members and statements (illustrative excerpt)
+track-03-lesson-10 1ae1beb6a09de835  # java17 L71: constructor signature written as documentation (parameter types shown)
+track-03-lesson-10 a9ee4c2021fd29a6  # java17 L285: fragment mixing imports, members and statements (illustrative excerpt)
+track-03-lesson-11 0ee56578508e3fe0  # java17 L89: fragment mixing imports, members and statements (illustrative excerpt)
+track-03-lesson-14 d908302dcfcaf1f4  # java21 L127: fragment mixing imports, members and statements (illustrative excerpt)
+track-03-lesson-17 da06fedeb7a5424a  # java17 L154: JMH annotations shown on their own
+track-03-lesson-25 e750193c83422741  # java L87: fragment mixing imports, members and statements (illustrative excerpt)
+track-03-lesson-25 fbe0a34d49278e01  # java L564: fragment mixing imports, members and statements (illustrative excerpt)
+track-03-lesson-25 d36086283ac36aa8  # java L597: ThreadLocal and ScopedValue side by side (same field name on purpose)
+track-04-lesson-05 b03f44112f94a5e3  # java17 L554: fragment mixing imports, members and statements (illustrative excerpt)
+track-06-lesson-07 7e3a761ae2aee5b5  # sql L468: CockroachDB REGIONAL BY ROW
+track-07-lesson-01 bf9b4c0d534a8dc6  # java L211: fragment mixing imports, members and statements (illustrative excerpt)
+track-07-lesson-04 dedb1bfac8ee1905  # java L315: list of alternative JMH annotations
+track-07-lesson-04 ed29373f2e66eaeb  # java L411: JMH annotation shown on its own
+track-07-lesson-07 eb559a12fa4238cc  # sql L467: "..." placeholder for column values
+track-07-lesson-12 fd1d8730a015fc41  # java L214: fragment mixing imports, members and statements (illustrative excerpt)
+track-07-lesson-20 83a4a46f01bcb0b0  # java L290: fragment mixing imports, members and statements (illustrative excerpt)
+track-08-lesson-01 1fe6fc6e41b26206  # java L36: fragment mixing imports, members and statements (illustrative excerpt)
+track-08-lesson-07 d8539e4ab33caf32  # java L356: fragment mixing imports, members and statements (illustrative excerpt)
+track-08-lesson-09 14ba73b0f22f0b5a  # sql L266: "..." placeholder for index columns
+track-08-lesson-10 c9f40440637aff7d  # sql L137: psql session that starts with the shell command to connect
+track-08-lesson-12 92dd5d45f0fa074d  # sql L524: WHERE-clause fragments shown as alternatives
+track-08-lesson-16 6061b1af345ba055  # sql L533: "..." placeholder for other columns
+track-08-lesson-17 b517fc89bcf33320  # sql L149: "..." placeholder for other columns
+track-08-lesson-18 49a6258b065aac02  # sql L230: Athena / Glue Hive DDL
+track-08-lesson-20 cda5586bcf0a2b6c  # sql L108: pgbench script (\set meta-commands)
+track-08-lesson-20 e87ec80176cd08bc  # sql L136: pgbench script (\set meta-commands)
+track-08-lesson-20 a0bd3fc9d03581c0  # sql L181: pgbench script (\set meta-commands)
+track-08-lesson-21 2596dfecf6b46c13  # sql L61: CockroachDB session (USE)
+track-08-lesson-21 3328de1e7fe2a16c  # sql L204: Google Spanner DDL
+track-08-lesson-21 aa24c53eaf2fc7c0  # sql L308: CockroachDB multi-region SQL
+track-09-lesson-04 5ba88ec64b0757fd  # java L265: fragment mixing imports, members and statements (illustrative excerpt)
+track-09-lesson-05 262ffe14b189bc90  # java L238: fragment mixing imports, members and statements (illustrative excerpt)
+track-09-lesson-05 64d0512eaaffb9fa  # java L469: catch clause shown on its own
+track-09-lesson-06 29a78b929728c3ea  # sql L372: "..." placeholder for column values
+track-09-lesson-15 0d814edcb11b436e  # java L545: "..." placeholder in constructor arguments
+track-09-lesson-16 0609525fd52e29ba  # java L271: fragment mixing imports, members and statements (illustrative excerpt)
+track-11-lesson-06 c0923ecb97733d5c  # java L233: fragment mixing imports, members and statements (illustrative excerpt)
+track-11-lesson-06 2b2603a3abbd0b23  # sql L393: Eclipse MAT OQL, not SQL
+track-11-lesson-11 70a1aad54782a3fb  # java L216: "..." placeholder in method arguments
+track-11-lesson-18 d9375bd1b845e228  # java L124: fragment mixing imports, members and statements (illustrative excerpt)
+track-13-lesson-07 69a7639830b3789d  # java L253: fragment mixing imports, members and statements (illustrative excerpt)
+track-13-lesson-07 be610bc760c60f44  # java L265: fragment mixing imports, members and statements (illustrative excerpt)

@@ -271,3 +271,78 @@ proven with a load test."
 - [Part 2: deep dives, failures, SLOs](#/tracks/track-14/lessons/track-14-lesson-03)
 - [Capstone 1: payment service](#/capstone/payment-service)
 - [Track 05: Scenario B: duplicate payments](#/tracks/track-05/lessons/track-05-lesson-03)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1402-01",
+    "question": "Why must the call to the payment provider (PSP) not happen inside the database transaction?",
+    "options": [
+      "Databases cannot make HTTP calls",
+      "PSP latency would hold a connection per request and exhaust the pool, and a rollback cannot undo a charge the PSP already made",
+      "The PSP requires its own XA transaction",
+      "It would make the payment idempotent twice"
+    ],
+    "correct": 1,
+    "explanation": "The design is TX1 (durable intent) → PSP call outside any transaction → TX2 (result, ledger, outbox). Holding a transaction open across a slow external call exhausts connections, and the external charge isn't covered by the rollback anyway."
+  },
+  {
+    "id": "kc-1402-02",
+    "question": "Why use an Idempotency-Key header instead of just the merchant's order id?",
+    "options": [
+      "The key identifies one request attempt across retries and is scoped per merchant; order ids may be reused, missing or not unique across merchants",
+      "Order ids are too long to index",
+      "Headers are encrypted and the body is not",
+      "The PSP rejects order ids"
+    ],
+    "correct": 0,
+    "explanation": "Idempotency is a protocol concern: the key names one operation, whatever the business data. Scoping it per merchant avoids collisions between merchants."
+  },
+  {
+    "id": "kc-1402-03",
+    "question": "What does TX1, before the PSP call, store?",
+    "options": [
+      "Nothing: the payment row is written only after the PSP answers",
+      "Only an audit log line",
+      "The durable intent: the payment in a pending state and the claimed idempotency key, so a crash leaves a traceable record to resolve",
+      "The final ledger postings"
+    ],
+    "correct": 2,
+    "explanation": "If the process dies during the PSP call, the pending row (with the key and the PSP reference) is what lets a worker find the payment and resolve its real outcome later."
+  },
+  {
+    "id": "kc-1402-04",
+    "question": "How should the payment amount be stored?",
+    "options": [
+      "As a double with two decimals",
+      "As a formatted string like \"10.50 GBP\"",
+      "As a float with the currency in another table",
+      "As an integer in minor units (or a fixed-scale decimal) together with an ISO 4217 currency code"
+    ],
+    "correct": 3,
+    "explanation": "Binary floating point cannot represent most decimal amounts exactly. Minor units (1050 for 10.50 GBP) or a fixed-scale decimal plus an explicit currency avoid rounding drift."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1402",
+  "title": "Payment service: requirements to API",
+  "description": "Produce the first-half artefacts of the payment-service round as you would on a whiteboard.",
+  "tasks": [
+    {
+      "id": "pc-1402-01",
+      "description": "Write the estimation sheet from 10 million users to payments per second (average and peak) and storage per year, with every assumption stated."
+    },
+    {
+      "id": "pc-1402-02",
+      "description": "Write the DDL for payment, idempotency_key, ledger posting and outbox tables: amounts in minor units with a currency, a unique (merchant_id, idempotency_key), and a status check constraint."
+    },
+    {
+      "id": "pc-1402-03",
+      "description": "Specify the API: POST /v1/payments with Idempotency-Key and its 201/202/409/422 responses, GET /v1/payments/{id} with an ETag, and POST /v1/payments/{id}/refunds protected with If-Match. Use RFC 9457 problem details for errors."
+    }
+  ]
+}
+-->

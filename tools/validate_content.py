@@ -10,7 +10,11 @@ Checks:
   5. Main-path (Core + Supporting) total ≤ 260 h
   6. No single lesson exceeds 75 min (T05 exception: ≤ 100 min)
   7. All 24 T05 lessons are present and ≤ 100 min
-  8. Cross-check: search-index.json contains entry for each registered lesson
+  8. Cross-check: search-index.json contains entry for each registered lesson,
+     and its text still matches the lesson file (run rebuild_search_index.py if not)
+  9. Mermaid sequence diagrams contain no ';'
+  10. No colliding or unreferenced lesson folders
+  11. Arabic lessons (index.ar.md): code blocks identical to the English lesson; missing file = warning
 
 Usage:
     python3 tools/validate_content.py [--docs-dir docs] [--verbose]
@@ -173,7 +177,8 @@ def _check_capstones(docs_dir, tracks_meta, errors, warnings):
     for script, message in (
             ("build_capstone_pages.py", "Capstone pages out of sync with examples/*/README.md: run tools/build_capstone_pages.py"),
             ("sync_manifest_tiers.py", "Lesson tiers in _track.json out of sync with CORE/SUPPORTING sets: run tools/sync_manifest_tiers.py"),
-            ("build_study_plan.py", "Study plan invalid or out of date: run tools/build_study_plan.py")):
+            ("build_study_plan.py", "Study plan invalid or out of date: run tools/build_study_plan.py"),
+            ("i18n/build_study_plan_ar.py", "Arabic study plan out of date: run tools/i18n/build_study_plan_ar.py")):
         path = os.path.join(repo_root, "tools", script)
         if os.path.exists(path):
             result = subprocess.run([sys.executable, path, "--check"], capture_output=True, text=True)
@@ -202,6 +207,32 @@ def _parse_frontmatter(content):
     return fm
 
 
+def _index_body(md_path):
+    """The search text rebuild_search_index.py would produce for one lesson."""
+    global _rebuild
+    if _rebuild is None:
+        import importlib.util
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        spec = importlib.util.spec_from_file_location("rebuild_search_index", os.path.join(root, "rebuild_search_index.py"))
+        _rebuild = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_rebuild)
+    return _rebuild.get_lesson_body(md_path)
+
+
+_rebuild = None
+
+_FENCE = re.compile(r'^(```|~~~)[^\n]*\n.*?^\1[ \t]*$', re.M | re.S)
+
+
+def _code_blocks(md_path):
+    """Column-0 fenced blocks of a lesson body (the ones assemble_lesson.py copies)."""
+    with open(md_path, encoding="utf-8") as f:
+        text = f.read()
+    fm = re.match(r'^---\n.*?\n---\n', text, re.S)
+    body = text[fm.end():] if fm else text
+    return [m.group(0) for m in _FENCE.finditer(body)]
+
+
 def validate(docs_dir, verbose):
     errors = []
     warnings = []
@@ -224,11 +255,14 @@ def validate(docs_dir, verbose):
     # Load search index (for cross-check)
     # -----------------------------------------------------------------
     search_indexed_ids = set()
+    search_bodies = {}
     if os.path.exists(search_index_path):
         with open(search_index_path) as f:
             si = json.load(f)
         for doc in si.get("documents", []):
             search_indexed_ids.add(doc.get("id", ""))
+            if doc.get("type") == "lesson":
+                search_bodies[doc.get("id", "")] = doc.get("body", "")
     else:
         warnings.append(f"search-index.json not found at {search_index_path}")
 
@@ -338,7 +372,8 @@ def validate(docs_dir, verbose):
                 )
                 if severity == "ERROR":
                     errors.append(msg)
-                else:
+                elif lid in MAIN_PATH_IDS:
+                    # Optional lessons sit outside the time budget, so their length is not a problem
                     warnings.append(msg)
 
             # CHECK 5: Accumulate main-path minutes
@@ -350,6 +385,17 @@ def validate(docs_dir, verbose):
             # Cross-check search index
             if lid and lid not in search_indexed_ids:
                 warnings.append(f"[{lid}] Not found in search-index.json")
+            # CHECK 11: Arabic version keeps the English code byte for byte
+            ar_path = full_path[:-len("index.md")] + "index.ar.md" if full_path.endswith("index.md") else None
+            if ar_path and os.path.exists(full_path):
+                if not os.path.exists(ar_path):
+                    warnings.append(f"[{lid}] No Arabic version (index.ar.md); the site shows English")
+                elif _code_blocks(full_path) != _code_blocks(ar_path):
+                    errors.append(f"[{lid}] index.ar.md code blocks differ from index.md: re-run tools/i18n/assemble_lesson.py")
+
+            if lid in search_bodies and os.path.exists(full_path) \
+                    and _index_body(full_path) != search_bodies[lid]:
+                errors.append(f"[{lid}] search-index.json text is out of date: run python3 rebuild_search_index.py")
 
     # CHECK 4: Prerequisites reference known IDs
     for track_dir in track_dirs:
@@ -374,8 +420,8 @@ def validate(docs_dir, verbose):
                 if isinstance(prereqs, list):
                     for prereq_id in prereqs:
                         if prereq_id and prereq_id not in all_lesson_ids:
-                            warnings.append(
-                                f"[{lid}] Prerequisite '{prereq_id}' not found in any manifest"
+                            errors.append(
+                                f"[{lid}] Prerequisite '{prereq_id}' not found in any manifest (use a lesson id like track-09-lesson-01)"
                             )
 
     # CHECK 5: Total main-path hours
@@ -432,9 +478,13 @@ def main():
 
     errors, warnings = validate(docs_dir, args.verbose)
 
-    if args.verbose or warnings:
-        for w in warnings:
+    # Long main-path lessons are a known, accepted trade-off: list them only with --verbose
+    long_lessons = [w for w in warnings if "estimatedMinutes=" in w and "exceeds" in w]
+    for w in warnings:
+        if args.verbose or w not in long_lessons:
             print(f"  WARN  {w}")
+    if long_lessons and not args.verbose:
+        print(f"  NOTE  {len(long_lessons)} main-path lessons are longer than the 75-minute cap (--verbose lists them)")
 
     if errors:
         print(f"\n{'='*60}")

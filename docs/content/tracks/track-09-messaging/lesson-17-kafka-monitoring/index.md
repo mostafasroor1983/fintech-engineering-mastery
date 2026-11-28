@@ -9,7 +9,7 @@ difficulty: advanced
 estimatedMinutes: 70
 status: published
 tags: [Kafka, monitoring, consumer-lag, JMX, Prometheus]
-prerequisites: [kafka-architecture, kafka-consumer]
+prerequisites: ["track-09-lesson-01", "track-09-lesson-03"]
 ---
 
 # Kafka Monitoring — Consumer Lag and Broker Metrics
@@ -386,7 +386,7 @@ kafka-consumer-groups.sh \
 
 LinkedIn's **Burrow** is a dedicated Kafka consumer monitoring tool that evaluates consumer group health over time, instead of using fixed thresholds. (Check the project's current activity before adopting it; widely used alternatives are the Prometheus *Kafka Exporter* plus alert rules, or the lag views of managed Kafka services and Kafka UIs.)
 
-```yaml
+```toml
 # burrow.toml — Burrow configuration
 [zookeeper]
 servers=["zk1:2181", "zk2:2181", "zk3:2181"]

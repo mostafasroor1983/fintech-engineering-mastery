@@ -297,7 +297,7 @@ public class PoolExhaustionDetector {
 
 يضيف Java 21 تفريغ خيوط يشمل الخيوط الافتراضية، مجمّعة حسب **حاوية الخيوط** (منفّذ أو `StructuredTaskScope`). وتعتمد حقول JSON الدقيقة على إصدار JDK — فالإصدارات الأحدث تضيف تفاصيل أكثر عن الحالة والأقفال. مثال مبسّط:
 
-```java21
+```jsonc
 // Java 21 thread dump includes virtual threads
 // Use: jcmd <pid> Thread.dump_to_file -format=json threads.json
 
@@ -366,7 +366,7 @@ flowchart TD
     C -->|No| E[Transient — monitor for recurrence]
     D -->|All blocking on same lock| F[Pool exhaustion or\nlock contention bottleneck]
     D -->|Circular wait| G[Deadlock — fix lock ordering]
-    D -->|Waiting for external service\n(often RUNNABLE in socketRead)| H[Circuit breaker / timeout issue]
+    D -->|"Waiting for external service\n(often RUNNABLE in socketRead)"| H[Circuit breaker / timeout issue]
     D -->|All RUNNABLE, high CPU| I[CPU spinning — check for tight loops]
     F --> J[Add circuit breaker\nand timeout]
     G --> K[Fix lock ordering\nor use tryLock]

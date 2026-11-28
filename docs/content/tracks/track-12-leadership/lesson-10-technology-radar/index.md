@@ -25,7 +25,7 @@ ThoughtWorks publishes a Technology Radar biannually. The model is worth adoptin
 - **Techniques**: Development practices, processes (e.g., Feature Flags, Event Sourcing, Chaos Engineering)
 - **Tools**: Software tools and utilities (e.g., Semgrep, Grafana, OpenTelemetry)
 - **Platforms**: Runtime infrastructure (e.g., Kubernetes, Kafka, AWS EKS)
-- **Languages & Frameworks**: Programming languages and frameworks (e.g., Java 21, Spring Boot, Resilience4j)
+- **Languages & Frameworks**: Programming languages and frameworks (e.g., Java 25, Spring Boot, Resilience4j)
 
 **Four rings** (what your organisation should do with it):
 - **Adopt**: Industry default; use it. The standard for your context.
@@ -141,6 +141,12 @@ ADOPT:
     Why: PCI DSS Requirement 8.6 (service accounts); prevents lateral movement;
          eliminates shared credentials between services
 
+  Virtual Threads (Java 21+)
+    Why: Significantly improves throughput for I/O-bound services without
+         reactive programming model complexity
+    Note: Java 24+ removed the main pitfall (pinning inside synchronized
+          blocks, JEP 491); on Java 21, watch for pinning in older libraries
+
 TRIAL:
   Event Sourcing for Ledger Services
     Why: Natural fit for accounting (immutable audit trail);
@@ -148,15 +154,10 @@ TRIAL:
     Risk: Eventual consistency model requires careful design;
           CQRS adds complexity; team training required
 
-  Virtual Threads (Java 21 Project Loom)
-    Why: Significantly improves throughput for I/O-bound services without
-         reactive programming model complexity; production-ready in Java 21
-    Risk: Some libraries not virtual-thread-safe; emerging ecosystem support
-
 ASSESS:
   eBPF-Based Observability (Cilium, Hubble)
     Why: Zero-instrumentation observability; Kubernetes-native network visibility
-    Risk: Requires Kernel 5.4+; operational complexity; emerging tooling
+    Risk: Requires a recent Linux kernel; operational complexity; evolving tooling
     Wait for: More operational maturity; better documentation
 
   Rust for Payment-Critical Services
@@ -166,16 +167,16 @@ ASSESS:
 HOLD:
   Reactive Programming (WebFlux/Reactor) for new services
     Why: Complexity exceeds benefit for most payment services;
-         Virtual Threads (Java 21) achieve similar throughput benefits
+         Virtual Threads (Java 21+) achieve similar throughput benefits
          with far simpler programming model
     Existing services: continue operating; don't migrate unless actively causing problems
     New services: use Virtual Threads + standard Spring MVC instead
 
   Apache ZooKeeper for new use cases
-    Why: Kafka KRaft mode eliminates ZooKeeper dependency;
+    Why: Kafka 4.0 removed ZooKeeper support entirely (KRaft only);
          etcd better for other coordination use cases;
          operational complexity without commensurate benefit
-    Existing use: migrate to KRaft on next major Kafka upgrade
+    Existing use: migrate Kafka clusters to KRaft (on 3.9) before upgrading to 4.x
 
 PLATFORMS
 ─────────────────────────────────────────────────────────────
@@ -194,24 +195,26 @@ ADOPT:
 
 HOLD:
   AWS Lambda for Payment Processing
-    Why: Cold start latency incompatible with payment SLO (< 500ms p99);
-         limited local testing story; cold starts affect reliability metrics
+    Why: Cold start latency hard to reconcile with payment SLO (< 500ms p99)
+         even with SnapStart; limited local testing story; cold starts affect
+         reliability metrics
     Acceptable for: Non-payment workloads (batch reporting, notifications)
     Not for: Payment authorisation, real-time fraud scoring, settlement
 
 LANGUAGES & FRAMEWORKS
 ─────────────────────────────────────────────────────────────
 ADOPT:
-  Java 21 LTS with Virtual Threads
-    Why: LTS release; production-ready; Virtual Threads mature in this version
+  Java 25 LTS (Java 21 LTS still acceptable)
+    Why: Current LTS release; Virtual Threads without synchronized pinning
     Migration: Java 17 services should migrate by end of 2027
 
-  Spring Boot 3.x
-    Why: Team expertise; native image support; Spring Security 6
-    Note: Spring Boot 2.x reaches EOL; migrate existing services
+  Spring Boot 4.x
+    Why: Current generation (Spring Framework 7, Jakarta EE 11); JSpecify
+         null-safety; open-source support for Spring Boot 3.5 ended mid-2026
+    Note: Spring Boot 3.x services plan their upgrade; 2.x is on Hold
 
   Resilience4j 2.x for circuit breaking
-    Why: Replaces Hystrix (EOL); native integration with Spring Boot 3; Micrometer metrics
+    Why: Replaces Hystrix (EOL); integrates with Spring Boot; Micrometer metrics
 
 HOLD:
   Hystrix (Netflix)
@@ -219,7 +222,7 @@ HOLD:
     Migration required by: End of Q1 2027
 
   Spring Boot 2.x
-    Why: EOL November 2024; no security patches
+    Why: Open-source support ended November 2023; no free security patches
     Migration required by: Immediate for all PCI-scoped services
 ```
 
@@ -229,7 +232,7 @@ HOLD:
 
 A radar published and never referenced is wasted effort.
 
-**Interactive format**: ThoughtWorks publishes their radar as an interactive SVG. Use `radar.thoughtworks.com`'s build tool or `aoe/radar-generator` to create the same for your organisation.
+**Interactive format**: ThoughtWorks publishes their radar as an interactive visualisation. Use Thoughtworks' "Build Your Own Radar" tool or the open-source `zalando/tech-radar` to create the same for your organisation.
 
 **Linkable ring definitions**: Each entry in your radar should link to your internal documentation: why this ring, what alternatives were considered, compliance considerations.
 
@@ -244,10 +247,10 @@ A radar published and never referenced is wasted effort.
 The Hold ring is actionable—it means "migrate away from this." But migration requires a plan.
 
 ```markdown
-# Sunsetting Plan: Spring Boot 2.x → Spring Boot 3.x
+# Sunsetting Plan: Spring Boot 2.x → Spring Boot 4.x
 
-BACKGROUND: Spring Boot 2.x reached EOL November 2024.
-No security patches available. PCI DSS Requirement 6.3.3 mandates patching.
+BACKGROUND: Spring Boot 2.x open-source support ended November 2023.
+No free security patches available. PCI DSS Requirement 6.3.3 mandates patching.
 
 SCOPE:
   Services on Spring Boot 2.x: 14 services (audit: October 2026)
@@ -256,7 +259,8 @@ SCOPE:
 
 APPROACH:
   NOT a big-bang migration. Each team migrates their own services.
-  Spring provides a migration guide. Breaking changes are documented.
+  Spring provides migration guides. Services step through 3.5 (javax → jakarta,
+  Spring Security 6) and then to 4.x. Breaking changes are documented.
 
 TIMELINE:
   Q1 2027: All PCI-scoped services migrated (mandatory; compliance)
@@ -265,7 +269,7 @@ TIMELINE:
 
 SUPPORT:
   Platform team runs 2 workshops on common migration issues
-  ADR published: common patterns for migrating from Spring Boot 2 to 3
+  ADR published: common patterns for migrating from Spring Boot 2 to 3 to 4
   Principal engineer available for 30-minute consulting sessions
 
 SUCCESS CRITERIA:
@@ -282,7 +286,7 @@ SUCCESS CRITERIA:
 - Fintech adds compliance and security posture as explicit evaluation criteria: a technology that cannot satisfy PCI DSS requirements is Hold regardless of technical merit
 - Hold decisions are actionable, not just advisory—each Hold item needs a migration plan with timeline, owner, and success criteria
 - Publish the radar in an interactive format and reference it in architecture reviews, onboarding, and design discussions—a radar that nobody reads is expensive documentation
-- Virtual Threads (Java 21) in Adopt and reactive programming in Hold is a defensible position for fintech: simpler programming model achieves comparable throughput for I/O-bound payment services
+- Virtual Threads (Java 21+) in Adopt and reactive programming in Hold is a defensible position for fintech: simpler programming model achieves comparable throughput for I/O-bound payment services
 
 <!-- KNOWLEDGE-CHECK
 {

@@ -709,10 +709,10 @@ public class SettlementProcessManager {
 
 ```java
 // WRONG — stores an intent, not a fact
-eventStore.append("PaymentRequested", { accountId, amount });
+eventStore.append(new PaymentRequested(accountId, amount));
 
 // CORRECT — stores what happened
-eventStore.append("FundsWithdrawn", { accountId, amount, newBalance, timestamp });
+eventStore.append(new FundsWithdrawn(accountId, amount, newBalance, timestamp));
 ```
 
 الأمر طلب قد يفشل. والحدث واقعة لا يمكن التراجع عنها. خزّن الأحداث فقط.

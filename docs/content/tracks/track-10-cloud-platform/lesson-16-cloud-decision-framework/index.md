@@ -66,28 +66,33 @@ OPTION A: AWS RDS PostgreSQL (managed)
     + Multi-AZ failover in 60-120 seconds
     + Read replica creation via console
     + Performance Insights for query monitoring
-    - Limited visibility into PostgreSQL internals
-    - Cannot install custom extensions (unless Aurora compatible)
+    - Limited visibility into PostgreSQL internals (no superuser, no OS access)
+    - Only extensions on the RDS supported list (it includes PostGIS,
+      pgvector, pg_partman, pg_cron; not e.g. TimescaleDB or your own C
+      extensions -- Trusted Language Extensions cover some cases)
     - Maintenance windows: AWS may restart during scheduled maintenance
 
-  Financial cost (us-east-1, db.r6g.4xlarge, Multi-AZ, 1TB gp3):
-    Instance:  $1,643/month (On-Demand)
-    Storage:   $230/month (1TB gp3 @ $0.23/GB-month)
-    Backups:   $115/month (1TB @ $0.095/GB)
-    Total:     ~$2,000/month
-    1yr RI:    ~$1,400/month (-30%)
+  Financial cost (us-east-1, db.r6g.4xlarge, Multi-AZ, 1TB gp3) --
+  rough list prices; check the AWS pricing calculator:
+    Instance:  ~$2,400/month (On-Demand; Multi-AZ doubles the instance price)
+    Storage:   ~$230/month (1TB gp3, Multi-AZ @ ~$0.23/GB-month)
+    Backups:   included up to the database size; extra retention billed
+    Total:     ~$2,600/month
+    1yr RI:    ~$1,800/month (about -30%)
 
   Performance ceiling:
-    db.r6g.8xlarge: 32 vCPU, 256GB RAM
-    Max IOPS: 80,000 (io2)
+    Largest instances: e.g. db.r7i.48xlarge (192 vCPU, 1.5 TiB RAM)
+    io2 Block Express storage: up to 256,000 IOPS
     Read replicas: up to 15
 
   Compliance:
     + AWS encrypts at rest (KMS CMK supported)
     + AWS CloudTrail logs all API calls to RDS
     + Can restrict to VPC (no public endpoint)
-    - AWS has access to data for maintenance (BAA required for HIPAA/PCI)
-    - Shared responsibility model: you own data, AWS owns infrastructure
+    + AWS is a PCI-DSS Level 1 service provider (Attestation of Compliance
+      available in AWS Artifact); a BAA is the HIPAA equivalent
+    - Shared responsibility model: you own data, access control and
+      configuration; AWS owns the underlying infrastructure
 
   Failure mode:
     Multi-AZ: automatic failover to standby (60-120s)
@@ -101,16 +106,17 @@ OPTION B: PostgreSQL on Kubernetes (self-managed with Patroni or CloudNativePG)
     - Requires deep PostgreSQL expertise on the team
     - On-call must understand Patroni leader election and failover
     + Full control over PostgreSQL configuration
-    + Can install any extension (pg_partman, timescaledb, pgvector)
+    + Can install any extension (TimescaleDB, custom C extensions, ...)
     + Can tune to your exact workload
     + No maintenance windows imposed by AWS
 
   Financial cost (EKS, 3x c6i.4xlarge nodes dedicated to PG, 500GB EBS io2):
     Compute: 3 * $0.68/hr * 730hr = $1,490/month
-    Storage: 3 * 500GB * $0.125/GB (io2) = $188/month
+    Storage: 3 * 500GB * $0.125/GB (io2) = $188/month (+ provisioned IOPS)
     Snapshots: ~$50/month
-    Total: ~$1,730/month
-    Savings vs RDS: ~$270/month (not compelling)
+    Total: ~$1,730/month + IOPS
+    Savings vs RDS: ~$900/month -- far less than the cost of the engineering
+    time needed to run it safely (not compelling)
 
   Performance ceiling:
     Limited by instance type selected (can use c6i.metal: 128 vCPU)
@@ -126,7 +132,7 @@ RECOMMENDATION for typical fintech:
   is significant. Self-manage only if:
     - You need extensions RDS does not support
     - Your workload exceeds RDS maximum instance size
-    - Cost at scale makes RDS uneconomical (> 10TB, > db.r6g.16xlarge)
+    - Cost at scale makes RDS uneconomical (many TB, the largest instances)
     - You have deep PostgreSQL expertise on the team
 
 Decision record format:
@@ -135,9 +141,10 @@ Decision record format:
   Date: 2026-11-08
   Decision: Use RDS PostgreSQL Multi-AZ
   Rationale: Lower operational risk, adequate performance for current scale,
-             cost difference < $400/month, team lacks Patroni expertise.
-  Trade-off: Accept RDS limitations (extension restrictions, maintenance windows).
-  Review trigger: If monthly cost exceeds $5,000 or we need PostGIS/pg_partman.
+             cost difference ~$900/month, team lacks Patroni expertise.
+  Trade-off: Accept RDS limitations (extension list, maintenance windows).
+  Review trigger: If monthly cost exceeds $5,000 or we need an extension
+                  RDS does not offer (e.g. TimescaleDB).
 ```
 
 ---
@@ -161,7 +168,9 @@ OPTION A: Single cloud (AWS)
                   Kafka vs SQS, Vault vs KMS where compliance allows)
 
   Reliability:
-    AWS us-east-1 had 7 notable incidents in 2022
+    Regions do fail as a whole now and then -- us-east-1 had high-profile
+    regional outages (e.g. December 2021, October 2025) that also hit
+    "global" services hosted there
     Mitigated by multi-AZ (protects from single-AZ failure)
     Multi-region (protects from region failure, but adds complexity)
 
@@ -223,13 +232,18 @@ OPTION B: Istio (or Linkerd)
   Real costs:
     - Each sidecar proxy: 50-100MB memory, 50-100m CPU
     - 100 pods × 75MB = 7.5GB memory overhead for Istio proxies
-    - At $0.004/GB-hr on EC2: $218/month just for sidecar memory
-    - Added latency: 1-5ms per hop (acceptable for most payment flows)
-    - Operational complexity: Istio has a learning curve and failure modes
+    - At ~$0.004/GB-hr on EC2: 7.5 × 0.004 × 730 ≈ $22/month for the memory
+      (plus the sidecars' CPU) -- the infrastructure bill is small
+    - Added latency: typically ~1ms or less per hop with sidecars
+      (ambient mode lowers both overhead and latency)
+    - Operational complexity: Istio has a learning curve and failure modes --
+      this, not the bill, is the real cost
 
   mTLS value for PCI-DSS:
-    PCI-DSS Requirement 4.2.1: transmit cardholder data over strong cryptography
-    Istio mTLS satisfies this for pod-to-pod communication
+    PCI-DSS 4.2.1 requires strong cryptography for cardholder data on OPEN,
+    PUBLIC networks; many companies' security standards (and QSAs, for
+    segmentation) also require encryption inside the CDE
+    Istio mTLS meets that internal-encryption requirement pod-to-pod
     Without Istio: application code must implement TLS for every service call
     With Istio: mTLS is automatic and enforced by policy
 
@@ -350,8 +364,12 @@ LOW LOCK-IN:
   GitHub Actions                   → migrate to Tekton/GitLab CI with effort
   Prometheus + Grafana             → runs anywhere
 
+MEDIUM LOCK-IN:
+  Aurora PostgreSQL               → wire-compatible with PostgreSQL; leaving means
+                                    a data migration (logical replication / dump)
+                                    and losing Aurora-only features
+
 HIGH LOCK-IN:
-  Aurora (AWS proprietary)        → cannot migrate to self-managed PostgreSQL easily
   SQS/SNS                         → migrate to Kafka/RabbitMQ requires code changes
   AWS Lambda                      → significant refactor to migrate to K8s
   AWS KMS for application-level   → key material cannot be exported (intentionally)
@@ -377,7 +395,11 @@ STRATEGY for fintech:
     Lock-in: HIGH — key material cannot be exported from KMS
     Migration cost: re-encrypt all data with new keys under new provider (~$200K + 6 months)
     Trigger: AWS changes KMS pricing by > 2x, or regulatory requirement for key custody
-    Mitigation: use Envelope Encryption — data keys are ours, KMS only wraps them
+    Mitigation: envelope encryption alone does NOT remove the lock-in -- the
+      data keys are stored wrapped by a KMS key and need KMS to unwrap.
+      Real options: imported key material (BYOK, a copy of the key stays
+      with you), the External Key Store (keys in your own HSM), or keeping
+      the data keys under a key hierarchy you control
 ```
 
 ---
@@ -408,16 +430,18 @@ Use AWS RDS PostgreSQL Multi-AZ, db.r6g.4xlarge (initial), with 1-year Reserved 
 
 ## Rationale
   1. Team expertise: 3 engineers with deep PostgreSQL experience, none with CockroachDB.
-  2. Aurora rejected: proprietary replication, 3x cost for current scale, lock-in risk.
+  2. Aurora rejected: higher cost at current scale for this workload, proprietary
+     storage/replication layer, Aurora-only features would add lock-in.
   3. Self-managed rejected: team does not have Patroni/CloudNativePG operational experience.
-     Risk of misconfigured failover causing data loss outweighs cost savings of $270/month.
+     Risk of misconfigured failover causing data loss outweighs cost savings of ~$900/month.
   4. CockroachDB rejected: PostgreSQL-compatible but behavioral differences in edge cases.
      Financial data correctness is paramount; introducing behavioral uncertainty is unacceptable.
-  5. RDS cost: $2,000/month On-Demand, $1,400/month with 1-year RI.
+  5. RDS cost: ~$2,600/month On-Demand, ~$1,800/month with 1-year RI.
      Acceptable for current scale.
 
 ## Trade-offs Accepted
-  - Cannot use pg_partman (partition management extension) — must use native partitioning.
+  - Limited to the RDS extension list (pg_partman, pg_cron, PostGIS are available;
+    TimescaleDB is not).
   - Maintenance windows: AWS may restart instance; Patroni self-managed would be faster.
   - Cost at 10x scale: may need to revisit (Aurora or self-managed may be more economical).
 
@@ -428,8 +452,8 @@ Use AWS RDS PostgreSQL Multi-AZ, db.r6g.4xlarge (initial), with 1-year Reserved 
 
 ## Review Triggers
   - Monthly cost exceeds $6,000 (re-evaluate Aurora vs self-managed)
-  - Need for partition management automation beyond native PostgreSQL
-  - Projected scale exceeds db.r6g.16xlarge capacity (256 vCPU, 512GB RAM)
+  - Need for an extension that RDS does not offer
+  - Projected scale approaches the largest RDS instance sizes
   - Team hires PostgreSQL DBA with Patroni experience (re-evaluate self-managed)
 
 ## Alternatives Remaining Open
@@ -499,19 +523,34 @@ Documentation:
   "questions": [
     {
       "text": "A fintech startup chooses self-managed PostgreSQL on EC2 over Amazon RDS Aurora because they want full control over PostgreSQL configuration. 18 months later the team has spent 400 engineering hours on: storage scaling incidents, replica lag debugging, manual failover procedures, and PostgreSQL version upgrades. What would a principal engineer have recommended initially and why?",
-      "options": ["Self-managed PostgreSQL was the correct choice; the team simply needs better operational tooling", "RDS Aurora PostgreSQL was likely the better starting choice: it handles automated failover in <30 seconds, storage auto-scaling to 128TB, automated minor version upgrades, and multi-AZ replication — the 400 hours of operational work largely disappears, and the cost of RDS vs EC2+operations is typically lower when engineering time is factored in", "The team should have used Google Cloud SQL instead of AWS RDS for better PostgreSQL compatibility", "The correct recommendation was CockroachDB which eliminates all operational overhead for PostgreSQL clusters"],
+      "options": [
+        "Self-managed PostgreSQL was the correct choice; the team simply needs better operational tooling",
+        "RDS Aurora PostgreSQL was likely the better starting choice: it handles automated failover in <30 seconds, storage auto-scaling to 128TB, automated minor version upgrades, and multi-AZ replication — the 400 hours of operational work largely disappears, and the cost of RDS vs EC2+operations is typically lower when engineering time is factored in",
+        "The team should have used Google Cloud SQL instead of AWS RDS for better PostgreSQL compatibility",
+        "The correct recommendation was CockroachDB which eliminates all operational overhead for PostgreSQL clusters"
+      ],
       "correct": 1,
       "explanation": "The principal engineer's default-to-managed-services principle applies here. Self-managed databases require the team to become expert in PostgreSQL operations — replication, failover, backup, monitoring, upgrades — in addition to their core product work. For most fintech startups, this operational investment is not a differentiator. RDS Aurora's automated failover, storage management, and backup eliminate the most common operational incidents. The specific configuration parameters that motivated choosing self-managed (e.g., max_connections, shared_buffers) can typically be set via RDS parameter groups."
     },
     {
       "text": "A payment platform uses AWS exclusively. The CTO proposes a multi-cloud strategy with Azure as a secondary cloud for resilience. A principal engineer evaluates this proposal. What is the most important question to answer before committing to multi-cloud?",
-      "options": ["Which Azure region has the lowest latency to the existing AWS region", "Whether the resilience goal (surviving a full AWS regional outage) is better served by multi-region on AWS versus multi-cloud, given that multi-cloud doubles operational complexity, requires cloud-agnostic tooling, and rarely provides better actual availability than a well-designed multi-region AWS architecture", "Whether Azure supports all the AWS services the platform currently uses", "Whether the team has Azure certifications to operate the second cloud"],
+      "options": [
+        "Which Azure region has the lowest latency to the existing AWS region",
+        "Whether the resilience goal (surviving a full AWS regional outage) is better served by multi-region on AWS versus multi-cloud, given that multi-cloud doubles operational complexity, requires cloud-agnostic tooling, and rarely provides better actual availability than a well-designed multi-region AWS architecture",
+        "Whether Azure supports all the AWS services the platform currently uses",
+        "Whether the team has Azure certifications to operate the second cloud"
+      ],
       "correct": 1,
-      "explanation": "Multi-cloud is frequently proposed as a resilience strategy but rarely delivers better availability than multi-region on a single cloud. AWS has never had a simultaneous failure across all regions — their blast radius is typically a single availability zone. Multi-region AWS (us-east-1 + us-west-2 active-passive) provides excellent resilience with one operational complexity budget. Multi-cloud requires maintaining expertise in two cloud platforms, cloud-agnostic abstractions (losing access to native services), and cross-cloud networking (high latency and cost). The principal engineer must quantify the resilience gap multi-cloud fills versus the operational cost it adds."
+      "explanation": "Multi-cloud is frequently proposed as a resilience strategy but rarely delivers better availability than multi-region on a single cloud. Regional outages do happen — us-east-1 has had several that also affected global services — but AWS regions are designed to fail independently, so a well-designed multi-region architecture (e.g. us-east-1 + us-west-2) covers that risk with one platform's operational complexity. Multi-cloud requires expertise in two platforms, cloud-agnostic abstractions (losing native services), and cross-cloud networking (latency and egress cost). The principal engineer must quantify the resilience gap multi-cloud fills versus the operational cost it adds."
     },
     {
       "text": "A payment platform evaluates adopting Istio service mesh. The evaluation criteria include: PCI-DSS mTLS requirements between all payment services, existing observability coverage (Prometheus + Jaeger already deployed), and team Kubernetes expertise (intermediate). What is the principal engineer's recommendation?",
-      "options": ["Adopt Istio immediately; mTLS is a PCI-DSS requirement and Istio is the industry standard", "Adopt Istio for the PCI-DSS mTLS requirement since the alternative (application-layer mTLS with certificate management per service) is more complex; acknowledge the memory overhead (50-100MB per sidecar) and invest in team training before production rollout", "Reject Istio; use Kubernetes NetworkPolicy for PCI-DSS compliance instead of a service mesh", "Delay the decision until the team has senior Istio expertise; run with application-layer TLS in the interim"],
+      "options": [
+        "Adopt Istio immediately; mTLS is a PCI-DSS requirement and Istio is the industry standard",
+        "Adopt Istio for the PCI-DSS mTLS requirement since the alternative (application-layer mTLS with certificate management per service) is more complex; acknowledge the memory overhead (50-100MB per sidecar) and invest in team training before production rollout",
+        "Reject Istio; use Kubernetes NetworkPolicy for PCI-DSS compliance instead of a service mesh",
+        "Delay the decision until the team has senior Istio expertise; run with application-layer TLS in the interim"
+      ],
       "correct": 1,
       "explanation": "The PCI-DSS mTLS requirement is a concrete, justified reason for service mesh adoption. Without Istio, achieving mTLS between all services requires each service to implement certificate management, rotation, and mutual authentication — a significant per-service burden. Istio provides this transparently via the sidecar. The evaluation correctly identifies the trade-offs: sidecar memory overhead (plan for it in resource budgets), operational complexity (invest in training), and the fact that Prometheus + Jaeger are already deployed (Istio's observability value is partially redundant but not harmful). This is a justified adoption, not premature optimization."
     }

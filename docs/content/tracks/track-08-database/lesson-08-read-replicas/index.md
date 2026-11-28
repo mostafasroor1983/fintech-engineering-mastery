@@ -65,25 +65,25 @@ FROM pg_stat_replication;
 
 **Synchronous:** Primary waits for replica acknowledgment before returning success to the client. No acknowledged commit is lost if the primary fails (as long as you fail over to a synchronous standby), but every write pays the replica round trip — and if no synchronous standby is available, commits wait.
 
-```sql
--- Configure synchronous replication for a critical replica
--- postgresql.conf on primary:
+```ini
+# Configure synchronous replication for a critical replica
+# postgresql.conf on primary:
 synchronous_standby_names = 'FIRST 1 (replica1, replica2)'
--- FIRST 1: wait for at least 1 of the named standbys to confirm
+# FIRST 1: wait for at least 1 of the named standbys to confirm
 
--- Synchronous confirmation levels:
--- synchronous_commit = remote_write  (replica wrote to OS buffer)
--- synchronous_commit = remote_apply  (replica applied changes — readable)
--- synchronous_commit = on            (replica flushed to disk)
+# Synchronous confirmation levels:
+# synchronous_commit = remote_write  (replica wrote to OS buffer)
+# synchronous_commit = remote_apply  (replica applied changes — readable)
+# synchronous_commit = on            (replica flushed to disk)
 ```
 
-```sql
--- For a fintech system: use synchronous replication for the primary replica
--- Use asynchronous for read-only reporting replicas
--- postgresql.conf:
+```ini
+# For a fintech system: use synchronous replication for the primary replica
+# Use asynchronous for read-only reporting replicas
+# postgresql.conf:
 synchronous_standby_names = 'FIRST 1 (replica_sync)'
--- replica_sync: synchronous, used for critical reads
--- replica_reporting: asynchronous, used for heavy analytics
+# replica_sync: synchronous, used for critical reads
+# replica_reporting: asynchronous, used for heavy analytics
 ```
 
 ---

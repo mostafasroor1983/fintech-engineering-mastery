@@ -9,7 +9,7 @@ difficulty: advanced
 estimatedMinutes: 80
 status: published
 tags: [Kafka, performance, throughput, latency, compression]
-prerequisites: [kafka-architecture, kafka-producer, kafka-consumer]
+prerequisites: ["track-09-lesson-01", "track-09-lesson-02", "track-09-lesson-03"]
 ---
 
 # ضبط أداء Kafka — الإنتاجية مقابل زمن الاستجابة
@@ -217,9 +217,12 @@ num.io.threads=16
 num.replica.fetchers=4
 
 # Socket buffer sizes
-socket.send.buffer.bytes=1048576     # 1MB (default: 100KB)
-socket.receive.buffer.bytes=1048576  # 1MB (default: 100KB)
-socket.request.max.bytes=104857600   # 100MB max request size
+# 1MB (default: 100KB)
+socket.send.buffer.bytes=1048576
+# 1MB (default: 100KB)
+socket.receive.buffer.bytes=1048576
+# 100MB max request size
+socket.request.max.bytes=104857600
 
 # Log flush — leave the defaults (no forced fsync): Kafka relies on
 # replication across brokers plus the OS page cache for durability.
@@ -227,8 +230,10 @@ socket.request.max.bytes=104857600   # 100MB max request size
 # costs throughput.
 
 # Log retention
-log.retention.hours=168   # 7 days
-log.segment.bytes=1073741824  # 1GB per segment
+# 7 days
+log.retention.hours=168
+# 1GB per segment
+log.segment.bytes=1073741824
 
 # ISR management
 min.insync.replicas=2

@@ -47,23 +47,24 @@ references:
 
 # Spring Boot 4 Testing — Slices, Testcontainers, and Observability
 
-Effective testing is the difference between a service you can refactor confidently and one you are afraid to touch. Spring Boot 4 ships with a testing story that is meaningfully better than SB3: `@MockitoBean` replaces the Boot-specific `@MockBean`, `@ServiceConnection` eliminates manual container property wiring, and `TestObservationRegistry` lets you assert on observability signals. This lesson covers everything needed to write a production-quality test suite for a fintech payment service.
+Effective testing is the difference between a service you can refactor confidently and one you are afraid to touch. Spring Boot 4 consolidates a testing story that matured over the 3.x line: `@MockitoBean` replaces the Boot-specific `@MockBean`, `@ServiceConnection` eliminates manual container property wiring, and Micrometer's `TestObservationRegistry` lets you assert on observability signals. This lesson covers everything needed to write a production-quality test suite for a fintech payment service.
 
 ---
 
 ## 1. `@MockitoBean` and `@MockitoSpyBean`
 
-Spring Framework 7 introduces `@MockitoBean` and `@MockitoSpyBean` as first-class Spring annotations in `spring-test`. They are functionally equivalent to `@MockBean` / `@SpyBean` from `spring-boot-test`, which are **removed** in Spring Boot 4.
+Spring Framework 6.2 introduced `@MockitoBean` and `@MockitoSpyBean` as first-class Spring annotations in `spring-test`. They are functionally equivalent to `@MockBean` / `@SpyBean` from `spring-boot-test`, which are **removed** in Spring Boot 4.
 
 **Key differences to understand:**
 
 | Feature | `@MockBean` (SB3, removed) | `@MockitoBean` (SB4) |
 |---|---|---|
-| Module | `spring-boot-test` | `spring-test` (Spring Framework 7) |
+| Module | `spring-boot-test` | `spring-test` (Spring Framework 6.2+) |
 | Works in `@SpringBootTest` | Yes | Yes |
 | Works in `@WebMvcTest` | Yes | Yes |
 | Works outside SB (plain `@SpringJUnitConfig`) | No | Yes |
 | Resets mock between tests | Yes (by default) | Yes (by default) |
+| Allowed in `@Configuration` / `@TestConfiguration` classes | Yes | No — declare on test class fields |
 
 **Payment service test with `@MockitoBean`:**
 
@@ -82,8 +83,9 @@ class PaymentAuthorizationTest {
     FraudService fraudService;
 
     @Test
-    @WithMockUser(username = "user-7f3a", roles = "PAYMENT_INITIATOR",
-                  authorities = "SCOPE_payment:initiate")
+    // roles and authorities cannot be combined in @WithMockUser — use authorities only
+    @WithMockUser(username = "user-7f3a",
+                  authorities = { "ROLE_PAYMENT_INITIATOR", "SCOPE_payment:initiate" })
     void authorizedPayment_returns201() throws Exception {
         var result = new PaymentResult("pay-123", "PENDING");
         given(paymentService.initiatePayment(any(), any(), any())).willReturn(result);
@@ -132,9 +134,15 @@ class AuditServiceTest {
     @MockitoSpyBean       // real AuditService bean, wrapped in a Mockito spy
     AuditService auditService;
 
+    @Autowired
+    PaymentService paymentService;
+
     @Test
     void paymentCreation_triggersAuditLog() {
-        // Real method is called, but we can verify interactions
+        paymentService.initiatePayment("acc-001", new BigDecimal("100.00"), "GBP");
+
+        // The real audit method ran, and we can still verify the interaction
+        // (timeout: the audit log is written asynchronously)
         verify(auditService, timeout(1000)).logPaymentCreated(any());
     }
 }
@@ -206,7 +214,7 @@ class PaymentRepositoryTest {
 
 ---
 
-## 3. Testcontainers 1.20 + `@ServiceConnection`
+## 3. Testcontainers + `@ServiceConnection`
 
 `@ServiceConnection` (introduced in SB3.1, fully mature in SB4) auto-wires connection details from a Testcontainers container into Spring's auto-configuration — eliminating all manual `@DynamicPropertySource` overrides.
 
@@ -215,6 +223,9 @@ class PaymentRepositoryTest {
 When Spring Boot sees a `@ServiceConnection`-annotated `@Container` field, it uses the container's `ConnectionDetails` implementation to populate the same properties that would be set by `application.yml`. No `@DynamicPropertySource` needed.
 
 ### PostgreSQL + Redis + Kafka setup
+
+> [!NOTE]
+> Spring Boot 4 manages Testcontainers 2.x, which moves many container classes into module-specific packages (for example `org.testcontainers.postgresql.PostgreSQLContainer` and `org.testcontainers.kafka.KafkaContainer`); the old `org.testcontainers.containers.*` classes are deprecated. The examples use the classic class names — adjust the imports to your version.
 
 ```java
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -233,9 +244,8 @@ class PaymentServiceIntegrationTest {
 
     @Container
     @ServiceConnection
-    static KafkaContainer kafka =
-        new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.0"))
-            .withKraft();                    // KRaft mode — no ZooKeeper container
+    static KafkaContainer kafka =            // org.testcontainers.kafka.KafkaContainer
+        new KafkaContainer("apache/kafka:4.0.0");   // KRaft only — no ZooKeeper container
 
     @Autowired
     PaymentCommandHandler commandHandler;
@@ -268,17 +278,27 @@ No `@DynamicPropertySource` callback. No `@TestPropertySource` with hardcoded po
 
 ## 4. WireMock 3.x for External Payment Rail APIs
 
-Payment services call external rails: FPS (Faster Payments Service), SWIFT, card networks. These cannot be called in tests. WireMock 3.x with the Spring Boot integration provides `@WireMockTest` for clean stub-per-test isolation.
+Payment services call external rails: FPS (Faster Payments Service), SWIFT, card networks. These cannot be called in tests. WireMock 3.x's JUnit 5 extension provides `@WireMockTest` for clean stub-per-test isolation, and the WireMock Spring Boot integration covers tests that need the Spring context.
 
 ```java
+// @WireMockTest is WireMock's own JUnit 5 extension — there is no Spring
+// context here, so build the client yourself against WireMock's URL
 @WireMockTest
 class FpsClientTest {
 
-    @Autowired
     FpsClient fpsClient;
 
+    @BeforeEach
+    void setUp(WireMockRuntimeInfo wm) {
+        var requestFactory = new JdkClientHttpRequestFactory();
+        requestFactory.setReadTimeout(Duration.ofSeconds(2));   // client timeout
+        fpsClient = new FpsClient(RestClient.builder()
+            .baseUrl(wm.getHttpBaseUrl())
+            .requestFactory(requestFactory));
+    }
+
     @Test
-    void submitPayment_successResponse_returnsFpsReference(WireMockRuntimeInfo wm) {
+    void submitPayment_successResponse_returnsFpsReference() {
         stubFor(post(urlEqualTo("/payments"))
             .withRequestBody(matchingJsonPath("$.amount", equalTo("100.00")))
             .willReturn(aResponse()
@@ -303,7 +323,7 @@ class FpsClientTest {
     }
 
     @Test
-    void submitPayment_fps503_throwsFpsUnavailableException(WireMockRuntimeInfo wm) {
+    void submitPayment_fps503_throwsFpsUnavailableException() {
         stubFor(post(urlEqualTo("/payments"))
             .willReturn(aResponse()
                 .withStatus(503)
@@ -317,7 +337,7 @@ class FpsClientTest {
     }
 
     @Test
-    void submitPayment_networkTimeout_throwsRetryableException(WireMockRuntimeInfo wm) {
+    void submitPayment_networkTimeout_throwsRetryableException() {
         stubFor(post(urlEqualTo("/payments"))
             .willReturn(aResponse()
                 .withFixedDelay(10_000)   // 10s delay > client timeout
@@ -331,19 +351,18 @@ class FpsClientTest {
 }
 ```
 
-**WireMock configuration for the `FpsClient` bean:**
+**With a Spring context instead:** the official WireMock Spring Boot integration starts WireMock and writes its URL into a property your client already reads:
 
 ```java
-@TestConfiguration
-public class WireMockFpsConfig {
+// org.wiremock.integrations:wiremock-spring-boot
+@SpringBootTest
+@EnableWireMock(@ConfigureWireMock(baseUrlProperties = "clients.fps.base-url"))
+class FpsClientSpringTest {
 
-    @Bean
-    FpsClient fpsClient(WireMockRuntimeInfo wm) {
-        return new FpsClient(RestClient.builder()
-            .baseUrl(wm.getHttpBaseUrl())
-            .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
-            .build());
-    }
+    @Autowired
+    FpsClient fpsClient;   // the real bean, pointed at WireMock
+
+    // ... same stubs and assertions as above
 }
 ```
 
@@ -351,11 +370,19 @@ public class WireMockFpsConfig {
 
 ## 5. Observability Testing with `TestObservationRegistry`
 
-Spring Boot 4 ships `ObservabilityTestAutoConfiguration` which replaces the production `ObservationRegistry` with a `TestObservationRegistry` in `@SpringBootTest` contexts. This lets you assert that operations emit the correct metrics and traces.
+Micrometer's `micrometer-observation-test` module provides `TestObservationRegistry`, which records every observation so you can assert on names, key-values and errors. Register it as a bean in the test — Spring Boot's auto-configured `ObservationRegistry` backs off when one is present. (Spring Boot's `@AutoConfigureObservability` is something else: it re-enables metrics and tracing *export* in tests.)
 
 ```java
 @SpringBootTest
 class PaymentObservabilityTest {
+
+    @TestConfiguration
+    static class ObservationTestConfig {
+        @Bean
+        TestObservationRegistry observationRegistry() {
+            return TestObservationRegistry.create();
+        }
+    }
 
     @Autowired
     PaymentService paymentService;
@@ -390,18 +417,16 @@ class PaymentObservabilityTest {
             .hasObservationWithNameEqualTo("payment.initiate")
             .that()
             .hasError()
-            .hasHighCardinalityKeyValue("exception", "FraudDetectedException");
+            .assertThatError()
+            .isInstanceOf(FraudDetectedException.class);
     }
 }
 ```
 
-Your `PaymentService` must use `@Observed` or manually create observations:
+Your `PaymentService` must create the observation — either with `@Observed` or manually. Use one or the other: annotating the class *and* creating the observation manually would record it twice.
 
 ```java
 @Service
-@Observed(name = "payment.initiate",
-           contextualName = "payment-initiation",
-           lowCardinalityKeyValues = {"service", "payment"})
 @RequiredArgsConstructor
 public class PaymentService {
 
@@ -491,44 +516,41 @@ With a unique `group-id`, each test class starts reading from the earliest offse
 Spring caches `ApplicationContext` instances between tests with the same configuration. `@MockitoBean` invalidates the cache for the declaring test class (the same behaviour as `@MockBean` in SB3). To maximise cache reuse:
 
 1. Group tests with the same `@MockitoBean` set into the same test class.
-2. Put `@MockitoBean` on the class, not individual test methods.
+2. Declare shared mocks once — in a common base class or test interface — so that test classes really share the same set.
 3. Avoid `@DirtiesContext` unless you mutate static state (e.g. thread-local `SecurityContextHolder`).
 
-### `@TestMethodOrder` for Stateful Tests
+### Avoid Order-Dependent Tests
 
-When test method order matters (e.g. a create → read → delete sequence in a `@DataJpaTest`), use:
+It is tempting to split a create → settle lifecycle into ordered test methods (`@TestMethodOrder`) that share a static id. In a `@DataJpaTest` this does not even work: every test method runs in a transaction that is **rolled back** at the end, so the row created by the first method is gone before the second one starts. Keep the lifecycle in one test, and force real database round-trips with `flush()` and `clear()`:
 
 ```java
 @DataJpaTest
-@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class PaymentLifecycleTest {
 
     @Autowired
     PaymentRepository repository;
 
-    private static String createdPaymentId;
+    @Autowired
+    TestEntityManager entityManager;
 
     @Test
-    @Order(1)
-    void createPayment() {
+    void payment_canBeCreatedAndSettled() {
         var payment = repository.save(Payment.pending("acc-001", new BigDecimal("100.00"), "GBP"));
-        createdPaymentId = payment.getId();
-        assertThat(createdPaymentId).isNotBlank();
-    }
+        entityManager.flush();
+        entityManager.clear();   // next read really hits the database
 
-    @Test
-    @Order(2)
-    void settlePayment() {
-        var payment = repository.findById(createdPaymentId).orElseThrow();
-        payment.settle("FPS-REF-001");
-        repository.save(payment);
-        assertThat(repository.findById(createdPaymentId).orElseThrow().getStatus())
+        var loaded = repository.findById(payment.getId()).orElseThrow();
+        loaded.settle("FPS-REF-001");
+        entityManager.flush();
+        entityManager.clear();
+
+        assertThat(repository.findById(payment.getId()).orElseThrow().getStatus())
             .isEqualTo(PaymentStatus.SETTLED);
     }
 }
 ```
 
-Prefer this pattern over `@BeforeEach` setup for lifecycle tests — it makes the test narrative explicit and avoids hidden setup state.
+Independent tests can run in any order (or in parallel) and still pass — a property worth protecting in a large payment codebase.
 
 ---
 
@@ -553,8 +575,8 @@ class PaymentControllerSecurityTest {
     // ---- Happy path ----
 
     @Test
-    @WithMockUser(username = "user-abc", roles = "PAYMENT_INITIATOR",
-                  authorities = "SCOPE_payment:initiate")
+    @WithMockUser(username = "user-abc",
+                  authorities = { "ROLE_PAYMENT_INITIATOR", "SCOPE_payment:initiate" })
     void initiatePayment_authorizedUser_returns201WithPaymentId() throws Exception {
         given(paymentService.initiatePayment("acc-001", new BigDecimal("150.00"), "GBP"))
             .willReturn(new PaymentResult("pay-999", "PENDING"));
@@ -584,7 +606,8 @@ class PaymentControllerSecurityTest {
                         .subject("user-jwt-001")
                         .claim("financial_roles", List.of("PAYMENT_INITIATOR"))
                         .claim("payment_limit", 50000)
-                        .claim("scope", "payment:initiate account:read")))
+                        .claim("scope", "payment:initiate account:read"))
+                    .authorities(new JwtConverterConfig.FinancialPermissionsConverter()))
                 .contentType(APPLICATION_JSON)
                 .content("""
                     {"accountId":"acc-002","amount":200.00,"currency":"EUR"}
@@ -599,7 +622,7 @@ class PaymentControllerSecurityTest {
     void initiatePayment_noAuth_returns401() throws Exception {
         mockMvc.perform(post("/api/v1/payments")
                 .contentType(APPLICATION_JSON)
-                .content("""{"accountId":"acc-001","amount":100.00,"currency":"GBP"}"""))
+                .content("{\"accountId\":\"acc-001\",\"amount\":100.00,\"currency\":\"GBP\"}"))
             .andExpect(status().isUnauthorized());
 
         verifyNoInteractions(paymentService);
@@ -610,7 +633,7 @@ class PaymentControllerSecurityTest {
     void initiatePayment_missingScope_returns403() throws Exception {
         mockMvc.perform(post("/api/v1/payments")
                 .contentType(APPLICATION_JSON)
-                .content("""{"accountId":"acc-001","amount":100.00,"currency":"GBP"}"""))
+                .content("{\"accountId\":\"acc-001\",\"amount\":100.00,\"currency\":\"GBP\"}"))
             .andExpect(status().isForbidden());
 
         verifyNoInteractions(paymentService);
@@ -619,11 +642,11 @@ class PaymentControllerSecurityTest {
     // ---- Input validation ----
 
     @Test
-    @WithMockUser(roles = "PAYMENT_INITIATOR", authorities = "SCOPE_payment:initiate")
+    @WithMockUser(authorities = { "ROLE_PAYMENT_INITIATOR", "SCOPE_payment:initiate" })
     void initiatePayment_negativeAmount_returns400() throws Exception {
         mockMvc.perform(post("/api/v1/payments")
                 .contentType(APPLICATION_JSON)
-                .content("""{"accountId":"acc-001","amount":-50.00,"currency":"GBP"}"""))
+                .content("{\"accountId\":\"acc-001\",\"amount\":-50.00,\"currency\":\"GBP\"}"))
             .andExpect(status().isBadRequest())
             .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
 
@@ -631,14 +654,14 @@ class PaymentControllerSecurityTest {
     }
 
     @Test
-    @WithMockUser(roles = "PAYMENT_INITIATOR", authorities = "SCOPE_payment:initiate")
+    @WithMockUser(authorities = { "ROLE_PAYMENT_INITIATOR", "SCOPE_payment:initiate" })
     void initiatePayment_serviceThrowsInsufficientFunds_returns422() throws Exception {
         given(paymentService.initiatePayment(any(), any(), any()))
             .willThrow(new InsufficientFundsException("acc-001"));
 
         mockMvc.perform(post("/api/v1/payments")
                 .contentType(APPLICATION_JSON)
-                .content("""{"accountId":"acc-001","amount":999999.00,"currency":"GBP"}"""))
+                .content("{\"accountId\":\"acc-001\",\"amount\":999999.00,\"currency\":\"GBP\"}"))
             .andExpect(status().isUnprocessableEntity())
             .andExpect(jsonPath("$.error").value("INSUFFICIENT_FUNDS"));
     }
@@ -649,11 +672,12 @@ class PaymentControllerSecurityTest {
 
 ## Summary
 
-- **`@MockitoBean` / `@MockitoSpyBean`** replace `@MockBean` / `@SpyBean` from `spring-boot-test`. They are Spring Framework 7 annotations that work in any `@SpringJUnitConfig` context, not just Spring Boot tests.
+- **`@MockitoBean` / `@MockitoSpyBean`** replace `@MockBean` / `@SpyBean` from `spring-boot-test`. They are Spring Framework annotations (since 6.2) that work in any `@SpringJUnitConfig` context, not just Spring Boot tests.
 - **Test slices** (`@WebMvcTest`, `@DataJpaTest`, `@DataRedisTest`) load a focused context — always prefer slices over `@SpringBootTest` for unit-style tests. Use `@AutoConfigureTestDatabase(replace = NONE)` with Testcontainers for realistic JPA behaviour.
 - **`@ServiceConnection`** eliminates `@DynamicPropertySource` for Testcontainers containers — annotate `@Container` with `@ServiceConnection` and Spring auto-wires the connection details.
-- **WireMock 3.x** with `@WireMockTest` provides per-test stub isolation for external payment rail APIs. Test timeout, 5xx, and network failure scenarios — not just happy paths.
-- **`TestObservationRegistry`** lets you assert on metric names, low-cardinality tags, and error state from `@Observed` methods. Use it to enforce observability contracts in CI.
+- **WireMock 3.x** with `@WireMockTest` (plain JUnit) or `@EnableWireMock` (Spring context) provides per-test stub isolation for external payment rail APIs. Test timeout, 5xx, and network failure scenarios — not just happy paths.
+- **`TestObservationRegistry`**, registered as a test bean, lets you assert on observation names, low-cardinality tags, and error state. Use it to enforce observability contracts in CI.
+- **Keep tests independent** — `@DataJpaTest` rolls back each test, so lifecycle scenarios belong in a single test method.
 - **Avoid `@DirtiesContext` for Kafka tests** — use unique `group-id` values per test class instead. This avoids expensive context rebuilds while maintaining state isolation.
 
 ---
@@ -665,12 +689,12 @@ class PaymentControllerSecurityTest {
     "question": "In Spring Boot 4, which annotation replaces @MockBean from spring-boot-test when you need to register a Mockito mock in the Spring ApplicationContext for a @WebMvcTest?",
     "options": [
       "@Mock (Mockito)",
-      "@MockitoBean (Spring Framework 7 / spring-test)",
+      "@MockitoBean (Spring Framework / spring-test, since 6.2)",
       "@TestBean (Spring Boot 4)",
       "@InjectMocks (Mockito)"
     ],
     "correct": 1,
-    "explanation": "@MockitoBean is a Spring Framework 7 annotation in the spring-test module that registers a Mockito mock in the ApplicationContext for the duration of the test. @Mock creates a bare Mockito mock with no Spring context integration. @MockBean from spring-boot-test is removed in Spring Boot 4."
+    "explanation": "@MockitoBean is a Spring Framework annotation (spring-test, since 6.2) that registers a Mockito mock in the ApplicationContext for the duration of the test. @Mock creates a bare Mockito mock with no Spring context integration. @MockBean from spring-boot-test is removed in Spring Boot 4."
   },
   {
     "id": "kc-08-02",
@@ -706,7 +730,7 @@ class PaymentControllerSecurityTest {
       "verify(tracer).startScopedSpan(\"payment.initiate\")"
     ],
     "correct": 1,
-    "explanation": "TestObservationRegistry (auto-configured in @SpringBootTest via ObservabilityTestAutoConfiguration in SB4) exposes AssertJ-based assertions through ObservationRegistryAssert. hasObservationWithNameEqualTo() finds the observation by name, and that().hasLowCardinalityKeyValue() asserts on the tags without coupling to specific metric implementations."
+    "explanation": "TestObservationRegistry (from micrometer-observation-test, registered as a bean in a @TestConfiguration so Boot's auto-configured registry backs off) exposes AssertJ-based assertions. hasObservationWithNameEqualTo() finds the observation by name, and that().hasLowCardinalityKeyValue() asserts on the tags without coupling to specific metric implementations."
   }
 ]
 -->
@@ -727,11 +751,11 @@ class PaymentControllerSecurityTest {
     },
     {
       "id": "pc-08-03",
-      "description": "Write a @WireMockTest class FpsClientTest with three test methods: (1) stub POST /payments returning 201 with fpsReference=FPS-2024-001 and assert FpsClient.submit() returns that reference, (2) stub returning 503 and assert FpsUnavailableException is thrown, (3) stub with withFixedDelay(10000) and assert RetryablePaymentException is thrown due to timeout. Use WireMockRuntimeInfo to get the base URL and configure FpsClient via a @TestConfiguration class."
+      "description": "Write a @WireMockTest class FpsClientTest with three test methods: (1) stub POST /payments returning 201 with fpsReference=FPS-2024-001 and assert FpsClient.submit() returns that reference, (2) stub returning 503 and assert FpsUnavailableException is thrown, (3) stub with withFixedDelay(10000) and assert RetryablePaymentException is thrown due to a 2-second client read timeout. Build FpsClient in a @BeforeEach method from WireMockRuntimeInfo.getHttpBaseUrl() (there is no Spring context in @WireMockTest); optionally add a Spring variant with @EnableWireMock."
     },
     {
       "id": "pc-08-04",
-      "description": "Write a @SpringBootTest class PaymentObservabilityTest that autowires TestObservationRegistry. Test that PaymentService.initiatePayment() with a valid payment emits an observation named 'payment.initiate' with low-cardinality key 'currency' set to 'GBP' and no error. Add a second test verifying that when the service throws FraudDetectedException, the same observation has an error and a high-cardinality key 'exception' set to 'FraudDetectedException'."
+      "description": "Write a @SpringBootTest class PaymentObservabilityTest that registers a TestObservationRegistry bean in a nested @TestConfiguration and autowires it. Test that PaymentService.initiatePayment() with a valid payment emits an observation named 'payment.initiate' with low-cardinality key 'currency' set to 'GBP' and no error. Add a second test verifying that when the service throws FraudDetectedException, the same observation has an error of type FraudDetectedException (assertThatError())."
     }
   ]
 }

@@ -9,7 +9,7 @@ difficulty: advanced
 estimatedMinutes: 75
 status: published
 tags: [Kafka-Connect, source-connector, sink-connector, SMT, worker]
-prerequisites: [kafka-architecture, outbox-cdc-debezium]
+prerequisites: ["track-09-lesson-01", "track-09-lesson-06"]
 ---
 
 # Kafka Connect — Source and Sink Connector Architecture

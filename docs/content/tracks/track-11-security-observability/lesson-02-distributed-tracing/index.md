@@ -57,18 +57,9 @@ A **trace** represents the full journey of a request through your distributed sy
 </dependencyManagement>
 
 <dependencies>
-  <dependency>
-    <groupId>io.opentelemetry</groupId>
-    <artifactId>opentelemetry-api</artifactId>
-  </dependency>
-  <dependency>
-    <groupId>io.opentelemetry</groupId>
-    <artifactId>opentelemetry-sdk</artifactId>
-  </dependency>
-  <dependency>
-    <groupId>io.opentelemetry</groupId>
-    <artifactId>opentelemetry-exporter-otlp</artifactId>
-  </dependency>
+  <!-- The starter brings the API, SDK, OTLP exporter and auto-configuration.
+       (Use a current BOM version. Spring Boot's own alternative is Micrometer
+       Tracing with the OTel bridge -- pick ONE of the two, not both.) -->
   <dependency>
     <groupId>io.opentelemetry.instrumentation</groupId>
     <artifactId>opentelemetry-spring-boot-starter</artifactId>
@@ -77,13 +68,12 @@ A **trace** represents the full journey of a request through your distributed sy
 ```
 
 ```yaml
-# application.yaml — OTel SDK configuration
-management:
-  tracing:
-    sampling:
-      probability: 1.0   # 100% in dev; use 0.01-0.1 in production
-
+# application.yaml — OTel SDK configuration (OpenTelemetry starter keys;
+# "management.tracing.*" would configure Micrometer Tracing instead)
 otel:
+  traces:
+    sampler: parentbased_traceidratio   # follow the caller's decision
+    sampler.arg: 1.0                     # 100% in dev; 0.01-0.1 in production
   exporter:
     otlp:
       endpoint: http://otel-collector:4317
@@ -93,12 +83,7 @@ otel:
       service.name: payment-service
       service.version: ${APP_VERSION:local}
       deployment.environment: ${ENVIRONMENT:dev}
-  traces:
-    exporter: otlp
-  metrics:
-    exporter: otlp
-  logs:
-    exporter: otlp
+  # exporters: otlp is the default for traces, metrics and logs
 ```
 
 ### 1.3 Manual Span Creation for Payment Business Logic
@@ -147,8 +132,11 @@ public class PaymentProcessingService {
 
             FraudResult fraud = runFraudCheck(request);
             if (fraud.isBlocked()) {
+                // A fraud block is an expected BUSINESS outcome, not a
+                // technical error: record it as an attribute and leave the
+                // status OK, or error dashboards and "keep all errors"
+                // sampling fill up with normal declines
                 span.setAttribute("payment.fraud_blocked", true);
-                span.setStatus(StatusCode.ERROR, "Fraud check blocked payment");
                 return PaymentResult.blocked(fraud.getReason());
             }
 
@@ -169,8 +157,9 @@ public class PaymentProcessingService {
     }
 
     private FraudResult runFraudCheck(PaymentRequest request) {
+        // INTERNAL: the HTTP client call inside creates its own CLIENT span
         Span fraudSpan = tracer.spanBuilder("fraudCheck")
-            .setSpanKind(SpanKind.CLIENT)
+            .setSpanKind(SpanKind.INTERNAL)
             .startSpan();
         try (Scope scope = fraudSpan.makeCurrent()) {
             fraudSpan.setAttribute("fraud.model_version", "v3.2");
@@ -203,8 +192,9 @@ public class PaymentProcessingService {
     }
 
     private void notifyParties(PaymentRequest request, LedgerEntry entry) {
+        // INTERNAL wrapper; the Kafka send inside gets its own PRODUCER span
         Span notifySpan = tracer.spanBuilder("notifyParties")
-            .setSpanKind(SpanKind.PRODUCER)
+            .setSpanKind(SpanKind.INTERNAL)
             .startSpan();
         try (Scope scope = notifySpan.makeCurrent()) {
             notificationService.sendPaymentConfirmation(request, entry);
@@ -227,11 +217,11 @@ traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 tracestate:  rojo=00f067aa0ba902b7,congo=t61rcWkgMzE
 ```
 
-The `flags` byte's low bit is the **sampled** flag. When it is `1`, all downstream services must record the span. This is the basis for head-based sampling.
+The `flags` byte's low bit is the **sampled** flag. With the usual parent-based sampler, downstream services follow it: when it is `1` they record their spans too, when `0` they don't. This is the basis for head-based sampling.
 
 ### 2.1 Propagating TraceContext Through Kafka
 
-Auto-instrumentation handles HTTP propagation. For Kafka you need explicit handling:
+Auto-instrumentation handles HTTP propagation — and the javaagent or Spring Kafka observation also handle Kafka. The explicit version below is needed only without them (and shows what they do):
 
 ```java
 package com.bank.payments.messaging;
@@ -304,7 +294,7 @@ public class PaymentEventMessaging {
 
         try (var scope = span.makeCurrent()) {
             span.setAttribute("messaging.system", "kafka");
-            span.setAttribute("messaging.destination", record.topic());
+            span.setAttribute("messaging.destination.name", record.topic());
             span.setAttribute("messaging.kafka.partition", record.partition());
             span.setAttribute("payment.id", record.value().getPaymentId());
             // process notification...
@@ -323,28 +313,34 @@ Sampling is the most critical architectural decision in distributed tracing. Fin
 
 ### 3.1 Head-Based Sampling
 
-The sampling decision is made at the **root span** before any downstream work. All child spans inherit the decision via the `sampled` flag in `traceparent`.
+The sampling decision is made at the **root span** before any downstream work — in the SDK of the first service. All child spans inherit the decision via the `sampled` flag in `traceparent`.
 
-**Pros:** Zero overhead for unsampled requests downstream. Simple to reason about.
+**Pros:** Unsampled requests produce no span data anywhere — the cheapest option. Simple to reason about.
 **Cons:** Cannot retroactively sample traces that turned out to be interesting because the decision was made upfront before the outcome was known.
 
 ```yaml
-# OTel Collector — head-based probabilistic sampling
+# Head-based sampling is configured in the SDK (env vars or properties):
+#   OTEL_TRACES_SAMPLER=parentbased_traceidratio
+#   OTEL_TRACES_SAMPLER_ARG=0.05            # root spans: keep 5%
+#
+# A probabilistic sampler in the COLLECTOR is a different thing: spans are
+# still created and sent, and the collector keeps 5% (consistently per
+# trace ID, so a trace is kept or dropped as a whole)
 processors:
   probabilistic_sampler:
-    sampling_percentage: 5   # keep 5% of all traces
+    sampling_percentage: 5
 
 service:
   pipelines:
     traces:
       receivers: [otlp]
       processors: [probabilistic_sampler, batch]
-      exporters: [jaeger]
+      exporters: [otlp/jaeger]   # Jaeger accepts OTLP (the old "jaeger" exporter was removed)
 ```
 
 ### 3.2 Tail-Based Sampling
 
-The sampling decision is deferred until **all spans in a trace have arrived** at a collector. This allows sampling based on the complete trace outcome: keep 100% of error traces and slow traces regardless of overall rate.
+The sampling decision is deferred until **all spans in a trace have arrived** at a collector. This allows sampling based on the complete trace outcome: keep 100% of error traces and slow traces regardless of overall rate. All spans of a trace must reach the same collector instance — with several replicas, route by trace ID first (loadbalancing exporter). The SDKs then sample at 100% (or a high rate), so the full volume flows to the collectors.
 
 ```yaml
 # OTel Collector — tail-based sampling
@@ -384,7 +380,7 @@ service:
     traces:
       receivers: [otlp]
       processors: [tail_sampling, batch]
-      exporters: [jaeger]
+      exporters: [otlp/jaeger]
 ```
 
 ### 3.3 Sampling Decision Matrix for Financial Services
@@ -404,9 +400,10 @@ service:
 
 ### 4.1 Production Jaeger Architecture
 
+Jaeger v1 reached end of life at the end of 2025; Jaeger v2 is built on the OpenTelemetry Collector (`jaegertracing/jaeger:2.x`, configured with a collector-style YAML file). The v1 compose file below still shows the moving parts — for a new setup, use v2 (or Grafana Tempo).
+
 ```yaml
-# docker-compose for local development
-version: "3.9"
+# docker-compose for local development (Jaeger v1 layout)
 services:
   jaeger:
     image: jaegertracing/all-in-one:1.57
@@ -436,6 +433,8 @@ volumes:
 For production, deploy Jaeger Collector and Jaeger Query as separate services behind a load balancer, with Elasticsearch as the distributed backend. Use index lifecycle management (ILM) to roll traces after 30 days.
 
 ### 4.2 Querying Traces via Jaeger HTTP API
+
+(`/api/traces` is the internal JSON API used by the Jaeger UI — convenient for tooling but not a stable contract; Jaeger v2 also offers the documented `/api/v3` API.)
 
 ```java
 package com.bank.payments.ops;
@@ -521,7 +520,7 @@ If you have existing Zipkin infrastructure, the OTel Collector can receive OTLP 
 
 ### 6.1 Identifying the Slow Span in a Waterfall
 
-A payment service with P99 = 1.8 s suddenly increases to 4.2 s. Using Jaeger trace comparison:
+*Illustrative scenario:* a payment service with P99 = 1.8 s suddenly increases to 4.2 s. Using Jaeger trace comparison:
 
 1. Pull a "normal" trace (1.4 s) and the slow trace (4.2 s) side by side.
 2. In the waterfall, expand each span's duration. The slow trace shows `fraudCheck` taking 2.9 s instead of the expected 180 ms.
@@ -601,17 +600,9 @@ Bridging traces to logs requires including `traceId` and `spanId` in every log l
 <!-- logback-spring.xml -->
 <configuration>
   <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
-    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
-      <provider class="net.logstash.logback.composite.loggingevent.LoggingEventPatternJsonProvider">
-        <pattern>
-          {
-            "trace_id": "%X{trace_id}",
-            "span_id": "%X{span_id}",
-            "trace_flags": "%X{trace_flags}"
-          }
-        </pattern>
-      </provider>
-    </encoder>
+    <!-- LogstashEncoder writes every MDC entry as a JSON field by default,
+         so trace_id / span_id / trace_flags appear without extra config -->
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
   </appender>
   <root level="INFO">
     <appender-ref ref="JSON"/>
@@ -638,44 +629,6 @@ Do **not** include the following as span attributes:
 - PIN or passwords
 - Full names combined with account identifiers
 
-<!-- KNOWLEDGE-CHECK
-{
-  "questions": [
-    {
-      "text": "Which OpenTelemetry sampling strategy is most appropriate for a payment service processing 50,000 TPS where every error trace must be captured?",
-      "options": ["Head-based sampling at 1% rate", "Tail-based sampling with error-always rule", "No sampling — capture all traces", "Random sampling at 10% rate"],
-      "correct": 1,
-      "explanation": "Tail-based sampling makes the sampling decision after the trace is complete, allowing you to enforce rules like 'always sample traces containing errors' regardless of volume. Head-based sampling at a fixed rate would miss many error traces."
-    },
-    {
-      "text": "What is the primary purpose of the W3C TraceContext propagation header format in distributed tracing?",
-      "options": ["Encrypt trace data between services", "Carry trace and span IDs across service boundaries to link spans into a single trace", "Define sampling rates across services", "Store span attributes in HTTP headers"],
-      "correct": 1,
-      "explanation": "W3C TraceContext (the `traceparent` header) carries the trace ID and parent span ID across service boundaries, enabling all spans from different services that served one request to be linked into a single distributed trace."
-    },
-    {
-      "text": "Why should card numbers (PAN) never be included as OpenTelemetry span attributes even in masked form?",
-      "options": ["Span attributes increase trace storage costs significantly", "Tracing backends are not PCI DSS certified and span data may be exported to non-compliant storage", "Span attributes cannot hold string values", "Jaeger does not support PCI data types"],
-      "correct": 1,
-      "explanation": "PCI DSS requires strict control over where cardholder data is stored and transmitted. Tracing backends (Jaeger, Zipkin, Tempo) are not PCI-scoped systems. Including PAN data in spans brings the entire tracing infrastructure into PCI scope, dramatically increasing compliance burden."
-    }
-  ]
-}
--->
-
-<!-- PRACTICAL-CHALLENGE
-{
-  "title": "Distributed Tracing for Payment Latency Investigation",
-  "difficulty": "advanced",
-  "estimatedMinutes": 60,
-  "tasks": [
-    {"id": "1", "description": "Instrument a Spring Boot payment service with OpenTelemetry, adding custom business spans for fraud-check, ledger-posting, and notification steps, with attributes for payment type, currency, and amount band (not the actual amount)."},
-    {"id": "2", "description": "Configure tail-based sampling in an OTel Collector that always captures error traces, always captures traces over 2 seconds, and samples 1% of successful fast traces."},
-    {"id": "3", "description": "Deploy a local Jaeger instance and verify traces appear with the correct parent-child span hierarchy; use the Jaeger HTTP API to programmatically fetch the slowest 10 traces from the past hour."},
-    {"id": "4", "description": "Configure Logback to inject trace_id and span_id into every log line, then write a LogQL query in Grafana that pivots from a Jaeger trace ID to all correlated log lines across payment-service and fraud-service."}
-  ]
-}
--->
 
 Use opaque identifiers (UUID payment IDs, masked account references) in traces. Add a scrubbing processor in the OTel Collector as a last-resort safety net:
 
@@ -723,3 +676,42 @@ Distributed tracing at the principal-engineer level requires three distinct comp
 3. **Analysis workflow** — the ROI of tracing comes from analysis. Build a runbook that tells on-call engineers: "P99 latency spike → open Jaeger → filter `payment-service` by duration > 1s → compare slow span with P50 baseline trace."
 
 The difference between teams that get value from tracing and those that do not is almost always the third point: without an analysis workflow embedded in runbooks, traces accumulate without anyone systematically using them.
+
+<!-- KNOWLEDGE-CHECK
+{
+  "questions": [
+    {
+      "text": "Which OpenTelemetry sampling strategy is most appropriate for a payment service processing 50,000 TPS where every error trace must be captured?",
+      "options": ["Head-based sampling at 1% rate", "Tail-based sampling with error-always rule", "No sampling — capture all traces", "Random sampling at 10% rate"],
+      "correct": 1,
+      "explanation": "Tail-based sampling makes the sampling decision after the trace is complete, allowing you to enforce rules like 'always sample traces containing errors' regardless of volume. Head-based sampling at a fixed rate would miss many error traces."
+    },
+    {
+      "text": "What is the primary purpose of the W3C TraceContext propagation header format in distributed tracing?",
+      "options": ["Encrypt trace data between services", "Carry trace and span IDs across service boundaries to link spans into a single trace", "Define sampling rates across services", "Store span attributes in HTTP headers"],
+      "correct": 1,
+      "explanation": "W3C TraceContext (the `traceparent` header) carries the trace ID and parent span ID across service boundaries, enabling all spans from different services that served one request to be linked into a single distributed trace."
+    },
+    {
+      "text": "Why should card numbers (PAN) never be included as OpenTelemetry span attributes even in masked form?",
+      "options": ["Span attributes increase trace storage costs significantly", "Tracing backends are not PCI DSS certified and span data may be exported to non-compliant storage", "Span attributes cannot hold string values", "Jaeger does not support PCI data types"],
+      "correct": 1,
+      "explanation": "PCI DSS requires strict control over where cardholder data is stored and transmitted. Tracing backends (Jaeger, Zipkin, Tempo) are not PCI-scoped systems. Including PAN data in spans brings the entire tracing infrastructure into PCI scope, dramatically increasing compliance burden."
+    }
+  ]
+}
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "title": "Distributed Tracing for Payment Latency Investigation",
+  "difficulty": "advanced",
+  "estimatedMinutes": 60,
+  "tasks": [
+    {"id": "1", "description": "Instrument a Spring Boot payment service with OpenTelemetry, adding custom business spans for fraud-check, ledger-posting, and notification steps, with attributes for payment type, currency, and amount band (not the actual amount)."},
+    {"id": "2", "description": "Configure tail-based sampling in an OTel Collector that always captures error traces, always captures traces over 2 seconds, and samples 1% of successful fast traces."},
+    {"id": "3", "description": "Deploy a local Jaeger instance and verify traces appear with the correct parent-child span hierarchy; use the Jaeger HTTP API to programmatically fetch the slowest 10 traces from the past hour."},
+    {"id": "4", "description": "Configure Logback to inject trace_id and span_id into every log line, then write a LogQL query in Grafana that pivots from a Jaeger trace ID to all correlated log lines across payment-service and fraud-service."}
+  ]
+}
+-->

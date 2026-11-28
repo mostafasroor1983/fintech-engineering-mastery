@@ -22,14 +22,14 @@ prerequisites: [track-11-lesson-16]
 The fundamental challenge: your payment service needs an encryption key to process transactions. How do you get that key to the service without:
 1. Hardcoding it in source code (accessible to every developer, committed to git)
 2. Storing it in a config file (readable by anyone with filesystem access)
-3. Transmitting it in an environment variable (visible in `kubectl describe pod`, CI logs)
+3. Passing it in an environment variable (visible in the pod spec, `/proc/<pid>/environ`, crash reports and CI logs)
 4. Storing it in the database (key and data in same breach blast radius)
 
 The answer is a Key Management System (KMS) or Hardware Security Module (HSM) that:
 - Stores keys securely, separate from application data
 - Provides controlled access based on identity (IAM roles, service accounts)
 - Logs every key operation for auditability
-- Performs cryptographic operations inside the secure boundary (data never leaves)
+- Performs cryptographic operations inside the secure boundary (the master key never leaves)
 
 ---
 
@@ -59,7 +59,7 @@ To decrypt:
 **Why envelope encryption?**
 - KMS has rate limits and latency (~1-5ms per call). Encrypting each record individually would be too slow.
 - Large data cannot be sent to KMS (AWS KMS limit: 4KB per encrypt/decrypt call).
-- Envelope encryption means KMS is called once per key generation, then the data key does the heavy lifting locally.
+- Envelope encryption means KMS is called once per data key (to generate it, and again to unwrap it on read), while the data key does the heavy lifting locally. For high volumes, cache unwrapped data keys briefly (e.g. the AWS Encryption SDK's data key caching) — trading a little exposure for far fewer KMS calls.
 
 ---
 
@@ -68,6 +68,8 @@ To decrypt:
 ```java
 @Service
 public class AwsKmsEnvelopeEncryption {
+
+    private static final SecureRandom RANDOM = new SecureRandom();  // getInstanceStrong() can block
 
     private final KmsClient kmsClient;
     private final String masterKeyArn;
@@ -106,7 +108,7 @@ public class AwsKmsEnvelopeEncryption {
         try {
             // 2. Encrypt data with the plaintext data key (AES-256-GCM, locally)
             byte[] iv = new byte[12];
-            SecureRandom.getInstanceStrong().nextBytes(iv);
+            RANDOM.nextBytes(iv);
 
             SecretKey secretKey = new SecretKeySpec(plaintextDataKey, "AES");
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
@@ -117,12 +119,16 @@ public class AwsKmsEnvelopeEncryption {
                 .encryptedDataKey(Base64.getEncoder().encodeToString(encryptedDataKey))
                 .iv(Base64.getEncoder().encodeToString(iv))
                 .ciphertext(Base64.getEncoder().encodeToString(ciphertext))
-                .keyVersion("v1")  // Track key version for rotation
                 .build();
+            // No key version needed: the encrypted data key blob identifies the
+            // KMS key, and KMS automatic rotation keeps old backing keys for
+            // decryption. (Also pass a record ID to cipher.updateAAD(...): the
+            // encryption context binds only the DATA KEY, not this ciphertext.)
 
         } finally {
-            // 3. CRITICAL: wipe plaintext data key from memory immediately
-            // Prevents key exposure via heap dumps
+            // 3. Wipe our copy of the plaintext data key as soon as possible.
+            // Best effort only: SdkBytes and SecretKeySpec hold their own copies
+            // that we cannot wipe -- treat heap dumps as sensitive regardless
             Arrays.fill(plaintextDataKey, (byte) 0);
         }
     }
@@ -168,7 +174,6 @@ public class EncryptedBundle {
     String encryptedDataKey;  // Base64-encoded encrypted data key (from KMS)
     String iv;                // Base64-encoded initialization vector
     String ciphertext;        // Base64-encoded encrypted data
-    String keyVersion;        // Key version for rotation tracking
 }
 ```
 
@@ -179,13 +184,14 @@ Encryption context is a map of key-value pairs that is cryptographically bound t
 2. **Auditability**: CloudTrail logs include the encryption context—you can see what service decrypted what data
 3. **Tamper protection**: If the encryption context does not match, decryption fails
 
+A CloudTrail record of a KMS `Decrypt` call (abridged):
+
 ```json
-// CloudTrail log for KMS decrypt call
 {
   "eventName": "Decrypt",
   "userIdentity": {
     "type": "AssumedRole",
-    "arn": "arn:aws:iam::123456789:assumed-role/payment-service-role/i-abc123"
+    "arn": "arn:aws:iam::123456789012:assumed-role/payment-service-role/i-abc123"
   },
   "requestParameters": {
     "encryptionContext": {
@@ -193,7 +199,7 @@ Encryption context is a map of key-value pairs that is cryptographically bound t
       "environment": "production",
       "purpose": "pan-encryption"
     },
-    "keyId": "arn:aws:kms:eu-west-1:123456789:key/abcd-1234"
+    "keyId": "arn:aws:kms:eu-west-1:123456789012:key/abcd-1234"
   },
   "responseElements": null
 }
@@ -210,7 +216,9 @@ Vault Transit provides encryption-as-a-service: your application sends plaintext
 public class VaultTransitEncryptionService {
 
     private final VaultTemplate vaultTemplate;
-    private final String transitKeyPath = "transit/payment-fields";
+    // Transit mounted at "transit/", key named "payment-service":
+    // endpoints are transit/encrypt/<key>, transit/decrypt/<key>, transit/rewrap/<key>
+    private static final String KEY = "payment-service";
 
     /**
      * Vault Transit — application sends data to Vault for encryption.
@@ -221,17 +229,18 @@ public class VaultTransitEncryptionService {
             .encodeToString(plaintext.getBytes(StandardCharsets.UTF_8));
 
         VaultResponse response = vaultTemplate.write(
-            transitKeyPath + "/encrypt/payment-service",
+            "transit/encrypt/" + KEY,
             Map.of("plaintext", base64Plaintext)
         );
 
         return (String) response.getData().get("ciphertext");
-        // Returns: "vault:v1:ABCDEF..." — Vault version prefix enables automatic re-wrapping
+        // Returns: "vault:v1:ABCDEF..." — the version prefix tells you (and Vault)
+        // which key version encrypted it; re-wrapping is still your job (see rewrap)
     }
 
     public String decrypt(String ciphertext) {
         VaultResponse response = vaultTemplate.write(
-            transitKeyPath + "/decrypt/payment-service",
+            "transit/decrypt/" + KEY,
             Map.of("ciphertext", ciphertext)
         );
 
@@ -246,7 +255,7 @@ public class VaultTransitEncryptionService {
      */
     public String rewrap(String oldCiphertext) {
         VaultResponse response = vaultTemplate.write(
-            transitKeyPath + "/rewrap/payment-service",
+            "transit/rewrap/" + KEY,
             Map.of("ciphertext", oldCiphertext)
         );
         return (String) response.getData().get("ciphertext");
@@ -264,7 +273,7 @@ vault write -f transit/keys/payment-service/rotate
 # Check key versions
 vault read transit/keys/payment-service
 # Key               Value
-# min_decryption_version  1   <- oldest decrytable version
+# min_decryption_version  1   <- oldest decryptable version
 # min_encryption_version  0   <- 0 = latest
 # latest_version         3   <- currently on version 3
 
@@ -281,13 +290,17 @@ vault write transit/keys/payment-service/config min_decryption_version=3
 
 An HSM is a tamper-resistant physical device that generates, stores, and uses cryptographic keys. The private key never leaves the HSM boundary—cryptographic operations happen inside the hardware.
 
-### HSM Hierarchy in PCI DSS
+### Where HSMs Are Required
 
-**FIPS 140-2 Level 3** is the minimum HSM security level for PCI DSS PAN encryption requirements:
-- Tamper-evident physical protection
-- Tamper response: key zeroization on physical attack
+PCI DSS itself does not demand an HSM for PAN encryption: key-encrypting keys must be stored in a secure cryptographic device (an HSM), *or* as at least two full-length key components, *or* encrypted under a key at least as strong (Requirement 3.6.1.2). HSMs become mandatory in **PIN processing and card issuing** (PCI PIN Security, PCI P2PE, card-scheme rules), where devices must be approved under **PCI PTS HSM** or validated to **FIPS 140-2/140-3 Level 3** or higher. In practice, most firms put their root keys in an HSM — or a cloud KMS, whose keys are protected by FIPS 140-validated HSMs — anyway.
+
+**FIPS 140 Level 3** HSMs provide:
+- Tamper-evident *and* tamper-resistant physical protection
+- Tamper response: key zeroisation on physical attack
 - Identity-based authentication required for all operations
-- Private keys cannot be exported in plaintext
+- Keys cannot be exported in plaintext
+
+(FIPS 140-3 has replaced FIPS 140-2: new validations are issued against 140-3, and remaining 140-2 certificates move to the historical list in September 2026.)
 
 **Common HSM vendors**: Thales (nShield), Utimaco, AWS CloudHSM, Azure Dedicated HSM
 
@@ -296,16 +309,25 @@ An HSM is a tamper-resistant physical device that generates, stores, and uses cr
 @Configuration
 public class HsmConfig {
 
+    private final VaultClient vaultClient;   // your wrapper for reading secrets from Vault
+
+    public HsmConfig(VaultClient vaultClient) {
+        this.vaultClient = vaultClient;
+    }
+
     @Bean
     public Provider hsmProvider() throws Exception {
         // Load the PKCS#11 provider for your HSM
-        // HSM vendor provides the library (e.g., /usr/lib/pkcs11/libcknfast.so)
+        // HSM vendor provides the library (e.g., /usr/lib/pkcs11/libcknfast.so).
+        // configure() takes a file name, or inline config prefixed with "--"
         Provider hsmProvider = Security.getProvider("SunPKCS11");
-        return hsmProvider.configure("""
-            name = PaymentsHSM
+        Provider configured = hsmProvider.configure("""
+            --name = PaymentsHSM
             library = /usr/lib/pkcs11/libcknfast.so
-            slot = 0
+            slotListIndex = 0
             """);
+        Security.addProvider(configured);
+        return configured;
     }
 
     @Bean
@@ -317,6 +339,7 @@ public class HsmConfig {
     }
 
     // Signing key for payment authorisation — private key lives in HSM
+    // (the returned object is only a HANDLE to the key inside the HSM)
     @Bean
     public PrivateKey paymentSigningKey(KeyStore hsmKeyStore) throws Exception {
         return (PrivateKey) hsmKeyStore.getKey("payment-signing-key-v1", null);
@@ -328,13 +351,14 @@ public class HsmConfig {
 public class PaymentAuthorisationSigner {
 
     private final PrivateKey signingKey;  // Lives in HSM
+    private final Provider hsmProvider;   // the SunPKCS11 provider bean
 
     public byte[] signPayment(PaymentAuthorisationRequest request) throws Exception {
         byte[] payload = serialiseToBytes(request);
 
         // This signature computation runs INSIDE the HSM
         // The private key never leaves the HSM boundary
-        Signature signer = Signature.getInstance("SHA256withRSA");
+        Signature signer = Signature.getInstance("SHA256withRSA", hsmProvider);
         signer.initSign(signingKey);
         signer.update(payload);
         return signer.sign();
@@ -352,17 +376,17 @@ A key ceremony is the formal procedure for generating a new master key. It requi
 Key Ceremony for Master Key Generation
 =======================================
 
-PARTICIPANTS (required, minimum quorum of 3 of 5):
-  - Chief Security Officer (CSO)
-  - Head of Operations
-  - Compliance Officer
-  - Independent auditor
-  - Senior Engineer (key administrator)
+PARTICIPANTS:
+  - 5 key custodians from different teams (quorum: 3 of 5 needed
+    to use or restore the key) — e.g. security, operations, engineering
+  - Ceremony administrator (runs the pre-approved script)
+  - Independent witness / auditor (NOT a custodian)
 
 LOCATION:
   - Secure facility (HSM room)
   - Faraday cage (prevents radio interception)
-  - No electronic devices, no cameras
+  - No personal electronic devices; only the facility's own CCTV,
+    positioned so that no PIN entry or key component is visible
 
 PROCEDURE:
 1. Identity verification
@@ -392,7 +416,7 @@ PROCEDURE:
 
 DOCUMENTATION:
   - Full written record of proceedings
-  - Video recording of ceremony (audio disabled near key generation)
+  - CCTV footage retained as evidence of who was present
   - Signed by all participants
   - Stored in fireproof safe and off-site copy
 ```
@@ -402,7 +426,8 @@ DOCUMENTATION:
 ## Spring Cloud Vault Integration
 
 ```yaml
-# bootstrap.yml — Vault integration for Spring Boot
+# application.yml — Vault integration for Spring Boot
+# (bootstrap.yml is the legacy mechanism; spring.config.import replaces it)
 spring:
   cloud:
     vault:
@@ -414,38 +439,51 @@ spring:
         # payment-service SA → Vault policy payment-service-policy
       config:
         lifecycle:
-          enabled: true          # Automatic secret renewal
-          min-renewal: 10s       # Start renewal 10s before expiry
-          expiry-threshold: 1m   # Renew when less than 1 minute remaining
+          enabled: true          # Automatic lease renewal
+          min-renewal: 10s       # Minimum lease duration requested on renewal
+          expiry-threshold: 1m   # Renew a lease 1 minute before it expires
+      database:
+        enabled: true            # Dynamic DB credentials from database/creds/<role>
+        role: payment-service    # → spring.datasource.username / password
 
   config:
     import: "vault://"
-    # Vault secret paths to load as properties
-    # vault/secret/payment-service/database → spring.datasource.*
-    # vault/secret/payment-service/kms → encryption.*
+    # Static secrets from the KV engine, e.g. secret/payment-service → properties
 ```
 
 ```java
-// Automatic secret renewal — Vault lease management
-@Service
-public class VaultSecretManager {
+// Spring Cloud Vault renews the DB credential lease automatically -- but when
+// the lease reaches its max TTL it EXPIRES, and Spring Cloud Vault does NOT
+// reconfigure HikariCP. Lease events come from SecretLeaseContainer (they are
+// not Spring ApplicationEvents, so @EventListener would never fire).
+@Component
+public class VaultDbCredentialRotation {
 
-    @Value("${database.username}")  // Injected from Vault dynamic secret
-    private String dbUsername;
+    private static final String PATH = "database/creds/payment-service";
 
-    @Value("${database.password}")  // Injected from Vault dynamic secret
-    private String dbPassword;
+    private final SecretLeaseContainer leaseContainer;
+    private final HikariDataSource dataSource;
 
-    // Spring Cloud Vault automatically renews leases before expiry
-    // When renewal fails (Vault unavailable), Spring context refreshes
-    // causing HikariCP to reconnect with new credentials
+    // ... constructor
 
-    @EventListener
-    public void onSecretLeaseExpired(SecretLeaseExpiredEvent event) {
-        log.warn("Vault secret lease expired: {}", event.getSource());
-        // Trigger connection pool refresh to pick up new credentials
-        dataSource.close();
-        dataSource = dataSourceFactory.createDataSource(dbUsername, dbPassword);
+    @PostConstruct
+    void registerListener() {
+        leaseContainer.addLeaseListener(event -> {
+            if (!PATH.equals(event.getSource().getPath())) return;
+
+            if (event instanceof SecretLeaseExpiredEvent) {
+                // Max TTL reached: ask Vault for a brand-new credential
+                leaseContainer.requestRotatingSecret(PATH);
+            } else if (event instanceof SecretLeaseCreatedEvent created) {
+                Map<String, Object> secrets = created.getSecrets();
+                HikariConfigMXBean config = dataSource.getHikariConfigMXBean();
+                config.setUsername((String) secrets.get("username"));
+                config.setPassword((String) secrets.get("password"));
+                // New connections use the new credential; replace the old
+                // ones gradually (in-use connections are closed when returned)
+                dataSource.getHikariPoolMXBean().softEvictConnections();
+            }
+        });
     }
 }
 ```
@@ -454,33 +492,48 @@ public class VaultSecretManager {
 
 ## Key Takeaways
 
-- Envelope encryption solves the KMS performance problem: generate one data key per record (or per customer), encrypt data locally with the data key, store only the KMS-encrypted data key
+- Envelope encryption solves the KMS performance and size problem: generate one data key per record (or per customer), encrypt data locally with the data key, store only the KMS-encrypted data key
 - Always use encryption context in AWS KMS calls: it provides authorisation context and makes CloudTrail logs meaningful ("which service, for what purpose, decrypted this key")
-- Vault Transit's rewrap operation rotates encryption keys without the plaintext ever leaving Vault — this is how you achieve key rotation at scale without a data migration
-- HSMs are required for PAN encryption under PCI DSS (FIPS 140-2 Level 3): the private key never leaves the hardware boundary regardless of physical or logical attack
+- Vault Transit's rewrap operation moves ciphertext to the latest key version without the plaintext ever leaving Vault — you still update the stored ciphertext, but no plaintext migration is needed
+- HSMs (PCI PTS HSM or FIPS 140-2/140-3 Level 3) are mandatory for PIN processing and card issuing; for PAN encryption PCI DSS also allows other key-protection options, but root keys in an HSM or HSM-backed KMS are standard practice — keys never leave the hardware boundary
 - Key ceremonies are not bureaucracy — they are the procedural control that ensures no single person can compromise the root of trust; they require a quorum, documentation, and independent witnesses
-- Wipe plaintext key material from memory immediately after use with `Arrays.fill(keyBytes, (byte) 0)`: heap dumps and core dumps can expose keys that linger in memory
+- Wipe plaintext key material from memory as soon as possible with `Arrays.fill(keyBytes, (byte) 0)` — best effort, since libraries keep their own copies; heap dumps and core dumps can expose keys that linger in memory, so treat them as sensitive data
 
 <!-- KNOWLEDGE-CHECK
 {
   "questions": [
     {
       "text": "What is envelope encryption, and why does it solve the KMS performance problem?",
-      "options": ["Envelope encryption encrypts data twice for extra security", "A DEK (Data Encryption Key) encrypts the data locally; the DEK itself is encrypted by KMS and stored alongside the data — only the DEK encryption/decryption requires KMS, not every data read/write", "Envelope encryption stores keys inside the database alongside the data", "Envelope encryption requires a hardware security module for every operation"],
+      "options": [
+        "Envelope encryption encrypts data twice for extra security",
+        "A DEK (Data Encryption Key) encrypts the data locally; the DEK itself is encrypted by KMS and stored alongside the data — only the DEK encryption/decryption requires KMS, not every data read/write",
+        "Envelope encryption stores keys inside the database alongside the data",
+        "Envelope encryption requires a hardware security module for every operation"
+      ],
       "correct": 1,
-      "explanation": "Calling AWS KMS for every database read/write would be impossibly slow (network round-trip per operation). Envelope encryption generates a local DEK, encrypts the data with the DEK in memory (fast), and only calls KMS to wrap/unwrap the DEK — which happens once at startup or on cache expiry, not on every data access."
+      "explanation": "Calling AWS KMS for every byte of data would be slow (a network round-trip per operation) and impossible for large records (KMS encrypts at most 4 KB). Envelope encryption encrypts the data locally with a DEK (fast) and calls KMS only to generate and to unwrap the DEK — once per record written or read, or even less often when unwrapped DEKs are cached briefly."
     },
     {
-      "text": "What is the FIPS 140-2 Level 3 requirement for HSMs, and when is it mandatory in financial services?",
-      "options": ["FIPS 140-2 Level 3 requires physical tamper-evidence; mandatory for PAN encryption under PCI DSS HSM requirements", "FIPS 140-2 Level 3 requires AES-256 encryption; mandatory for all financial services", "FIPS 140-2 Level 3 requires network isolation; mandatory for internet-facing services", "FIPS 140-2 Level 3 is optional guidance; never strictly mandatory"],
+      "text": "Where are FIPS 140 Level 3 (or PCI PTS HSM) approved HSMs mandatory in payments, and what does Level 3 add?",
+      "options": [
+        "In PIN processing and card issuing (PCI PIN Security, P2PE, card-scheme rules); Level 3 adds tamper-resistance with key zeroisation and identity-based authentication",
+        "For every service that stores any personal data",
+        "Only for internet-facing web servers that terminate TLS",
+        "Nowhere — FIPS 140 is US-government guidance with no role in payments"
+      ],
       "correct": 0,
-      "explanation": "FIPS 140-2 Level 3 requires physical tamper-evidence, tamper-resistance, and identity-based authentication. PCI DSS requires HSMs meeting FIPS 140-2 Level 3 (or higher) for PAN encryption operations. The key benefit: private keys never leave the hardware boundary, so even physical access to the HSM device cannot extract the keys."
+      "explanation": "PIN processing and card issuing require HSMs approved under PCI PTS HSM or validated to FIPS 140-2/140-3 Level 3 or higher. Level 3 adds tamper-resistance (keys are zeroised on physical attack) and identity-based operator authentication. For PAN encryption, PCI DSS 3.6.1.2 also allows key-encrypting keys to be stored as split components or encrypted under an equally strong key — though root keys in an HSM or HSM-backed KMS are standard practice. FIPS 140-3 has replaced 140-2 for new validations."
     },
     {
       "text": "Why should plaintext key material be wiped from Java byte arrays immediately after use with Arrays.fill()?",
-      "options": ["To improve garbage collection performance", "Java's garbage collector does not immediately free memory; key material can persist in heap until GC runs. Heap dumps, core dumps, or memory analysis tools can expose key bytes that linger in memory after use", "To comply with Java memory management best practices", "To prevent key material from being logged accidentally"],
+      "options": [
+        "To improve garbage collection performance",
+        "Java's garbage collector does not immediately free memory; key material can persist in heap until GC runs. Heap dumps, core dumps, or memory analysis tools can expose key bytes that linger in memory after use",
+        "To comply with Java memory management best practices",
+        "To prevent key material from being logged accidentally"
+      ],
       "correct": 1,
-      "explanation": "Unlike stack variables in some languages, Java byte arrays on the heap persist until GC collects them, which may be minutes later. Heap dumps (JVM diagnostic tool), core dumps (OS crash), or memory forensics can recover key bytes still in memory. Arrays.fill() zeroes the bytes immediately, limiting the window of exposure."
+      "explanation": "Java byte arrays on the heap persist until the garbage collector reclaims them, which may be minutes later — and even then the memory is not zeroed until reused. Heap dumps (JVM diagnostics), core dumps (OS crash), or memory forensics can recover key bytes still in memory. Arrays.fill() zeroes your copy immediately, limiting the window of exposure; it is best effort, because libraries such as SecretKeySpec keep internal copies."
     }
   ]
 }

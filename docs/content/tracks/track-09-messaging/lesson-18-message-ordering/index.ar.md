@@ -9,7 +9,7 @@ difficulty: advanced
 estimatedMinutes: 75
 status: published
 tags: [message-ordering, partition-key, global-order, sequence-number]
-prerequisites: [kafka-architecture, kafka-producer, kafka-consumer]
+prerequisites: ["track-09-lesson-01", "track-09-lesson-02", "track-09-lesson-03"]
 ---
 
 # ترتيب الرسائل — الضمانات الشاملة مقابل ضمانات مستوى القسم

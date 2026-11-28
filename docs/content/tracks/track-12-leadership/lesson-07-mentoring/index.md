@@ -53,7 +53,7 @@ What are they working on next? Where is the opportunity to stretch? What support
 
 ## Giving Technical Feedback Using SBI
 
-**SBI** (Situation, Behaviour, Impact) is a structured feedback model that makes feedback concrete and actionable rather than personal and vague.
+**SBI** (Situation, Behaviour, Impact), developed by the Center for Creative Leadership, is a structured feedback model that makes feedback concrete and actionable rather than personal and vague.
 
 **Situation**: Describe the specific context. When and where did this happen?
 
@@ -79,12 +79,12 @@ Compare to the common alternative: "Great RFC—really thorough." This is nice t
 ```
 "In the architecture review for the fraud service redesign last Thursday (Situation),
 when [@senior-architect] asked about the database sharding approach, you defended
-your original proposal without acknowledging the concerns he raised about hot keys (Behaviour).
-Two engineers in the room told me afterward that they agreed with his concern but
+your original proposal without acknowledging the concerns they raised about hot keys (Behaviour).
+Two engineers in the room told me afterward that they agreed with that concern but
 didn't want to pile on. The sharding strategy now needs revisiting after three months
 of implementation (Impact).
 
-What I want to explore with you is: what was going through your mind when he raised that?"
+What I want to explore with you is: what was going through your mind when that was raised?"
 ```
 
 The question at the end opens a coaching conversation rather than delivering a verdict.
@@ -184,7 +184,7 @@ Fintech has unique mentoring requirements that do not exist in product companies
 
 **Risk thinking**: Financial services operates in an environment where mistakes have direct customer and regulatory consequences. Help mentees develop a reflexive habit of asking "what is the worst-case outcome here?" and "how do we know if this is happening?"
 
-**Security training**: Many fintech companies require annual security awareness training. Beyond the mandatory training, help mentees build real security engineering instincts through design reviews that include security threat modelling.
+**Security training**: Annual security awareness training is mandatory in most fintechs (PCI DSS Requirement 12.6, for example). Beyond the mandatory training, help mentees build real security engineering instincts through design reviews that include security threat modelling.
 
 ---
 

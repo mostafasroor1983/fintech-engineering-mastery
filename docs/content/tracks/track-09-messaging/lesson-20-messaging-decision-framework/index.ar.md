@@ -9,7 +9,7 @@ difficulty: principal
 estimatedMinutes: 65
 status: published
 tags: [decision-framework, messaging, trade-offs, staff-engineer, broker]
-prerequisites: [kafka-architecture, rabbitmq-vs-kafka, kafka-security, kafka-performance]
+prerequisites: ["track-09-lesson-01", "track-09-lesson-19", "track-09-lesson-12", "track-09-lesson-13"]
 ---
 
 # إطار قرارات المراسلة للمهندس الرئيسي

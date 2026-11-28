@@ -296,7 +296,7 @@ flowchart TD
 
 ## Bar Raiser Role
 
-The bar raiser is an interviewer from outside the hiring team who assesses against the company-wide engineering bar, not the team's immediate needs or pressure to fill a vacancy.
+The bar raiser (a practice popularised by Amazon) is an interviewer from outside the hiring team who assesses against the company-wide engineering bar, not the team's immediate needs or pressure to fill a vacancy.
 
 **What makes a bar raiser effective:**
 
@@ -312,6 +312,8 @@ The bar raiser is an interviewer from outside the hiring team who assesses again
 ---
 
 ## Levelling Matrix: L5 / L6 / L7
+
+Level names and numbers vary between companies; the matrix below is one common mapping.
 
 | Dimension | L5 (Staff Engineer) | L6 (Principal Engineer) | L7 (Distinguished Engineer) |
 |-----------|--------------------|-----------------------|----------------------------|

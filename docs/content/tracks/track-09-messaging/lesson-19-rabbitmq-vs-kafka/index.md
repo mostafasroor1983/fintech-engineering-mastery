@@ -9,7 +9,7 @@ difficulty: advanced
 estimatedMinutes: 75
 status: published
 tags: [RabbitMQ, Kafka, comparison, queue, log]
-prerequisites: [kafka-architecture]
+prerequisites: ["track-09-lesson-01"]
 ---
 
 # RabbitMQ vs Kafka — Choosing the Right Broker

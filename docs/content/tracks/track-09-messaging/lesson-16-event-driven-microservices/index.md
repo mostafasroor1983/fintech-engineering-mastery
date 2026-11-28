@@ -9,7 +9,7 @@ difficulty: advanced
 estimatedMinutes: 85
 status: published
 tags: [event-driven, microservices, event-mesh, choreography, decoupling]
-prerequisites: [kafka-architecture, outbox-cdc-debezium, saga-pattern]
+prerequisites: ["track-09-lesson-01", "track-09-lesson-06", "track-09-lesson-15"]
 ---
 
 # Event-Driven Microservices — Integration Patterns

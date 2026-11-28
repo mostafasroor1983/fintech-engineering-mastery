@@ -57,11 +57,11 @@ Apache Kafka 4.0 completes the KRaft (Kafka Raft Metadata) transition — ZooKee
 
 ### What Disappeared from Configuration
 
-Apache Kafka 4.0 removes all ZooKeeper-dependent code paths. For Spring Boot applications, this affects both producer/consumer `bootstrap-servers` behaviour and several properties that previously delegated to ZooKeeper-based admin operations.
+Apache Kafka 4.0 removes all ZooKeeper-dependent code paths from the broker. Client applications are barely affected — they talk to brokers via `bootstrap-servers` — but old configurations often still carry `zookeeper.*` entries that should be cleaned up:
 
-**Properties removed in Spring Kafka 4 / Kafka 4.0:**
+**Leftover properties to delete:**
 
-| Removed property | Notes |
+| Leftover property | Notes |
 |---|---|
 | `spring.kafka.admin.properties.zookeeper.connect` | ZK admin gone; use KRaft |
 | `spring.kafka.properties.zookeeper.session.timeout.ms` | ZK-only; remove from configs |
@@ -85,14 +85,14 @@ spring:
 spring:
   kafka:
     bootstrap-servers: kafka-0:9092,kafka-1:9092,kafka-2:9092
-    # No zookeeper.* properties — they will cause startup warnings in SK4
-    # and are ignored by Kafka 4.0 brokers
+    # No zookeeper.* properties — the Kafka client only logs
+    # "supplied but isn't a known config" warnings for them
     properties:
       security.protocol: SASL_SSL
       sasl.mechanism: SCRAM-SHA-512
 ```
 
-The broker addresses are identical — KRaft does not change the client-facing protocol. The elimination is purely in the broker metadata layer, but SK4 will log warnings if it detects ZooKeeper properties in the client config, since they indicate a misconfigured environment.
+The broker addresses are identical — KRaft does not change the client-facing protocol. (Kafka clients have not needed ZooKeeper since the old Scala consumer disappeared; `zookeeper.*` entries in client configs are leftovers that the client ignores with a warning.) The change is in the broker metadata layer: Kafka 4.0 brokers run KRaft only, so clusters must be migrated to KRaft (via Kafka 3.9) before upgrading.
 
 ### KRaft Impact on Kafka Admin Operations
 
@@ -120,14 +120,14 @@ NewTopic paymentEventsDlt() {
 
 ---
 
-## 2. `KafkaTemplate` in SK4 — `CompletableFuture` Everywhere
+## 2. `KafkaTemplate` — `CompletableFuture` Everywhere
 
-`ListenableFuture` was a Spring utility type used in SK3 for async send results. It is **removed** in SK4. All `KafkaTemplate.send()` overloads now return `CompletableFuture<SendResult<K, V>>`.
+`ListenableFuture` was a Spring utility type used by Spring Kafka 2.x for async send results. Since **Spring Kafka 3.0** (Spring Boot 3), all `KafkaTemplate.send()` overloads return `CompletableFuture<SendResult<K, V>>`, and Spring Framework 7 has removed `ListenableFuture` altogether. Services that skipped the Boot 3 migration must convert their callbacks now.
 
-**Spring Kafka 3.x (removed):**
+**Spring Kafka 2.x style:**
 
 ```java
-// DOES NOT COMPILE in Spring Kafka 4
+// Does not compile on Spring Kafka 3 or 4
 ListenableFuture<SendResult<String, PaymentEvent>> future =
     kafkaTemplate.send("payment-events", event.paymentId(), event);
 future.addCallback(
@@ -163,7 +163,7 @@ public class PaymentEventPublisher {
 }
 ```
 
-Type safety also improved: `KafkaTemplate<String, PaymentEvent>` now enforces the value type at the generics level, and Spring Boot 4 auto-configuration will create typed templates when you declare a `ProducerFactory<String, PaymentEvent>` bean.
+Spring Boot auto-configures a `KafkaTemplate` that you can inject with your own generic types (`KafkaTemplate<String, PaymentEvent>`); the configured serializers decide what is actually written. Note that `exceptionally` only observes a failure — the caller must still decide what to do with an event that could not be published (retry, outbox, or fail the request).
 
 ---
 
@@ -190,25 +190,26 @@ spring:
       group-id: payment-processor
 ```
 
-`transaction-id-prefix` triggers `KafkaTransactionManager` auto-configuration in SB4. Combined with `enable.idempotence=true` and `acks=all`, this gives you exactly-once producer semantics (EOS).
+`transaction-id-prefix` makes the producer transactional and triggers `KafkaTransactionManager` auto-configuration. Combined with `enable.idempotence=true` and `acks=all`, this gives you exactly-once semantics *within Kafka* (EOS): consume-process-produce loops and multi-record publishes commit atomically, and `read_committed` consumers never see aborted records.
 
 ### Spanning a DB Transaction and a Kafka Transaction
 
-The classic `ChainedTransactionManager` was removed in Spring Framework 6.1. In SK4 with Spring Framework 7, the recommended pattern is `@Transactional` with the Kafka transaction manager as the primary, with the JPA transaction synchronized via Spring's `TransactionSynchronizationManager`.
+A database and Kafka cannot share one ACID transaction. `ChainedKafkaTransactionManager` (deprecated in Spring Kafka 2.7, removed in 3.0) used to chain them; today the recommended pattern is to make the **JPA transaction the outer transaction** and let the transactional `KafkaTemplate` *synchronize* its Kafka transaction with it.
 
 ```java
 @Service
 @RequiredArgsConstructor
-@Transactional(transactionManager = "kafkaTransactionManager")
+@Transactional   // the primary (JPA) transaction manager
 public class PaymentCommandHandler {
 
     private final PaymentRepository paymentRepository;
     private final KafkaTemplate<String, PaymentEvent> kafkaTemplate;
 
     /**
-     * Kafka transaction wraps both the DB write (via JPA synchronization)
-     * and the Kafka produce. If Kafka commit fails, DB is rolled back.
-     * If DB fails, Kafka transaction is aborted before commit.
+     * The JPA transaction is the outer one. The send() joins a Kafka transaction
+     * that Spring synchronizes with it: the DB commits first, then Kafka.
+     * If the method throws, both roll back. If Kafka's commit fails AFTER the
+     * DB commit, the event is lost -- see the outbox note below.
      */
     public PaymentResult handleCreatePayment(CreatePaymentCommand cmd) {
         // 1. Persist payment in PostgreSQL within the synchronized JPA transaction
@@ -235,7 +236,9 @@ public class TransactionConfig {
         return new KafkaTransactionManager<>(producerFactory);
     }
 
-    // JPA transaction manager participates as a secondary via synchronization
+    // Spring Boot's JPA transaction manager backs off when ANY TransactionManager
+    // bean exists (including the Kafka one) -- so declare it explicitly and make
+    // it the primary one used by plain @Transactional
     @Bean
     @Primary
     PlatformTransactionManager transactionManager(EntityManagerFactory emf) {
@@ -244,9 +247,11 @@ public class TransactionConfig {
 }
 ```
 
-**The correct mental model**: declare `@Transactional(transactionManager = "kafkaTransactionManager")` on the method. Spring's transaction infrastructure begins a Kafka transaction; the `KafkaResourceHolder` is registered with the transaction synchronization mechanism. When the Kafka transaction begins, any `JpaTransactionManager` operations within the same thread participate through `TransactionSynchronizationManager`. On commit: JPA flushes first (synchronization `beforeCommit`), then Kafka sends `commitTransaction`. On failure: JPA rolls back via synchronization `afterRollback`, Kafka aborts the transaction.
+**The correct mental model**: `@Transactional` starts the JPA transaction. When `kafkaTemplate.send()` runs inside it, the transactional template starts a Kafka transaction and registers it with Spring's `TransactionSynchronizationManager`. On success, Spring commits the database transaction and then commits the Kafka transaction. If the method throws, the database rolls back and the Kafka transaction is aborted, so `read_committed` consumers never see the event.
 
-This is not full XA — if the Kafka broker crashes after the JPA commit but before the Kafka commit, you have a window. For true atomic guarantees in production fintech, use the **transactional outbox pattern** (insert an event row in the same DB transaction, then a separate relay publishes it to Kafka and deletes the row).
+(Do **not** put `@Transactional(transactionManager = "kafkaTransactionManager")` on the method instead: the repository call would then run in its *own* JPA transaction, committed immediately — before Kafka — and a later failure would leave the payment in the database without its event.)
+
+This is best-effort one-phase commit, not XA — if Kafka's commit fails after the database commit (broker unreachable at that moment), the event is lost. For true atomicity in production fintech, use the **transactional outbox pattern**: insert an event row in the same database transaction, and let a relay (e.g. Debezium CDC or a poller) publish it to Kafka.
 
 ---
 
@@ -254,12 +259,12 @@ This is not full XA — if the Kafka broker crashes after the JPA commit but bef
 
 ### Error Handler API Replacement
 
-`ErrorHandler` and `BatchErrorHandler` interfaces were deprecated in SK3 and are **removed** in SK4. The replacement is `CommonErrorHandler`, which handles both record-by-record and batch consumption through a single interface.
+The legacy `ErrorHandler`/`BatchErrorHandler` interfaces and `SeekToCurrentErrorHandler` were deprecated in Spring Kafka 2.8 and removed in **3.0**. The replacement is `CommonErrorHandler` (usually `DefaultErrorHandler`), which handles both record-by-record and batch consumption through a single interface. As with `ListenableFuture`, this only bites services that skipped the Boot 3 migration.
 
-**SK3 (removed):**
+**Spring Kafka 2.x style:**
 
 ```java
-// DOES NOT COMPILE in Spring Kafka 4
+// Does not compile on Spring Kafka 3 or 4
 @Bean
 ConcurrentKafkaListenerContainerFactory<String, PaymentEvent> factory(
         ConsumerFactory<String, PaymentEvent> cf) {
@@ -279,8 +284,10 @@ ConcurrentKafkaListenerContainerFactory<String, PaymentEvent> paymentListenerFac
 
     var factory = new ConcurrentKafkaListenerContainerFactory<String, PaymentEvent>();
     factory.setConsumerFactory(cf);
-    factory.setConcurrency(3);                    // 3 threads per consumer
+    factory.setConcurrency(3);                    // 3 consumer threads
     factory.setAutoStartup(true);
+    // The listener below takes an Acknowledgment -> manual ack mode
+    factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL);
 
     // DefaultErrorHandler replaces SeekToCurrentErrorHandler
     var dlt = new DeadLetterPublishingRecoverer(kafkaTemplate,
@@ -309,11 +316,10 @@ public class PaymentEventConsumer {
     private final AccountService accountService;
 
     @KafkaListener(
+        id = "payment-processor",                 // used by the health indicator below
         topics = "payment-events",
         groupId = "payment-processor",
-        containerFactory = "paymentListenerFactory",
-        concurrency = "3",
-        autoStartup = "true"
+        containerFactory = "paymentListenerFactory"
     )
     public void onPaymentEvent(
             @Payload PaymentEvent event,
@@ -354,14 +360,14 @@ public class PaymentEventConsumer {
 ```mermaid
 flowchart TD
     subgraph Producer["Payment Service (EOS Producer)"]
-        A[POST /api/v1/payments] --> B[Begin Kafka Transaction]
+        A[POST /api/v1/payments] --> B[Begin DB transaction]
         B --> C[INSERT payment\nPostgreSQL]
         C --> D{DB write\nsuccessful?}
-        D -- No --> E[Rollback DB\nAbort Kafka Txn]
-        D -- Yes --> F[kafkaTemplate.send\npayment-events]
-        F --> G{Kafka send\nsuccessful?}
-        G -- No --> H[Abort Kafka Txn\nRollback DB sync]
-        G -- Yes --> I[Commit Kafka Txn\nCommit DB sync]
+        D -- No --> E[Rollback DB]
+        D -- Yes --> F[kafkaTemplate.send\njoins synchronized Kafka txn]
+        F --> G{Send\nsuccessful?}
+        G -- No --> H[Rollback DB\nAbort Kafka Txn]
+        G -- Yes --> I[Commit DB\nthen commit Kafka Txn]
         I --> J[201 Created]
     end
 
@@ -401,7 +407,7 @@ spring:
 
 `observation-enabled: true` injects a Micrometer `Observation` around each `@KafkaListener` invocation. Combined with a `Tracer` bean (Brave or OpenTelemetry), this produces distributed traces that connect the HTTP request (producer side) to the Kafka consumer invocation.
 
-**Programmatic consumer lag check:**
+**Programmatic consumer lag check** (think twice before wiring lag into a *readiness* probe: a lag spike would take every consumer pod out of service at once — usually lag belongs in a metric and an alert, as in the observability lessons):
 
 ```java
 @Component
@@ -409,6 +415,8 @@ spring:
 public class KafkaLagHealthIndicator implements HealthIndicator {
 
     private final KafkaListenerEndpointRegistry registry;
+    // Not auto-configured: create one from Boot's KafkaAdmin, e.g.
+    // AdminClient.create(kafkaAdmin.getConfigurationProperties())
     private final AdminClient adminClient;
 
     @Override
@@ -425,7 +433,9 @@ public class KafkaLagHealthIndicator implements HealthIndicator {
 
             long totalLag = calculateLag(offsets);
             if (totalLag > 100_000) {
-                return Health.degraded()
+                // There is no Health.degraded(); use a custom status
+                // (and map it to an HTTP code via management.endpoint.health.status.http-mapping)
+                return Health.status("DEGRADED")
                     .withDetail("lag", totalLag)
                     .withDetail("threshold", 100_000)
                     .build();
@@ -442,7 +452,7 @@ public class KafkaLagHealthIndicator implements HealthIndicator {
 
 ## 7. Testing with `@EmbeddedKafka` and KRaft Mode
 
-SK4's `@EmbeddedKafka` runs in KRaft mode by default — no ZooKeeper process is started. The `EmbeddedKafkaBroker` API is unchanged from SK3, so existing tests compile without modification, but the underlying broker is now a KRaft broker.
+`@EmbeddedKafka` has defaulted to KRaft mode since Spring Kafka 3.1, and Spring Kafka 4 removes the ZooKeeper-based embedded broker entirely. Tests that relied on `EmbeddedKafkaZKBroker` or ZooKeeper-specific settings must be updated; plain `@EmbeddedKafka` tests usually compile unchanged.
 
 ```java
 @SpringBootTest
@@ -513,11 +523,11 @@ class PaymentEventConsumerIntegrationTest {
 ## Summary
 
 - **KRaft is the only mode** in Kafka 4.0. Remove all `zookeeper.*` properties from your Spring Boot application configs — SK4 will warn and Kafka 4.0 brokers will ignore them.
-- **`ListenableFuture` is gone** — all `KafkaTemplate.send()` calls return `CompletableFuture<SendResult<K, V>>`. Update all callback code to use `thenApply` / `exceptionally`.
-- **EOS requires** `transaction-id-prefix` + `enable.idempotence=true` + `acks=all` on the producer, and `isolation-level=read_committed` on consumers. Span DB + Kafka writes in a single `@Transactional(transactionManager = "kafkaTransactionManager")` method; use the outbox pattern for the strongest guarantees.
-- **`CommonErrorHandler`** replaces `ErrorHandler` and `BatchErrorHandler`. Use `DefaultErrorHandler` with `FixedBackOff` and `DeadLetterPublishingRecoverer` for retry + DLT in one configuration.
+- **`ListenableFuture` is gone** (since Spring Kafka 3.0; removed from Framework 7) — `KafkaTemplate.send()` returns `CompletableFuture<SendResult<K, V>>`. Update callback code to use `thenApply` / `exceptionally` / `whenComplete`.
+- **EOS requires** `transaction-id-prefix` + `enable.idempotence=true` + `acks=all` on the producer, and `isolation-level=read_committed` on consumers. To combine a DB write and a Kafka publish, make the JPA transaction the outer `@Transactional` and let the transactional `KafkaTemplate` synchronize with it (best-effort 1PC); use the outbox pattern for real atomicity.
+- **`CommonErrorHandler`** (since Spring Kafka 2.8/3.0) replaces `ErrorHandler` and `BatchErrorHandler`. Use `DefaultErrorHandler` with `FixedBackOff` and `DeadLetterPublishingRecoverer` for retry + DLT in one configuration.
 - **`observation-enabled: true`** wires Micrometer tracing spans around listener invocations for distributed tracing without code changes.
-- **`@EmbeddedKafka`** in SK4 runs KRaft mode by default — existing test code compiles unchanged.
+- **`@EmbeddedKafka`** runs KRaft only in SK4 (the ZooKeeper embedded broker is removed) — plain tests usually compile unchanged.
 
 ---
 
@@ -537,7 +547,7 @@ class PaymentEventConsumerIntegrationTest {
   },
   {
     "id": "kc-06-02",
-    "question": "In Spring Kafka 4, what does KafkaTemplate.send() return?",
+    "question": "In Spring Kafka 3 and 4, what does KafkaTemplate.send() return?",
     "options": [
       "ListenableFuture<SendResult<K, V>>",
       "Future<RecordMetadata>",
@@ -545,11 +555,11 @@ class PaymentEventConsumerIntegrationTest {
       "Mono<SendResult<K, V>>"
     ],
     "correct": 2,
-    "explanation": "Spring Kafka 4 removes ListenableFuture (a Spring-specific type) and all send() methods return CompletableFuture<SendResult<K, V>>, aligning with the standard Java concurrency API. Reactive types like Mono are available through ReactiveKafkaProducerTemplate, not KafkaTemplate."
+    "explanation": "Since Spring Kafka 3.0, send() returns CompletableFuture<SendResult<K, V>>, aligning with the standard Java concurrency API (Spring Framework 7 has removed ListenableFuture entirely). Reactive types like Mono are available through ReactiveKafkaProducerTemplate, not KafkaTemplate."
   },
   {
     "id": "kc-06-03",
-    "question": "To configure a @KafkaListener to retry failed messages 3 times with a 1-second delay and then publish unrecoverable messages to a dead-letter topic in Spring Kafka 4, which class should you use as the CommonErrorHandler?",
+    "question": "To configure a @KafkaListener to retry failed messages 3 times with a 1-second delay and then publish unrecoverable messages to a dead-letter topic in Spring Kafka 3/4, which class should you use as the CommonErrorHandler?",
     "options": [
       "SeekToCurrentErrorHandler with a DeadLetterPublishingRecoverer",
       "DefaultErrorHandler with FixedBackOff and DeadLetterPublishingRecoverer",
@@ -557,7 +567,7 @@ class PaymentEventConsumerIntegrationTest {
       "BatchErrorHandler with KafkaBackOff"
     ],
     "correct": 1,
-    "explanation": "DefaultErrorHandler (which implements CommonErrorHandler) replaces SeekToCurrentErrorHandler in SK4. It accepts a RecovererAndClassifier — typically a DeadLetterPublishingRecoverer — and a BackOff strategy like FixedBackOff(1000L, 3L). SeekToCurrentErrorHandler and BatchErrorHandler are removed in SK4."
+    "explanation": "DefaultErrorHandler (which implements CommonErrorHandler) replaced SeekToCurrentErrorHandler in Spring Kafka 2.8 and is the standard since 3.0. It accepts a ConsumerRecordRecoverer — typically a DeadLetterPublishingRecoverer — and a BackOff strategy like FixedBackOff(1000L, 3L). SeekToCurrentErrorHandler and BatchErrorHandler were removed in 3.0."
   },
   {
     "id": "kc-06-04",
@@ -586,11 +596,11 @@ class PaymentEventConsumerIntegrationTest {
     },
     {
       "id": "pc-06-02",
-      "description": "Implement PaymentCommandHandler with a method handleCreatePayment(CreatePaymentCommand) annotated @Transactional(transactionManager=\"kafkaTransactionManager\"). The method must: (1) save a Payment entity via PaymentRepository, (2) call kafkaTemplate.send(\"payment-events\", payment.getId(), PaymentEvent.created(payment)). Declare KafkaTransactionManager<String, PaymentEvent> as a @Bean in a TransactionConfig class."
+      "description": "Implement PaymentCommandHandler with a method handleCreatePayment(CreatePaymentCommand) annotated with plain @Transactional (the primary JPA transaction manager). The method must: (1) save a Payment entity via PaymentRepository, (2) call kafkaTemplate.send(\"payment-events\", payment.getId(), PaymentEvent.created(payment)) so the Kafka transaction is synchronized with the JPA one. In a TransactionConfig class, declare the JpaTransactionManager as @Primary (Boot's would back off) alongside the KafkaTransactionManager. Write a test proving that an exception thrown after send() leaves neither a database row nor a committed Kafka record."
     },
     {
       "id": "pc-06-03",
-      "description": "Create a ConcurrentKafkaListenerContainerFactory bean named paymentListenerFactory with: concurrency=3, a DefaultErrorHandler using FixedBackOff(1000L, 3L), a DeadLetterPublishingRecoverer that routes to partition-matched DLT topic (record.topic() + \".DLT\"), and InvalidPaymentException added as a non-retryable exception. Write a @KafkaListener method in PaymentEventConsumer that calls FraudService.screen() and AccountService.debit() and uses manual Acknowledgment."
+      "description": "Create a ConcurrentKafkaListenerContainerFactory bean named paymentListenerFactory with: concurrency=3, AckMode.MANUAL, a DefaultErrorHandler using FixedBackOff(1000L, 3L), a DeadLetterPublishingRecoverer that routes to partition-matched DLT topic (record.topic() + \".DLT\"), and InvalidPaymentException added as a non-retryable exception. Write a @KafkaListener method in PaymentEventConsumer that calls FraudService.screen() and AccountService.debit() and uses manual Acknowledgment."
     },
     {
       "id": "pc-06-04",

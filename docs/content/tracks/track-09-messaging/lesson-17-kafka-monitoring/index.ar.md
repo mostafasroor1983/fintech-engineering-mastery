@@ -9,7 +9,7 @@ difficulty: advanced
 estimatedMinutes: 70
 status: published
 tags: [Kafka, monitoring, consumer-lag, JMX, Prometheus]
-prerequisites: [kafka-architecture, kafka-consumer]
+prerequisites: ["track-09-lesson-01", "track-09-lesson-03"]
 ---
 
 # مراقبة Kafka — تأخر المستهلكين ومقاييس الوسطاء
@@ -378,7 +378,7 @@ kafka-consumer-groups.sh \
 
 ‏**Burrow** من LinkedIn أداة مخصصة لمراقبة مستهلكي Kafka تقيّم صحة مجموعات المستهلكين عبر الزمن، بدل استخدام عتبات ثابتة. (تحقق من نشاط المشروع الحالي قبل اعتماده؛ والبدائل الشائعة *Kafka Exporter* لـ Prometheus مع قواعد تنبيه، أو عروض التأخر في خدمات Kafka المُدارة وواجهات Kafka.)
 
-```yaml
+```toml
 # burrow.toml — Burrow configuration
 [zookeeper]
 servers=["zk1:2181", "zk2:2181", "zk3:2181"]

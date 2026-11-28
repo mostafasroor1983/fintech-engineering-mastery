@@ -68,7 +68,7 @@ There is a spectrum of review engagement. Know which mode is appropriate:
 //
 // After:
 // String sql = "SELECT * FROM transactions WHERE status = ?";
-// return jdbcTemplate.query(sql, new Object[]{status}, transactionRowMapper);
+// return jdbcTemplate.query(sql, transactionRowMapper, status);
 
 // GOOD code review comment (non-blocking):
 // Consider: If this cache grows large (>10k entries) it could cause GC pressure.
@@ -121,7 +121,7 @@ SCALABILITY
   [ ] Where are the bottlenecks? Database? External services? CPU?
   [ ] What happens at 2x expected load? 10x?
 
-COMPLIANCE (financial services addition)
+REGULATORY CHANGE (financial services addition)
   [ ] Does this change require regulatory approval or notification?
   [ ] Does it introduce new data processing activities requiring a DPIA?
 ```
@@ -195,7 +195,10 @@ Conditions:
   2. Redis access credentials via Vault dynamic secrets (not static config)
   3. PAN or sensitive customer data must NOT be stored in Redis
      (rate limiting counters only — no customer data)
-  4. Redis health check required in payment-service readiness probe
+  4. Documented behaviour when Redis is unavailable (fail open or fail closed per
+     endpoint); Redis health is monitored and alerted, but NOT part of the
+     payment-service readiness probe (a Redis outage would otherwise take every
+     payment pod out of service)
   
 Review required if:
   - Redis is used to store data beyond rate limiting counters

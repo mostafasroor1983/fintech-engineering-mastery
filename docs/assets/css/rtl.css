@@ -63,7 +63,7 @@ html[lang="ar"] [class*="-label"] {
 html[dir="rtl"] body.sidebar-collapsed .sidebar-toggle-btn svg { transform: none; }
 
 /* Mobile drawer slides in from the right */
-@media (max-width: 768px) {
+@media (max-width: 768px), (max-height: 500px) and (pointer: coarse) {  /* narrow screens, and phones in landscape: navigation becomes a drawer */
   [dir="rtl"] #sidebar { transform: translateX(100%); }
   [dir="rtl"] #sidebar.open { transform: translateX(0); }
 }
@@ -79,7 +79,7 @@ html[dir="rtl"] body.sidebar-collapsed .sidebar-toggle-btn svg { transform: none
   border: 1px solid var(--border);
   background: var(--bg-base);
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 600;
   cursor: pointer;
   transition: background var(--ease), color var(--ease), border-color var(--ease);
@@ -183,10 +183,10 @@ html[lang="ar"] pre em {
 }
 html[lang="ar"] em { font-weight: 600; }
 
-/* Mermaid measures label widths with its configured Latin font; inheriting the Arabic
-   page font makes the rendered text wider than measured, so cluster titles get clipped. */
+/* Mermaid measures label widths with its configured font (the same stack as the page);
+   keep diagrams on exactly that stack so rendered text matches the measured width. */
 html[lang="ar"] .mermaid-block,
 html[lang="ar"] .mermaid-block * {
-  font-family: Inter, system-ui, sans-serif;
+  font-family: var(--font-sans);
   letter-spacing: normal;
 }

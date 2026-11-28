@@ -467,8 +467,8 @@ catch (ProducerFencedException | OutOfOrderSequenceException e) {
 
 **الإصلاح:** اضبط دائمًا `isolation.level=read_committed` على المستهلكين الذين يقرؤون من مواضيع يكتب إليها منتجون معاملاتيون.
 
-```java
-// In application.properties for Spring Boot consumers:
+```properties
+# In application.properties for Spring Boot consumers:
 spring.kafka.consumer.properties.isolation.level=read_committed
 ```
 

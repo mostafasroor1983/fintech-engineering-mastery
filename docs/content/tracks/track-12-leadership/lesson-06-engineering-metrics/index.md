@@ -32,6 +32,9 @@ You need a framework for these conversations that is grounded in research, resis
 
 The DORA (DevOps Research and Assessment) four metrics are the most research-validated set of engineering effectiveness indicators available. They predict both software delivery performance and organisational performance (revenue growth, market share, profitability).
 
+> [!NOTE]
+> The tier thresholds below follow the clusters of the 2023 Accelerate State of DevOps report (approximately — the clusters are recalculated from survey data every year). The metrics themselves have also evolved: MTTR was renamed *failed deployment recovery time* (2023), *rework rate* was added as a fifth metric (2024), and the 2025 report replaced the four tiers with team profiles. The four classic metrics remain the common baseline.
+
 ### Metric 1: Deployment Frequency
 
 **What it measures**: How often do you successfully release to production?
@@ -57,7 +60,7 @@ Low:    Monthly or less
 **What it measures**: Time from code commit to code running in production.
 
 ```
-Elite:  Less than 1 hour
+Elite:  Less than 1 day
 High:   Between 1 day and 1 week
 Medium: Between 1 week and 1 month
 Low:    More than 1 month
@@ -73,7 +76,8 @@ Low:    More than 1 month
 
 ```bash
 # Measure lead time using git and deployment records
-# Time from first commit on branch to deployment tag
+# Time from first commit on branch to deployment
+# (illustrative: assumes your pipeline writes a deployment-time annotation)
 git log --format="%H %ai" origin/main..HEAD | tail -1  # First commit time
 # vs
 kubectl get deployment payment-service -o jsonpath='{.metadata.annotations.deployment-time}'
@@ -87,10 +91,10 @@ kubectl get deployment payment-service -o jsonpath='{.metadata.annotations.deplo
 **What it measures**: What percentage of deployments cause a production failure requiring rollback, hotfix, or remediation?
 
 ```
-Elite:  0-5%
-High:   5-10%
-Medium: 10-15%
-Low:    More than 15%
+Elite:  ~5%
+High:   ~10%
+Medium: ~15%
+Low:    well above 15% (the 2023 low cluster was ~64%)
 ```
 
 **What it tells you**: High failure rate indicates:
@@ -101,7 +105,7 @@ Low:    More than 15%
 
 **What it does not mean**: Zero failure rate. Aiming for zero change failures incentivises deploying nothing, which is worse.
 
-### Metric 4: MTTR (Mean Time to Restore)
+### Metric 4: MTTR (Mean Time to Restore) / Failed Deployment Recovery Time
 
 **What it measures**: How long does it take to recover from a production failure?
 
@@ -109,7 +113,7 @@ Low:    More than 15%
 Elite:  Less than 1 hour
 High:   Less than 1 day
 Medium: Between 1 day and 1 week
-Low:    More than 1 week
+Low:    More than 1 month
 ```
 
 **What it tells you**: Long MTTR indicates:
@@ -145,7 +149,7 @@ SPACE measures five dimensions:
 
 ## DevEx Metrics
 
-Developer Experience (DevEx) metrics focus on the friction and flow of an engineer's day-to-day work. High DevEx predicts high output quality, low burnout, and strong retention.
+Developer Experience (DevEx) metrics focus on the friction and flow of an engineer's day-to-day work. The DevEx framework (Noda, Storey, Forsgren and Greiler, 2023) groups it into three dimensions: **feedback loops**, **cognitive load**, and **flow state**. High DevEx is associated with high output quality, low burnout, and strong retention.
 
 ### Core DevEx Metrics for Fintech Teams
 
@@ -177,7 +181,7 @@ Every metric, once used for performance evaluation, creates an incentive to game
 
 **Deployment frequency gaming**: Teams deploy trivial changes (typo fixes, comment updates) to inflate their deployment count. Mitigation: measure deployments of meaningful changes; track change complexity alongside frequency.
 
-**Lead time gaming**: Teams create short-lived branches for each PR to minimise measured lead time. Mitigation: measure from "ticket started" not "code committed"; use business outcomes alongside process metrics.
+**Lead time gaming**: Engineers keep work local and commit only just before merging (or squash history) so the measured commit-to-deploy time looks short. Mitigation: also measure from "ticket started", not only "code committed"; use business outcomes alongside process metrics.
 
 **MTTR gaming**: Teams close incidents prematurely to show fast resolution times. Mitigation: measure customer impact duration, not just incident ticket open/close time.
 

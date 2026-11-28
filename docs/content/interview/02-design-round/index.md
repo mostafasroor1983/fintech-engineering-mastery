@@ -20,7 +20,7 @@ A design round is a 45-minute conversation where *you* drive. Interviewers score
 trade-offs and depth, not a "correct" diagram. Use a fixed time plan (RESHADED), say your
 assumptions aloud, do the arithmetic, and spend the second half on one or two deep dives where money
 can be lost (idempotency, consistency, failure handling). This lesson is the *how to run the round*
-checklist. The design patterns themselves are taught in Tracks 06 and 16.
+checklist. The design patterns themselves are taught in Tracks 05, 06 and 14.
 
 ## Analogy
 
@@ -151,3 +151,78 @@ the cost is …' for every choice, and let the interviewer redirect me."
 - [Track 14: Reference sheets (patterns, estimation, databases)](#/tracks/track-14/lessons/track-14-lesson-08)
 - [Track 05: Transactional outbox](#/tracks/track-05/lessons/track-05-lesson-13)
 - [Capstone 1: payment service](#/capstone/payment-service)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1502-01",
+    "question": "By which minute should you be starting the deep dive in a 45-minute design round?",
+    "options": [
+      "Minute 10",
+      "Around minute 24–25",
+      "Minute 40",
+      "Only if the interviewer asks"
+    ],
+    "correct": 1,
+    "explanation": "Requirements, estimation, schema, high-level design and API fit in the first 24 minutes. If you are still drawing at minute 25 in practice, cut the high-level design to five boxes."
+  },
+  {
+    "id": "kc-1502-02",
+    "question": "The interviewer asks why you chose PostgreSQL over Cassandra. Which answer scores best?",
+    "options": [
+      "\"Cassandra scales better, so PostgreSQL is a safer default.\"",
+      "\"PostgreSQL is more popular.\"",
+      "\"The core needs multi-row atomic transactions and strong consistency, and the estimate shows one primary with partitioning handles the write rate; I'd add replicas or a read model for heavy reads.\"",
+      "\"I always use PostgreSQL.\""
+    ],
+    "correct": 2,
+    "explanation": "Tie the choice to a requirement (atomic debit + credit + idempotency key in one commit) and to your estimate, and name what you'd add if load grows."
+  },
+  {
+    "id": "kc-1502-03",
+    "question": "The payment provider times out. What is the right statement in the design round?",
+    "options": [
+      "The outcome is unknown, not failed: keep the payment pending, retry with the same key or query the provider, and reconcile at end of day",
+      "Mark it failed and let the user retry",
+      "Charge again with a new key to be safe",
+      "Refund immediately"
+    ],
+    "correct": 0,
+    "explanation": "If the provider did charge and you mark it failed, the user retries and pays twice."
+  },
+  {
+    "id": "kc-1502-04",
+    "question": "How do you keep the ledger and the event stream in agreement?",
+    "options": [
+      "Write to the database and Kafka in one transaction",
+      "Publish to Kafka first, then write the database",
+      "Use a distributed lock around both writes",
+      "A transactional outbox with an at-least-once relay, idempotent consumers, and a reconciliation job as the safety net"
+    ],
+    "correct": 3,
+    "explanation": "There's no shared transaction between PostgreSQL and Kafka without XA, which is usually unavailable or too slow."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1502",
+  "title": "Run a timed design round",
+  "description": "Practise the run-sheet under a real clock.",
+  "tasks": [
+    {
+      "id": "pc-1502-01",
+      "description": "Set a 45-minute timer and design \"a payment acceptance API for merchants\" on paper, following the RESHADED run-sheet. Write the clock time at the start of each step."
+    },
+    {
+      "id": "pc-1502-02",
+      "description": "Write the estimation block with the arithmetic shown, stating every assumption (users, payments per user, peak factor, bytes per row)."
+    },
+    {
+      "id": "pc-1502-03",
+      "description": "Afterwards, compare your step times with the plan. If the deep dive started after minute 25, write down what you will cut next time."
+    }
+  ]
+}
+-->

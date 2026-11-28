@@ -140,7 +140,10 @@ Trace context must be propagated across all service boundaries — HTTP headers,
 // Incoming: traceparent: 00-abc123def456...-span1234-01
 // Outgoing: propagated by OTEL HTTP client instrumentation
 
-// Kafka: propagate trace context in message headers
+// Kafka: propagate trace context in message headers.
+// The javaagent (and Spring Kafka observation) already does this for
+// KafkaTemplate and @KafkaListener -- write it by hand only WITHOUT them,
+// otherwise each message gets duplicate traceparent headers.
 @Component
 public class PaymentEventPublisher {
 
@@ -205,13 +208,14 @@ public class PaymentMetrics {
             .setUnit("payments")
             .build();
         
-        // End-to-end authorisation latency histogram
+        // End-to-end authorisation latency histogram (OpenTelemetry semantic
+        // conventions use SECONDS for durations)
         this.paymentLatency = meter.histogramBuilder("payments.authorisation.duration")
             .setDescription("Payment authorisation duration")
-            .setUnit("ms")
+            .setUnit("s")
             // Bucket boundaries tuned for financial SLO (P50, P95, P99 visibility)
             .setExplicitBucketBoundariesAdvice(List.of(
-                10.0, 25.0, 50.0, 100.0, 150.0, 200.0, 500.0, 1000.0))
+                0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.500, 1.0))
             .build();
         
         // Queue depth gauge — payment processing backlog
@@ -230,7 +234,7 @@ public class PaymentMetrics {
             .build();
         
         paymentCounter.add(1, attrs);
-        paymentLatency.record(latency.toMillis(), attrs);
+        paymentLatency.record(latency.toNanos() / 1e9, attrs);
     }
     
     private String getAmountBucket(BigDecimal amount) {
@@ -249,9 +253,12 @@ public class PaymentMetrics {
 Logs are most valuable when they include the trace ID and span ID, enabling direct navigation from a log line to the distributed trace.
 
 ```java
-// Spring Boot + Logback + OTEL: automatically inject trace/span IDs into MDC
-// Add to logback-spring.xml pattern:
-// %d{ISO8601} %-5level [%X{traceId},%X{spanId}] %logger{36} - %msg%n
+// Spring Boot + Logback: trace/span IDs are put into the MDC automatically.
+// The MDC key names depend on the instrumentation:
+//   Micrometer Tracing (Spring Boot):  traceId / spanId
+//   OpenTelemetry javaagent:            trace_id / span_id
+// Add to logback-spring.xml pattern (here: javaagent keys):
+// %d{ISO8601} %-5level [%X{trace_id},%X{span_id}] %logger{36} - %msg%n
 
 // Application code: add business context to MDC
 @Service
@@ -307,6 +314,12 @@ receivers:
         endpoint: 0.0.0.0:4318
 
 processors:
+  # Protect the collector from running out of memory under load (first!)
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
   # Add environment metadata to all telemetry
   resource:
     attributes:
@@ -317,11 +330,14 @@ processors:
       value: eu-west-1
       action: insert
       
-  # Sample traces — keep 100% of error traces, 10% of success traces
-  # Critical for financial: never sample away errors or slow traces
-  probabilistic_sampler:
-    sampling_percentage: 10
-    
+  # Sample traces — keep 100% of error and slow traces, 10% of the rest.
+  # Critical for financial: never sample away errors or slow traces.
+  # (Policies are OR-ed: a trace is kept if ANY policy says so. A policy
+  #  like "payment.id matches .*" would keep every payment trace and switch
+  #  sampling off.)
+  # Tail sampling needs ALL spans of a trace on the same collector: in a
+  # multi-replica setup, put a first tier with the loadbalancing exporter
+  # (routing by trace ID) in front of the sampling collectors.
   tail_sampling:
     decision_wait: 10s
     policies:
@@ -331,12 +347,9 @@ processors:
     - name: keep-slow
       type: latency
       latency: { threshold_ms: 500 }             # keep all traces > 500ms
-    - name: keep-payments
-      type: string_attribute
-      string_attribute:                           # keep all payment traces
-        key: payment.id
-        values: [".*"]
-        enabled_regex_matching: true
+    - name: sample-the-rest
+      type: probabilistic
+      probabilistic: { sampling_percentage: 10 } # 10% of everything else
       
   # Batch for efficiency
   batch:
@@ -351,26 +364,29 @@ exporters:
       cert_file: /certs/collector.crt
       key_file: /certs/collector.key
       
+  # Prometheus must run with --web.enable-remote-write-receiver
+  # (or use Prometheus' native OTLP receiver instead)
   prometheusremotewrite:
     endpoint: http://prometheus:9090/api/v1/write
-    
-  loki:
-    endpoint: http://loki:3100/loki/api/v1/push
+
+  # Loki 3.x ingests OTLP natively (the old "loki" exporter was removed)
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
 
 service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [resource, tail_sampling, batch]
+      processors: [memory_limiter, resource, tail_sampling, batch]
       exporters: [otlp/jaeger]
     metrics:
       receivers: [otlp]
-      processors: [resource, batch]
+      processors: [memory_limiter, resource, batch]
       exporters: [prometheusremotewrite]
     logs:
       receivers: [otlp]
-      processors: [resource, batch]
-      exporters: [loki]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/loki]
 ```
 
 ---
@@ -407,8 +423,10 @@ public class SCAComplianceTracer {
             
         complianceSpan.end();
         
-        // Also emit a compliance event to the audit log — traces have TTL,
-        // but compliance records must be retained for 5+ years
+        // Also emit a compliance event to the audit log — traces are sampled
+        // and expire after days or weeks, but compliance records must be
+        // complete and kept for years (e.g. 5 years under EU anti-money-
+        // laundering rules; check your local regulation)
         complianceAuditLog.record(ComplianceEvent.sca(paymentId, method, decision));
     }
 }
@@ -458,12 +476,12 @@ public class SCAComplianceTracer {
       "text": "PSD2 requires that SCA (Strong Customer Authentication) decisions are auditable. Why is an OTEL trace with a 7-day retention TTL NOT sufficient for this compliance requirement?",
       "options": [
         "OTEL traces cannot store compliance attributes",
-        "PSD2 requires SCA records to be retained for the minimum 5-year financial record retention period — OTEL traces are operational data with short TTL, not compliance records",
+        "Regulatory audit records must be complete and kept for years (e.g. 5 years under EU anti-money-laundering record-keeping rules) — OTEL traces are sampled operational data with a short TTL, not compliance records",
         "OTEL is not approved by European Banking Authority",
         "Traces are not structured enough for regulatory queries"
       ],
       "correct": 1,
-      "explanation": "OTEL traces are operational telemetry — typically retained for 7-30 days for incident investigation. Regulatory compliance records must be retained for 5+ years under PSD2 and GDPR. The correct architecture is: use OTEL for operational tracing AND write compliance events to a separate, long-retention, immutable audit store (append-only database, WORM storage)."
+      "explanation": "OTEL traces are operational telemetry — sampled, and typically retained for 7-30 days for incident investigation. Regulatory records must be complete (every SCA decision, never sampled) and kept for years: PSD2 requires the SCA decisions to be auditable, and record-keeping rules such as the EU AML rules (5 years) or local banking law set the retention. The correct architecture is: use OTEL for operational tracing AND write compliance events to a separate, long-retention, immutable audit store (append-only database, WORM storage)."
     }
   ]
 }
@@ -471,25 +489,25 @@ public class SCAComplianceTracer {
 
 <!-- PRACTICAL-CHALLENGE
 {
-  "title": "OpenTelemetry \u2014 Instrumentation for Financial Services \u2014 Production Implementation",
+  "title": "Instrument a Payment Flow with OpenTelemetry",
   "difficulty": "advanced",
   "estimatedMinutes": 85,
   "tasks": [
     {
       "id": "1",
-      "description": "Write the OTEL Java agent JVM arguments"
+      "description": "Write the OTEL Java agent JVM arguments for payment-api (service name, OTLP endpoint, exporters for traces, metrics and logs, resource attributes for environment and region) and verify in Jaeger/Tempo that HTTP, JDBC and Kafka spans appear without code changes."
     },
     {
       "id": "2",
-      "description": "Instrument the fraud scoring call"
+      "description": "Instrument the fraud scoring call manually: create a child span with payment id, channel and decision attributes (no card data), record exceptions and set the span status on failure, and verify the span appears under the payment-api trace."
     },
     {
       "id": "3",
-      "description": "Write the MDC setup and teardown"
+      "description": "Write the MDC setup and teardown for paymentId, accountId and channel in a try/finally block, configure the Logback pattern with the trace and span ID keys of your instrumentation, and show a log line that can be followed to its trace."
     },
     {
       "id": "4",
-      "description": "Write the tail sampling configuration"
+      "description": "Write the OTEL Collector tail sampling configuration: keep all error traces and all traces slower than 500ms, sample 10% of the rest, with memory_limiter and batch processors. Explain how you route all spans of a trace to the same collector replica."
     }
   ]
 }

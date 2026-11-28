@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "lastBuilt": "2026-11-11",
+  "lastBuilt": "2026-11-27",
   "totalDocs": 338,
   "documents": [
     {
@@ -674,7 +674,7 @@
         "SaaS",
         "row-level-security"
       ],
-      "body": "When a European payment infrastructure provider launched its SaaS platform in 2019, it initially gave every bank customer a dedicated database. Within two years, with 400 clients onboarded, the operational cost of managing 400 separate database clusters had consumed the entire platform margin. The re-architecture to a shared-database multi-tenant model — done correctly, with strong isolation guarantees — reduced infrastructure cost by 73% while maintaining strict data separation auditable under "
+      "body": "Consider a European payment infrastructure provider (a composite example) that launched its SaaS platform by giving every bank customer a dedicated database. Within two years, with 400 clients onboarded, the operational cost of managing 400 separate database clusters had consumed the entire platform margin. The re-architecture to a shared-database multi-tenant model — done correctly, with strong isolation guarantees — reduced infrastructure cost by 73% while maintaining strict data separation au"
     },
     {
       "id": "track-01-lesson-17",
@@ -696,7 +696,7 @@
         "Kong",
         "Spring-Cloud-Gateway"
       ],
-      "body": "A mobile banking app team at a European neobank was making 11 separate HTTP calls on the home screen load — accounts, recent transactions, credit limits, rewards balance, exchange rates, notifications, spending insights, card status, pending payments, upcoming direct debits, and product offers. On a 4G connection, the sequential calls took 3.2 seconds. With a Backend-for-Frontend that composed all 11 responses into a single call, load time dropped to 380 milliseconds. The BFF also reduced the mo"
+      "body": "Consider a mobile banking app team at a European neobank (a composite example) that was making 11 separate HTTP calls on the home screen load — accounts, recent transactions, credit limits, rewards balance, exchange rates, notifications, spending insights, card status, pending payments, upcoming direct debits, and product offers. On a 4G connection, the sequential calls took 3.2 seconds. With a Backend-for-Frontend that composed all 11 responses into a single call, load time dropped to 380 milli"
     },
     {
       "id": "track-01-lesson-18",
@@ -1006,7 +1006,7 @@
         "membership",
         "SWIM"
       ],
-      "body": "Gossip Protocols and Epidemic Algorithms > [!NOTE] > Gossip protocols power some of the most reliable distributed databases used in fintech: Cassandra uses gossip for cluster membership and schema propagation, and DynamoDB's internal architecture is built on similar epidemic algorithms. Understanding gossip is essential for operating, debugging, and scaling Cassandra-backed transaction state stores. The Gossip Analogy A gossip protocol spreads information through a cluster the same way gossip sp"
+      "body": "Gossip Protocols and Epidemic Algorithms > [!NOTE] > Gossip protocols power some of the most reliable distributed databases used in fintech: Cassandra uses gossip for cluster membership and schema propagation, and Amazon's original Dynamo design (the 2007 paper) used gossip for membership too. (DynamoDB, the managed service, has a different design that uses Multi-Paxos per partition.) Understanding gossip is essential for operating, debugging, and scaling Cassandra-backed transaction state store"
     },
     {
       "id": "track-02-lesson-13",
@@ -1136,7 +1136,7 @@
         "CRDT",
         "CockroachDB"
       ],
-      "body": "Cross-Region Active-Active Architecture > [!NOTE] > Active-active means every region can accept writes and serve reads. No region is a hot standby waiting for a failover. This eliminates the recovery time objective (RTO) for a region failure — traffic shifts immediately — and can achieve a recovery point objective (RPO) of near zero. It is also the hardest distributed systems architecture to build correctly, particularly for financial systems where conflicting writes on the same account balance "
+      "body": "Cross-Region Active-Active Architecture > [!NOTE] > Active-active means every region can accept writes and serve reads. No region is a hot standby waiting for a failover. When a region fails, traffic shifts to the others within seconds, and with synchronous (quorum) replication the recovery point objective (RPO) can be zero. But availability for each piece of data still depends on where its replicas live — an account whose replicas are all in the failed region is unavailable until it returns. It"
     },
     {
       "id": "track-02-lesson-19",
@@ -1355,7 +1355,7 @@
       "estimatedMinutes": 60,
       "status": "published",
       "tags": "",
-      "body": "Overview The Java Memory Model governs thread visibility at the language level. But there is a hardware-level visibility cost that the JMM does not expose: false sharing. Two threads updating entirely separate variables can destroy each other's performance if those variables happen to occupy the same CPU cache line — without any shared data at all. In a high-throughput payment gateway with per-thread counters, false sharing can reduce throughput by 10–40x. The fix is padding or the annotation — "
+      "body": "Overview The Java Memory Model governs thread visibility at the language level. But there is a hardware-level visibility cost that the JMM does not expose: false sharing. Two threads updating entirely separate variables can destroy each other's performance if those variables happen to occupy the same CPU cache line — without any shared data at all. In a high-throughput payment gateway with per-thread counters, false sharing can cut throughput by an order of magnitude. The fix is padding or the a"
     },
     {
       "id": "track-03-lesson-10",
@@ -1445,7 +1445,7 @@
       "estimatedMinutes": 60,
       "status": "published",
       "tags": "",
-      "body": "Overview has been Java's mechanism for thread-scoped context since Java 1.2. It works by associating a value with the current platform thread — each thread has its own independent copy. With the arrival of virtual threads in Java 21, has critical shortcomings: virtual threads are cheap and numerous, values accumulate in heap memory without cleanup, and mutable state can be inadvertently shared when thread pools reuse threads. Scoped Values (JEP 446, Java 21 Preview) provide a better model: immut"
+      "body": "Overview has been Java's mechanism for thread-scoped context since Java 1.2. It works by associating a value with the current platform thread — each thread has its own independent copy. With the arrival of virtual threads in Java 21, shows its weaknesses: virtual threads are cheap and numerous, so per-thread copies of values multiply; a value lives as long as its thread unless someone calls ; any code can change it with ; and on pooled threads a forgotten value leaks into the next request. Scope"
     },
     {
       "id": "track-03-lesson-16",
@@ -1525,7 +1525,7 @@
         "executor-isolation",
         "back-pressure"
       ],
-      "body": "Thread pool exhaustion is one of the most common causes of payment system outages. It is deceptively simple: a shared executor fills up, callers queue indefinitely, latency spikes, and the entire service stops responding — all without a single exception being thrown. Understanding how pools exhaust, detecting it early, and designing bulkhead boundaries separating critical paths from non-critical work is a core Principal Engineer competency. Learning Objectives By the end of this lesson you will "
+      "body": "Overview Thread pool exhaustion is one of the most common causes of payment system outages. It is deceptively simple: a shared executor fills up, callers queue indefinitely, latency spikes, and the entire service stops responding — all without a single exception being thrown. Understanding how pools exhaust, detecting it early, and designing bulkhead boundaries separating critical paths from non-critical work is a core Principal Engineer competency. Learning Objectives By the end of this lesson "
     },
     {
       "id": "track-03-lesson-21",
@@ -1545,7 +1545,7 @@
         "pessimistic-locking",
         "SELECT-FOR-UPDATE"
       ],
-      "body": "Balance management is the most financially consequential concurrent programming problem you will face. An overdraft caused by a race condition is not just a bug — it is a regulatory failure, a fraud vector, and a customer trust crisis. This lesson covers the full spectrum of approaches from in-memory atomic operations to distributed database locking, and when each is appropriate. Learning Objectives By the end of this lesson you will be able to: Identify the three failure modes in concurrent bal"
+      "body": "Overview Balance management is the most financially consequential concurrent programming problem you will face. An overdraft caused by a race condition is not just a bug — it is a regulatory failure, a fraud vector, and a customer trust crisis. This lesson covers the full spectrum of approaches from in-memory atomic operations to distributed database locking, and when each is appropriate. Learning Objectives By the end of this lesson you will be able to: Identify the three failure modes in concu"
     },
     {
       "id": "track-03-lesson-22",
@@ -1565,7 +1565,7 @@
         "constructor-safety",
         "JMM"
       ],
-      "body": "An object is \"safely published\" when every thread that can see the reference to it also sees the fully initialised state of its fields. Without safe publication, another thread can observe the object in a partially constructed state — with fields holding default zero/null values even though the constructor has \"completed\". This is one of the most subtle and dangerous aspects of the Java Memory Model. Learning Objectives By the end of this lesson you will be able to: Explain why object constructi"
+      "body": "Overview An object is \"safely published\" when every thread that can see the reference to it also sees the fully initialised state of its fields. Without safe publication, another thread can observe the object in a partially constructed state — with fields holding default zero/null values even though the constructor has \"completed\". This is one of the most subtle and dangerous aspects of the Java Memory Model. Learning Objectives By the end of this lesson you will be able to: Explain why object c"
     },
     {
       "id": "track-03-lesson-23",
@@ -1585,7 +1585,7 @@
         "acquire-release",
         "JMM-internals"
       ],
-      "body": "Memory barriers are the hardware mechanism underlying every high-level Java concurrency primitive. , , and all ultimately emit memory barrier instructions. Principal Engineers who understand barriers can reason about JMM guarantees without memorising rules — they can derive correct behaviour from first principles, design lock-free data structures, and interpret disassembly output from profilers. Learning Objectives By the end of this lesson you will be able to: Explain what instruction reorderin"
+      "body": "Overview Memory barriers are the hardware mechanism underlying every high-level Java concurrency primitive. , , and all ultimately emit memory barrier instructions. Principal Engineers who understand barriers can reason about JMM guarantees without memorising rules — they can derive correct behaviour from first principles, design lock-free data structures, and interpret disassembly output from profilers. Learning Objectives By the end of this lesson you will be able to: Explain what instruction "
     },
     {
       "id": "track-03-lesson-24",
@@ -1606,7 +1606,7 @@
         "Phaser",
         "synchronizers"
       ],
-      "body": "The synchronizer toolkit gives Principal Engineers precise, composable coordination primitives beyond the coarse-grained keyword. Each class encodes a different coordination protocol: who waits for whom, how many times, and whether participants can dynamically join or leave. Choosing the wrong primitive leads to either correctness failures (using a one-shot latch where a reusable barrier is needed) or unnecessary complexity (using a Phaser where a simple Semaphore suffices). In payments and bank"
+      "body": "Overview The synchronizer toolkit gives Principal Engineers precise, composable coordination primitives beyond the coarse-grained keyword. Each class encodes a different coordination protocol: who waits for whom, how many times, and whether participants can dynamically join or leave. Choosing the wrong primitive leads to either correctness failures (using a one-shot latch where a reusable barrier is needed) or unnecessary complexity (using a Phaser where a simple Semaphore suffices). In payments"
     },
     {
       "id": "track-03-lesson-25",
@@ -1627,7 +1627,7 @@
         "ThreadLocal",
         "Micrometer"
       ],
-      "body": "Modern Java payment systems rarely execute a transaction on a single thread from entry to completion. A REST controller receives a payment authorisation request, forks enrichment and fraud checks via , merges results on a common pool thread, and logs every step. The correlation ID, authenticated user principal, and distributed trace context that arrived in the HTTP headers must accompany each log line and downstream call — but -based containers like MDC, Spring Security's , and Micrometer's trac"
+      "body": "Overview Modern Java payment systems rarely execute a transaction on a single thread from entry to completion. A REST controller receives a payment authorisation request, forks enrichment and fraud checks via , merges results on a common pool thread, and logs every step. The correlation ID, authenticated user principal, and distributed trace context that arrived in the HTTP headers must accompany each log line and downstream call — but -based containers like MDC, Spring Security's , and Micromet"
     },
     {
       "id": "track-03-lesson-26",
@@ -1648,7 +1648,7 @@
         "fence",
         "acquire-release"
       ],
-      "body": "The Java Memory Model specification is not a performance guideline — it is a formal contract between the programmer and the JVM. Most engineers know the surface rules: gives visibility, gives mutual exclusion. Principal Engineers must go deeper: understanding the JMM's formal semantics around final fields, the precise fence taxonomy exposed by , the role plays in the ecosystem, and the distinction between happens-before as a partial order versus real-time causality. This lesson arms you with the"
+      "body": "Overview The Java Memory Model specification is not a performance guideline — it is a formal contract between the programmer and the JVM. Most engineers know the surface rules: gives visibility, gives mutual exclusion. Principal Engineers must go deeper: understanding the JMM's formal semantics around final fields, the precise fence taxonomy exposed by , the role plays in the ecosystem, and the distinction between happens-before as a partial order versus real-time causality. This lesson arms you"
     },
     {
       "id": "track-03-lesson-27",
@@ -1669,7 +1669,7 @@
         "event-ordering",
         "partitioning"
       ],
-      "body": "Distributed payment systems fail in ways that sequential programs never do. A network timeout does not mean a transaction failed — it means you do not know. A consumer that processes events out of order can reverse a debit before it was applied. A thread pool that shares a work queue can starve time-sensitive authorizations behind bulk settlement jobs. These are not theoretical problems: they are the class of incident that makes the front page of financial news. This lesson catalogues the six co"
+      "body": "Overview Distributed payment systems fail in ways that sequential programs never do. A network timeout does not mean a transaction failed — it means you do not know. A consumer that processes events out of order can reverse a debit before it was applied. A thread pool that shares a work queue can starve time-sensitive authorizations behind bulk settlement jobs. These are not theoretical problems: they are the class of incident that makes the front page of financial news. This lesson catalogues t"
     },
     {
       "id": "track-03-lesson-28",
@@ -1690,7 +1690,7 @@
         "staff-engineer",
         "principal-engineer"
       ],
-      "body": "Concurrency is a design space with many correct answers. The difference between a senior and a principal engineer is not knowing more techniques — it is knowing which technique to reach for, when, and how to justify that choice to a team. This lesson synthesises Track 3 into a decision framework you can apply to real production problems and articulate to peers, architects, and engineering managers. Learning Objectives By the end of this lesson you will be able to: Apply a structured decision pro"
+      "body": "Overview Concurrency is a design space with many correct answers. The difference between a senior and a principal engineer is not knowing more techniques — it is knowing which technique to reach for, when, and how to justify that choice to a team. This lesson synthesises Track 3 into a decision framework you can apply to real production problems and articulate to peers, architects, and engineering managers. Learning Objectives By the end of this lesson you will be able to: Apply a structured dec"
     },
     {
       "id": "track-03-lesson-29",
@@ -1741,7 +1741,7 @@
       "estimatedMinutes": 90,
       "status": "published",
       "tags": "",
-      "body": "Payment processing sits at the intersection of the core banking system and the external payment schemes that move money between banks. Every card swipe, contactless tap, or online checkout triggers a precisely choreographed sequence of messages spanning merchants, acquirers, card schemes, and issuing banks — often completing the visible authorisation in under 300 milliseconds while the actual money movement takes days. Understanding where authorisation ends and settlement begins, and what happen"
+      "body": "Overview Payment processing sits at the intersection of the core banking system and the external payment schemes that move money between banks. Every card swipe, contactless tap, or online checkout triggers a precisely choreographed sequence of messages spanning merchants, acquirers, card schemes, and issuing banks — often completing the visible authorisation in under 300 milliseconds while the actual money movement takes days. Understanding where authorisation ends and settlement begins, and wh"
     },
     {
       "id": "track-04-lesson-03",
@@ -1756,7 +1756,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Every financial system built on top of a core banking system ultimately writes to a general ledger. The general ledger is not a database table — it is an accounting structure governed by rules that have been unchanged since Luca Pacioli formalised them in 1494. Those rules — double-entry bookkeeping — are what make a financial system verifiable: any error that creates or destroys value leaves a mathematical trace. As a Principal Engineer designing banking systems, you must understand double-entr"
+      "body": "Overview Every financial system built on top of a core banking system ultimately writes to a general ledger. The general ledger is not a database table — it is an accounting structure governed by rules that have been unchanged since Luca Pacioli formalised them in 1494. Those rules — double-entry bookkeeping — are what make a financial system verifiable: any error that creates or destroys value leaves a mathematical trace. As a Principal Engineer designing banking systems, you must understand do"
     },
     {
       "id": "track-04-lesson-04",
@@ -1771,7 +1771,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "The account is the atom of the banking system — every customer relationship, every financial obligation, and every regulatory requirement ultimately resolves to an account record with a status, a balance, and a set of permitted operations. While Lesson 1 introduced the account concept in the context of core banking architecture, this lesson examines account management in full depth: how different account types encode different financial relationships, how the account state machine protects both "
+      "body": "Overview The account is the atom of the banking system — every customer relationship, every financial obligation, and every regulatory requirement ultimately resolves to an account record with a status, a balance, and a set of permitted operations. While Lesson 1 introduced the account concept in the context of core banking architecture, this lesson examines account management in full depth: how different account types encode different financial relationships, how the account state machine prote"
     },
     {
       "id": "track-04-lesson-05",
@@ -1786,7 +1786,7 @@
       "estimatedMinutes": 85,
       "status": "published",
       "tags": "",
-      "body": "Funds reservation — the act of earmarking money for a pending obligation before the funds actually leave the account — is the mechanism that bridges the gap between the moment a payment is authorised and the moment it settles. Without holds, two concurrent authorisations for a customer with a £500 balance could each see £500 available and both approve, leaving the account £500 overdrawn when both settle. This lesson examines the holds system in full technical detail: schema design, the atomic an"
+      "body": "Overview Funds reservation — the act of earmarking money for a pending obligation before the funds actually leave the account — is the mechanism that bridges the gap between the moment a payment is authorised and the moment it settles. Without holds, two concurrent authorisations for a customer with a £500 balance could each see £500 available and both approve, leaving the account £500 overdrawn when both settle. This lesson examines the holds system in full technical detail: schema design, the "
     },
     {
       "id": "track-04-lesson-06",
@@ -1808,7 +1808,7 @@
         "correspondent-banking",
         "SWIFT-network"
       ],
-      "body": "SWIFT (Society for Worldwide Interbank Financial Telecommunication) carries over 44 million messages per day across more than 11,500 financial institutions in 200+ countries. Despite ISO 20022 migration underway, the MT (Message Type) format remains the operational backbone of cross-border payments for the foreseeable future. Senior engineers maintaining payment gateways must understand the byte-level structure of MT messages, the correspondent banking topology those messages traverse, and how t"
+      "body": "Overview SWIFT (Society for Worldwide Interbank Financial Telecommunication) carries tens of millions of messages per day between more than 11,000 financial institutions in over 200 countries and territories. For decades the MT (Message Type) format was the operational backbone of cross-border payments. > [!IMPORTANT] > Status in 2026: the MT/ISO 20022 coexistence period for cross-border payment instructions on SWIFT ended in November 2025. Payment instructions between banks (formerly MT103, MT2"
     },
     {
       "id": "track-04-lesson-07",
@@ -1830,7 +1830,7 @@
         "CBPR+",
         "migration"
       ],
-      "body": "ISO 20022 is the global financial industry standard for electronic data interchange between financial institutions. Where SWIFT MT messages are plain-text, tag-delimited telegrams designed for the 1970s telex era, ISO 20022 (also called MX) uses structured XML with formally defined schemas, rich data elements, and a universal data dictionary that spans payments, securities, trade finance, cards, and foreign exchange. The migration from MT to ISO 20022 is the most significant change to global pay"
+      "body": "Overview ISO 20022 is the global financial industry standard for electronic data interchange between financial institutions. Where SWIFT MT messages are plain-text, tag-delimited telegrams designed for the 1970s telex era, ISO 20022 (also called MX) uses structured XML with formally defined schemas, rich data elements, and a universal data dictionary that spans payments, securities, trade finance, cards, and foreign exchange. The migration from MT to ISO 20022 is the most significant change to g"
     },
     {
       "id": "track-04-lesson-08",
@@ -1851,7 +1851,7 @@
         "RTP",
         "latency"
       ],
-      "body": "Real-time payments (RTP) have fundamentally changed consumer and business expectations: a payment that once took three days via BACS or one day via ACH now settles permanently in under 10 seconds around the clock, every day of the year. For the engineers building the systems that deliver this capability, real-time is not a marketing claim — it is a hard engineering constraint. Every network hop, every database round trip, every AML rule evaluation, and every account validation call must fit insi"
+      "body": "Overview Real-time payments (RTP) have fundamentally changed consumer and business expectations: a payment that once took three days via BACS or one day via ACH now settles permanently in under 10 seconds around the clock, every day of the year. For the engineers building the systems that deliver this capability, real-time is not a marketing claim — it is a hard engineering constraint. Every network hop, every database round trip, every AML rule evaluation, and every account validation call must"
     },
     {
       "id": "track-04-lesson-09",
@@ -1872,7 +1872,7 @@
         "SWIFT-GPI",
         "FX"
       ],
-      "body": "Cross-border payments — moving money from an account in one country to an account in another — are among the most complex operations in finance. Unlike domestic payments that run on a single clearing infrastructure, international transfers traverse chains of banks connected by bilateral correspondent relationships, each applying its own fees, exchange rates, and compliance controls. Despite representing only a fraction of total payment volume, cross-border payments generate a disproportionate sh"
+      "body": "Overview Cross-border payments — moving money from an account in one country to an account in another — are among the most complex operations in finance. Unlike domestic payments that run on a single clearing infrastructure, international transfers traverse chains of banks connected by bilateral correspondent relationships, each applying its own fees, exchange rates, and compliance controls. Despite representing only a fraction of total payment volume, cross-border payments generate a disproport"
     },
     {
       "id": "track-04-lesson-10",
@@ -1887,7 +1887,7 @@
       "estimatedMinutes": 85,
       "status": "published",
       "tags": "",
-      "body": "Foreign exchange is the largest financial market on earth, turning over approximately $7.5 trillion per day (BIS 2022). Every bank that holds multi-currency accounts, processes cross-border payments, or issues cards used abroad operates an FX system — yet FX systems are among the most precision-critical and operationally complex components in a banking technology stack. A single floating-point rounding error compounded across millions of daily conversions can cost a bank hundreds of thousands of"
+      "body": "Overview Foreign exchange is the largest financial market on earth, turning over roughly $9.6 trillion per day (BIS Triennial Survey, April 2025; $7.5 trillion in 2022). Every bank that holds multi-currency accounts, processes cross-border payments, or issues cards used abroad operates an FX system — yet FX systems are among the most precision-critical and operationally complex components in a banking technology stack. A single floating-point rounding error compounded across millions of daily co"
     },
     {
       "id": "track-04-lesson-11",
@@ -1902,7 +1902,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "The question \"which rail do I send this payment on?\" sounds simple until you are building the system that must answer it in under 50 milliseconds for 10,000 payments per second, honour cut-off times across five clearing schemes in four time zones, fall back gracefully when a scheme is degraded, and guarantee that the chosen rail's format, value limits, and processing cycle constraints are all satisfied. Payment routing is not a configuration table — it is a decision engine with real-time scheme "
+      "body": "Overview The question \"which rail do I send this payment on?\" sounds simple until you are building the system that must answer it in under 50 milliseconds for 10,000 payments per second, honour cut-off times across five clearing schemes in four time zones, fall back gracefully when a scheme is degraded, and guarantee that the chosen rail's format, value limits, and processing cycle constraints are all satisfied. Payment routing is not a configuration table — it is a decision engine with real-tim"
     },
     {
       "id": "track-04-lesson-12",
@@ -1917,7 +1917,7 @@
       "estimatedMinutes": 85,
       "status": "published",
       "tags": "",
-      "body": "Reconciliation is the operational immune system of a bank. It is the process by which a bank continuously verifies that its internal records agree with the external world — that what the core banking system believes happened at a correspondent bank actually happened, that what a card processor reports it settled matches the internal transaction ledger, and that client money held in segregated accounts equals what clients are owed to the penny. When reconciliation works invisibly, nothing is brok"
+      "body": "Overview Reconciliation is the operational immune system of a bank. It is the process by which a bank continuously verifies that its internal records agree with the external world — that what the core banking system believes happened at a correspondent bank actually happened, that what a card processor reports it settled matches the internal transaction ledger, and that client money held in segregated accounts equals what clients are owed to the penny. When reconciliation works invisibly, nothin"
     },
     {
       "id": "track-04-lesson-13",
@@ -1932,7 +1932,7 @@
       "estimatedMinutes": 90,
       "status": "published",
       "tags": "",
-      "body": "Money laundering moves an estimated $800 billion to $2 trillion through the global financial system every year (UNODC). Banks are the primary gatekeepers against this flow, and regulators have made clear that gatekeeper failures carry existential consequences: Danske Bank paid €2 billion in fines over its Estonian branch money-laundering scandal; Westpac paid AUD 1.3 billion for 23 million breaches of AML/CTF law. The engineering systems that detect, alert, and report suspicious activity are the"
+      "body": "Overview Money laundering moves an estimated $800 billion to $2 trillion through the global financial system every year (UNODC). Banks are the primary gatekeepers against this flow, and regulators have made clear that gatekeeper failures carry existential consequences: Danske Bank agreed to pay about $2 billion (2022) over its Estonian branch money-laundering scandal; Westpac paid AUD 1.3 billion for 23 million breaches of AML/CTF law. The engineering systems that detect, alert, and report suspi"
     },
     {
       "id": "track-04-lesson-14",
@@ -1954,7 +1954,7 @@
         "PEP",
         "onboarding"
       ],
-      "body": "Know Your Customer (KYC) is the cornerstone obligation of financial crime compliance. Every regulated financial institution must be able to answer a deceptively simple question before opening an account: who is this person, are they who they claim to be, what risk do they pose, and is their intended use of the product consistent with legitimate activity? Getting that answer wrong in either direction costs real money — HSBC paid $1.9 billion in a 2012 US Department of Justice settlement for syste"
+      "body": "Overview Know Your Customer (KYC) is the cornerstone obligation of financial crime compliance. Every regulated financial institution must be able to answer a deceptively simple question before opening an account: who is this person, are they who they claim to be, what risk do they pose, and is their intended use of the product consistent with legitimate activity? Getting that answer wrong in either direction costs real money — HSBC paid $1.9 billion in a 2012 US Department of Justice settlement "
     },
     {
       "id": "track-04-lesson-15",
@@ -1975,7 +1975,7 @@
         "fuzzy-matching",
         "false-positive"
       ],
-      "body": "Sanctions compliance is the highest-stakes domain in financial crime prevention. Where KYC failures attract regulatory fines, sanctions violations attract criminal prosecution. Standard Chartered Bank paid $1.1 billion across two deferred prosecution agreements (2012 and 2019) for processing transactions that violated US, EU, and UN sanctions against Iran, Sudan, Libya, and Syria. The 2019 agreement found that employees had deliberately stripped beneficiary information from SWIFT messages to eva"
+      "body": "Overview Sanctions compliance is the highest-stakes domain in financial crime prevention. Where KYC failures attract regulatory fines, sanctions violations attract criminal prosecution. Standard Chartered Bank paid about $667 million in 2012 and a further $1.1 billion in 2019 to US and UK authorities over transactions that breached sanctions on Iran and other countries. Several of the cases against large banks in that period found \"wire stripping\": staff deliberately removed or altered reference"
     },
     {
       "id": "track-04-lesson-16",
@@ -1996,7 +1996,7 @@
         "ML",
         "velocity-checks"
       ],
-      "body": "Fraud is the single largest source of financial loss for retail banks in absolute terms. UK Finance reported £1.17 billion lost to authorised and unauthorised fraud in the UK alone in 2023, with Authorised Push Payment (APP) fraud accounting for £459.7 million — a category that barely existed a decade ago. The engineering challenge in fraud detection is fundamentally different from AML or sanctions compliance: where sanctions screening asks \"is this party on a list?\", fraud detection asks \"does "
+      "body": "Overview Fraud is the single largest source of financial loss for retail banks in absolute terms. UK Finance reported £1.17 billion lost to authorised and unauthorised fraud in the UK alone in 2023, with Authorised Push Payment (APP) fraud accounting for £459.7 million — a category that was barely even measured a decade ago. The engineering challenge in fraud detection is fundamentally different from AML or sanctions compliance: where sanctions screening asks \"is this party on a list?\", fraud de"
     },
     {
       "id": "track-04-lesson-17",
@@ -2017,7 +2017,7 @@
         "data-lineage",
         "reporting-pipeline"
       ],
-      "body": "Regulatory reporting is the unglamorous backbone of financial market oversight. It does not generate revenue, it does not improve the customer experience, and it only becomes visible to the board when it fails. When it fails, the consequences are severe: Deutsche Bank was fined €7 million by BaFin in 2019 for 1.6 million late or missing MiFID II transaction reports; Goldman Sachs was fined £34.3 million by the FCA in 2019 for failing to report 220.4 million transactions accurately between Novemb"
+      "body": "Overview Regulatory reporting is the unglamorous backbone of financial market oversight. It does not generate revenue, it does not improve the customer experience, and it only becomes visible to the board when it fails. When it fails, the consequences are severe: in 2019 the FCA fined Goldman Sachs International £34.3 million for inaccurate or missing transaction reports — around 220 million of them between November 2007 and March 2017 — and in 2017 it fined Merrill Lynch International £34.5 mil"
     },
     {
       "id": "track-04-lesson-18",
@@ -2039,7 +2039,7 @@
         "EMV",
         "tokenisation"
       ],
-      "body": "Every time a consumer taps a card at a point-of-sale terminal, an intricate multi-party protocol executes in under two seconds, coordinating cryptographic proof-of-presence, credit-risk decisioning, and cross-bank fund reservation across a minimum of four independent organisations. Card payments remain the highest-volume retail payment rail on earth — Visa alone processed 212 billion transactions in fiscal year 2023 — and the engineering systems behind them must reconcile the conflicting demands"
+      "body": "Overview Every time a consumer taps a card at a point-of-sale terminal, an intricate multi-party protocol executes in under two seconds, coordinating cryptographic proof-of-presence, credit-risk decisioning, and cross-bank fund reservation across a minimum of four independent organisations. Card payments remain the highest-volume retail payment rail on earth — Visa alone processed about 213 billion transactions in fiscal year 2023 — and the engineering systems behind them must reconcile the conf"
     },
     {
       "id": "track-04-lesson-19",
@@ -2060,7 +2060,7 @@
         "tokenisation",
         "PSD2"
       ],
-      "body": "Digital wallets have matured from convenience features into critical financial infrastructure: PayPal holds $38.5 billion in customer funds, Revolut manages 35 million accounts across 160+ currencies, and Alipay processes 175,000 transactions per second at Lunar New Year peak. The engineering challenge is not primarily one of velocity — the internal ledger of a wallet is a relatively constrained domain — but of regulatory compliance at every layer of the stack. The choice of legal structure (e-m"
+      "body": "Overview Digital wallets have matured from convenience features into critical financial infrastructure: the largest wallets hold tens of billions of dollars of customer money for tens of millions of customers, and the biggest Asian platforms handle hundreds of thousands of transactions per second at shopping-festival peaks. The engineering challenge is not primarily one of velocity — the internal ledger of a wallet is a relatively constrained domain — but of regulatory compliance at every layer "
     },
     {
       "id": "track-04-lesson-20",
@@ -2082,7 +2082,7 @@
         "consent-management",
         "CDR"
       ],
-      "body": "Open banking mandates that financial institutions expose customer account data and payment initiation capabilities to regulated third parties via standardised APIs — fundamentally changing the competitive architecture of retail banking. As of 2024, the UK Open Banking ecosystem processes over 11 million API calls per day, with more than 7 million active users sharing data or making payments via TPP applications. For the engineering teams building both the bank-side API infrastructure (Account Se"
+      "body": "Overview Open banking mandates that financial institutions expose customer account data and payment initiation capabilities to regulated third parties via standardised APIs — fundamentally changing the competitive architecture of retail banking. By 2025 the UK ecosystem had more than 10 million users and handled well over a billion API calls a month. For the engineering teams building both the bank-side API infrastructure (Account Servicing Payment Service Providers — ASPSPs) and the TPP-side in"
     },
     {
       "id": "track-04-lesson-21",
@@ -2103,7 +2103,7 @@
         "back-pressure",
         "performance"
       ],
-      "body": "Designing a payment platform that sustains 10,000 transactions per second is not simply a matter of adding more application servers. The bottlenecks in payment systems are almost always at the database layer — specifically, the tension between the strict correctness requirements of financial processing (ACID transactions, idempotency, audit log) and the write amplification that those requirements impose at scale. At 10,000 TPS, a naive single-write-path design that performs 4-6 database writes p"
+      "body": "Overview Designing a payment platform that sustains 10,000 transactions per second is not simply a matter of adding more application servers. The bottlenecks in payment systems are almost always at the database layer — specifically, the tension between the strict correctness requirements of financial processing (ACID transactions, idempotency, audit log) and the write amplification that those requirements impose at scale. At 10,000 TPS, a naive single-write-path design that performs 4-6 database"
     },
     {
       "id": "track-04-lesson-22",
@@ -2123,7 +2123,7 @@
         "trade-offs",
         "staff-engineer"
       ],
-      "body": "A principal engineer in a banking or payments company occupies a rare intersection: deep enough in the technical stack to understand why a 50-microsecond NUMA-aware memory allocation matters for a card authorisation service, yet close enough to the business to know that the answer to \"should we build our own core banking system?\" is almost always no. The decisions that define a bank's technical architecture — which payment rails to connect, whether to build or buy fraud detection, how to structu"
+      "body": "Overview A principal engineer in a banking or payments company occupies a rare intersection: deep enough in the technical stack to understand why a 50-microsecond NUMA-aware memory allocation matters for a card authorisation service, yet close enough to the business to know that the answer to \"should we build our own core banking system?\" is almost always no. The decisions that define a bank's technical architecture — which payment rails to connect, whether to build or buy fraud detection, how t"
     },
     {
       "id": "track-05-lesson-01",
@@ -2183,7 +2183,7 @@
       "estimatedMinutes": 90,
       "status": "published",
       "tags": "",
-      "body": "A digital wallet processes peer-to-peer transfers in milliseconds. That speed is a feature — until two requests for the same account arrive within the same window and the balance check races itself into negative territory. This lesson dissects the exact sequence that causes a double-spend, then builds three layers of defence: a pessimistic database lock, a funds-reservation model that separates \"authorise\" from \"settle\", and a CAS-based in-memory guard for wallets that cache balances. By the end"
+      "body": "Overview A digital wallet processes peer-to-peer transfers in milliseconds. That speed is a feature — until two requests for the same account arrive within the same window and the balance check races itself into negative territory. This lesson dissects the exact sequence that causes a double-spend, then builds three layers of defence: a pessimistic database lock, a funds-reservation model that separates \"authorise\" from \"settle\", and a CAS-based in-memory guard for wallets that cache balances. B"
     },
     {
       "id": "track-05-lesson-05",
@@ -2198,7 +2198,7 @@
       "estimatedMinutes": 85,
       "status": "published",
       "tags": "",
-      "body": "Settlement systems are unforgiving environments. A ledger entry that posts twice, a debit without a matching credit, or a batch total that disagrees with its constituent rows are not edge cases to be handled gracefully — they are regulatory violations, audit failures, and in some jurisdictions, reportable incidents. This lesson follows a settlement engine that broke the double-entry invariant under concurrent load, dissects why higher isolation levels alone could not save it, and builds the idem"
+      "body": "Overview Settlement systems are unforgiving environments. A ledger entry that posts twice, a debit without a matching credit, or a batch total that disagrees with its constituent rows are not edge cases to be handled gracefully — they are regulatory violations, audit failures, and in some jurisdictions, reportable incidents. This lesson follows a settlement engine that broke the double-entry invariant under concurrent load, dissects why higher isolation levels alone could not save it, and builds"
     },
     {
       "id": "track-05-lesson-06",
@@ -2213,7 +2213,7 @@
       "estimatedMinutes": 95,
       "status": "published",
       "tags": "",
-      "body": "A payment that is half-committed is worse than a payment that never happened. When a customer's card is charged by an external processor but the internal ledger never records the debit, the company has collected money it cannot account for — and the customer's balance is wrong. This scenario dissects exactly that failure mode, examines why standard database transactions cannot prevent it, and teaches you to build a compensation-based saga that recovers reliably even when the recovery itself fail"
+      "body": "Overview A payment that is half-committed is worse than a payment that never happened. When a customer's card is charged by an external processor but the internal ledger never records the debit, the company has collected money it cannot account for — and the customer's balance is wrong. This scenario dissects exactly that failure mode, examines why standard database transactions cannot prevent it, and teaches you to build a compensation-based saga that recovers reliably even when the recovery it"
     },
     {
       "id": "track-05-lesson-07",
@@ -2228,7 +2228,7 @@
       "estimatedMinutes": 95,
       "status": "published",
       "tags": "",
-      "body": "There is no distributed transaction that spans a relational database and Apache Kafka. This is not a limitation that will be fixed in the next version of either system. It is a fundamental property of how they are architected. Any code that writes to a database and then publishes to Kafka in two separate operations has a failure window — a moment in time where the application can crash and leave the two systems inconsistent. In financial systems, that inconsistency means downstream services — le"
+      "body": "Overview There is no distributed transaction that spans a relational database and Apache Kafka. This is not a limitation that will be fixed in the next version of either system. It is a fundamental property of how they are architected. Any code that writes to a database and then publishes to Kafka in two separate operations has a failure window — a moment in time where the application can crash and leave the two systems inconsistent. In financial systems, that inconsistency means downstream serv"
     },
     {
       "id": "track-05-lesson-08",
@@ -2249,7 +2249,7 @@
         "consumer-idempotency",
         "deduplication"
       ],
-      "body": "A Kafka consumer that processes a event, posts to the ledger, then crashes before committing its offset will replay that event on restart — and the ledger will silently accept both copies. This is not a theoretical edge case; it is the default behaviour of every at-least-once Kafka consumer that does not defend itself. This lesson exposes exactly how the failure window opens, then closes it with three complementary techniques: a database-level idempotency table, Kafka's own transactional exactly"
+      "body": "Overview A Kafka consumer that processes a event, posts to the ledger, then crashes before committing its offset will replay that event on restart — and the ledger will silently accept both copies. This is not a theoretical edge case; it is the default behaviour of every at-least-once Kafka consumer that does not defend itself. This lesson exposes exactly how the failure window opens, then closes it with three complementary techniques: a database-level idempotency table, Kafka's own transactiona"
     },
     {
       "id": "track-05-lesson-09",
@@ -2270,7 +2270,7 @@
         "event-sourcing",
         "Kafka"
       ],
-      "body": "Kafka guarantees strict ordering within a single partition for a single consumer group. That guarantee is narrower than most engineers assume. A partition rebalance, a consumer lag spike, or a multi-partition topic with account events spread across partitions is enough for a event to arrive before the it reverses — and an account balance to be corrupted in a way that neither the application nor the database will detect, because the SQL executed correctly. This lesson traces the exact conditions "
+      "body": "Overview Kafka guarantees strict ordering within a single partition for a single consumer group. That guarantee is narrower than most engineers assume. A partition rebalance, a consumer lag spike, or a multi-partition topic with account events spread across partitions is enough for a event to arrive before the it reverses — and an account balance to be corrupted in a way that neither the application nor the database will detect, because the SQL executed correctly. This lesson traces the exact co"
     },
     {
       "id": "track-05-lesson-10",
@@ -2291,7 +2291,7 @@
         "audit",
         "shadow-ledger"
       ],
-      "body": "End-of-day reconciliation at a payment processor found 150 accounts where the internal ledger balance differed from the settlement file — discrepancies ranging from $0.01 to $500. The on-call engineer had no tooling to answer the most critical question in those first minutes: is any real customer money at risk right now, or is this a data artefact? This lesson builds the full reconciliation stack — internal balance checks, external settlement matching, shadow ledgers, and threshold-driven alerti"
+      "body": "Overview End-of-day reconciliation at a payment processor found 150 accounts where the internal ledger balance differed from the settlement file — discrepancies ranging from $0.01 to $500. The on-call engineer had no tooling to answer the most critical question in those first minutes: is any real customer money at risk right now, or is this a data artefact? This lesson builds the full reconciliation stack — internal balance checks, external settlement matching, shadow ledgers, and threshold-driv"
     },
     {
       "id": "track-05-lesson-11",
@@ -2312,7 +2312,7 @@
         "partitioning",
         "CRDT"
       ],
-      "body": "A merchant account receiving 800 concurrent debits per second broke one of the most common assumptions in banking system design: that is a sufficient concurrency primitive. At 800 req/s with each database lock held for 10 ms, the queue grew faster than it was drained, p99 latency climbed to 8 seconds, and payment terminals across three retail chains began timing out. This lesson traces the physics of the hot-account problem, then implements four progressively more scalable solutions — from queue"
+      "body": "Overview A merchant account receiving 800 concurrent debits per second broke one of the most common assumptions in banking system design: that is a sufficient concurrency primitive. At 800 req/s with each database lock held for 10 ms, the queue grew faster than it was drained, p99 latency climbed to 8 seconds, and payment terminals across three retail chains began timing out. This lesson traces the physics of the hot-account problem, then implements four progressively more scalable solutions — f"
     },
     {
       "id": "track-05-lesson-12",
@@ -2333,7 +2333,7 @@
         "Redis",
         "distributed-idempotency"
       ],
-      "body": "Idempotency is the contractual guarantee that submitting an identical operation multiple times produces exactly the same result as submitting it once. For payment systems, this guarantee is not a convenience feature — it is a correctness requirement. Every retry path, every network timeout, and every Kafka redelivery is a potential duplicate, and without idempotency the customer pays twice. This lesson covers idempotency rigorously: the mathematical definition, the three layers at which it must "
+      "body": "Overview Idempotency is the contractual guarantee that submitting an identical operation multiple times produces exactly the same result as submitting it once. For payment systems, this guarantee is not a convenience feature — it is a correctness requirement. Every retry path, every network timeout, and every Kafka redelivery is a potential duplicate, and without idempotency the customer pays twice. This lesson covers idempotency rigorously: the mathematical definition, the three layers at which"
     },
     {
       "id": "track-05-lesson-13",
@@ -2354,7 +2354,7 @@
         "Debezium",
         "reliable-messaging"
       ],
-      "body": "Every distributed system built on microservices eventually confronts the same brutal constraint: you cannot atomically commit a database write and publish a message to a broker in a single operation. The Transactional Outbox pattern resolves this by treating the outbox table as a durable, append-only staging area that is part of the same local ACID transaction as your business data. What reaches the message broker is derived from what is already committed to the database — not the other way arou"
+      "body": "Overview Every distributed system built on microservices eventually confronts the same brutal constraint: you cannot atomically commit a database write and publish a message to a broker in a single operation. The Transactional Outbox pattern resolves this by treating the outbox table as a durable, append-only staging area that is part of the same local ACID transaction as your business data. What reaches the message broker is derived from what is already committed to the database — not the other"
     },
     {
       "id": "track-05-lesson-14",
@@ -2375,7 +2375,7 @@
         "compensation",
         "distributed-transactions"
       ],
-      "body": "Distributed systems shattered the ACID transaction boundary. When a payment flows through a fraud-screening service, an external card processor, a ledger-posting service, and a notification gateway, there is no distributed lock that can hold all four systems in a single atomic unit without introducing catastrophic coupling. The Saga pattern replaces the monolithic transaction with a sequence of local transactions — each isolated within a single service — connected by events or an orchestrator, a"
+      "body": "Overview Distributed systems shattered the ACID transaction boundary. When a payment flows through a fraud-screening service, an external card processor, a ledger-posting service, and a notification gateway, there is no distributed lock that can hold all four systems in a single atomic unit without introducing catastrophic coupling. The Saga pattern replaces the monolithic transaction with a sequence of local transactions — each isolated within a single service — connected by events or an orches"
     },
     {
       "id": "track-05-lesson-15",
@@ -2396,7 +2396,7 @@
         "trade-offs",
         "XA"
       ],
-      "body": "The question of whether to use two-phase commit or a saga is not an ideological one — it is an engineering decision driven by the failure characteristics of your specific infrastructure. Principal engineers who default to \"sagas everywhere because 2PC is bad\" or \"2PC because we need ACID\" without analyzing the deployment context are trading one set of failure modes for another without understanding either. Two-phase commit provides linearizability and atomicity at the cost of blocking under coor"
+      "body": "Overview The question of whether to use two-phase commit or a saga is not an ideological one — it is an engineering decision driven by the failure characteristics of your specific infrastructure. Principal engineers who default to \"sagas everywhere because 2PC is bad\" or \"2PC because we need ACID\" without analyzing the deployment context are trading one set of failure modes for another without understanding either. Two-phase commit provides linearizability and atomicity at the cost of blocking u"
     },
     {
       "id": "track-05-lesson-16",
@@ -2417,7 +2417,7 @@
         "retry",
         "conflict-detection"
       ],
-      "body": "Optimistic locking is the high-throughput alternative to row-level locks. Instead of holding a database lock for the duration of a transaction, you read freely and then verify at write time that nobody else modified the row since you read it. In banking systems where most accounts are read far more often than they are written, optimistic locking can eliminate lock contention entirely — until it cannot, and that failure mode is the part most engineers underestimate. Learning Objectives Explain th"
+      "body": "Overview Optimistic locking is the high-throughput alternative to row-level locks. Instead of holding a database lock for the duration of a transaction, you read freely and then verify at write time that nobody else modified the row since you read it. In banking systems where most accounts are read far more often than they are written, optimistic locking can eliminate lock contention entirely — until it cannot, and that failure mode is the part most engineers underestimate. Learning Objectives E"
     },
     {
       "id": "track-05-lesson-17",
@@ -2438,7 +2438,7 @@
         "deadlock",
         "PostgreSQL"
       ],
-      "body": "Pessimistic locking assumes the worst: another transaction is about to touch the same row, so the database acquires an exclusive lock the moment you read it. In payment systems this is not paranoia — it is the correct default for any operation where the cost of a conflict exceeds the cost of waiting. Optimistic locking wins when conflicts are rare; pessimistic locking wins when they are not, and when user-facing correctness cannot tolerate a retry loop. Learning Objectives Explain the semantics "
+      "body": "Overview Pessimistic locking assumes the worst: another transaction is about to touch the same row, so the database acquires an exclusive lock the moment you read it. In payment systems this is not paranoia — it is the correct default for any operation where the cost of a conflict exceeds the cost of waiting. Optimistic locking wins when conflicts are rare; pessimistic locking wins when they are not, and when user-facing correctness cannot tolerate a retry loop. Learning Objectives Explain the s"
     },
     {
       "id": "track-05-lesson-18",
@@ -2459,7 +2459,7 @@
         "snapshot",
         "audit-trail"
       ],
-      "body": "Event sourcing is not a storage optimisation — it is a fundamentally different answer to the question \"what is the truth?\" In a conventional system the truth is the current row in the accounts table. In an event-sourced system the truth is the ordered log of things that happened, and the balance is a derivative you compute by replaying that log. For financial ledgers this distinction is transformative: you get a full, immutable audit trail without a separate audit table, the ability to recompute"
+      "body": "Overview Event sourcing is not a storage optimisation — it is a fundamentally different answer to the question \"what is the truth?\" In a conventional system the truth is the current row in the accounts table. In an event-sourced system the truth is the ordered log of things that happened, and the balance is a derivative you compute by replaying that log. For financial ledgers this distinction is transformative: you get a full, immutable audit trail without a separate audit table, the ability to "
     },
     {
       "id": "track-05-lesson-19",
@@ -2480,7 +2480,7 @@
         "eventual-consistency",
         "payments"
       ],
-      "body": "Command Query Responsibility Segregation is not an architecture pattern that solves performance — it is a pattern that honestly reflects that writing and reading in a high-throughput payment system have fundamentally different requirements. Writes need serialisable isolation, row-level locks, and strict consistency; reads need sub-millisecond latency at scale, often serving hundreds of queries per second for dashboards, mobile apps, and downstream APIs simultaneously. Attempting to serve both fr"
+      "body": "Overview Command Query Responsibility Segregation is not an architecture pattern that solves performance — it is a pattern that honestly reflects that writing and reading in a high-throughput payment system have fundamentally different requirements. Writes need strong isolation (row-level locks or serializable transactions) and strict consistency; reads need sub-millisecond latency at scale, often serving hundreds of queries per second for dashboards, mobile apps, and downstream APIs simultaneou"
     },
     {
       "id": "track-05-lesson-20",
@@ -2495,7 +2495,7 @@
       "estimatedMinutes": 85,
       "status": "published",
       "tags": "",
-      "body": "The gap between JVM concurrency primitives and database transaction semantics is one of the most reliable sources of production incidents in banking systems. A thread holds a database connection for the entire duration of a method, isolation levels determine which concurrent anomalies are possible, and Hibernate's first-level cache can silently serve stale data while balances diverge on-screen. These are not theoretical concerns — they appear repeatedly in post-incident reviews at digital banks,"
+      "body": "Overview The gap between JVM concurrency primitives and database transaction semantics is one of the most reliable sources of production incidents in banking systems. A thread holds a database connection for the entire duration of a method, isolation levels determine which concurrent anomalies are possible, and Hibernate's first-level cache can silently serve stale data while balances diverge on-screen. These are not theoretical concerns — they appear repeatedly in post-incident reviews at digit"
     },
     {
       "id": "track-05-lesson-21",
@@ -2510,7 +2510,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "A financial audit trail is not a feature — it is a legal obligation. PCI-DSS, SOX, and PSD2 each require that records of financial transactions be immutable, tamper-evident, and retained for defined periods. When regulators or forensic auditors examine a system after a fraud event, they will ask two questions: can you prove what happened, and can you prove that the records have not been altered? This lesson builds an audit trail that answers both questions definitively, from the database schema "
+      "body": "Overview A financial audit trail is not a feature — it is a legal obligation. PCI DSS requires audit logs to be protected from modification; SOX requires reliable financial records and internal controls over them; payment and anti-money-laundering rules require transaction records to be kept for defined periods. When regulators or forensic auditors examine a system after a fraud event, they will ask two questions: can you prove what happened, and can you prove that the records have not been alte"
     },
     {
       "id": "track-05-lesson-22",
@@ -2525,7 +2525,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "Balance reconciliation is the control mechanism that detects when the financial system lies. A running balance stored on an account row is a performance optimisation — a cache of the mathematical truth that lives in the ledger entry sequence. Like all caches, it can drift. Concurrent update races, rolled-back transactions whose balance update landed, infrastructure failover mid-write, or a silent ORM bug can all cause the account row to report a balance that disagrees with the sum of its entries"
+      "body": "Overview Balance reconciliation is the control mechanism that detects when the financial system lies. A running balance stored on an account row is a performance optimisation — a cache of the mathematical truth that lives in the ledger entry sequence. Like all caches, it can drift. Concurrent update races, rolled-back transactions whose balance update landed, infrastructure failover mid-write, or a silent ORM bug can all cause the account row to report a balance that disagrees with the sum of it"
     },
     {
       "id": "track-05-lesson-23",
@@ -2546,7 +2546,7 @@
         "CAMT.056",
         "ISO-20022"
       ],
-      "body": "In financial systems, mistakes happen: a payment is sent to the wrong account, a card transaction is disputed, a batch job double-posts an entry. The disciplined response is never to delete or update the original record. Instead, you append a new transaction that neutralises the effect of the first. This is a compensating transaction — an immutable, traceable correction that preserves the full audit trail required by regulators and reconciliation systems. Getting compensation right is one of the"
+      "body": "Overview In financial systems, mistakes happen: a payment is sent to the wrong account, a card transaction is disputed, a batch job double-posts an entry. The disciplined response is never to delete or update the original record. Instead, you append a new transaction that neutralises the effect of the first. This is a compensating transaction — an immutable, traceable correction that preserves the full audit trail required by regulators and reconciliation systems. Getting compensation right is o"
     },
     {
       "id": "track-05-lesson-24",
@@ -2566,7 +2566,7 @@
         "correctness-vs-performance",
         "staff-engineer"
       ],
-      "body": "Across the twenty-three lessons of Track 6 you have built a toolkit: optimistic locks, pessimistic locks, outbox patterns, sagas, idempotent consumers, event sourcing, audit trails, compensating transactions, and reconciliation jobs. The hardest part of principal engineering is not implementing any one of these — it is choosing the right one for the situation in front of you, articulating the trade-offs to your team, and committing to a design that will hold under production conditions you have "
+      "body": "Overview Across the twenty-three lessons of Track 5 you have built a toolkit: optimistic locks, pessimistic locks, outbox patterns, sagas, idempotent consumers, event sourcing, audit trails, compensating transactions, and reconciliation jobs. The hardest part of principal engineering is not implementing any one of these — it is choosing the right one for the situation in front of you, articulating the trade-offs to your team, and committing to a design that will hold under production conditions "
     },
     {
       "id": "track-06-lesson-01",
@@ -2602,7 +2602,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "In distributed payment systems, remote dependencies fail. Card network APIs return 504s. Fraud-scoring services go into garbage collection pauses. Core banking connectors time out during batch windows. Without protective patterns, one slow dependency cascades into full service unavailability — the classic thread starvation failure. The circuit breaker is the first line of defence: it detects repeated failures on a dependency, stops sending requests while the dependency recovers, and re-admits tr"
+      "body": "Overview In distributed payment systems, remote dependencies fail. Card network APIs return 504s. Fraud-scoring services go into garbage collection pauses. Core banking connectors time out during batch windows. Without protective patterns, one slow dependency cascades into full service unavailability — the classic thread starvation failure. The circuit breaker is the first line of defence: it detects repeated failures on a dependency, stops sending requests while the dependency recovers, and re-"
     },
     {
       "id": "track-06-lesson-03",
@@ -2617,7 +2617,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "A payment service calls three downstream dependencies: a fraud-scoring API, an account-lookup service, and a notification gateway. The fraud API degrades under load, responding in 8 seconds instead of 200ms. Within two minutes every thread in the shared pool is blocked waiting for fraud responses. Account lookups — which were healthy — now queue indefinitely. Notifications never fire. The entire payment flow collapses because of a single slow dependency. The bulkhead pattern prevents this. Named"
+      "body": "Overview A payment service calls three downstream dependencies: a fraud-scoring API, an account-lookup service, and a notification gateway. The fraud API degrades under load, responding in 8 seconds instead of 200ms. Within two minutes every thread in the shared pool is blocked waiting for fraud responses. Account lookups — which were healthy — now queue indefinitely. Notifications never fire. The entire payment flow collapses because of a single slow dependency. The bulkhead pattern prevents th"
     },
     {
       "id": "track-06-lesson-04",
@@ -2680,7 +2680,7 @@
         "failure-injection",
         "resilience-testing"
       ],
-      "body": "Chaos Engineering — GameDay and Failure Injection > [!NOTE] > Chaos engineering is not about breaking things randomly. It is a disciplined practice of introducing controlled failures to verify that your resilience mechanisms actually work before a real outage tests them for you. The Core Principle Netflix coined the term, but the principle is ancient: pre-mortem analysis made executable. The question chaos engineering answers is: \"We believe our system handles this failure gracefully — does it a"
+      "body": "Chaos Engineering — GameDay and Failure Injection > [!NOTE] > Chaos engineering is not about breaking things randomly. It is a disciplined practice of introducing controlled failures to verify that your resilience mechanisms actually work before a real outage tests them for you. The Core Principle Netflix popularised the practice (Chaos Monkey, around 2011), but the principle is old: pre-mortem analysis made executable. The question chaos engineering answers is: \"We believe our system handles th"
     },
     {
       "id": "track-06-lesson-07",
@@ -2695,7 +2695,7 @@
       "estimatedMinutes": 90,
       "status": "published",
       "tags": "",
-      "body": "A single-region payment service offers 99.9% availability — about 8.7 hours of downtime per year. For a payment platform processing 10 million transactions daily, that is 36,000 failed transactions per hour of downtime. Moving to multi-region active-active architecture pushes availability toward 99.999% by ensuring that no single region failure takes the service offline. But active-active is deceptively difficult: when every region can accept writes, you face the write conflict problem — the har"
+      "body": "Overview A single-region payment service offers 99.9% availability — about 8.7 hours of downtime per year. For a payment platform processing 10 million transactions daily, that is roughly 400,000 failed transactions per hour of downtime. Moving to multi-region active-active architecture pushes availability toward 99.999% by ensuring that no single region failure takes the service offline. But active-active is deceptively difficult: when every region can accept writes, you face the write conflict"
     },
     {
       "id": "track-06-lesson-08",
@@ -2799,7 +2799,7 @@
         "ISR",
         "leader-election"
       ],
-      "body": "Kafka High Availability — Replication and Partition Leadership > [!NOTE] > Kafka's durability guarantees are only as strong as your configuration. The defaults (replication.factor=1, acks=1) mean you can lose messages on a single broker failure. For payment event processing, losing a \"PAYMENT_DEBITED\" event means the debit is unrecorded and the customer's balance is wrong. The correct configuration for fintech — replication.factor=3, min.insync.replicas=2, acks=all — provides durability guarante"
+      "body": "Kafka High Availability — Replication and Partition Leadership > [!NOTE] > Kafka's durability guarantees are only as strong as your configuration. Since Kafka 3.0 the producer defaults are safe ( , idempotence on), but the broker defaults ( , ) still mean you can lose messages on a single broker failure. For payment event processing, losing a \"PAYMENT_DEBITED\" event means the debit is unrecorded and the customer's balance is wrong. The correct configuration for fintech — replication.factor=3, mi"
     },
     {
       "id": "track-06-lesson-13",
@@ -2814,7 +2814,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Security teams implement rate limiting to prevent credential stuffing and API abuse. Reliability engineers implement rate limiting for a different reason: to protect downstream services from being overwhelmed by legitimate traffic. A payment processing service that sends 10,000 transaction queries per second to a fraud-scoring API is not attacking it — but the effect is indistinguishable. Rate limiting as a reliability tool is about defining sustainable load, enforcing it at the boundary, and de"
+      "body": "Overview Security teams implement rate limiting to prevent credential stuffing and API abuse. Reliability engineers implement rate limiting for a different reason: to protect downstream services from being overwhelmed by legitimate traffic. A payment processing service that sends 10,000 transaction queries per second to a fraud-scoring API is not attacking it — but the effect is indistinguishable. Rate limiting as a reliability tool is about defining sustainable load, enforcing it at the boundar"
     },
     {
       "id": "track-06-lesson-14",
@@ -2955,7 +2955,7 @@
       "estimatedMinutes": 85,
       "status": "published",
       "tags": "",
-      "body": "Garbage collection pauses are among the most insidious performance problems in JVM-based fintech applications. They are intermittent, they are invisible in APM dashboards unless you correlate carefully, and their root causes are buried in raw GC log output that most engineers never open. A single 400 ms stop-the-world pause during a payment authorization flow looks identical to a network timeout from the caller's perspective — but the fix is completely different. This lesson teaches you to read "
+      "body": "Overview Garbage collection pauses are among the most insidious performance problems in JVM-based fintech applications. They are intermittent, they are invisible in APM dashboards unless you correlate carefully, and their root causes are buried in raw GC log output that most engineers never open. A single 400 ms stop-the-world pause during a payment authorization flow looks identical to a network timeout from the caller's perspective — but the fix is completely different. This lesson teaches you"
     },
     {
       "id": "track-07-lesson-03",
@@ -3114,7 +3114,7 @@
         "data-structures",
         "latency"
       ],
-      "body": "Redis Performance — Pipelining, Scripting, and Data Structures > [!NOTE] > Redis is single-threaded for command execution, which means its performance profile is entirely dominated by network round-trip time, not compute. Every architectural decision — pipelining, scripting, data structure selection — is about minimizing round trips and maximizing the work done per command. Redis Pipelining — Batching Commands to Reduce Round Trips Without pipelining, each command requires a full network round t"
+      "body": "Redis Performance — Pipelining, Scripting, and Data Structures > [!NOTE] > Redis executes commands on a single thread (newer versions can use extra threads only for network I/O). Most commands take microseconds, so for typical workloads the client's experience is dominated by network round-trip time, not compute. Every architectural decision — pipelining, scripting, data structure selection — is about minimizing round trips and maximizing the work done per command. Redis Pipelining — Batching Co"
     },
     {
       "id": "track-07-lesson-12",
@@ -3135,7 +3135,7 @@
         "compression",
         "linger"
       ],
-      "body": "Kafka Producer Tuning — Throughput, Latency, and Financial Durability > [!NOTE] > Kafka producer configuration has a direct impact on throughput, end-to-end latency, and message durability. For financial systems, the default configuration is almost always wrong — it optimises for neither performance nor durability, sitting in an uncomfortable middle ground that serves neither goal well. Learning Objectives By the end of this lesson you will be able to: Explain the throughput vs latency trade-off"
+      "body": "Kafka Producer Tuning — Throughput, Latency, and Financial Durability > [!NOTE] > Kafka producer configuration has a direct impact on throughput, end-to-end latency, and message durability. Since Kafka 3.0 the producer defaults are durable ( , ), but they are not tuned for throughput, and many systems still run older clients or override the defaults. For financial systems, set every durability-related value explicitly and tune batching for your workload. Learning Objectives By the end of this le"
     },
     {
       "id": "track-07-lesson-13",
@@ -3171,7 +3171,7 @@
         "executor",
         "sizing"
       ],
-      "body": "Thread Pool Sizing — Little's Law and Optimal Concurrency > [!NOTE] > Undersized thread pools cause request queuing and latency spikes under load. Oversized pools waste memory (each thread consumes ~1MB stack), increase context switching, and degrade throughput. Little's Law provides the mathematical foundation to size thread pools correctly for payment processors — but the formula requires measuring your actual service latency and arrival rate under production conditions. The Cost of Getting Th"
+      "body": "Thread Pool Sizing — Little's Law and Optimal Concurrency > [!NOTE] > Undersized thread pools cause request queuing and latency spikes under load. Oversized pools waste memory (each platform thread reserves a stack, ~1MB by default, plus kernel resources), increase context switching, and degrade throughput. Little's Law provides the mathematical foundation to size thread pools correctly for payment processors — but the formula requires measuring your actual service latency and arrival rate under"
     },
     {
       "id": "track-07-lesson-15",
@@ -3192,7 +3192,7 @@
         "pinning",
         "carrier-thread"
       ],
-      "body": "Virtual Threads Performance — Benchmarking Java 21 > [!NOTE] > Virtual threads are not faster than platform threads for CPU-bound work — they provide higher throughput for IO-bound workloads by allowing millions of concurrent lightweight threads without the memory overhead of platform threads. For payment processors that spend 90% of request time waiting on IO (database, fraud APIs, payment networks), virtual threads can increase throughput 5–10x with no code changes. What Are Virtual Threads? V"
+      "body": "Virtual Threads Performance — Benchmarking Java 21 > [!NOTE] > Virtual threads are not faster than platform threads for CPU-bound work — they provide higher throughput for IO-bound workloads by allowing millions of concurrent lightweight threads without the memory overhead of platform threads. For payment processors that spend most of each request waiting on IO (database, fraud APIs, payment networks), virtual threads remove the thread-pool ceiling on concurrency with little or no code change — "
     },
     {
       "id": "track-07-lesson-16",
@@ -3255,7 +3255,7 @@
         "padding",
         "jol"
       ],
-      "body": "Memory Layout — Object Padding, Cache Lines, and False Sharing > [!NOTE] > False sharing is a silent performance killer in concurrent financial systems. When two threads on different CPU cores modify fields that happen to share the same 64-byte cache line, they invalidate each other's cache on every write — causing 10–50x slowdowns in high-throughput counters, payment rate limiters, and concurrent balance accumulators. The fix is a single annotation, but you must first know where to look. Java O"
+      "body": "Memory Layout — Object Padding, Cache Lines, and False Sharing > [!NOTE] > False sharing is a silent performance killer in concurrent financial systems. When two threads on different CPU cores modify fields that happen to share the same 64-byte cache line, they invalidate each other's cache on every write — which can slow high-throughput counters, payment rate limiters, and concurrent accumulators by an order of magnitude. The fixes are simple ( , padding, or the JDK-internal ), but you must fir"
     },
     {
       "id": "track-07-lesson-19",
@@ -3270,7 +3270,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Database Partitioning — Range, Hash, and List Strategies A fintech transaction table that accumulates one billion rows over three years is not an edge case — it is the routine. A single monolithic PostgreSQL table at that scale produces three concrete problems: query plans must scan enormous B-tree indexes, and run for hours locking out maintenance windows, and dropping old data requires a full table scan via . Declarative partitioning, introduced as a first-class feature in PostgreSQL 10 and si"
+      "body": "Database Partitioning — Range, Hash, and List Strategies A fintech transaction table that accumulates one billion rows over three years is not an edge case — it is the routine. A single monolithic PostgreSQL table at that scale produces three concrete problems: query plans must scan enormous B-tree indexes, and run for hours and compete with production load, and dropping old data requires a full table scan via . Declarative partitioning, introduced as a first-class feature in PostgreSQL 10 and s"
     },
     {
       "id": "track-07-lesson-20",
@@ -3306,7 +3306,7 @@
         "Nagle",
         "socket-timeout"
       ],
-      "body": "Network I/O Tuning — TCP, Keepalive, and Buffer Sizing > [!NOTE] > Payment systems make thousands of network calls per second — to databases, payment gateways, fraud services, and messaging systems. A misconfigured TCP socket can add 40ms to every payment that hits a card network. At 1,000 TPS that is 40,000ms of unnecessary latency per second, manifesting as p99 degradation that no amount of algorithmic optimization can fix. TCP_NODELAY — Disabling the Nagle Algorithm The Nagle algorithm was de"
+      "body": "Network I/O Tuning — TCP, Keepalive, and Buffer Sizing > [!NOTE] > Payment systems make thousands of network calls per second — to databases, payment gateways, fraud services, and messaging systems. A misconfigured TCP socket can add tens of milliseconds to every payment call, or make the first request after an idle period fail — p99 problems that no amount of algorithmic optimization can fix. TCP_NODELAY — Disabling the Nagle Algorithm The Nagle algorithm was designed in 1984 for telnet session"
     },
     {
       "id": "track-07-lesson-22",
@@ -3469,7 +3469,7 @@
       "estimatedMinutes": 85,
       "status": "published",
       "tags": "",
-      "body": "A single PostgreSQL primary can sustain roughly 10,000 to 20,000 write transactions per second on modern NVMe hardware before CPU, WAL throughput, or lock contention becomes the ceiling. For a mid-sized payment processor handling 50,000 transactions per second at peak, that ceiling arrives faster than the engineering team expects. Vertical scaling buys time — a 192-core machine with 6 TB RAM exists, and it costs $80,000 per month. Horizontal scaling via sharding distributes the data and the writ"
+      "body": "Overview A single PostgreSQL primary on modern NVMe hardware can sustain many thousands of write transactions per second — the exact ceiling depends heavily on transaction size, indexes and durability settings — before CPU, WAL throughput, or lock contention becomes the limit. For a payment processor handling tens of thousands of transactions per second at peak, that ceiling arrives faster than the engineering team expects. Vertical scaling buys time — very large machines (hundreds of cores, ter"
     },
     {
       "id": "track-08-lesson-08",
@@ -3553,7 +3553,7 @@
         "logical-replication",
         "streaming"
       ],
-      "body": "WAL and CDC — Change Data Capture with Debezium > [!NOTE] > The dual-write problem — keeping a database and a message broker in sync atomically — has caused some of the most expensive outages in financial services. Change Data Capture via the WAL is the correct architectural solution: the database is the single source of truth, and all downstream systems derive their state from the WAL stream, not from application-level dual writes. PostgreSQL WAL Internals The Write-Ahead Log (WAL) is PostgreSQ"
+      "body": "WAL and CDC — Change Data Capture with Debezium > [!NOTE] > The dual-write problem — keeping a database and a message broker in sync atomically — is a classic source of lost events, ghost events and reconciliation breaks in financial systems. Change Data Capture via the WAL is a robust architectural answer: the database is the single source of truth, and downstream systems derive their state from the committed change stream, not from application-level dual writes. PostgreSQL WAL Internals The Wr"
     },
     {
       "id": "track-08-lesson-12",
@@ -3583,7 +3583,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Time-Series Data — TimescaleDB and Hypertables Fintech platforms generate enormous volumes of time-ordered data: payment throughput metrics sampled every second, OHLCV candlestick data for every currency pair, fraud score time series per account, and system health metrics tied to business events. Vanilla PostgreSQL handles this workload poorly at scale. TimescaleDB — a PostgreSQL extension — transforms it into a first-class time-series database without sacrificing SQL compatibility or ACID guara"
+      "body": "Time-Series Data — TimescaleDB and Hypertables Fintech platforms generate enormous volumes of time-ordered data: payment throughput metrics sampled every second, OHLCV candlestick data for every currency pair, fraud score time series per account, and system health metrics tied to business events. Vanilla PostgreSQL can store this data, but at scale it needs a lot of manual work (partitions, rollups, retention jobs). TimescaleDB — a PostgreSQL extension — automates that work and adds time-series "
     },
     {
       "id": "track-08-lesson-14",
@@ -3604,7 +3604,7 @@
         "bitemporal",
         "trigger"
       ],
-      "body": "Audit Tables — Temporal Tables and History Tracking > [!NOTE] > Audit logging is a compliance requirement in every regulated financial system. The question is not whether to build it, but how to build it correctly. Shadow tables driven by database triggers provide reliable, tamper-evident history that cannot be bypassed by application bugs. Bitemporal modelling adds the ability to answer \"what did we know, when did we know it\" — a question that arises in every regulatory investigation. Why Audit"
+      "body": "Audit Tables — Temporal Tables and History Tracking > [!NOTE] > Audit logging is a compliance requirement in every regulated financial system. The question is not whether to build it, but how to build it correctly. Shadow tables driven by database triggers provide reliable history that application bugs and side doors cannot skip (only privileged roles that can disable triggers could — restrict and monitor those). Bitemporal modelling adds the ability to answer \"what did we know, when did we know"
     },
     {
       "id": "track-08-lesson-15",
@@ -3682,7 +3682,7 @@
         "tiering",
         "S3"
       ],
-      "body": "Data Archival — Cold Storage and Tiered Data Management > [!NOTE] > The Bank Secrecy Act (BSA) requires retention of transaction records for at least 5 years; anti-money laundering regulations commonly require 7 years. Storing 7 years of transactions in a single hot PostgreSQL table is prohibitively expensive. Tiered archival moves old data to progressively cheaper storage while maintaining the ability to query it for compliance. Regulatory Retention Requirements Hot/Warm/Cold Tiering Strategy F"
+      "body": "Data Archival — Cold Storage and Tiered Data Management > [!NOTE] > The US Bank Secrecy Act (BSA) requires retention of transaction records for at least 5 years; other regimes and internal policies often set 5–10 years (7 is a common policy choice). Keeping 7 years of transactions in a single hot PostgreSQL table is expensive and operationally heavy. Tiered archival moves old data to progressively cheaper storage while maintaining the ability to query it for compliance. Regulatory Retention Requ"
     },
     {
       "id": "track-08-lesson-19",
@@ -3787,7 +3787,7 @@
         "consumer-group",
         "broker"
       ],
-      "body": "Kafka Architecture — Topics, Partitions, and Consumer Groups > [!NOTE] > Apache Kafka is the dominant messaging platform in financial services — not because it's simple, but because it provides the combination of durability, throughput, and replay capability that event-driven financial systems require. This lesson builds the architectural mental model needed to use Kafka correctly. Why Kafka Exists — The Problem It Solves Traditional message queues (RabbitMQ, ActiveMQ) delete messages after cons"
+      "body": "Kafka Architecture — Topics, Partitions, and Consumer Groups > [!NOTE] > Apache Kafka is the dominant messaging platform in financial services — not because it's simple, but because it provides the combination of durability, throughput, and replay capability that event-driven financial systems require. This lesson builds the architectural mental model needed to use Kafka correctly. Why Kafka Exists — The Problem It Solves Traditional message queues (classic RabbitMQ queues, ActiveMQ) delete mess"
     },
     {
       "id": "track-09-lesson-02",
@@ -4240,7 +4240,7 @@
         "Flux",
         "declarative"
       ],
-      "body": "Helm and GitOps — Declarative Infrastructure with ArgoCD > [!NOTE] > GitOps is the deployment model that satisfies the change management requirements in ISO 27001, SOX, and PCI-DSS simultaneously. Every change to production passes through a pull request, every deployment is traceable to a Git commit, and rollback is . For financial institutions under regulatory scrutiny, this is not a convenience — it is a compliance mechanism. The GitOps Mental Model for Financial Services Traditional deploymen"
+      "body": "Helm and GitOps — Declarative Infrastructure with ArgoCD > [!NOTE] > GitOps is a deployment model that supports the change management controls of ISO 27001, SOX, and PCI-DSS at the same time. Every change to production passes through a pull request, every deployment is traceable to a Git commit, and rollback is . For financial institutions under regulatory scrutiny, this is not just a convenience — it is a large part of the compliance evidence (auditors still look at access control, break-glass "
     },
     {
       "id": "track-10-lesson-05",
@@ -4255,7 +4255,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "Service Mesh — Istio Traffic Management and Observability A service mesh adds a dedicated infrastructure layer for service-to-service communication, handling encryption, retries, circuit breaking, and distributed tracing transparently — without changing application code. For fintech platforms where every inter-service call carries financial data, Istio's mutual TLS enforcement and fine-grained authorization policies provide security controls that satisfy PCI-DSS Requirement 4 (encryption in tran"
+      "body": "Service Mesh — Istio Traffic Management and Observability A service mesh adds a dedicated infrastructure layer for service-to-service communication, handling encryption, retries, circuit breaking, and distributed tracing transparently — without changing application code. For fintech platforms where every inter-service call carries financial data, Istio's mutual TLS enforcement and fine-grained authorization policies provide security controls that support PCI-DSS requirements on encryption in tra"
     },
     {
       "id": "track-10-lesson-06",
@@ -4297,7 +4297,7 @@
         "rotation",
         "encryption-at-rest"
       ],
-      "body": "Secret Management — Vault and External Secrets Operator > [!NOTE] > Hardcoded database credentials are the leading cause of financial data breaches. HashiCorp Vault with dynamic secrets means no one ever knows the production database password — not the DBA, not the application developer, not the platform engineer. The credential exists for the duration of the connection lease and is then destroyed. This is the gold standard for PCI-DSS key management. Why Kubernetes Secrets Alone Are Not Enough "
+      "body": "Secret Management — Vault and External Secrets Operator > [!NOTE] > Leaked and hard-coded credentials are one of the most common starting points of data breaches. HashiCorp Vault with dynamic secrets means no one ever knows the production database password — not the DBA, not the application developer, not the platform engineer. The credential exists for the duration of its lease and is then destroyed. This is the strongest common pattern for managing application credentials in a PCI-DSS environm"
     },
     {
       "id": "track-10-lesson-08",
@@ -4411,7 +4411,7 @@
       "estimatedMinutes": 80,
       "status": "published",
       "tags": "",
-      "body": "CI/CD Pipelines — Secure Delivery for Financial Services A CI/CD pipeline in a financial services company is not just an automation convenience — it is a PCI-DSS control. Requirement 6 mandates that all system components and software are protected from known vulnerabilities, and that security is integrated into the development lifecycle. This lesson builds a complete, PCI-DSS-mapped pipeline from code commit to production deployment. Pipeline Architecture Overview PCI-DSS Requirement 6 Mapping |"
+      "body": "CI/CD Pipelines — Secure Delivery for Financial Services A CI/CD pipeline in a financial services company is not just an automation convenience — it is a PCI-DSS control. Requirement 6 mandates that all system components and software are protected from known vulnerabilities, and that security is integrated into the development lifecycle. This lesson builds a complete, PCI-DSS-mapped pipeline from code commit to production deployment. Pipeline Architecture Overview PCI-DSS Requirement Mapping (v4"
     },
     {
       "id": "track-10-lesson-14",
@@ -4441,7 +4441,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Disaster Recovery on Kubernetes — Backup and Restore A Kubernetes cluster without a tested disaster recovery plan is an operational liability. For financial services regulated under PCI-DSS Requirement 12.3.3, backup testing is not optional — it must be performed regularly and results documented. This lesson covers what must be backed up, how to back it up, and how to verify that recovery actually works before you need it. DR Objectives for Kubernetes 1.1 RTO and RPO Definitions Recovery Time Ob"
+      "body": "Disaster Recovery on Kubernetes — Backup and Restore A Kubernetes cluster without a tested disaster recovery plan is an operational liability. For regulated financial services, recovery testing is not optional: PCI-DSS 12.10 requires an incident response plan — including business recovery and continuity procedures and data backup processes — that is tested at least annually, and resilience regulations such as the EU's DORA require regular testing of backup and recovery. Results must be documente"
     },
     {
       "id": "track-10-lesson-16",
@@ -4690,7 +4690,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "mTLS in Practice — Certificate Rotation and SPIFFE An expired certificate in a payment service is not a theoretical risk — it is a production outage. In 2021 a major payments processor suffered a 90-minute outage because a TLS certificate expired without automated renewal. This lesson covers the mechanics of mutual TLS, automated certificate rotation using SPIRE and cert-manager, Vault PKI integration, and monitoring for certificate expiry before it becomes an incident. mTLS Mechanics Standard T"
+      "body": "mTLS in Practice — Certificate Rotation and SPIFFE An expired certificate in a payment service is not a theoretical risk — it is a production outage. Well-documented examples include the December 2018 Ericsson software-certificate expiry that took down mobile data for O2 and other operators, and the February 2020 Microsoft Teams outage caused by an expired authentication certificate. This lesson covers the mechanics of mutual TLS, automated certificate rotation using SPIRE and cert-manager, Vaul"
     },
     {
       "id": "track-11-lesson-13",
@@ -4720,7 +4720,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Penetration Testing — Financial API Security Assessment Penetration testing (pentesting) is the practice of simulating adversarial attacks against your own systems to discover vulnerabilities before malicious actors do. In financial services, where the cost of a breach can be regulatory fines, customer compensation, and permanent reputation damage, structured pentesting is not optional — it is a compliance requirement under PCI-DSS, FCA, and most national cyber-resilience frameworks. This lesson"
+      "body": "Penetration Testing — Financial API Security Assessment Penetration testing (pentesting) is the practice of simulating adversarial attacks against your own systems to discover vulnerabilities before malicious actors do. In financial services, where the cost of a breach can be regulatory fines, customer compensation, and permanent reputation damage, structured pentesting is not optional — PCI DSS requires internal and external penetration tests at least annually and after significant changes (Req"
     },
     {
       "id": "track-11-lesson-15",
@@ -4756,7 +4756,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Data Encryption — At-Rest and In-Transit for Finance Financial data at rest and in transit is subject to the most stringent protection requirements of any industry. PCI-DSS Requirement 3 mandates that Primary Account Numbers (PANs) are rendered unreadable anywhere they are stored. Requirement 4 mandates strong cryptography over open networks. GDPR requires appropriate technical measures for personal data. The FCA expects firms to protect sensitive customer information as a condition of authorisa"
+      "body": "Data Encryption — At-Rest and In-Transit for Finance Financial data at rest and in transit is subject to the most stringent protection requirements of any industry. PCI-DSS Requirement 3 mandates that Primary Account Numbers (PANs) are rendered unreadable anywhere they are stored. Requirement 4 mandates strong cryptography over open networks. GDPR requires appropriate technical measures for personal data. Financial supervisors (the FCA in the UK, and DORA's ICT risk-management rules in the EU) e"
     },
     {
       "id": "track-11-lesson-17",
@@ -4941,7 +4941,7 @@
         "cruft",
         "refactoring"
       ],
-      "body": "Managing Technical Debt — Prioritisation and Paydown > [!NOTE] > Technical debt in financial services has a unique property: some of it is literally non-negotiable. Compliance debt (outdated encryption, missing audit logs, non-compliant data retention) is not a prioritisation question—it is a legal obligation. Understanding which debt is optional and which is mandatory changes how you have the conversation with product. Debt Taxonomy: Cunningham's Quadrant Ward Cunningham, who coined the term \"t"
+      "body": "Managing Technical Debt — Prioritisation and Paydown > [!NOTE] > Technical debt in financial services has a unique property: some of it is literally non-negotiable. Compliance debt (outdated encryption, missing audit logs, non-compliant data retention) is not a prioritisation question—it is a legal obligation. Understanding which debt is optional and which is mandatory changes how you have the conversation with product. Debt Taxonomy: The Technical Debt Quadrant Ward Cunningham coined the \"techn"
     },
     {
       "id": "track-12-lesson-06",
@@ -5133,7 +5133,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Overview Spring Boot 4.0 is the most disruptive major release since the 2.x-to-3.x jump. It raises the Java baseline from 17 to 21, moves entirely onto Spring Framework 7, and adopts Jakarta EE 11 as its servlet and persistence baseline. For fintech engineering teams running payment processors, ledger services, or risk engines on Spring Boot 3.x, the upgrade path requires deliberate planning: the namespace changes are mechanical, but the shifts in auto-configuration loading, AOT compilation requ"
+      "body": "Overview Spring Boot 4.0 (released November 2025) is the biggest major release since the 2.x-to-3.x jump. It keeps Java 17 as the minimum (Java 21 or the current LTS, Java 25, is recommended), moves onto Spring Framework 7, and adopts Jakarta EE 11 (Servlet 6.1, Jakarta Persistence 3.2, Bean Validation 3.1). For fintech engineering teams running payment processors, ledger services, or risk engines on Spring Boot 3.x, the upgrade requires deliberate planning: most changes are mechanical, but the "
     },
     {
       "id": "track-13-lesson-02",
@@ -5148,7 +5148,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Spring Framework 7 — New Baseline Features Spring Framework 7 is the foundation of Spring Boot 4. Most of the user-visible changes live at the SF7 layer: a production-ready declarative HTTP client, a new blocking that supersedes , a significantly improved AOT metadata pipeline, the first-class API, and test annotation renames. This lesson covers each in depth with fintech-grade code examples. HTTP Interfaces ( ) — Production-Ready Declarative HTTP Before SF7, teams writing microservice clients f"
+      "body": "Spring Framework 7 — New Baseline Features Spring Framework 7 (November 2025) is the foundation of Spring Boot 4. Its headline features are HTTP service client groups (declarative clients configured in bulk), built-in API versioning, JSpecify null-safety across the portfolio, core resilience annotations ( , ), Jackson 3 support, and the move to GraalVM's new unified reachability metadata. This lesson covers the HTTP client stack ( interfaces and , both introduced in Framework 6 and now the recom"
     },
     {
       "id": "track-13-lesson-03",
@@ -5178,7 +5178,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Spring Data 4 — JDBC, JPA, and Redis Spring Data 4 ships with Spring Boot 4 and brings three significant changes: Hibernate 7 as the JPA provider (with virtual-thread safety and record entity support), revised repository hierarchy recommendations, and Spring Data Redis 4 backed by Lettuce 6 (which eliminates Netty pinning issues with virtual threads). This lesson covers each module with production fintech examples. Spring Data JPA 4 + Hibernate 7 Hibernate 7 is the first Hibernate release that i"
+      "body": "Spring Data 4 — JDBC, JPA, and Redis Spring Boot 4 ships the Spring Data 2025.1 release train (Spring Data JPA 4, JDBC 4, Redis 4). The changes that matter most: Hibernate ORM 7 as the JPA provider (Jakarta Persistence 3.2), JSpecify null-safety in the repository APIs, a revised API, and continued use of Lettuce as the Redis driver. This lesson covers each module with production fintech examples — including where Java records fit in the persistence layer, and where they do not. Spring Data JPA 4"
     },
     {
       "id": "track-13-lesson-05",
@@ -5193,7 +5193,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Spring Security 7 — OAuth2, JWT, and Authorization Server Spring Security 7 ships with Spring Framework 7 and Spring Boot 4. If you have been running a fintech service on Spring Boot 3.x with Spring Security 6.x, the migration surface is smaller than the 5→6 jump — but several APIs that were deprecated in SS6 are now removed, and the lambda DSL is no longer optional. This lesson covers exactly what changed and why, then builds toward a production-grade OAuth2 setup that you would use at Revolut-"
+      "body": "Spring Security 7 — OAuth2, JWT, and Authorization Server Spring Security 7 ships with Spring Framework 7 and Spring Boot 4. If you have been running a fintech service on Spring Boot 3.x with Spring Security 6.x, the migration surface is smaller than the 5→6 jump — but several APIs that were deprecated in SS6 are now removed, the lambda DSL is no longer optional, and Spring Authorization Server has moved into Spring Security itself. This lesson covers exactly what changed and why, then builds to"
     },
     {
       "id": "track-13-lesson-06",
@@ -5223,7 +5223,7 @@
       "estimatedMinutes": 75,
       "status": "published",
       "tags": "",
-      "body": "Migrating a Spring Boot 3.x Payment Service to 4.x This lesson is a step-by-step migration walkthrough, not a conceptual overview. The target is a production payment service running Spring Boot 3.3.x that processes FPS (Faster Payments) transactions, stores to PostgreSQL, publishes to Kafka, and uses Spring Security with JWT. By the end, every class compiles and all tests pass under Spring Boot 4. Pre-Migration State of the Service Step 1: Pre-Migration Checklist Before touching : 1.1 Verify Jav"
+      "body": "Migrating a Spring Boot 3.x Payment Service to 4.x This lesson is a step-by-step migration walkthrough, not a conceptual overview. The target is a production payment service running Spring Boot 3.5.x that processes FPS (Faster Payments) transactions, stores to PostgreSQL, publishes to Kafka, and uses Spring Security with JWT. By the end, every class compiles and all tests pass under Spring Boot 4. Pre-Migration State of the Service > [!NOTE] > Upgrade to the latest Spring Boot 3.5.x first and fi"
     },
     {
       "id": "track-13-lesson-08",
@@ -5238,7 +5238,7 @@
       "estimatedMinutes": 70,
       "status": "published",
       "tags": "",
-      "body": "Spring Boot 4 Testing — Slices, Testcontainers, and Observability Effective testing is the difference between a service you can refactor confidently and one you are afraid to touch. Spring Boot 4 ships with a testing story that is meaningfully better than SB3: replaces the Boot-specific , eliminates manual container property wiring, and lets you assert on observability signals. This lesson covers everything needed to write a production-quality test suite for a fintech payment service. and Spring"
+      "body": "Spring Boot 4 Testing — Slices, Testcontainers, and Observability Effective testing is the difference between a service you can refactor confidently and one you are afraid to touch. Spring Boot 4 consolidates a testing story that matured over the 3.x line: replaces the Boot-specific , eliminates manual container property wiring, and Micrometer's lets you assert on observability signals. This lesson covers everything needed to write a production-quality test suite for a fintech payment service. a"
     },
     {
       "id": "track-14-lesson-01",
@@ -5458,7 +5458,7 @@
         "trade-offs",
         "time-management"
       ],
-      "body": "In one minute A design round is a 45-minute conversation where you drive. Interviewers score structure, trade-offs and depth, not a \"correct\" diagram. Use a fixed time plan (RESHADED), say your assumptions aloud, do the arithmetic, and spend the second half on one or two deep dives where money can be lost (idempotency, consistency, failure handling). This lesson is the how to run the round checklist. The design patterns themselves are taught in Tracks 06 and 16. Analogy It is like a pilot's chec"
+      "body": "In one minute A design round is a 45-minute conversation where you drive. Interviewers score structure, trade-offs and depth, not a \"correct\" diagram. Use a fixed time plan (RESHADED), say your assumptions aloud, do the arithmetic, and spend the second half on one or two deep dives where money can be lost (idempotency, consistency, failure handling). This lesson is the how to run the round checklist. The design patterns themselves are taught in Tracks 05, 06 and 14. Analogy It is like a pilot's "
     },
     {
       "id": "track-15-lesson-03",

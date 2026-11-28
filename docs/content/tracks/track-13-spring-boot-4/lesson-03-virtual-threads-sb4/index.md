@@ -32,23 +32,23 @@ references:
 
 Virtual threads (Project Loom, finalized in Java 21 via JEP 444) change the fundamental cost model for I/O-bound concurrent Java applications. A platform thread consumes approximately 1 MB of OS stack memory and requires an OS context switch on blocking — meaning a service handling 10,000 concurrent requests needs 10,000 platform threads and 10 GB of stack memory, plus enormous scheduling overhead. A virtual thread is a JVM-managed construct scheduled on a small pool of carrier platform threads; a blocked virtual thread consumes only a few hundred bytes on the heap and yields its carrier thread for other work immediately.
 
-Spring Boot 4 makes virtual thread adoption a one-line configuration change: `spring.threads.virtual.enabled=true`. This single property triggers auto-configuration that replaces the thread pool executors in four subsystems simultaneously: Tomcat's request handler executor, the default `@Async` task executor, the `@Scheduled` thread pool, and the `@EventListener` executor. For a payment processing service that makes multiple downstream I/O calls per request (gateway, fraud engine, ledger, FX rates), virtual threads eliminate the thread-pool sizing problem entirely.
+Spring Boot (since 3.2, and still in 4) makes virtual thread adoption a one-line configuration change on Java 21+: `spring.threads.virtual.enabled=true`. This single property switches several subsystems at once: the embedded web server's request handling (Tomcat/Jetty), the default `applicationTaskExecutor` used by `@Async`, the `@Scheduled` task scheduler, and supported messaging listener containers (Kafka, RabbitMQ). For a payment processing service that makes multiple downstream I/O calls per request (gateway, fraud engine, ledger, FX rates), virtual threads eliminate the thread-pool sizing problem entirely.
 
-The adoption is not entirely frictionless, however. The critical operational concern is **carrier thread pinning**: when a virtual thread executes a `synchronized` block or calls a native method, it pins to its carrier platform thread and cannot yield, defeating the entire benefit of virtual threads and potentially causing all carrier threads to be pinned simultaneously under load. Fintech codebases frequently accumulate `synchronized` usage in cryptographic libraries, connection pool code, and legacy compliance SDKs. This lesson teaches you to detect, diagnose, and fix pinning — and introduces `StructuredTaskScope` for the specific pattern of parallel fan-out that is ubiquitous in payment enrichment pipelines.
+The adoption is not entirely frictionless, however. The critical operational concern is **carrier thread pinning**: on Java 21–23, when a virtual thread blocks inside a `synchronized` block — and on every version, when it blocks inside a native method — it stays pinned to its carrier platform thread and cannot yield, defeating the benefit of virtual threads and potentially pinning all carrier threads under load. (Java 24, via JEP 491, removed the `synchronized` case.) Fintech codebases frequently accumulate `synchronized` usage in cryptographic libraries, connection pool code, and legacy compliance SDKs. This lesson teaches you to detect, diagnose, and fix pinning — and introduces `StructuredTaskScope` for the specific pattern of parallel fan-out that is ubiquitous in payment enrichment pipelines.
 
 ## Learning Objectives
 
 - Understand what virtual threads are, how the JVM schedules them, and why they eliminate the thread-pool sizing problem for I/O-bound services
-- Configure `spring.threads.virtual.enabled=true` and understand all four subsystems it reconfigures
-- Explain what carrier thread pinning is, why `synchronized` causes it, and how to detect it with `-Djdk.tracePinnedThreads=full`
+- Configure `spring.threads.virtual.enabled=true` and understand the subsystems it reconfigures
+- Explain what carrier thread pinning is, why `synchronized` causes it on Java 21–23, and how to detect it with JFR's `jdk.VirtualThreadPinned` event
 - Replace `synchronized` with `ReentrantLock` to eliminate pinning in a payment crypto library
-- Use `StructuredTaskScope.ShutdownOnFailure` for parallel payment enrichment with timeout and cancellation
+- Use `StructuredTaskScope` (a preview API) for parallel payment enrichment with timeout and cancellation
 - Replace `ThreadLocal` with `ScopedValue` for passing request context in a virtual thread environment
 - Write an integration test that verifies virtual thread usage in a Spring Boot 4 controller
 
 ## SB4 Virtual Thread Auto-Configuration
 
-When `spring.threads.virtual.enabled=true` is set, Spring Boot 4 activates four auto-configuration customizers. Each is in its own `@ConditionalOnProperty`-gated bean, so they activate independently and can be overridden individually.
+When `spring.threads.virtual.enabled=true` is set (and the application runs on Java 21+), Spring Boot activates several auto-configuration customizers. Each backs off when you define your own bean, so they can be overridden individually. The snippets below are simplified illustrations of what the auto-configuration does.
 
 ```yaml
 # application.yml
@@ -73,46 +73,40 @@ public TomcatProtocolHandlerCustomizer<?> virtualThreadTomcatProtocolHandlerCust
 
 Each incoming HTTP request is now handled on its own virtual thread. The accept threads (the threads that accept TCP connections from the OS) remain platform threads — they are not virtual. `server.tomcat.threads.max` is ignored when virtual threads are active.
 
-**`@Async`** — `TaskExecutionAutoConfiguration` registers a `VirtualThreadTaskExecutor` as the default `ApplicationTaskExecutor`:
+**`@Async`** — the task execution auto-configuration registers a `SimpleAsyncTaskExecutor` that creates a new virtual thread per task as the default `applicationTaskExecutor`:
 
 ```java
-// Spring Boot 4 source (simplified) — TaskExecutionVirtualThreadsAutoConfiguration
-@Bean(name = APPLICATION_TASK_EXECUTOR_BEAN_NAME)
+// Simplified — what the task execution auto-configuration does
+@Bean(name = { "applicationTaskExecutor", "taskExecutor" })
 @ConditionalOnMissingBean(Executor.class)
-@ConditionalOnProperty(value = "spring.threads.virtual.enabled", havingValue = "true")
-public VirtualThreadTaskExecutor applicationTaskExecutor() {
-    return new VirtualThreadTaskExecutor("app-");
+public SimpleAsyncTaskExecutor applicationTaskExecutor() {
+    var executor = new SimpleAsyncTaskExecutor("task-");
+    executor.setVirtualThreads(true);
+    // Unbounded by default! Cap it for work that hits limited resources:
+    //   spring.task.execution.simple.concurrency-limit=200
+    return executor;
 }
 ```
 
-This means `@Async` methods run on virtual threads automatically. Any existing `ThreadPoolTaskExecutor` bean named `taskExecutor` will override this — review for conflicts during migration.
+This means `@Async` methods run on virtual threads automatically. If the application defines *any* `Executor` bean of its own, this default backs off — review existing executor beans during migration.
 
-**`@Scheduled`** — `TaskSchedulingAutoConfiguration` registers a `VirtualThreadTaskScheduler`:
+**`@Scheduled`** — the task scheduling auto-configuration registers a `SimpleAsyncTaskScheduler` that runs each scheduled execution on a virtual thread:
 
 ```java
-// SB4 simplified
+// Simplified — what the task scheduling auto-configuration does
 @Bean
 @ConditionalOnMissingBean({ TaskScheduler.class, ScheduledExecutorService.class })
-@ConditionalOnProperty(value = "spring.threads.virtual.enabled", havingValue = "true")
-public ThreadPoolTaskScheduler taskScheduler() {
-    var scheduler = new VirtualThreadTaskScheduler();
+public SimpleAsyncTaskScheduler taskScheduler() {
+    var scheduler = new SimpleAsyncTaskScheduler();
     scheduler.setThreadNamePrefix("scheduling-");
+    scheduler.setVirtualThreads(true);
     return scheduler;
 }
 ```
 
-**`@EventListener`** — `ApplicationEventMulticasterConfiguration` reconfigures the event multicaster:
+**Messaging listeners** — the Kafka and RabbitMQ listener container factories use virtual threads for their consumer threads as well.
 
-```java
-// SB4 simplified
-@Bean(name = APPLICATION_EVENT_MULTICASTER_BEAN_NAME)
-@ConditionalOnProperty(value = "spring.threads.virtual.enabled", havingValue = "true")
-public ApplicationEventMulticaster applicationEventMulticaster() {
-    var multicaster = new SimpleApplicationEventMulticaster();
-    multicaster.setTaskExecutor(new VirtualThreadTaskExecutor("event-"));
-    return multicaster;
-}
-```
+What does *not* change: `@EventListener` methods still run synchronously on the publishing thread (unless you also annotate them with `@Async`), and HikariCP still has a fixed pool of database connections — virtual threads remove the thread limit, not the connection limit.
 
 The resulting architecture under virtual threads:
 
@@ -157,15 +151,16 @@ flowchart TD
 
 Carrier thread pinning occurs when a virtual thread cannot be unmounted from its carrier thread. Two causes:
 
-1. **`synchronized` block or method**: the JVM's current implementation (Java 21-23) pins the virtual thread to its carrier while inside any `synchronized` block. Java 24+ has a fix in progress (JEP 491) but SB4's Java 21 baseline means you must handle this manually.
-2. **Native method call**: calling into native code via JNI pins the thread for the duration of the call.
+1. **`synchronized` block or method (Java 21–23)**: these versions pin the virtual thread to its carrier while it blocks inside a `synchronized` block. Java 24 fixed this (JEP 491) — on Java 24/25, `synchronized` no longer pins. Teams still on Java 21 LTS must handle it manually.
+2. **Native method call (all versions)**: blocking inside native code (JNI, or a native frame such as a foreign function call) pins the thread for the duration of the call.
 
 In a payment service, pinning is dangerous because a small number of carrier threads (default: `Runtime.getRuntime().availableProcessors()`) can all be pinned simultaneously, causing the entire service to stall while thousands of virtual threads are queued waiting for a carrier.
 
-**Detecting pinning at development time:**
+**Detecting pinning at development time (Java 21–23):**
 
 ```bash
 # Start the payment service with pinning diagnostics enabled
+# (this flag was removed in Java 24 — use the JFR event below instead)
 java -Djdk.tracePinnedThreads=full \
      -jar payment-service.jar
 
@@ -176,7 +171,7 @@ java -Djdk.tracePinnedThreads=full \
 #         com.acme.payments.service.PaymentProcessingService.initiatePayment(PaymentProcessingService.java:112)
 ```
 
-**Detecting pinning at runtime with JVM flight recorder:**
+**Detecting pinning at runtime with JDK Flight Recorder (all versions):**
 
 ```bash
 # Record a 60-second JFR snapshot while running load test
@@ -189,7 +184,7 @@ jfr print --events jdk.VirtualThreadPinned payment-service.jfr
 
 ## Fixing Pinning: `ReentrantLock` vs `synchronized`
 
-The fix for `synchronized`-caused pinning is to replace `synchronized` with `java.util.concurrent.locks.ReentrantLock`. `ReentrantLock.lock()` and `unlock()` are park/unpark operations that the JVM implements without pinning — the virtual thread unmounts while waiting for the lock.
+On Java 21–23, the fix for `synchronized`-caused pinning is to replace `synchronized` with `java.util.concurrent.locks.ReentrantLock` (or to upgrade to Java 24+). `ReentrantLock.lock()` and `unlock()` are park/unpark operations that the JVM implements without pinning — the virtual thread unmounts while waiting for the lock.
 
 ```java
 package com.acme.payments.crypto;
@@ -302,7 +297,7 @@ public class PinningLibraryWrapper {
 
 ## Structured Concurrency: Parallel Payment Enrichment
 
-`StructuredTaskScope` (JEP 453, preview in Java 21, standard in Java 23+) provides a safe concurrency API for fan-out/fan-in patterns. Rather than submitting to an executor and manually managing `Future` lifecycles, you open a `StructuredTaskScope` block, fork tasks within it, and join — the scope guarantees all forked tasks are completed or cancelled before the join returns.
+`StructuredTaskScope` provides a safe concurrency API for fan-out/fan-in patterns. It is still a **preview API** (it needs `--enable-preview`): JEP 453 previewed it in Java 21, and Java 25 (JEP 505) redesigned it — the scope is created with `StructuredTaskScope.open(Joiner.awaitAllSuccessfulOrThrow(), cfg -> cfg.withTimeout(...))` instead of `new ShutdownOnFailure()`. The example below uses the Java 21–24 API; the concepts are identical. Rather than submitting to an executor and manually managing `Future` lifecycles, you open a `StructuredTaskScope` block, fork tasks within it, and join — the scope guarantees all forked tasks are completed or cancelled before the join returns.
 
 The `ShutdownOnFailure` policy cancels all remaining subtasks if any one fails. This is the correct policy for payment enrichment: if the fraud score lookup fails, there is no point in waiting for the FX rate.
 
@@ -495,9 +490,9 @@ public record AccountInfo(UUID accountId, String iban, BigDecimal availableBalan
 `ThreadLocal` is the traditional mechanism for passing request-scoped state (correlation IDs, security context, tenant context) down a call stack without threading it through every method signature. Under virtual threads, `ThreadLocal` works but has two problems:
 
 1. **Inheritance cost**: `InheritableThreadLocal` copies values to child threads at fork time. With `StructuredTaskScope` forking hundreds of virtual threads, this copying can be expensive.
-2. **Lifecycle risk**: `ThreadLocal` values must be manually removed to prevent memory leaks and cross-request contamination. Virtual threads can be pooled internally by the JVM, so leaked `ThreadLocal` values can appear in unrelated requests.
+2. **Memory and lifecycle**: `ThreadLocal` values are mutable and must be removed explicitly. Libraries that cache expensive objects per thread in a `ThreadLocal` (formatters, buffers) assume a few long-lived pooled threads; with one virtual thread per request — virtual threads should never be pooled — those caches are rebuilt for every request and multiplied by the number of concurrent threads.
 
-`ScopedValue` (JEP 446, finalized in Java 21) is an immutable, structured alternative. A `ScopedValue` is bound for the duration of a `ScopedValue.where(...).run(...)` or `.call(...)` block and is automatically unbound when the block exits. It is inherited by subtasks forked within a `StructuredTaskScope` without copying.
+`ScopedValue` is an immutable, structured alternative. It was a preview API in Java 21–24 (JEP 446 onwards) and became final in Java 25 (JEP 506). A `ScopedValue` is bound for the duration of a `ScopedValue.where(...).run(...)` or `.call(...)` block and is automatically unbound when the block exits. It is inherited by subtasks forked within a `StructuredTaskScope` without copying.
 
 ```java
 package com.acme.payments.context;
@@ -556,6 +551,8 @@ public class PaymentRequestContextFilter extends OncePerRequestFilter {
 }
 ```
 
+Two caveats: Spring Security's `SecurityContextHolder` and SLF4J's MDC are still `ThreadLocal`-based, so keep them in place for those frameworks; and a `ScopedValue` is *not* visible in work handed to an executor (for example an `@Async` method) — only in code called within the binding and in `StructuredTaskScope` subtasks.
+
 ```java
 // Anywhere in the call stack (including subtasks in StructuredTaskScope):
 public class SomeDeepService {
@@ -572,7 +569,7 @@ public class SomeDeepService {
 
 ## `@Async` with Virtual Threads: Before and After
 
-Before virtual threads, `@Async` required a custom `ThreadPoolTaskExecutor` to control pool size and queue behavior. With `spring.threads.virtual.enabled=true`, the default executor is a `VirtualThreadTaskExecutor` and no custom pool configuration is needed for most cases.
+Before virtual threads, `@Async` required a custom `ThreadPoolTaskExecutor` to control pool size and queue behavior. With `spring.threads.virtual.enabled=true`, the default executor creates a virtual thread per task and no pool sizing is needed for most cases — but set a concurrency limit when the async work hits a limited resource (an SMTP relay, a partner API with rate limits, the database pool).
 
 ```java
 package com.acme.payments.notifications;
@@ -591,7 +588,7 @@ public class PaymentNotificationService {
     // Pool sizing was a guessing game: too small → queuing lag; too large → memory waste.
 
     // ── AFTER virtual threads (SB4 pattern) ──────────────────────────────────
-    // @Async uses VirtualThreadTaskExecutor automatically.
+    // @Async uses the virtual-thread SimpleAsyncTaskExecutor automatically.
     // No pool size tuning needed — each invocation gets its own virtual thread.
 
     @Async
@@ -624,7 +621,7 @@ public class PaymentNotificationService {
 }
 ```
 
-If you have an existing `ThreadPoolTaskExecutor` bean that must be retained for other uses, pin virtual threads only to `@Async` methods that use the default executor:
+If you need a dedicated platform-thread executor for some work, keep in mind that defining *any* `Executor` bean makes the default auto-configured executor back off. Define the virtual-thread default explicitly next to it:
 
 ```java
 @Configuration
@@ -645,23 +642,30 @@ public class AsyncConfig {
         return executor;
     }
 
-    // No default taskExecutor bean here — SB4 auto-configuration provides
-    // VirtualThreadTaskExecutor when spring.threads.virtual.enabled=true
+    // Because hsmExecutor is an Executor bean, the auto-configured default
+    // backs off -- so declare the virtual-thread default explicitly
+    @Bean(name = { "applicationTaskExecutor", "taskExecutor" })
+    public SimpleAsyncTaskExecutor applicationTaskExecutor() {
+        var executor = new SimpleAsyncTaskExecutor("task-");
+        executor.setVirtualThreads(true);
+        executor.setConcurrencyLimit(200);
+        return executor;
+    }
 }
 ```
 
 ## Summary
 
-- `spring.threads.virtual.enabled=true` reconfigures four Spring subsystems — Tomcat, `@Async`, `@Scheduled`, `@EventListener` — to use virtual threads. No other code changes are required for the basic switch.
-- Carrier thread pinning from `synchronized` blocks is the primary operational risk. Use `-Djdk.tracePinnedThreads=full` in development and JFR `jdk.VirtualThreadPinned` events in production to detect it. Replace `synchronized` with `ReentrantLock`, or quarantine pinning libraries in a dedicated platform thread pool.
-- `StructuredTaskScope.ShutdownOnFailure` is the correct API for parallel fan-out in payment enrichment. It provides structured cancellation, deadline enforcement, and clean error propagation without manual `Future` management.
-- `ScopedValue` replaces `ThreadLocal` for request context propagation in virtual thread environments. It is immutable, automatically unbound when the scope exits, and inherited by `StructuredTaskScope` subtasks without copying overhead.
+- `spring.threads.virtual.enabled=true` (Java 21+) switches the web server, the default `@Async` executor, the `@Scheduled` scheduler and messaging listeners to virtual threads. No other code changes are required for the basic switch — but database connection pools and partner rate limits still bound throughput.
+- Carrier thread pinning is the primary operational risk: from `synchronized` on Java 21–23 (fixed in Java 24), and from blocking native calls on every version. Detect it with JFR `jdk.VirtualThreadPinned` events (and `-Djdk.tracePinnedThreads=full` on Java 21–23). Replace `synchronized` with `ReentrantLock`, upgrade the JDK, or quarantine pinning libraries in a dedicated platform thread pool.
+- `StructuredTaskScope` (still a preview API; redesigned in Java 25) is the right model for parallel fan-out in payment enrichment. It provides structured cancellation, deadline enforcement, and clean error propagation without manual `Future` management.
+- `ScopedValue` (final in Java 25) replaces `ThreadLocal` for request context propagation in virtual thread environments. It is immutable, automatically unbound when the scope exits, and inherited by `StructuredTaskScope` subtasks without copying overhead.
 - `@Async` with virtual threads eliminates thread-pool sizing guesswork for I/O-bound async work. Retain named platform thread executors only for code that cannot be de-pinned (native calls, legacy `synchronized` libraries).
 
 <!-- KNOWLEDGE-CHECK [
   {
     "id": "kc-vt301-01",
-    "question": "A payment service enables spring.threads.virtual.enabled=true. Under high load, the service becomes unresponsive even though CPU is idle and there are thousands of pending virtual threads. JVM thread dump shows all carrier threads are in TIMED_WAITING state inside org.bouncycastle.crypto.engines.AESEngine.processBlock(). What is the most likely cause and fix?",
+    "question": "A payment service on Java 21 enables spring.threads.virtual.enabled=true. Under high load it becomes unresponsive even though CPU is idle and thousands of virtual threads are pending. A thread dump shows every carrier thread blocked on a socket read inside a synchronized method of a legacy HSM client library. What is the most likely cause and fix?",
     "options": [
       "The JVM's virtual thread scheduler is misconfigured — increase jdk.virtualThreadScheduler.parallelism system property",
       "BouncyCastle uses synchronized methods that pin carrier threads; replace synchronized with ReentrantLock or quarantine BouncyCastle calls in a platform thread pool",
@@ -669,11 +673,11 @@ public class AsyncConfig {
       "The connection pool for the downstream database is exhausted — increase spring.datasource.hikari.maximum-pool-size"
     ],
     "correct": 1,
-    "explanation": "BouncyCastle (and many crypto libraries) use synchronized methods internally, which pin virtual threads to their carrier threads on Java 21. When all carrier threads are pinned, no other virtual thread can run, causing service stall. The fix is to either replace synchronized with ReentrantLock in the library (if source is available) or run all BouncyCastle calls in a dedicated fixed platform thread pool so the pinning is quarantined. Increasing parallelism adds more carrier threads but doesn't fix the root cause."
+    "explanation": "On Java 21–23, a virtual thread that blocks inside a synchronized method stays pinned to its carrier. When all carrier threads are pinned waiting on HSM I/O, no other virtual thread can run and the service stalls. Fixes: replace synchronized with ReentrantLock (if you own the code), upgrade to Java 24+ where JEP 491 removed this pinning, or run the library's calls on a dedicated fixed platform thread pool to quarantine it. Increasing scheduler parallelism only adds carriers and postpones the stall."
   },
   {
     "id": "kc-vt301-02",
-    "question": "A PaymentEnrichmentService uses StructuredTaskScope.ShutdownOnFailure to concurrently call fraud scoring, FX rates, and account info services with a 2-second deadline. The fraud scoring service returns a 503 after 500ms. What happens to the FX rate and account info subtasks?",
+    "question": "A PaymentEnrichmentService uses StructuredTaskScope.ShutdownOnFailure (the Java 21–24 preview API) to concurrently call fraud scoring, FX rates, and account info services with a 2-second deadline. The fraud scoring service returns a 503 after 500ms. What happens to the FX rate and account info subtasks?",
     "options": [
       "They continue running until they complete or timeout individually",
       "They are cancelled immediately when ShutdownOnFailure detects the fraud subtask failure",
@@ -693,7 +697,7 @@ public class AsyncConfig {
       "StructuredTaskScope propagates ScopedValues only if they are declared as static final in the same class"
     ],
     "correct": 1,
-    "explanation": "ScopedValue bindings are automatically inherited by subtasks forked within a StructuredTaskScope that runs inside the ScopedValue.where(...).call() block. The subtask sees the same binding without any explicit re-binding or copying. This is a key advantage over InheritableThreadLocal, which copies all thread-local values on fork. The ScopedValue's visibility is purely structural (determined by the call stack), not by class declarations."
+    "explanation": "ScopedValue bindings are automatically inherited by subtasks forked within a StructuredTaskScope that runs inside the ScopedValue.where(...).call() block. The subtask sees the same binding without any explicit re-binding or copying. This is a key advantage over InheritableThreadLocal, which copies all thread-local values on fork. The ScopedValue's visibility is purely structural (determined by the call stack), not by class declarations. (ScopedValue became a final API in Java 25; StructuredTaskScope is still a preview API.)"
   },
   {
     "id": "kc-vt301-04",
@@ -705,7 +709,7 @@ public class AsyncConfig {
       "It uses virtual threads internally within the hsmExecutor pool, which must be reconfigured to prevent this"
     ],
     "correct": 1,
-    "explanation": "@Async methods that explicitly name an executor bean — @Async(\"hsmExecutor\") — always use that specific executor, regardless of the default. spring.threads.virtual.enabled=true only configures the DEFAULT executor (the APPLICATION_TASK_EXECUTOR_BEAN_NAME bean). The hsmExecutor ThreadPoolTaskExecutor continues to use platform threads exactly as configured. This is the recommended pattern for isolating pinning libraries."
+    "explanation": "@Async methods that explicitly name an executor bean — @Async(\"hsmExecutor\") — always use that executor. spring.threads.virtual.enabled=true only affects the auto-configured DEFAULT executor (applicationTaskExecutor). One caveat: because hsmExecutor is itself an Executor bean, the auto-configured default backs off, so declare a virtual-thread default executor explicitly alongside it."
   }
 ] -->
 
@@ -714,8 +718,17 @@ public class AsyncConfig {
   "title": "Enable and Validate Virtual Threads in a Payment Service",
   "description": "Enable virtual threads in a Spring Boot 4 payment service, detect and fix a carrier thread pinning issue, and implement a parallel payment enrichment flow with StructuredTaskScope.",
   "tasks": [
-    { "id": "pc-vt301-01", "description": "Enable spring.threads.virtual.enabled=true in a Spring Boot 4 payment service. Write an integration test using @SpringBootTest with MockMvc that sends 500 concurrent requests to POST /payments and asserts: (a) the HTTP response status is 202 for all requests, (b) the thread handling the request is a virtual thread (Thread.currentThread().isVirtual() == true, verified via a debug endpoint or test hook), and (c) the total time for 500 requests is under 10 seconds with a stubbed 20ms downstream delay per request." },
-    { "id": "pc-vt301-02", "description": "Identify a synchronized method in the payment service's LegacyHsmSigner class. Run the service with -Djdk.tracePinnedThreads=full and trigger a pinning trace by calling the signing endpoint. Replace the synchronized method with ReentrantLock. Write a unit test that creates 100 virtual threads all calling sign() concurrently and verifies no deadlock or stall occurs within 5 seconds." },
-    { "id": "pc-vt301-03", "description": "Implement the PaymentEnrichmentService using StructuredTaskScope.ShutdownOnFailure to call FraudScoringClient, FxRateClient, and LedgerClient in parallel with a 2-second deadline. Use ScopedValue for correlation ID propagation. Write a unit test with stubbed clients where FraudScoringClient sleeps 100ms, FxRateClient sleeps 150ms, and LedgerClient sleeps 200ms — assert that EnrichedPayment is returned in under 300ms (not 450ms sequentially). Write a second test where FraudScoringClient throws an exception and assert that PaymentEnrichmentException is thrown and the other two clients' subtasks were cancelled." }
+    {
+      "id": "pc-vt301-01",
+      "description": "Enable spring.threads.virtual.enabled=true in a Spring Boot 4 payment service. Write an integration test using @SpringBootTest with MockMvc that sends 500 concurrent requests to POST /payments and asserts: (a) the HTTP response status is 202 for all requests, (b) the thread handling the request is a virtual thread (Thread.currentThread().isVirtual() == true, verified via a debug endpoint or test hook), and (c) the total time for 500 requests is under 10 seconds with a stubbed 20ms downstream delay per request."
+    },
+    {
+      "id": "pc-vt301-02",
+      "description": "Identify a synchronized method in the payment service's LegacyHsmSigner class. Run the service on Java 21 with JFR recording the jdk.VirtualThreadPinned event (or -Djdk.tracePinnedThreads=full) and trigger a pinning trace by calling the signing endpoint. Replace the synchronized method with ReentrantLock. Write a unit test that creates 100 virtual threads all calling sign() concurrently and verifies no deadlock or stall occurs within 5 seconds. Then repeat the JFR run on Java 25 with the original synchronized version and compare."
+    },
+    {
+      "id": "pc-vt301-03",
+      "description": "Implement the PaymentEnrichmentService using StructuredTaskScope (with --enable-preview; ShutdownOnFailure on Java 21–24 or Joiner.awaitAllSuccessfulOrThrow() on Java 25) to call FraudScoringClient, FxRateClient, and LedgerClient in parallel with a 2-second deadline. Use ScopedValue for correlation ID propagation. Write a unit test with stubbed clients where FraudScoringClient sleeps 100ms, FxRateClient sleeps 150ms, and LedgerClient sleeps 200ms — assert that EnrichedPayment is returned in under 300ms (not 450ms sequentially). Write a second test where FraudScoringClient throws an exception and assert that PaymentEnrichmentException is thrown and the other two clients' subtasks were cancelled."
+    }
   ]
 } -->

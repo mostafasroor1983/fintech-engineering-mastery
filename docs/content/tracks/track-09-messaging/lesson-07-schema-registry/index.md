@@ -9,7 +9,7 @@ difficulty: advanced
 estimatedMinutes: 75
 status: published
 tags: [schema-registry, Avro, Protobuf, schema-evolution, compatibility]
-prerequisites: [kafka-architecture, kafka-producer, kafka-consumer]
+prerequisites: ["track-09-lesson-01", "track-09-lesson-02", "track-09-lesson-03"]
 ---
 
 # Schema Registry — Avro, Protobuf, and Schema Evolution
@@ -178,7 +178,7 @@ Old producers write:                   New consumer reads:
 
 **Rule:** You may add fields **with** default values and delete fields (the new reader simply ignores them). Upgrade **consumers first**, then producers.
 
-```json
+```jsonc
 // V1 — Original schema
 {
     "name": "PaymentCreated",
@@ -212,7 +212,7 @@ Old consumers can read data written with the new schema.
 
 **Rule:** You may add fields (old readers skip unknown fields, so no default is needed) and delete only fields that **have** a default in the old schema (old readers fill them in). Upgrade **producers first**, then consumers.
 
-```json
+```jsonc
 // V2 — FORWARD compatible: old consumer reads V2 data, ignores new field
 {
     "name": "PaymentCreated",
@@ -248,7 +248,7 @@ Default: FULL_TRANSITIVE
 
 ### Safe: Adding an Optional Field
 
-```json
+```jsonc
 // V1
 {"name": "paymentId", "type": "string"},
 {"name": "amountMinor", "type": "long"}
@@ -264,7 +264,7 @@ New consumers reading V1 data: `merchantId` is null (default applied).
 
 ### Safe: Widening a Union Type
 
-```json
+```jsonc
 // V1
 {"name": "region", "type": "string"}
 
@@ -274,7 +274,7 @@ New consumers reading V1 data: `merchantId` is null (default applied).
 
 ### Breaking for Old Consumers: Removing a Field Without a Default
 
-```json
+```jsonc
 // V1
 {"name": "paymentId", "type": "string"},
 {"name": "accountId", "type": "string"},
@@ -290,7 +290,7 @@ New consumers reading V1 data: `merchantId` is null (default applied).
 
 ### Breaking: Renaming a Field
 
-```json
+```jsonc
 // V1
 {"name": "accountId", "type": "string"}
 
@@ -549,8 +549,10 @@ curl -X PUT http://schema-registry:8081/config/payments.events-value \
   run: |
     mvn schema-registry:test-compatibility \
       -Dschema.registry.url=http://schema-registry:8081
+```
 
-# Maven plugin configuration (pom.xml)
+```xml
+<!-- Maven plugin configuration (pom.xml) -->
 <plugin>
     <groupId>io.confluent</groupId>
     <artifactId>kafka-schema-registry-maven-plugin</artifactId>

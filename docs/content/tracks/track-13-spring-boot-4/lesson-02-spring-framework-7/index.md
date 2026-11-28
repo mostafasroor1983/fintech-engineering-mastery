@@ -44,15 +44,15 @@ references:
 
 # Spring Framework 7 — New Baseline Features
 
-Spring Framework 7 is the foundation of Spring Boot 4. Most of the user-visible changes live at the SF7 layer: a production-ready declarative HTTP client, a new blocking `RestClient` that supersedes `RestTemplate`, a significantly improved AOT metadata pipeline, the first-class `Observation` API, and test annotation renames. This lesson covers each in depth with fintech-grade code examples.
+Spring Framework 7 (November 2025) is the foundation of Spring Boot 4. Its headline features are HTTP service client *groups* (declarative clients configured in bulk), built-in API versioning, JSpecify null-safety across the portfolio, core resilience annotations (`@Retryable`, `@ConcurrencyLimit`), Jackson 3 support, and the move to GraalVM's new unified reachability metadata. This lesson covers the HTTP client stack (`@HttpExchange` interfaces and `RestClient`, both introduced in Framework 6 and now the recommended way to call HTTP APIs), AOT hints, observability with Micrometer's `Observation` API, the other Framework 7 changes, and the test annotation migration — with fintech-grade code examples.
 
 ---
 
 ## 1. HTTP Interfaces (`@HttpExchange`) — Production-Ready Declarative HTTP
 
-Before SF7, teams writing microservice clients faced a choice: hand-roll a `WebClient`/`RestClient` wrapper, pull in OpenFeign (a non-Spring dependency), or use `RestTemplate` with interceptors. SF7 makes `@HttpExchange` the canonical answer for declarative HTTP clients in the Spring ecosystem.
+Teams writing microservice clients used to choose between hand-rolling a `WebClient`/`RestTemplate` wrapper and pulling in OpenFeign (whose Spring Cloud integration is now in maintenance mode). HTTP interfaces — `@HttpExchange` — have been the Spring-native answer since Framework 6.0.
 
-**What changed from SF6**: in SF6.1 (SB3.x), `@HttpExchange` was labelled "experimental / beta." SF7 removes that label, adds production-tested error handling, response body decoding for problem detail (RFC 9457), and native image AOT hints for all annotated interfaces.
+**What changed in SF7**: an *HTTP service registry*. Instead of building a `HttpServiceProxyFactory` by hand for every interface, you declare groups of interfaces with `@ImportHttpServices`, and Spring Boot 4 configures each group (base URL, timeouts) from `spring.http.serviceclient.<group>.*` properties. AOT hints for the interfaces are generated automatically, so they also work in native images.
 
 ### Defining a Payment Infrastructure Client
 
@@ -89,7 +89,24 @@ public interface FxRateClient {
 
 ### Registering the Clients
 
-SF7's `HttpServiceProxyFactory` backed by `RestClient` (blocking):
+The SF7 way — declare groups and configure them with properties:
+
+```java
+@Configuration
+@ImportHttpServices(group = "fraud", types = FraudCheckClient.class)
+@ImportHttpServices(group = "fx", types = FxRateClient.class)
+public class HttpServicesConfiguration {
+    // Spring Boot 4 configures each group from properties, e.g.
+    //   spring.http.serviceclient.fraud.base-url=https://fraud.vendor.example
+    //   spring.http.serviceclient.fraud.read-timeout=2s
+    //   spring.http.serviceclient.fx.base-url=http://fx-service
+    //   spring.http.serviceclient.fx.read-timeout=500ms
+    // Per-group customisation (auth headers, status handlers) goes in a
+    // RestClientHttpServiceGroupConfigurer bean.
+}
+```
+
+The explicit way — build each proxy yourself (works on Framework 6 too, and gives full control):
 
 ```java
 @Configuration
@@ -100,12 +117,14 @@ public class HttpClientConfiguration {
     public FraudCheckClient fraudCheckClient(
             @Value("${clients.fraud.base-url}") String baseUrl,
             @Value("${clients.fraud.connect-timeout-ms:1000}") long connectMs,
-            @Value("${clients.fraud.read-timeout-ms:2000}") long readMs) {
+            @Value("${clients.fraud.read-timeout-ms:2000}") long readMs,
+            @Value("${clients.fraud.api-key}") String apiKey) {   // from Vault / secret store
 
         RestClient restClient = RestClient.builder()
             .baseUrl(baseUrl)
             .requestFactory(clientHttpRequestFactory(connectMs, readMs))
-            .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer ${clients.fraud.api-key}")
+            // A "${...}" inside a Java string literal is NOT resolved -- inject the value
+            .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
             .defaultStatusHandler(
                 HttpStatusCode::is4xxClientError,
                 (req, resp) -> {
@@ -154,16 +173,15 @@ public class HttpClientConfiguration {
 
 ### Error Handling and Problem Detail (RFC 9457)
 
-SF7's `RestClient` and the HTTP interfaces adapter natively decode `application/problem+json` into `ProblemDetail`:
+When no custom status handler intercepts the error, `RestClient` (and the HTTP interfaces backed by it) throws `HttpClientErrorException` for 4xx responses; the `application/problem+json` body can be decoded into a `ProblemDetail` with `getResponseBodyAs(...)`:
 
 ```java
-// If the fraud API returns 422 Unprocessable Entity with application/problem+json,
-// SF7 decodes it to ProblemDetail and wraps it in HttpClientErrorException
-// with getProblemDetail() available on the exception.
+// If the fraud API returns 422 Unprocessable Entity with application/problem+json
+// (and no defaultStatusHandler converts 4xx into a custom exception first):
 try {
     var result = fraudCheckClient.checkPayment(request);
 } catch (HttpClientErrorException ex) {
-    ProblemDetail problem = ex.getProblemDetail();
+    ProblemDetail problem = ex.getResponseBodyAs(ProblemDetail.class);
     log.warn("Fraud check declined: type={} detail={}",
         problem.getType(), problem.getDetail());
     return AuthorizationResult.declined(problem.getDetail());
@@ -174,33 +192,37 @@ try {
 
 ## 2. `RestClient` — The New Blocking HTTP Client
 
-`RestClient` was introduced in SF6.1 and is now the primary blocking HTTP abstraction in SF7. It is not reactive — it uses a `ClientHttpRequestFactory` backed by JDK `HttpClient`, Apache `HttpComponents 5`, or `Jetty HttpClient`. With virtual threads (default in SB4), blocking `RestClient` calls park the virtual thread while waiting, so the application scales as well as reactive without the complexity.
+`RestClient` was introduced in SF6.1 and is the primary blocking HTTP abstraction in SF7. It is not reactive — it uses a `ClientHttpRequestFactory` backed by the JDK `HttpClient`, Apache HttpComponents 5, Jetty, or Reactor Netty. When virtual threads are enabled (`spring.threads.virtual.enabled=true` — still opt-in in SB4), a blocking `RestClient` call parks the virtual thread while waiting for I/O, so I/O-bound services scale close to reactive ones without the reactive programming model.
 
 ### Comparison with `WebClient` and `RestTemplate`
 
 ```mermaid
 flowchart TD
     subgraph "Spring Boot 4 HTTP Client Landscape"
-        RT["RestTemplate\n(maintenance mode)\nBlocking, thread-per-request\nNo new features"]
-        RC["RestClient\n(SB4 default for blocking)\nFluent API, virtual-thread friendly\nProblem Detail support"]
-        WC["WebClient\n(reactive)\nProject Reactor / RxJava\nNon-blocking I/O"]
+        RT["RestTemplate\n(maintenance; deprecation planned)\nBlocking, template API"]
+        RC["RestClient\n(recommended for blocking code)\nFluent API, works with HTTP interfaces"]
+        WC["WebClient\n(reactive)\nProject Reactor, non-blocking I/O"]
     end
 
-    VT["Virtual Thread (default SB4)"]
-    PT["Platform Thread (opt-out)"]
+    VT["Virtual thread\n(spring.threads.virtual.enabled=true)"]
+    PT["Platform thread\n(default)"]
+    EL["Event loop threads"]
 
     RC --> VT
+    RC --> PT
+    RT --> VT
     RT --> PT
-    WC --> PT
+    WC --> EL
 
-    VT -->|"parks on I/O\n(no carrier thread pinning)"| IO["I/O Operation"]
-    PT -->|"blocks carrier thread"| IO
+    VT -->|"parks while waiting for I/O\n(carrier thread is freed)"| IO["I/O Operation"]
+    PT -->|"blocks the OS thread"| IO
+    EL -->|"callback when data arrives"| IO
 ```
 
 **When to use `RestClient` vs `WebClient`**:
-- Use `RestClient` for all new blocking code in SB4. With virtual threads, throughput is equivalent to `WebClient` for I/O-bound workloads, and the code is simpler.
+- Use `RestClient` for all new blocking code in SB4. With virtual threads enabled, throughput for I/O-bound workloads comes close to `WebClient`, and the code is simpler.
 - Use `WebClient` only when integrating with an existing reactive pipeline (e.g., a service already using `Flux`/`Mono` end-to-end, or a reactive `R2DBC` data layer).
-- Do not write new code with `RestTemplate`. It is in maintenance mode and lacks Problem Detail support, `@HttpExchange` integration, and virtual-thread-aware timeouts.
+- Do not write new code with `RestTemplate`. It is in maintenance mode, the Spring team plans to deprecate it in a 7.x release, and `RestClient` offers the same features with a fluent API (it can even reuse your existing `RestTemplate` configuration via `RestClient.create(restTemplate)`).
 
 ### `RestClient` in a Payment Settlement Service
 
@@ -258,9 +280,9 @@ GraalVM native image requires knowing at build time every class that will be acc
 ```mermaid
 flowchart LR
     SRC["Application Source\n(@Configuration, @Service, @Entity)"]
-    SCAN["AOT Scanner\nspring-aot-maven-plugin"]
+    SCAN["AOT processing\nspring-boot-maven-plugin\n(process-aot goal)"]
     HINTS["RuntimeHints\n(reflection, proxy,\nresources, serialization)"]
-    META["META-INF/native-image/\nreflect-config.json\nproxy-config.json\nresource-config.json"]
+    META["META-INF/native-image/\nreachability-metadata.json\n(older GraalVM: reflect-config.json,\nproxy-config.json, resource-config.json)"]
     AOT_CTX["AOT Application Context\n(BeanDefinitionRegistrar classes)"]
 
     SRC --> SCAN
@@ -271,7 +293,7 @@ flowchart LR
 
 ### When Manual Hints Are Still Needed
 
-The AOT scanner handles: `@Component`-scanned beans, `@Entity` classes, Jackson-annotated types, standard `@ConfigurationProperties`. You need manual hints for:
+AOT processing handles: `@Component`-scanned beans, `@ConfigurationProperties`, Spring Data repositories and JPA entities, and the request/response body types in controller method signatures. You need manual hints for:
 
 1. **Dynamic class loading** — `Class.forName(className)` where `className` is a runtime string
 2. **JNI-based libraries** — some legacy crypto libraries
@@ -315,20 +337,18 @@ public class PaymentCodecConfiguration {
 
 ### `@RegisterReflectionForBinding`
 
-For Spring MVC / Spring WebFlux response/request bodies that are plain POJOs (not standard Jackson-annotated records), use `@RegisterReflectionForBinding` to declare the types that need full reflection:
+Types that appear in `@RestController` method signatures get binding hints automatically. Use `@RegisterReflectionForBinding` for types that Jackson (de)serialises *outside* those signatures — bodies sent with `RestClient`, Kafka message payloads, or types read from a generic `Map`/`JsonNode`:
 
 ```java
-// SB4 / SF7: annotation directly on the @RestController
-@RestController
-@RequestMapping("/api/v1/payments")
+// Types serialised by RestClient and the Kafka listener — not visible to AOT
+// through any controller signature
+@Configuration
 @RegisterReflectionForBinding({
-    PaymentRequest.class,
-    PaymentResponse.class,
-    PaymentError.class
+    SettlementRequest.class,
+    SettlementConfirmation.class,
+    PaymentEvent.class
 })
-public class PaymentController {
-    // For records with @JsonProperty annotations, AOT handles hints automatically.
-    // @RegisterReflectionForBinding is primarily needed for legacy POJO classes.
+public class SettlementBindingHints {
 }
 ```
 
@@ -336,7 +356,7 @@ public class PaymentController {
 
 ## 4. Observability — `Observation` API and `@Observed`
 
-Micrometer's `Observation` API (shipped as part of Micrometer 1.14+, bundled with SB4) is the unified instrumentation primitive. A single `Observation` automatically produces:
+Micrometer's `Observation` API (Micrometer 1.10+; Spring Boot 4 ships Micrometer 1.16) is the unified instrumentation primitive. A single `Observation` can automatically produce:
 - A timer/distribution metric in the `MeterRegistry`
 - A span in the tracing context (exported via OTLP or Zipkin)
 - Structured log correlation (MDC `traceId`/`spanId`)
@@ -344,11 +364,9 @@ Micrometer's `Observation` API (shipped as part of Micrometer 1.14+, bundled wit
 ### `@Observed` — Zero-Boilerplate Method Instrumentation
 
 ```java
-// Enable @Observed AOP support in a @Configuration class
-@Configuration
-@EnableObservability  // new in SF7 — wires ObservationAspect
-public class ObservabilityConfiguration {
-}
+// Enable @Observed support: Spring Boot 4 registers the ObservedAspect when
+// AspectJ is on the classpath (spring-boot-starter-aspectj) and
+//   management.observations.annotations.enabled=true
 
 // Apply to any Spring-managed bean method
 @Service
@@ -400,15 +418,19 @@ public class LedgerUpdateService {
 
 ---
 
-## 5. `BeanDefinitionParserDelegate` Strictness and Context Changes
+## 5. Other Framework 7 Changes Worth Knowing
 
-SF7 tightens several context bootstrap behaviors that were lenient in SF5/6:
+**JSpecify null-safety**: the whole Spring portfolio is annotated with JSpecify (`@NullMarked` packages, `@Nullable` from `org.jspecify.annotations`), replacing Spring's own `@Nullable`/`@NonNull`. Tools such as NullAway can now check your code against Spring's APIs at build time — attractive for payment code where an unexpected `null` amount is a production incident.
 
-**Duplicate bean definitions**: `spring.main.allow-bean-definition-overriding` defaults to `false` and now produces a startup failure rather than a silent override. This catches class-path ordering bugs that caused wrong beans to be loaded silently.
+**API versioning**: `@RequestMapping` and its variants have a `version` attribute (e.g. `@GetMapping(path = "/payments/{id}", version = "2")`). The version is resolved from a header, query parameter, path segment or media type parameter, configured via `ApiVersionConfigurer` or Spring Boot's `spring.mvc.apiversion.*` properties. `RestClient` and HTTP interfaces can send a version too.
 
-**Lazy `@Bean` resolution**: `@Bean` methods on `@Configuration` classes are now parsed strictly at context refresh time. A `@Bean` method that returns `null` causes an immediate startup error instead of a lazy NPE.
+**Resilience in the core**: `@Retryable` (with backoff and jitter) and `@ConcurrencyLimit`, enabled with `@EnableResilientMethods`, cover simple retry and bulkhead needs without Spring Retry or Resilience4j. Only retry operations that are idempotent — for payments, that means calls carrying an idempotency key.
 
-**Jakarta EE 11 package alignment**: SF7 requires Jakarta EE 11. For fintech services this mostly matters if you use `jakarta.validation.*` (Bean Validation 3.1) — the `@NotNull`, `@Size`, `@Pattern` annotations are unchanged, but `ConstraintValidator` SPI has new default methods. Any custom validators must be recompiled against Jakarta EE 11.
+**Jackson 3**: Framework 7 supports Jackson 3 (`tools.jackson` packages); Jackson 2 support is deprecated. Custom serialisers and `ObjectMapper` customisations need migrating.
+
+**Jakarta EE 11 alignment**: Servlet 6.1, Jakarta Persistence 3.2, Bean Validation 3.1. The common validation annotations (`@NotNull`, `@Size`, `@Pattern`) are unchanged; libraries compiled against older Jakarta EE versions should be upgraded.
+
+**Bean definition overriding** stays disabled by default in Spring Boot (as since 2.1): two beans with the same name fail the startup instead of silently replacing each other.
 
 ---
 
@@ -466,15 +488,15 @@ class PaymentAuthorizationServiceTest {
 }
 ```
 
-**What else changed in `@SpringBootTest`**: SB4 replaces the internal mock-creation mechanism with Mockito 5's `MockitoSession`, which handles virtual threads correctly (no static `Mockito.reset()` required between tests running on different virtual threads).
+**Where the new annotations can be used**: `@MockitoBean` and `@MockitoSpyBean` (part of Spring Framework since 6.2) are declared on fields of the *test class* (or at type level on the test class), not inside `@Configuration`/`@TestConfiguration` classes. If you had `@MockBean` fields in a shared `@TestConfiguration`, move them into the tests (or into a shared base class or test interface).
 
-**`@DataJpaTest` and `@WebMvcTest` slices**: still work but now use `@MockitoBean` in their auto-generated test slices. If you have custom `@TestConfiguration` classes that add `@MockBean`, they need updating.
+**`@DataJpaTest` and `@WebMvcTest` slices**: still work as before; combine them with `@MockitoBean` for the collaborators the slice does not load. Note that in Spring Boot 4 the slice annotations moved to technology-specific test modules (for example `spring-boot-data-jpa-test`, `spring-boot-webmvc-test`), so imports and test dependencies change.
 
 ---
 
 ## Summary
 
-Spring Framework 7 raises the ceiling on what you can build without reaching for external libraries. `@HttpExchange` replaces Feign for most use cases. `RestClient` replaces `RestTemplate` for new blocking code. The `Observation` API replaces raw Micrometer `Timer`/`Counter` as the instrumentation primitive. The AOT improvements reduce the native image maintenance burden. And the test annotation renames, while mechanical, are a signal that test infrastructure is now a first-class Spring Framework concern rather than a Spring Boot concern.
+Spring Framework 7 raises the ceiling on what you can build without reaching for external libraries. `@HttpExchange` interfaces — now configurable in groups — replace Feign for most use cases. `RestClient` replaces `RestTemplate` for new blocking code. Micrometer's `Observation` API replaces raw `Timer`/`Counter` instrumentation. JSpecify, API versioning and core resilience annotations remove whole categories of hand-written code. And the move from `@MockBean` to `@MockitoBean` shows that test infrastructure is now a Spring Framework concern rather than a Spring Boot one.
 
 Lesson 03 covers virtual thread integration at the SB4 configuration level — specifically how the defaults changed, how to detect carrier thread pinning, and how HikariCP and Hibernate 7 fit into the picture.
 
@@ -484,15 +506,15 @@ Lesson 03 covers virtual thread integration at the SB4 configuration level — s
 [
   {
     "id": "kc-15-02-01",
-    "question": "A payment service needs to call an external fraud API and an internal FX rate service using Spring Framework 7 HTTP interfaces. The fraud API returns `application/problem+json` on 4xx errors. Which statement correctly describes how SF7 handles this?",
+    "question": "A payment service calls an external fraud API through a Spring Framework 7 HTTP interface backed by RestClient, without a custom status handler. The fraud API returns 422 with an `application/problem+json` body. How do you get at the problem details?",
     "options": [
-      "SF7 HTTP interfaces cannot handle `application/problem+json` — you must register a custom `ResponseErrorHandler`",
-      "`RestClientAdapter` automatically decodes `application/problem+json` responses into `ProblemDetail`, and `HttpClientErrorException.getProblemDetail()` returns the decoded object when a 4xx status is received",
+      "HTTP interfaces cannot handle `application/problem+json` — you must switch to WebClient",
+      "RestClient throws `HttpClientErrorException` (a `RestClientResponseException`) for the 4xx status; calling `getResponseBodyAs(ProblemDetail.class)` on it decodes the body into a `ProblemDetail`",
       "You must annotate the interface method with `@ProblemDetailResponse` to enable RFC 9457 decoding",
-      "`ProblemDetail` decoding only works with `WebClient`, not `RestClient` or HTTP interfaces backed by `RestClientAdapter`"
+      "The interface method returns `null` and the problem details are lost"
     ],
     "correct": 1,
-    "explanation": "SF7's `RestClient` and `RestClientAdapter` natively support RFC 9457 / RFC 9110. When the response content type is `application/problem+json` and the status is 4xx or 5xx, the response body is decoded into a `ProblemDetail` object. The resulting `HttpClientErrorException` (for 4xx) or `HttpServerErrorException` (for 5xx) has a `getProblemDetail()` method that returns the decoded object. No additional annotation or configuration is required."
+    "explanation": "Without a custom status handler, RestClient (and therefore the HTTP interface proxy) throws HttpClientErrorException for 4xx and HttpServerErrorException for 5xx. Both extend RestClientResponseException, whose getResponseBodyAs(Class) decodes the error body with the configured message converters — getResponseBodyAs(ProblemDetail.class) gives you type, title, detail and extension properties. If you register a defaultStatusHandler that throws your own exception, you must decode the body there instead. There is no @ProblemDetailResponse annotation."
   },
   {
     "id": "kc-15-02-02",
@@ -516,7 +538,7 @@ Lesson 03 covers virtual thread integration at the SB4 configuration level — s
       "`lowCardinalityKeyValue` is for `Timer` metrics only; `highCardinalityKeyValue` is for `Counter` metrics only"
     ],
     "correct": 1,
-    "explanation": "Micrometer's Observation API distinguishes cardinality explicitly to prevent a common observability mistake. `lowCardinalityKeyValue` values (e.g., `currency=USD`, `channel=API`) are safe as metric tag dimensions because the value space is bounded — adding them to a Prometheus counter or histogram does not create an unbounded label. `highCardinalityKeyValue` values (e.g., `account.id=acc_1234567890`) have an unbounded value space and would cause metric cardinality explosion in Prometheus, Datadog, or any TSDB if used as tags. SF7/Micrometer 1.14 routes high-cardinality values only to the tracing backend (as span attributes), never to the metrics backend."
+    "explanation": "Micrometer's Observation API distinguishes cardinality explicitly to prevent a common observability mistake. `lowCardinalityKeyValue` values (e.g., `currency=USD`, `channel=API`) are safe as metric tag dimensions because the value space is bounded — adding them to a Prometheus counter or histogram does not create an unbounded label. `highCardinalityKeyValue` values (e.g., `account.id=acc_1234567890`) have an unbounded value space and would cause metric cardinality explosion in Prometheus, Datadog, or any TSDB if used as tags. Micrometer routes high-cardinality values only to the tracing backend (as span attributes), never to the metrics backend."
   },
   {
     "id": "kc-15-02-04",
@@ -549,7 +571,7 @@ Lesson 03 covers virtual thread integration at the SB4 configuration level — s
     },
     {
       "id": "pc-15-02-03",
-      "description": "Instrument the `FraudCheckService.check(FraudCheckRequest)` method using `@Observed(name=\"payment.fraud-check\")` with `lowCardinalityKeyValue` tags for `fraud.result` (approved/declined/error) and `currency`. Enable `@EnableObservability` on a `@Configuration` class. Write a test using `TestObservationRegistry` (from `micrometer-test`) that verifies an observation named `payment.fraud-check` is recorded with the correct tags after a successful fraud check call."
+      "description": "Instrument the `FraudCheckService.check(FraudCheckRequest)` method using `@Observed(name=\"payment.fraud-check\")` with `lowCardinalityKeyValue` tags for `fraud.result` (approved/declined/error) and `currency`. Enable annotation support with `management.observations.annotations.enabled=true` (and the AspectJ starter). Write a test using `TestObservationRegistry` (from `micrometer-test`) that verifies an observation named `payment.fraud-check` is recorded with the correct tags after a successful fraud check call."
     },
     {
       "id": "pc-15-02-04",

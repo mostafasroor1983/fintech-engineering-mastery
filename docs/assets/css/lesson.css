@@ -14,6 +14,7 @@
 
 .lesson-main {
   grid-column: 2;
+  min-width: 0;   /* let wide code/tables scroll inside their own box instead of widening the column */
   padding: var(--sp-8) var(--sp-4) var(--sp-16);
 }
 
@@ -81,7 +82,7 @@
 }
 
 .lesson-title {
-  font-size: 2rem;
+  font-size: clamp(1.5rem, 1.1rem + 1.8vw, 2rem);
   font-weight: 700;
   color: var(--text-primary);
   letter-spacing: -0.025em;
@@ -151,7 +152,7 @@
 /* Headings */
 .lesson-body h1,
 .lesson-body h2 {
-  font-size: 1.5rem;
+  font-size: clamp(1.25rem, 1.05rem + 0.9vw, 1.5rem);
   font-weight: 700;
   color: var(--text-primary);
   letter-spacing: -0.02em;
@@ -164,7 +165,7 @@
 }
 
 .lesson-body h3 {
-  font-size: 1.2rem;
+  font-size: clamp(1.075rem, 1rem + 0.4vw, 1.2rem);
   font-weight: 600;
   color: var(--text-primary);
   letter-spacing: -0.015em;
@@ -246,12 +247,24 @@
   white-space: nowrap;
 }
 
-/* Tables */
+/* Tables: the .table-scroll box (added by renderer.js) scrolls sideways on narrow screens */
+.lesson-body .table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  margin-bottom: 1.5em;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+}
+.lesson-body .table-scroll:focus-visible { outline: 2px solid var(--text-link); outline-offset: 2px; }
 .lesson-body table {
   width: 100%;
   border-collapse: collapse;
   font-size: var(--text-sm);
   margin-bottom: 1.5em;
+}
+.lesson-body .table-scroll > table { margin-bottom: 0; }
+.lesson-body > table {            /* before the renderer wraps it */
   overflow: hidden;
   border-radius: var(--r-md);
   border: 1px solid var(--border);
@@ -546,7 +559,7 @@ pre.line-numbers { padding-inline-start: 3.8em; }
 }
 
 .code-tab-btn .tab-ver-badge {
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   padding: 1px 6px;
   border-radius: var(--r-full);
   font-family: var(--font-sans);
@@ -555,8 +568,8 @@ pre.line-numbers { padding-inline-start: 3.8em; }
   color: var(--tab-color, var(--accent));
 }
 
-.code-tab-btn[data-ver="java17"] { --tab-color: #58a6ff; --tab-muted: rgba(88,166,255,0.12); }
-.code-tab-btn[data-ver="java21"] { --tab-color: #f97316; --tab-muted: rgba(249,115,22,0.12); }
+.code-tab-btn[data-ver="java17"] { --tab-color: var(--blue);   --tab-muted: var(--blue-muted); }
+.code-tab-btn[data-ver="java21"] { --tab-color: var(--accent); --tab-muted: var(--accent-muted); }
 
 .code-tab-panes { }
 
@@ -667,7 +680,7 @@ pre.line-numbers { padding-inline-start: 3.8em; }
 .kc-question:last-child { margin-bottom: 0; }
 
 .kc-question-num {
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-family: var(--font-mono);
   font-weight: 600;
   color: var(--text-muted);
@@ -812,7 +825,7 @@ pre.line-numbers { padding-inline-start: 3.8em; }
 }
 
 .practical-challenge-label {
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -890,6 +903,8 @@ pre.line-numbers { padding-inline-start: 3.8em; }
 .challenge-task.done .challenge-task-check svg { opacity: 1; }
 
 .challenge-task-text {
+  min-width: 0;
+  overflow-wrap: anywhere;   /* long class names and paths wrap instead of overflowing */
   font-size: var(--text-base);
   color: var(--text-secondary);
   line-height: 1.6;
@@ -940,7 +955,7 @@ pre.line-numbers { padding-inline-start: 3.8em; }
 }
 
 .lesson-nav-label {
-  font-size: 10px;
+  font-size: 0.75rem;  /* 12px minimum for legibility */
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -1001,13 +1016,14 @@ pre.line-numbers { padding-inline-start: 3.8em; }
    ------------------------------------------------------------ */
 @media (max-width: 900px) {
   .lesson-wrap {
-    grid-template-columns: 1fr;
+    /* minmax(0, 1fr), not 1fr: a plain 1fr track grows to its widest child (a long code
+       line or table), which made the whole text column wider than the phone screen */
+    grid-template-columns: minmax(0, 1fr);
   }
   .lesson-main {
     grid-column: 1;
     padding: var(--sp-5) var(--sp-4) var(--sp-10);
   }
-  .lesson-title { font-size: 1.6rem; }
   .knowledge-check { padding: var(--sp-4) var(--sp-5); }
   .practical-challenge { padding: var(--sp-4) var(--sp-5); }
   .lesson-nav { grid-template-columns: 1fr; }
@@ -1020,7 +1036,7 @@ pre.line-numbers { padding-inline-start: 3.8em; }
   .lesson-body pre.code-block,
   .lesson-body pre[class*="language-"] {
     padding: var(--sp-4) !important;
-    font-size: 0.8rem;
+    font-size: 0.875rem;   /* with the 0.875em code size inside: >= 12px */
   }
   .code-tab-btn { padding: var(--sp-2) var(--sp-3); font-size: var(--text-xs); }
 }
@@ -1066,7 +1082,7 @@ pre.line-numbers { padding-inline-start: 3.8em; }
 }
 .dz-btn:hover:not(:disabled) {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border-color: var(--accent);
 }
 .dz-btn:disabled {
@@ -1149,3 +1165,18 @@ pre.line-numbers { padding-inline-start: 3.8em; }
 [data-theme="dark"] .mermaid-block {
   background: var(--surface-1);
 }
+
+/* ------------------------------------------------------------
+   Reading measure: prose lines stay at a comfortable 60-75 characters.
+   Code, tables, diagrams and callouts keep the full column width.
+   ------------------------------------------------------------ */
+.lesson-body > :is(p, ul, ol, dl, blockquote, h1, h2, h3, h4),
+.doc-page > :is(p, ul, ol, dl, blockquote) {
+  max-width: 72ch;
+}
+
+/* Narrow screens: long inline code and URLs wrap instead of running off the screen */
+.lesson-body a { overflow-wrap: anywhere; }
+/* Inline code wraps at spaces (and anywhere as a last resort) when it doesn't fit the line:
+   some lessons quote a whole SQL statement inline */
+.lesson-body :not(pre) > code { white-space: normal; overflow-wrap: anywhere; }

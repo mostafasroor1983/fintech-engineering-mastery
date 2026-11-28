@@ -151,3 +151,78 @@ I can show."
 - [Track 03: Virtual threads](#/tracks/track-03/lessons/track-03-lesson-12)
 - [Track 05: Optimistic locking](#/tracks/track-05/lessons/track-05-lesson-16)
 - [Capstone 3: card authorisation](#/capstone/card-authorisation)
+
+<!-- KNOWLEDGE-CHECK
+[
+  {
+    "id": "kc-1503-01",
+    "question": "Why might a @Transactional method not roll back?",
+    "options": [
+      "PostgreSQL does not support rollback",
+      "It was called from the same class (no proxy), a checked exception was thrown (no rollback by default), or the exception was caught inside",
+      "Transactions only work on interfaces",
+      "Spring Boot 4 disables rollback by default"
+    ],
+    "correct": 1,
+    "explanation": "@Transactional is applied by a proxy. Self-invocation bypasses it, and by default only unchecked exceptions trigger a rollback."
+  },
+  {
+    "id": "kc-1503-02",
+    "question": "What does volatile guarantee?",
+    "options": [
+      "Atomic compound actions such as count++",
+      "That only one thread can access the field",
+      "Visibility and ordering (happens-before) for that variable, but not atomicity of compound actions",
+      "That the value is stored in main memory and never cached"
+    ],
+    "correct": 2,
+    "explanation": "count++ on a volatile field is still a race. Use AtomicLong, LongAdder or a lock for compound updates."
+  },
+  {
+    "id": "kc-1503-03",
+    "question": "Should a team move to virtual threads?",
+    "options": [
+      "Yes for I/O-bound request handling, after checking pinning risks (JDK version, synchronized + blocking), ThreadLocal-heavy libraries and explicit downstream limits, measured with a load test",
+      "Yes, they make every request faster",
+      "No, they are still a preview feature",
+      "Only for CPU-bound work"
+    ],
+    "correct": 0,
+    "explanation": "Virtual threads add concurrency, not speed. Without limits on the DB pool and other dependencies they can overload them faster."
+  },
+  {
+    "id": "kc-1503-04",
+    "question": "Which is the correct way to compare BigDecimal values for equality of amount?",
+    "options": [
+      "equals(), because it compares the value",
+      "==, because BigDecimal values are cached",
+      "Convert both to double and compare",
+      "compareTo() == 0, because equals() also compares scale (1.0 is not equal to 1.00)"
+    ],
+    "correct": 3,
+    "explanation": "BigDecimal.equals checks both value and scale. Also create amounts from strings, not doubles: new BigDecimal(0.1) carries binary error."
+  }
+]
+-->
+
+<!-- PRACTICAL-CHALLENGE
+{
+  "id": "pc-1503",
+  "title": "Prove the gotchas",
+  "description": "Turn five of the thirty gotchas into code you can show in an interview.",
+  "tasks": [
+    {
+      "id": "pc-1503-01",
+      "description": "Write a test that shows @Transactional self-invocation not rolling back, then fix it (move the method to another bean) and show the test passing."
+    },
+    {
+      "id": "pc-1503-02",
+      "description": "Write a multi-threaded test with a start latch that shows count++ on a volatile int losing updates, then fix it with AtomicLong. Run it in a loop to show the failure is real."
+    },
+    {
+      "id": "pc-1503-03",
+      "description": "Write three small examples with a short explanation each: BigDecimal equals vs compareTo, ConcurrentHashMap get-then-put vs compute, and an HTTP client call with connect and read timeouts set."
+    }
+  ]
+}
+-->

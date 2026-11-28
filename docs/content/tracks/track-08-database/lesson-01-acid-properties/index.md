@@ -222,18 +222,18 @@ PostgreSQL provides durability through:
 1. **WAL fsync** — before returning success for a COMMIT, the WAL record is flushed to disk
 2. **Synchronous replication** — when synchronous standbys are configured, `synchronous_commit = on` makes the primary wait until the required standbys have *flushed* the WAL to their disk (`remote_write` waits only until they have written it, `remote_apply` until it is visible on them)
 
-```sql
--- Configure synchronous replication for a financial production environment
--- postgresql.conf
+```ini
+# Configure synchronous replication for a financial production environment
+# postgresql.conf
 
-synchronous_commit = on                                -- wait for standby WAL flush
-synchronous_standby_names = 'ANY 1 (standby1, standby2)' -- any one of two confirms
--- (With only ONE synchronous standby, commits stop when that standby fails.)
+synchronous_commit = on                                # wait for standby WAL flush
+synchronous_standby_names = 'ANY 1 (standby1, standby2)' # any one of two confirms
+# (With only ONE synchronous standby, commits stop when that standby fails.)
 
--- WARNING: synchronous_commit = off returns before the local WAL flush:
--- a crash can lose the last fraction of a second of commits (no corruption).
--- Never use it for financial writes or audit records. Acceptable for:
--- analytics events, caches, other reconstructable non-financial state.
+# WARNING: synchronous_commit = off returns before the local WAL flush:
+# a crash can lose the last fraction of a second of commits (no corruption).
+# Never use it for financial writes or audit records. Acceptable for:
+# analytics events, caches, other reconstructable non-financial state.
 ```
 
 ### Durability Verification

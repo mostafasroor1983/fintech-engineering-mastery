@@ -59,6 +59,8 @@ EM.I18n = (function () {
       'nav.decisionLab':     'Decision Lab',
       'nav.concurrencyLab':  'Concurrency Lab',
       'nav.capstone':        'Capstone Projects',
+      'nav.studyPlan':       'Study Plan',
+      'nav.glossary':        'Glossary',
       'nav.search':          'Search',
       'nav.about':           'About',
 
@@ -193,6 +195,8 @@ EM.I18n = (function () {
       'nav.decisionLab':     'مختبر القرارات',
       'nav.concurrencyLab':  'مختبر التزامن',
       'nav.capstone':        'المشاريع التطبيقية',
+      'nav.studyPlan':       'خطة الدراسة',
+      'nav.glossary':        'المسرد',
       'nav.search':          'بحث',
       'nav.about':           'عن البرنامج',
 

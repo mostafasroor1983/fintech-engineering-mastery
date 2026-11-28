@@ -302,7 +302,7 @@ spec:
 > [!WARNING]
 > القائمة أدناه توضيح مختصر — فـ JVM الحقيقية تحتاج أكثر (مثل `rt_sigreturn`، و`sigaltstack`، و`madvise`، و`prctl`، و`gettid`، و`newfstatat`/`statx`، و`pread64`، و`clock_nanosleep`)، والمجموعة الدقيقة تعتمد على إصدار JDK، وجامع القمامة، والمكتبات. لا تكتب القائمة يدويًا: **سجّلها** (Security Profiles Operator، أو `strace -f -c` تحت حمل اختبار كامل)، وراجعها، واختبر كل مسار في الشيفرة — فاستدعاء نظام ناقص يُسقط الخدمة في الإنتاج. وتحتاج كل عقدة kubelet أيضًا ملف الإعداد.
 
-```json
+```jsonc
 // /var/lib/kubelet/seccomp/profiles/payment-processor.json
 {
   "defaultAction": "SCMP_ACT_ERRNO",

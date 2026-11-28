@@ -122,7 +122,7 @@ A well-designed integration event has an envelope that carries routing and versi
 
 Avro is the preferred serialisation format for integration events in production fintech systems. It provides schema evolution support, compact binary encoding, and schema registry integration.
 
-```json
+```jsonc
 // src/main/avro/payment-completed-v2.avsc
 {
   "namespace": "com.meridian.payment.events",

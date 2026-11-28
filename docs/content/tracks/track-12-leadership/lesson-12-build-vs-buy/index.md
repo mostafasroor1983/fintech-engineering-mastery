@@ -140,7 +140,7 @@ SECURITY EVALUATION CHECKLIST:
   [ ] Annual penetration test results available under NDA
   [ ] Responsible disclosure/bug bounty program
   [ ] CVE response time for critical vulnerabilities (target: < 48 hours)
-  [ ] Data encryption: AES-256 at rest, TLS 1.3 in transit
+  [ ] Data encryption: AES-256 at rest, TLS 1.2+ in transit (1.3 preferred)
   [ ] Data residency: Can data be restricted to your required jurisdiction (EU, UK)?
 
 PCI DSS SPECIFIC:
@@ -189,15 +189,15 @@ Open source is not free—it is a different cost structure.
 
 **Slow CVE response**: Check the CVE history (NVD database). How quickly were critical vulnerabilities patched? Log4Shell was patched within days by the Log4j team—exemplary. Some projects take weeks.
 
-**Aggressive license**: Check the license carefully. AGPL, SSPL, and Business Source License have restrictions that may prevent commercial use or require open-sourcing your modifications. Apache 2.0 and MIT are permissive.
+**Restrictive license**: Check the license carefully. AGPL requires you to publish the source of your modifications if users interact with the software over a network; SSPL and the Business Source License restrict offering the software as a service or using it in production without a commercial licence. Apache 2.0 and MIT are permissive. Licences can also change between versions (Elasticsearch, Redis, Terraform and CockroachDB all moved away from permissive licences).
 
 **No enterprise edition**: For infrastructure components (databases, queues), enterprise editions provide commercial support contracts. Without these, your P1 support path is a public GitHub issue.
 
 ### Open Source Security Process
 
-```java
-// Every open-source dependency must be tracked and scanned
-// pom.xml — OWASP Dependency Check integration
+```xml
+<!-- Every open-source dependency must be tracked and scanned -->
+<!-- pom.xml — OWASP Dependency Check integration -->
 <plugin>
     <groupId>org.owasp</groupId>
     <artifactId>dependency-check-maven</artifactId>
@@ -212,7 +212,8 @@ OPEN SOURCE LIFECYCLE PROCESS:
   Adoption: Principal engineer approval required for new open-source dependencies
   Tracking: All dependencies in SBOM (Software Bill of Materials)
   Monitoring: Daily CVE scan via Snyk or OWASP Dependency Check
-  Patching: Critical CVE < 48 hours, High CVE < 7 days (PCI DSS requirement)
+  Patching: Critical CVE < 48 hours, High CVE < 7 days (firm policy — PCI DSS 6.3.3
+            sets the floor: critical/high patches within one month of release)
   Retirement: Deprecated or abandoned dependencies replaced within 90 days
 ```
 
@@ -233,7 +234,7 @@ Building a KYC pipeline from scratch—document verification, liveness detection
 Your ledger is the financial heart of your product. Its data model reflects your specific product constructs (wallets, accounts, sub-accounts, holds). Generic ledger software rarely fits well. Build with PostgreSQL and your own application layer. The technical complexity is manageable; the business fit is non-negotiable.
 
 **Observability: Open Source (Prometheus/Grafana) or Buy (Datadog)**
-Both are legitimate choices depending on your team's SRE capacity and compliance requirements (see Lesson 20).
+Both are legitimate choices depending on your team's SRE capacity and compliance requirements (see the decision-framework lessons in Tracks 10 and 11).
 
 ---
 
@@ -263,11 +264,14 @@ This is not core differentiation — Onfido solves it better than we would.
 What is core differentiation: our risk decisioning logic (how we combine Onfido's
 score with our own signals — transaction history, device, etc.). We build that.
 
-## Total Cost Analysis
-Build from scratch: £1.8M (12 months × 3 senior ML engineers × £150k)
+## Total Cost Analysis (illustrative figures)
+Build from scratch:
+  6 engineers (4 ML + 2 backend) × 12 months × £150k fully-loaded = £900k
+  + training data, labelling and ML infrastructure                  = £200k
+  = £1.1M initial; then 2 engineers to maintain = £300k/year
 Onfido: £180k/year + £60k integration + £40k/year internal operations
          = £280k year 1, £220k year 2+
-5-year TCO Build: £1.8M initial + £360k maintenance = £2.16M
+5-year TCO Build: £1.1M initial + £300k × 4 maintenance = £2.3M
 5-year TCO Buy:   £280k + £220k × 4 = £1.16M
 
 Buy is cheaper AND higher quality AND faster. Clear decision.
@@ -315,10 +319,22 @@ Buy is cheaper AND higher quality AND faster. Clear decision.
   "difficulty": "advanced",
   "estimatedMinutes": 45,
   "tasks": [
-    {"id": "1", "description": "Conduct a complete TCO analysis for a build vs buy decision on an internal KYC/AML platform. Build scenario: 4 senior engineers × 9 months × £150k annual fully-loaded cost + 25% ongoing maintenance. Buy scenario: Onfido at £200k/year license + £80k integration cost + £50k/year internal operations. Include opportunity cost (the build engineers could build a core fraud feature estimated at £500k revenue impact). Calculate 3-year and 5-year TCO for both options, identify all TCO components, and produce a recommendation with rationale."},
-    {"id": "2", "description": "Apply the core vs context framework to a fintech platform considering 8 capabilities: (1) credit risk scoring model, (2) SMS/email notification delivery, (3) double-entry accounting ledger, (4) card payment acquiring, (5) identity document verification, (6) payment fraud rules engine, (7) observability and monitoring, (8) encryption key management. For each, classify as core or context, recommend build/buy/open-source, and provide a one-sentence fintech-specific rationale."},
-    {"id": "3", "description": "Complete a vendor security evaluation for a hypothetical SaaS payment orchestration platform. Using the fintech vendor checklist from the lesson, design a security questionnaire (at least 15 questions) covering: SOC 2 and PCI DSS certification, CVE response SLA, data residency for EU customers, P1 incident support model, GDPR Data Processing Agreement, and exit data portability. For each question, specify what a passing vs failing answer looks like and what the consequence of a failure is (block vendor, require mitigation, or note risk)."},
-    {"id": "4", "description": "Write a complete ADR for a build vs buy decision on a double-entry accounting ledger. The ADR must evaluate three options: (1) build on PostgreSQL with custom application layer, (2) buy a commercial ledger platform (Tigerbeetle, Ledger.io), (3) use an open-source ledger library. Include: the decision drivers specific to your payment product's ledger requirements, TCO analysis for each option, compliance assessment (PCI DSS scope, audit trail requirements), the final decision with explicit rationale and negative consequences acknowledged."}
+    {
+      "id": "1",
+      "description": "Conduct a complete TCO analysis for a build vs buy decision on an internal KYC/AML platform. Build scenario: 4 senior engineers × 9 months × £150k annual fully-loaded cost + 25% ongoing maintenance. Buy scenario: Onfido at £200k/year license + £80k integration cost + £50k/year internal operations. Include opportunity cost (the build engineers could build a core fraud feature estimated at £500k revenue impact). Calculate 3-year and 5-year TCO for both options, identify all TCO components, and produce a recommendation with rationale."
+    },
+    {
+      "id": "2",
+      "description": "Apply the core vs context framework to a fintech platform considering 8 capabilities: (1) credit risk scoring model, (2) SMS/email notification delivery, (3) double-entry accounting ledger, (4) card payment acquiring, (5) identity document verification, (6) payment fraud rules engine, (7) observability and monitoring, (8) encryption key management. For each, classify as core or context, recommend build/buy/open-source, and provide a one-sentence fintech-specific rationale."
+    },
+    {
+      "id": "3",
+      "description": "Complete a vendor security evaluation for a hypothetical SaaS payment orchestration platform. Using the fintech vendor checklist from the lesson, design a security questionnaire (at least 15 questions) covering: SOC 2 and PCI DSS certification, CVE response SLA, data residency for EU customers, P1 incident support model, GDPR Data Processing Agreement, and exit data portability. For each question, specify what a passing vs failing answer looks like and what the consequence of a failure is (block vendor, require mitigation, or note risk)."
+    },
+    {
+      "id": "4",
+      "description": "Write a complete ADR for a build vs buy decision on a double-entry accounting ledger. The ADR must evaluate three options: (1) build on PostgreSQL with custom application layer, (2) buy a commercial ledger platform (e.g. Modern Treasury Ledgers or Formance Cloud), (3) adopt an open-source ledger database (e.g. TigerBeetle or the open-source Formance ledger). Include: the decision drivers specific to your payment product's ledger requirements, TCO analysis for each option, compliance assessment (PCI DSS scope, audit trail requirements), the final decision with explicit rationale and negative consequences acknowledged."
+    }
   ]
 }
 -->

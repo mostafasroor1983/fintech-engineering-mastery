@@ -82,7 +82,7 @@ The Google SRE Workbook defines the gold standard: alert on two windows simultan
 
 ### The Four Alert Combinations
 
-| Alert | Short Window | Long Window | Burn Rate | Budget Consumed | Action |
+| Alert | Long Window | Short Window | Burn Rate | Budget Consumed | Action |
 |-------|-------------|-------------|-----------|-----------------|--------|
 | P1 Critical | 1 hour | 5 minutes | 14× | 2% in 1h | Page immediately |
 | P2 High | 6 hours | 30 minutes | 6× | 5% in 6h | Page (business hours) |
@@ -91,11 +91,11 @@ The Google SRE Workbook defines the gold standard: alert on two windows simultan
 
 **Why two windows per alert?**
 
-The short window catches fast-burning incidents quickly. The long window prevents false positives from short spikes. Both must be true simultaneously to fire.
+The long window proves that a significant part of the budget has really been burned — a brief spike cannot push a 1-hour average over 14×. The short window proves the problem is *still happening*, so the alert stops soon after recovery instead of firing for another hour while the long average decays. Both must be true simultaneously to fire.
 
 For a P1 alert (14× burn rate):
-- Short window (1h) detects the problem within 5 minutes of it starting
-- Long window (5 min) confirms it's not a 10-second blip
+- Long window (1h): at least ~2% of the monthly budget is already gone — no 10-second blip can do that
+- Short window (5 min): the error rate is high right now; once the fix lands, the alert clears within minutes
 
 ---
 
@@ -256,7 +256,7 @@ groups:
 
 ## Latency SLO Alerting
 
-For payment APIs, latency SLOs are as important as availability. p99 < 500ms for payment submissions.
+For payment APIs, latency SLOs are as important as availability. The SLO here: 99.9% of payment submissions complete in under 500ms (requests slower than that count as "bad"). This needs a histogram bucket boundary at exactly 0.5s.
 
 ```yaml
 # Recording rules for latency
@@ -305,8 +305,8 @@ groups:
           severity: critical
           slo: payment_api_latency
         annotations:
-          summary: "Payment API p99 latency SLO: critical burn rate"
-          description: "More than 14x the allowed latency violations. p99 likely above 500ms."
+          summary: "Payment API latency SLO: critical burn rate"
+          description: "Slow requests (> 500ms) are arriving at more than 14x the rate the latency SLO allows."
 ```
 
 ---
@@ -328,28 +328,29 @@ route:
 
   routes:
     # Critical SLO burns → PagerDuty immediately (24/7)
-    - match:
-        severity: critical
-        slo: payment_api_availability
+    - matchers:                     # "match:" is the deprecated older syntax
+        - severity="critical"
+        - slo="payment_api_availability"
       receiver: 'pagerduty-payments-critical'
-      continue: false
 
     # High SLO burns → PagerDuty with business hours schedule
-    - match:
-        severity: high
-        slo: payment_api_availability
+    - matchers:
+        - severity="high"
+        - slo="payment_api_availability"
       receiver: 'pagerduty-payments-high'
-      continue: false
 
     # Medium burns → Slack channel during business hours
-    - match:
-        severity: medium
+    - matchers:
+        - severity="medium"
       receiver: 'slack-payments-team'
       active_time_intervals:
         - business_hours
-      continue: false
 
 receivers:
+  - name: 'default'
+    slack_configs:
+      - channel: '#alerts-unrouted'
+
   - name: 'pagerduty-payments-critical'
     pagerduty_configs:
       - routing_key: '<PAGERDUTY_KEY>'
@@ -359,6 +360,11 @@ receivers:
           slo: '{{ .CommonLabels.slo }}'
           runbook: '{{ .CommonAnnotations.runbook_url }}'
           dashboard: '{{ .CommonAnnotations.dashboard_url }}'
+
+  - name: 'pagerduty-payments-high'
+    pagerduty_configs:
+      - routing_key: '<PAGERDUTY_KEY_BUSINESS_HOURS>'
+        severity: error
 
   - name: 'slack-payments-team'
     slack_configs:
@@ -372,17 +378,17 @@ receivers:
 
 inhibit_rules:
   # If P1 fires, suppress P2 and P3 for the same SLO (avoid alert storm)
-  - source_match:
-      severity: critical
-    target_match_re:
-      severity: ^(high|medium)$
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity=~"high|medium"
     equal: ['slo', 'team']
 
   # Suppress component alerts when parent service is down
-  - source_match:
-      alertname: PaymentServiceDown
-    target_match:
-      team: payments
+  - source_matchers:
+      - alertname="PaymentServiceDown"
+    target_matchers:
+      - team="payments"
     equal: ['environment']
 
 time_intervals:
@@ -425,32 +431,25 @@ Measure these metrics on your alerting system monthly:
 ### Alert Deduplication Configuration
 
 ```java
-// Spring Boot — ensure metrics have consistent labels for effective grouping
-@Component
-public class PaymentMetrics {
-    private final Counter requestsTotal;
-    private final Counter errorsTotal;
+// Spring Boot — consistent labels for effective grouping.
+// Use the built-in http.server.requests metrics (status, uri, method tags
+// included) and add the same common tags to every meter.
+// Don't add a "job" tag yourself: Prometheus sets "job" at scrape time,
+// and a clashing metric label is renamed to "exported_job". And don't put
+// ".total" in counter names -- the Prometheus registry adds "_total" itself.
+@Configuration
+public class MetricsTagsConfig {
 
-    public PaymentMetrics(MeterRegistry registry) {
-        // Consistent label schema — all payment API metrics use same job/endpoint labels
-        this.requestsTotal = Counter.builder("http.requests.total")
-            .tag("job", "payment-api")
-            .tag("service", "payment-service")
-            .register(registry);
-
-        this.errorsTotal = Counter.builder("http.requests.errors.total")
-            .tag("job", "payment-api")
-            .tag("service", "payment-service")
-            .register(registry);
-    }
-
-    public void recordRequest(String endpoint, int statusCode) {
-        requestsTotal.increment();
-        if (statusCode >= 500) {
-            errorsTotal.increment();
-        }
+    @Bean
+    public MeterFilter commonTags() {
+        return MeterFilter.commonTags(List.of(
+            Tag.of("service", "payment-service"),
+            Tag.of("team", "payments")));
     }
 }
+// Equivalent in application.yml:
+//   management.metrics.tags.service: payment-service
+//   management.metrics.tags.team: payments
 ```
 
 ---
@@ -461,9 +460,11 @@ public class PaymentMetrics {
 
 | SLO | Target | Window | Error Budget |
 |-----|--------|--------|--------------|
-| Availability | 99.9% | 30 days | 43.2 minutes |
-| Latency p99 | < 500ms | 30 days | Same budget |
-| Latency p50 | < 100ms | 30 days | Same budget |
+| Availability | 99.9% of requests succeed | 30 days | 0.1% of requests (≈ 43.2 minutes) |
+| Latency | 99.9% of requests < 500ms | 30 days | 0.1% of requests may be slower |
+| Latency (typical) | 50% of requests < 100ms | 30 days | its own budget: 50% may be slower |
+
+Each SLO has its **own** error budget and its own burn-rate alerts.
 
 ```yaml
 # slo-definitions.yml — source of truth, referenced by alerts
@@ -488,8 +489,8 @@ slos:
         windows: [1d, 2h]
         severity: medium
 
-  payment_api_latency_p99:
-    description: "Payment submission API p99 latency < 500ms"
+  payment_api_latency_500ms:
+    description: "99.9% of payment submissions faster than 500ms"
     target: 0.999
     window: 30d
     sli:
@@ -562,19 +563,34 @@ slos:
   "questions": [
     {
       "text": "A payment API has a 99.9% availability SLO over 30 days. If the current burn rate is 14x, how long until the error budget is exhausted at this rate?",
-      "options": ["30 days", "7 days", "2 days", "12 hours"],
+      "options": [
+        "30 days",
+        "7 days",
+        "2 days",
+        "12 hours"
+      ],
       "correct": 2,
       "explanation": "At a burn rate of 14x, the error budget is consumed 14 times faster than the SLO window. 30 days / 14 = approximately 2.1 days. This is why a 14x burn rate fires a critical alert — you have roughly 2 days of budget remaining, not 30."
     },
     {
       "text": "Why does multi-window burn rate alerting require BOTH a short window (e.g., 5 minutes) AND a long window (e.g., 1 hour) to trigger an alert?",
-      "options": ["To reduce Prometheus storage costs", "The short window confirms the problem is happening right now; the long window confirms it is sustained enough to consume significant budget — requiring both eliminates false positives from brief spikes", "Because Alertmanager requires two conditions", "PCI DSS requires dual-window alerting"],
+      "options": [
+        "To reduce Prometheus storage costs",
+        "The short window confirms the problem is happening right now; the long window confirms it is sustained enough to consume significant budget — requiring both eliminates false positives from brief spikes",
+        "Because Alertmanager requires two conditions",
+        "PCI DSS requires dual-window alerting"
+      ],
       "correct": 1,
-      "explanation": "A 5-minute window alone fires on transient spikes that resolve themselves. A 1-hour window alone is too slow to respond to fast-burning incidents. Requiring both simultaneously means: the problem is happening right now (5-min window) AND has been sustained enough to burn meaningful budget (1-hour window)."
+      "explanation": "A 5-minute window alone fires on transient spikes that resolve themselves. A 1-hour window alone keeps firing long after an incident is fixed, because the 1-hour average decays slowly. Requiring both simultaneously means: enough budget has really been burned (1-hour window) AND the problem is still happening right now (5-minute window)."
     },
     {
       "text": "What metric should you track monthly to diagnose alert fatigue in a payment operations team?",
-      "options": ["Number of deploys per month", "Alert-to-incident ratio — the number of alerts fired divided by the number of incidents that required human action", "Mean time to recovery (MTTR)", "Number of SLO breaches"],
+      "options": [
+        "Number of deploys per month",
+        "Alert-to-incident ratio — the number of alerts fired divided by the number of incidents that required human action",
+        "Mean time to recovery (MTTR)",
+        "Number of SLO breaches"
+      ],
       "correct": 1,
       "explanation": "Alert-to-incident ratio measures how much noise your alerting produces relative to actionable alerts. A healthy ratio is below 3:1. Above 10:1 indicates alert fatigue — most pages are noise, engineers stop responding promptly, and real incidents get missed."
     }
