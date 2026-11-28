@@ -36,7 +36,9 @@ KEY_PAGES = ["/", "/curriculum", "/curriculum/track/track-05", "/tracks/track-05
              "/tracks/track-14/lessons/track-14-lesson-08", "/tracks/track-15/lessons/track-15-lesson-03",
              "/tracks/track-03/lessons/track-03-lesson-18", "/decision-lab", "/decision-lab/lab-01",
              "/concurrency-lab", "/concurrency-lab/java-01", "/capstone", "/capstone/project-a",
-             "/study-plan", "/glossary", "/search", "/about"]
+             "/study-plan", "/glossary", "/search", "/about",
+             "/tracks/track-17/lessons/track-17-lesson-04", "/tracks/track-17/lessons/track-17-lesson-12",
+             "/tracks/track-17/lessons/track-17-lesson-14"]
 MAX_MEASURE_CH = 75
 
 MEASURE = r"""() => {

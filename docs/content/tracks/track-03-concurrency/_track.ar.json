@@ -28,7 +28,8 @@
         "happens-before",
         "volatile"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-02",
@@ -46,7 +47,8 @@
         "records",
         "final-fields"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-03",
@@ -64,7 +66,8 @@
         "StampedLock",
         "Condition"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-04",
@@ -82,7 +85,8 @@
         "LongAdder",
         "lock-free"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-05",
@@ -99,7 +103,8 @@
         "CAS",
         "lock-free"
       ],
-      "tier": "supporting"
+      "tier": "supporting",
+      "localized": true
     },
     {
       "id": "track-03-lesson-06",
@@ -116,7 +121,8 @@
         "CopyOnWriteArrayList",
         "concurrent-collections"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-07",
@@ -133,7 +139,8 @@
         "lost-updates",
         "financial-integrity"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-08",
@@ -151,7 +158,8 @@
         "lock-ordering",
         "thread-dump"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-09",
@@ -169,7 +177,8 @@
         "JMH",
         "performance"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-03-lesson-10",
@@ -187,7 +196,8 @@
         "queue-capacity",
         "rejection-policy"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-11",
@@ -205,7 +215,8 @@
         "thenCompose",
         "exceptionally"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-12",
@@ -222,7 +233,8 @@
         "thread-per-request",
         "Project-Loom"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-13",
@@ -240,7 +252,8 @@
         "ReentrantLock",
         "java-21"
       ],
-      "tier": "supporting"
+      "tier": "supporting",
+      "localized": true
     },
     {
       "id": "track-03-lesson-14",
@@ -257,7 +270,8 @@
         "StructuredTaskScope",
         "subtasks"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-15",
@@ -275,7 +289,8 @@
         "thread-local",
         "context-propagation"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-03-lesson-16",
@@ -293,7 +308,8 @@
         "JUnit",
         "stress-testing"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-17",
@@ -311,7 +327,8 @@
         "throughput",
         "latency"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-03-lesson-18",
@@ -329,7 +346,8 @@
         "jstack",
         "VisualVM"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-19",
@@ -346,7 +364,8 @@
         "monitor-contention",
         "async-profiler"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-03-lesson-20",
@@ -363,7 +382,8 @@
         "executor-isolation",
         "back-pressure"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-21",
@@ -380,7 +400,8 @@
         "pessimistic-locking",
         "SELECT-FOR-UPDATE"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-22",
@@ -397,7 +418,8 @@
         "constructor-safety",
         "JMM"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-03-lesson-23",
@@ -414,7 +436,8 @@
         "acquire-release",
         "JMM-internals"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-03-lesson-24",
@@ -432,7 +455,8 @@
         "Phaser",
         "synchronizers"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-03-lesson-25",
@@ -450,7 +474,8 @@
         "ThreadLocal",
         "Micrometer"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-03-lesson-26",
@@ -468,7 +493,8 @@
         "fence",
         "acquire-release"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-03-lesson-27",
@@ -486,7 +512,8 @@
         "event-ordering",
         "partitioning"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-03-lesson-28",
@@ -504,7 +531,8 @@
         "staff-engineer",
         "principal-engineer"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-03-lesson-29",
@@ -522,7 +550,8 @@
         "concurrent-design",
         "review"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     }
   ],
   "mainPathMinutes": 1585,

@@ -29,7 +29,8 @@
         "triage",
         "senior",
         "staff"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-02",
@@ -47,7 +48,8 @@
         "reconciliation",
         "compliance",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-03",
@@ -65,7 +67,8 @@
         "collections",
         "generics",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-04",
@@ -83,7 +86,8 @@
         "jmm",
         "locks",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-05",
@@ -101,7 +105,8 @@
         "memory",
         "profiling",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-06",
@@ -119,7 +124,8 @@
         "transactions",
         "jpa",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-07",
@@ -137,7 +143,8 @@
         "kafka",
         "spring-ai",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-08",
@@ -155,7 +162,8 @@
         "consensus",
         "partitioning",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-09",
@@ -173,7 +181,8 @@
         "saga",
         "resilience",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-10",
@@ -191,7 +200,8 @@
         "mvcc",
         "replication",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-11",
@@ -210,7 +220,8 @@
         "sre",
         "leadership",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-12",
@@ -229,7 +240,8 @@
         "idempotency",
         "money",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-13",
@@ -248,7 +260,8 @@
         "resilience",
         "reconciliation",
         "interview"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-14",
@@ -265,7 +278,8 @@
         "multiple-choice",
         "interview",
         "scenarios"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-15",
@@ -282,7 +296,8 @@
         "multiple-choice",
         "interview",
         "scenarios"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-16",
@@ -300,7 +315,8 @@
         "communication",
         "senior",
         "staff"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-17",
@@ -318,7 +334,8 @@
         "communication",
         "senior",
         "staff"
-      ]
+      ],
+      "localized": false
     },
     {
       "id": "track-17-lesson-18",
@@ -337,7 +354,8 @@
         "triage",
         "senior",
         "staff"
-      ]
+      ],
+      "localized": false
     }
   ],
   "mainPathMinutes": 720,

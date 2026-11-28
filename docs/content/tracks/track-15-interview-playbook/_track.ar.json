@@ -25,7 +25,8 @@
       "tags": [
         "behavioural",
         "star"
-      ]
+      ],
+      "localized": true
     },
     {
       "id": "track-15-lesson-02",
@@ -40,7 +41,8 @@
       "tags": [
         "system-design",
         "reshaded"
-      ]
+      ],
+      "localized": true
     },
     {
       "id": "track-15-lesson-03",
@@ -56,7 +58,8 @@
         "java",
         "spring",
         "questions"
-      ]
+      ],
+      "localized": true
     },
     {
       "id": "track-15-lesson-04",
@@ -72,7 +75,8 @@
         "kafka",
         "payments",
         "questions"
-      ]
+      ],
+      "localized": true
     },
     {
       "id": "track-15-lesson-05",
@@ -87,7 +91,8 @@
       "tags": [
         "mock-interview",
         "rubric"
-      ]
+      ],
+      "localized": true
     }
   ],
   "mainPathMinutes": 250,

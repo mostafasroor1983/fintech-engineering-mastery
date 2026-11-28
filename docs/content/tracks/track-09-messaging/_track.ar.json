@@ -28,7 +28,8 @@
         "consumer-group",
         "broker"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-09-lesson-02",
@@ -46,7 +47,8 @@
         "idempotent",
         "ordering"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-09-lesson-03",
@@ -64,7 +66,8 @@
         "rebalance",
         "commit-strategy"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-09-lesson-04",
@@ -82,7 +85,8 @@
         "state-store",
         "windowing"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-05",
@@ -100,7 +104,8 @@
         "idempotent-producer",
         "EOS"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-09-lesson-06",
@@ -118,7 +123,8 @@
         "dual-write",
         "WAL"
       ],
-      "tier": "supporting"
+      "tier": "supporting",
+      "localized": true
     },
     {
       "id": "track-09-lesson-07",
@@ -136,7 +142,8 @@
         "schema-evolution",
         "compatibility"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-08",
@@ -154,7 +161,8 @@
         "SMT",
         "worker"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-09",
@@ -172,7 +180,8 @@
         "snapshot",
         "projection"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-10",
@@ -190,7 +199,8 @@
         "eventual-consistency",
         "Kafka"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-11",
@@ -208,7 +218,8 @@
         "retry",
         "alerting"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-12",
@@ -226,7 +237,8 @@
         "ACL",
         "mTLS"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-13",
@@ -244,7 +256,8 @@
         "latency",
         "compression"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-14",
@@ -262,7 +275,8 @@
         "failover",
         "Kafka"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-15",
@@ -280,7 +294,8 @@
         "compensation",
         "Axon"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-09-lesson-16",
@@ -298,7 +313,8 @@
         "choreography",
         "decoupling"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-17",
@@ -316,7 +332,8 @@
         "JMX",
         "Prometheus"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-18",
@@ -333,7 +350,8 @@
         "global-order",
         "sequence-number"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-19",
@@ -351,7 +369,8 @@
         "queue",
         "log"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-09-lesson-20",
@@ -369,7 +388,8 @@
         "staff-engineer",
         "broker"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     }
   ],
   "mainPathMinutes": 505,

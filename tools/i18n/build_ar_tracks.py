@@ -31,6 +31,9 @@ for f in sorted(glob.glob(os.path.join(ROOT, 'content/tracks/*/_track.json'))):
         l = dict(l)
         if l['id'] in LESSONS: l['title'] = LESSONS[l['id']]
         else: missing.append(l['id'])
+        # Tells the site whether an Arabic body exists, so it never requests a missing index.ar.md
+        # (a 404 would show up as a console error before the English fallback loads)
+        l['localized'] = os.path.exists(os.path.join(ROOT, l['path'].replace('index.md', 'index.ar.md')))
         lessons.append(l)
     t['lessons'] = lessons
     json.dump(t, open(f.replace('_track.json', '_track.ar.json'), 'w', encoding='utf-8'), ensure_ascii=False, indent=2)

@@ -28,7 +28,8 @@
         "journal-entries",
         "T-accounts"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-02",
@@ -46,7 +47,8 @@
         "optimistic-locking",
         "concurrent-withdrawals"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-03",
@@ -64,7 +66,8 @@
         "at-least-once",
         "deduplication"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-04",
@@ -82,7 +85,8 @@
         "atomic-debit",
         "SELECT-FOR-UPDATE"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-05",
@@ -100,7 +104,8 @@
         "SERIALIZABLE",
         "partitioning"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-06",
@@ -118,7 +123,8 @@
         "saga",
         "funds-reservation"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-07",
@@ -136,7 +142,8 @@
         "Kafka",
         "consistency"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-08",
@@ -154,7 +161,8 @@
         "consumer-idempotency",
         "deduplication"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-09",
@@ -172,7 +180,8 @@
         "event-sourcing",
         "Kafka"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-10",
@@ -190,7 +199,8 @@
         "audit",
         "shadow-ledger"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-11",
@@ -208,7 +218,8 @@
         "partitioning",
         "CRDT"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-12",
@@ -226,7 +237,8 @@
         "Redis",
         "distributed-idempotency"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-13",
@@ -244,7 +256,8 @@
         "Debezium",
         "reliable-messaging"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-14",
@@ -262,7 +275,8 @@
         "compensation",
         "distributed-transactions"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-15",
@@ -280,7 +294,8 @@
         "trade-offs",
         "XA"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-16",
@@ -298,7 +313,8 @@
         "retry",
         "conflict-detection"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-17",
@@ -316,7 +332,8 @@
         "deadlock",
         "PostgreSQL"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-18",
@@ -334,7 +351,8 @@
         "snapshot",
         "audit-trail"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-19",
@@ -352,7 +370,8 @@
         "eventual-consistency",
         "payments"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-20",
@@ -370,7 +389,8 @@
         "Spring-Transaction",
         "Hibernate"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-21",
@@ -388,7 +408,8 @@
         "compliance",
         "tamper-evidence"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-22",
@@ -406,7 +427,8 @@
         "batch-reconciliation",
         "shadow-balance"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-23",
@@ -424,7 +446,8 @@
         "CAMT.056",
         "ISO-20022"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-05-lesson-24",
@@ -441,7 +464,8 @@
         "correctness-vs-performance",
         "staff-engineer"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     }
   ],
   "mainPathMinutes": 2065,

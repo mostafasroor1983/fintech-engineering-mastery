@@ -2,7 +2,7 @@
 
 A focused self-study program for **Senior Software Engineer** roles at large fintechs and banks:
 payments, ledgers, wallets, FX, cards, reconciliation and resilience, in **Java 21 and Spring Boot 4**.
-It is sized to **30 weeks × 10 hours**: a 227.8-hour main path (167.8 h of lessons + 60 h for five capstone projects), plus
+It is sized to **30 weeks × 10 hours**: a 239.8-hour main path (179.8 h of lessons + 60 h for five capstone projects), plus
 reserved time for mock interviews, review and slack.
 
 **Start here:**
@@ -13,6 +13,7 @@ reserved time for mock interviews, review and slack.
 | Capstone projects (runnable, tested) | [`examples/`](examples/README.md): five Spring Boot 4.0.9 services, 67 tests on real PostgreSQL/Kafka/Redis |
 | Interview playbook | Track 15 (`docs/content/interview/`): STAR stories, the 45-minute design round, top 60 questions, 10 mock interviews |
 | First 90 days in a new job | Track 16 (`docs/content/new-job/`) |
+| Final interview prep (12 hours) | Track 17: 500 Q&As, 10 tested coding challenges ([`examples/track-17-coding`](examples/track-17-coding)), 100 self-test MCQs, 300 tips; generated from `tools/final-prep/` |
 | Review notes and decisions | [`docs/review/`](docs/review/) |
 | Arabic version | Every lesson, lab, capstone page, the study plan and the glossary (`*.ar.md`, `docs/data/ar/`); switch language in the site's top bar |
 
@@ -85,7 +86,8 @@ Track 05 (transaction integrity) is entirely Core and is studied early (weeks 3�
 | 14 | `track-14` | System Design for Fintech Interviews | 8 | 9.1 h | 9.1 h |
 | 15 | `track-15` | Interview Playbook | 5 | 4.2 h | 4.2 h |
 | 16 | `track-16` | First 90 Days | 2 | 1.6 h | 1.6 h |
-| | | **Total** | **272** | **167.8 h** | **354.8 h** |
+| 17 | `track-17` | Final Interview Prep | 18 | 12.0 h | 12.0 h |
+| | | **Total** | **290** | **179.8 h** | **366.8 h** |
 
 Plus **five capstone projects** (12 h each, 60 h, in the main path), **20 Decision Lab scenarios** and **25 Concurrency Lab experiments**.
 
@@ -110,7 +112,7 @@ Plus **five capstone projects** (12 h each, 60 h, in the main path), **20 Decisi
 - **Progress tracking** — mark lessons complete; overall and per-track progress rings on the Dashboard and Curriculum pages
 
 ### Search
-- **Full-text search** via `lunr.js` over 338 indexed documents (lessons, tracks, scenarios, experiments, capstones), with a separate Arabic index
+- **Full-text search** via `lunr.js` over 357 indexed documents (lessons, tracks, scenarios, experiments, capstones), with a separate Arabic index
 - Searches title (boost ×10), tags (×6), subtitle (×4), track name (×3), body text (×1)
 - Results grouped by type with direct links
 
@@ -153,6 +155,7 @@ fintech-engineering-mastery/
 python3 tools/sync_manifest_tiers.py     # after changing tiers (CORE_IDS / SUPPORTING_IDS in the validator)
 python3 tools/build_capstone_pages.py    # after editing a capstone README in examples/
 python3 tools/build_study_plan.py        # after changing the schedule or lesson minutes
+python3 tools/build_final_prep.py        # after editing Track 17 sources in tools/final-prep/ (Q&As, MCQs, tips, lessons)
 python3 tools/i18n/build_study_plan_ar.py  # after build_study_plan.py (Arabic plan)
 python3 rebuild_search_index.py          # after adding or editing lessons
 python3 tools/i18n/build_ar_data.py      # after the line above (Arabic search index and data)

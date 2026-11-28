@@ -28,7 +28,8 @@
         "general-ledger",
         "architecture"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-04-lesson-02",
@@ -46,7 +47,8 @@
         "clearing",
         "settlement"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-04-lesson-03",
@@ -64,7 +66,8 @@
         "general-ledger",
         "chart-of-accounts"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-04-lesson-04",
@@ -82,7 +85,8 @@
         "savings",
         "loan-account"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-05",
@@ -100,7 +104,8 @@
         "settlement",
         "clearing"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-04-lesson-06",
@@ -119,7 +124,8 @@
         "correspondent-banking",
         "SWIFT-network"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-07",
@@ -138,7 +144,8 @@
         "CBPR+",
         "migration"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-04-lesson-08",
@@ -156,7 +163,8 @@
         "RTP",
         "latency"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-04-lesson-09",
@@ -174,7 +182,8 @@
         "SWIFT-GPI",
         "FX"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-10",
@@ -192,7 +201,8 @@
         "spot-rate",
         "FX-exposure"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-11",
@@ -210,7 +220,8 @@
         "BACS",
         "ACH"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-12",
@@ -227,7 +238,8 @@
         "day-end",
         "break-management"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-13",
@@ -245,7 +257,8 @@
         "STR",
         "FATF"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-14",
@@ -264,7 +277,8 @@
         "PEP",
         "onboarding"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-15",
@@ -282,7 +296,8 @@
         "fuzzy-matching",
         "false-positive"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-16",
@@ -300,7 +315,8 @@
         "ML",
         "velocity-checks"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-17",
@@ -318,7 +334,8 @@
         "data-lineage",
         "reporting-pipeline"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-18",
@@ -337,7 +354,8 @@
         "EMV",
         "tokenisation"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-19",
@@ -355,7 +373,8 @@
         "tokenisation",
         "PSD2"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-20",
@@ -374,7 +393,8 @@
         "consent-management",
         "CDR"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-21",
@@ -392,7 +412,8 @@
         "back-pressure",
         "performance"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-04-lesson-22",
@@ -409,7 +430,8 @@
         "trade-offs",
         "staff-engineer"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     }
   ],
   "mainPathMinutes": 515,

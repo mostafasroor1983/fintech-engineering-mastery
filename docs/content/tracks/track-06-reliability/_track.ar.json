@@ -28,7 +28,8 @@
         "SLI",
         "reliability"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-06-lesson-02",
@@ -46,7 +47,8 @@
         "OPEN",
         "HALF_OPEN"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-06-lesson-03",
@@ -64,7 +66,8 @@
         "isolation",
         "Resilience4j"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-06-lesson-04",
@@ -82,7 +85,8 @@
         "idempotency",
         "Resilience4j"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-06-lesson-05",
@@ -100,7 +104,8 @@
         "read-timeout",
         "connect-timeout"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-06-lesson-06",
@@ -118,7 +123,8 @@
         "failure-injection",
         "resilience-testing"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-07",
@@ -136,7 +142,8 @@
         "conflict-resolution",
         "latency"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-08",
@@ -154,7 +161,8 @@
         "failover",
         "BCP"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-09",
@@ -171,7 +179,8 @@
         "priority-queue",
         "admission-control"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-10",
@@ -189,7 +198,8 @@
         "startup-probe",
         "Actuator"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-11",
@@ -207,7 +217,8 @@
         "replication",
         "failover"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-12",
@@ -225,7 +236,8 @@
         "ISR",
         "leader-election"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-13",
@@ -242,7 +254,8 @@
         "sliding-window",
         "downstream-protection"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-14",
@@ -260,7 +273,8 @@
         "degraded-mode",
         "Resilience4j"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-15",
@@ -278,7 +292,8 @@
         "runbook",
         "escalation"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-16",
@@ -296,7 +311,8 @@
         "five-whys",
         "action-items"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-17",
@@ -314,7 +330,8 @@
         "Gatling",
         "k6"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-06-lesson-18",
@@ -332,7 +349,8 @@
         "staff-engineer",
         "SLO"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     }
   ],
   "mainPathMinutes": 390,

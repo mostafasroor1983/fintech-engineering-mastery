@@ -27,7 +27,8 @@
         "technical-debt",
         "ADR"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-02",
@@ -43,7 +44,8 @@
         "decision-records",
         "architecture-documentation"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-03",
@@ -61,7 +63,8 @@
         "container",
         "component"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-04",
@@ -78,7 +81,8 @@
         "ubiquitous-language",
         "context-mapping"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-01-lesson-05",
@@ -97,7 +101,8 @@
         "repository",
         "domain-service"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-01-lesson-06",
@@ -114,7 +119,8 @@
         "clean-architecture",
         "dependency-inversion"
       ],
-      "tier": "supporting"
+      "tier": "supporting",
+      "localized": true
     },
     {
       "id": "track-01-lesson-07",
@@ -131,7 +137,8 @@
         "CQRS",
         "domain-events"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-01-lesson-08",
@@ -149,7 +156,8 @@
         "read-model",
         "write-model"
       ],
-      "tier": "supporting"
+      "tier": "supporting",
+      "localized": true
     },
     {
       "id": "track-01-lesson-09",
@@ -167,7 +175,8 @@
         "API-design",
         "OpenAPI"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-01-lesson-10",
@@ -184,7 +193,8 @@
         "modular-monolith",
         "strangler-fig"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-11",
@@ -202,7 +212,8 @@
         "mTLS",
         "traffic-management"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-12",
@@ -219,7 +230,8 @@
         "data-lake",
         "analytical-platform"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-13",
@@ -236,7 +248,8 @@
         "consumer-driven",
         "API-compatibility"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-14",
@@ -254,7 +267,8 @@
         "token-bucket",
         "leaky-bucket"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-01-lesson-15",
@@ -271,7 +285,8 @@
         "canary",
         "LaunchDarkly"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-16",
@@ -288,7 +303,8 @@
         "data-partitioning",
         "SaaS"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-17",
@@ -306,7 +322,8 @@
         "authentication",
         "routing"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-18",
@@ -323,7 +340,8 @@
         "identity",
         "least-privilege"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-19",
@@ -340,7 +358,8 @@
         "legacy-modernisation",
         "anti-corruption-layer"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-01-lesson-20",
@@ -357,7 +376,8 @@
         "staff-engineer",
         "principal-engineer"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     }
   ],
   "mainPathMinutes": 595,

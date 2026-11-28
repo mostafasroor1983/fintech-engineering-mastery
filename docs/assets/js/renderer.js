@@ -195,7 +195,11 @@ EM.Renderer = (function () {
     var mdResp, mdFallback = false;
     try {
       var localPath = EM.I18n.localizedPath(lesson.path);
-      if (localPath !== lesson.path) {
+      // lesson.localized === false (from _track.ar.json): no Arabic body yet, go straight to English
+      if (lesson.localized === false) {
+        mdResp = await fetch(lesson.path);
+        mdFallback = true;
+      } else if (localPath !== lesson.path) {
         mdResp = await fetch(localPath);
         if (!mdResp.ok) { mdResp = await fetch(lesson.path); mdFallback = true; }
       } else {

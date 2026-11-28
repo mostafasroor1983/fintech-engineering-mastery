@@ -1180,3 +1180,30 @@ pre.line-numbers { padding-inline-start: 3.8em; }
 /* Inline code wraps at spaces (and anywhere as a last resort) when it doesn't fit the line:
    some lessons quote a whole SQL statement inline */
 .lesson-body :not(pre) > code { white-space: normal; overflow-wrap: anywhere; }
+
+/* ------------------------------------------------------------
+   Collapsible Q&A items (Track 17): answer first, then open to check
+   ------------------------------------------------------------ */
+.lesson-body details.qa {
+  border-bottom: 1px solid var(--border-muted);
+  max-width: 80ch;
+}
+.lesson-body details.qa > summary {
+  cursor: pointer;
+  padding: var(--sp-3) var(--sp-2);
+  border-radius: var(--r-md);
+  line-height: 1.5;
+  color: var(--text-primary);
+  list-style-position: outside;
+  margin-inline-start: 1.1em;      /* room for the disclosure marker */
+}
+.lesson-body details.qa > summary:hover { background: var(--bg-surface); }
+.lesson-body details.qa > summary:focus-visible { outline: 2px solid var(--text-link); outline-offset: 2px; }
+.lesson-body details.qa > summary strong { color: var(--accent); margin-inline-end: 0.35em; }
+.lesson-body details.qa[open] > summary { background: var(--bg-surface); }
+.lesson-body details.qa > :not(summary) {
+  max-width: 72ch;
+  margin: var(--sp-2) 0 var(--sp-4);
+  padding-inline-start: var(--sp-4);
+  border-inline-start: 3px solid var(--accent-border);
+}

@@ -28,7 +28,8 @@
         "pod",
         "namespace"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-10-lesson-02",
@@ -46,7 +47,8 @@
         "toleration",
         "resource-quota"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-03",
@@ -64,7 +66,8 @@
         "NetworkPolicy",
         "Calico"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-04",
@@ -82,7 +85,8 @@
         "Flux",
         "declarative"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-10-lesson-05",
@@ -100,7 +104,8 @@
         "traffic-management",
         "Envoy"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-06",
@@ -118,7 +123,8 @@
         "seccomp",
         "non-root"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-07",
@@ -136,7 +142,8 @@
         "rotation",
         "encryption-at-rest"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-08",
@@ -154,7 +161,8 @@
         "CSI",
         "EBS"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-09",
@@ -172,7 +180,8 @@
         "auto-scaling",
         "event-driven-scaling"
       ],
-      "tier": "core"
+      "tier": "core",
+      "localized": true
     },
     {
       "id": "track-10-lesson-10",
@@ -190,7 +199,8 @@
         "workload-distribution",
         "DR"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-11",
@@ -208,7 +218,8 @@
         "reserved-instances",
         "right-sizing"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-12",
@@ -226,7 +237,8 @@
         "golden-path",
         "paved-road"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-13",
@@ -244,7 +256,8 @@
         "SAST",
         "DAST"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-14",
@@ -262,7 +275,8 @@
         "traffic-split",
         "Argo-Rollouts"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-15",
@@ -280,7 +294,8 @@
         "restore",
         "RTO"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     },
     {
       "id": "track-10-lesson-16",
@@ -298,7 +313,8 @@
         "staff-engineer",
         "platform"
       ],
-      "tier": "optional"
+      "tier": "optional",
+      "localized": true
     }
   ],
   "mainPathMinutes": 250,

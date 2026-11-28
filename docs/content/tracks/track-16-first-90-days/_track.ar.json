@@ -25,7 +25,8 @@
       "tags": [
         "onboarding",
         "actuator"
-      ]
+      ],
+      "localized": true
     },
     {
       "id": "track-16-lesson-02",
@@ -41,7 +42,8 @@
         "on-call",
         "flyway",
         "migrations"
-      ]
+      ],
+      "localized": true
     }
   ],
   "mainPathMinutes": 95,
