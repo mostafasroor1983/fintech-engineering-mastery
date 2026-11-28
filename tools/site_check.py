@@ -32,9 +32,6 @@ import threading
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS = os.path.join(ROOT, "docs")
 HARNESS = os.path.join(ROOT, "tools", "site-check", "crawl.html")
-# Lesson bodies that are deliberately English-only for now (Arabic titles and navigation exist).
-# Remove an entry once its index.ar.md files are written.
-ENGLISH_ONLY_ROUTES = ("/tracks/track-17/",)
 
 
 def find_chrome():
@@ -107,7 +104,7 @@ def problems(report):
             out.append(f"{where}: {r['mermaidErr']} diagram(s) show a Mermaid syntax error")
         if "/lessons/" in r["route"] and (r["kc"] == 0 or r["pc"] == 0):
             out.append(f"{where}: knowledge check or practical challenge missing")
-        if lang == "ar" and r["fallback"] and not r["route"].startswith(ENGLISH_ONLY_ROUTES):
+        if lang == "ar" and r["fallback"]:
             out.append(f"{where}: no Arabic version, English shown")
         if r["errText"]:
             out.append(f"{where}: page shows an error message")

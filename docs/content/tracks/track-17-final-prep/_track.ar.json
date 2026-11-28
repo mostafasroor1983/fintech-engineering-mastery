@@ -30,7 +30,7 @@
         "senior",
         "staff"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-02",
@@ -49,7 +49,7 @@
         "compliance",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-03",
@@ -68,7 +68,7 @@
         "generics",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-04",
@@ -87,7 +87,7 @@
         "locks",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-05",
@@ -106,7 +106,7 @@
         "profiling",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-06",
@@ -125,7 +125,7 @@
         "jpa",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-07",
@@ -144,7 +144,7 @@
         "spring-ai",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-08",
@@ -163,7 +163,7 @@
         "partitioning",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-09",
@@ -182,7 +182,7 @@
         "resilience",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-10",
@@ -201,7 +201,7 @@
         "replication",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-11",
@@ -221,7 +221,7 @@
         "leadership",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-12",
@@ -241,7 +241,7 @@
         "money",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-13",
@@ -261,7 +261,7 @@
         "reconciliation",
         "interview"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-14",
@@ -279,7 +279,7 @@
         "interview",
         "scenarios"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-15",
@@ -297,7 +297,7 @@
         "interview",
         "scenarios"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-16",
@@ -316,7 +316,7 @@
         "senior",
         "staff"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-17",
@@ -335,7 +335,7 @@
         "senior",
         "staff"
       ],
-      "localized": false
+      "localized": true
     },
     {
       "id": "track-17-lesson-18",
@@ -355,7 +355,7 @@
         "senior",
         "staff"
       ],
-      "localized": false
+      "localized": true
     }
   ],
   "mainPathMinutes": 720,

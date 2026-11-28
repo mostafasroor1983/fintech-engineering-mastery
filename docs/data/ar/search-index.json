@@ -5609,7 +5609,7 @@
         "senior",
         "staff"
       ],
-      "body": "In one minute This track is the last stretch before senior and staff interviews for FinTech and large-scale distributed systems roles in Java and Spring. It has five parts: 500 technical and architectural Q&As, 10 coding challenges with tested reference solutions, 100 scenario-based multiple-choice questions, 300 interview tips, and this 12-hour plan. Everything fits in 12 hours (720 minutes), the total of the lessons' times. The method is retrieval practice: you answer first, then check. That's"
+      "body": "--- id: \"track-17-lesson-01\" title: \"ابدأ هنا: خطة التحضير النهائي في 12 ساعة\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 1 slug: \"start-here\" difficulty: \"senior\" estimatedMinutes: 15 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [] tags: [\"interview\", \"study-plan\", \"time-boxing\", \"triage\", \"senior\", \"staff\"] references: - \"Henry L. Roediger and Jeffrey D. Karpicke, Test-Enhanced Learning (Psychological Science, 2006): retrieval practice\" - \"G"
     },
     {
       "id": "track-17-lesson-02",
@@ -5630,7 +5630,7 @@
         "compliance",
         "interview"
       ],
-      "body": "In one minute Fifty interview questions on money representation, ledgers and double entry, the card and instant-payment lifecycle, settlement and reconciliation, wallets and FX, fraud and compliance, and the operational reality of 24/7 finance, each with a concise answer that covers the trade-off, the edge case or the production failure mode an interviewer is listening for. The answers are hidden: read the question, answer aloud in about 30 seconds, then open it and compare. Budget: 40 minutes ("
+      "body": "--- id: \"track-17-lesson-02\" title: \"الأسئلة 1-50: الأنظمة المالية والمدفوعات\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 2 slug: \"qa-financial-systems\" difficulty: \"senior\" estimatedMinutes: 40 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"payments\", \"ledger\", \"reconciliation\", \"compliance\", \"interview\"] references: - \"ISO 20022 message definitions (iso20022.org)\" - \"PCI DSS v4.0.1 (PCI Security Standards Council"
     },
     {
       "id": "track-17-lesson-03",
@@ -5651,7 +5651,7 @@
         "generics",
         "interview"
       ],
-      "body": "In one minute Fifty interview questions on records and value objects, equality and hashing, collections and their complexity, generics, modern Java features (sealed types, pattern matching, scoped values), exceptions, streams and object design, each with a concise answer that covers the trade-off, the edge case or the production failure mode an interviewer is listening for. The answers are hidden: read the question, answer aloud in about 30 seconds, then open it and compare. Budget: 40 minutes ("
+      "body": "--- id: \"track-17-lesson-03\" title: \"الأسئلة 51-100: لغة Java والسجلات وكائنات القيمة\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 3 slug: \"qa-java-language\" difficulty: \"senior\" estimatedMinutes: 40 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"java\", \"records\", \"collections\", \"generics\", \"interview\"] references: - \"Java Language Specification, Java SE 25 (Oracle)\" - \"JEP 395 Records, JEP 409 Sealed Classes, JEP 4"
     },
     {
       "id": "track-17-lesson-04",
@@ -5672,7 +5672,7 @@
         "locks",
         "interview"
       ],
-      "body": "In one minute Fifty interview questions on the Java Memory Model, locks and atomics, deadlocks, executors and pool sizing, CompletableFuture, virtual threads and pinning, structured concurrency, concurrent collections and production concurrency failures, each with a concise answer that covers the trade-off, the edge case or the production failure mode an interviewer is listening for. The answers are hidden: read the question, answer aloud in about 30 seconds, then open it and compare. Budget: 40"
+      "body": "--- id: \"track-17-lesson-04\" title: \"الأسئلة 101-150: التزامن في Java والخيوط الافتراضية\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 4 slug: \"qa-java-concurrency\" difficulty: \"senior\" estimatedMinutes: 40 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"concurrency\", \"virtual-threads\", \"jmm\", \"locks\", \"interview\"] references: - \"Java Language Specification, chapter 17: Threads and Locks (Oracle)\" - \"JEP 444 Virtual T"
     },
     {
       "id": "track-17-lesson-05",
@@ -5693,7 +5693,7 @@
         "profiling",
         "interview"
       ],
-      "body": "In one minute Fifty interview questions on JVM memory areas, garbage collectors and GC logs, memory leaks and container memory, JIT and startup, profiling with JFR and async-profiler, and methodical performance engineering, each with a concise answer that covers the trade-off, the edge case or the production failure mode an interviewer is listening for. The answers are hidden: read the question, answer aloud in about 30 seconds, then open it and compare. Budget: 40 minutes (about 45 seconds per "
+      "body": "--- id: \"track-17-lesson-05\" title: \"الأسئلة 151-200: JVM وجمع المهملات والذاكرة والأداء\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 5 slug: \"qa-jvm-performance\" difficulty: \"senior\" estimatedMinutes: 40 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"jvm\", \"gc\", \"memory\", \"profiling\", \"interview\"] references: - \"HotSpot Virtual Machine Garbage Collection Tuning Guide (Oracle, JDK 25)\" - \"JEP 439 Generational ZGC (o"
     },
     {
       "id": "track-17-lesson-06",
@@ -5714,7 +5714,7 @@
         "jpa",
         "interview"
       ],
-      "body": "In one minute Fifty interview questions on dependency injection and auto-configuration, proxies and AOP, transaction propagation and isolation, JPA performance and locking, REST API design in Spring, Actuator and operations, testing, and Spring Boot 4, each with a concise answer that covers the trade-off, the edge case or the production failure mode an interviewer is listening for. The answers are hidden: read the question, answer aloud in about 30 seconds, then open it and compare. Budget: 40 m"
+      "body": "--- id: \"track-17-lesson-06\" title: \"الأسئلة 201-250: نواة Spring وBoot والمعاملات والبيانات\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 6 slug: \"qa-spring-core-data\" difficulty: \"senior\" estimatedMinutes: 40 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"spring\", \"spring-boot\", \"transactions\", \"jpa\", \"interview\"] references: - \"Spring Framework Reference Documentation 7.0: Data Access, Web MVC (docs.spring.io)\" - "
     },
     {
       "id": "track-17-lesson-07",
@@ -5735,7 +5735,7 @@
         "spring-ai",
         "interview"
       ],
-      "body": "In one minute Fifty interview questions on Spring Security and OAuth2, resilience with Spring Cloud and Resilience4j, Spring Batch restartability, Kafka and RabbitMQ with Spring, Spring Integration, Spring AI, and observability, each with a concise answer that covers the trade-off, the edge case or the production failure mode an interviewer is listening for. The answers are hidden: read the question, answer aloud in about 30 seconds, then open it and compare. Budget: 40 minutes (about 45 seconds"
+      "body": "--- id: \"track-17-lesson-07\" title: \"الأسئلة 251-300: Spring Security وCloud وBatch والمراسلة والذكاء الاصطناعي\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 7 slug: \"qa-spring-ecosystem\" difficulty: \"senior\" estimatedMinutes: 40 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"spring-security\", \"spring-batch\", \"kafka\", \"spring-ai\", \"interview\"] references: - \"Spring Security 7 Reference (docs.spring.io)\" - \"Spring for"
     },
     {
       "id": "track-17-lesson-08",
@@ -5756,7 +5756,7 @@
         "partitioning",
         "interview"
       ],
-      "body": "In one minute Fifty interview questions on consistency models and CAP, consensus and leader election, replication and conflict resolution, partitioning, time and ordering, failure models, distributed transactions and sagas, each with a concise answer that covers the trade-off, the edge case or the production failure mode an interviewer is listening for. The answers are hidden: read the question, answer aloud in about 30 seconds, then open it and compare. Budget: 40 minutes (about 45 seconds per "
+      "body": "--- id: \"track-17-lesson-08\" title: \"الأسئلة 301-350: أسس الأنظمة الموزعة\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 8 slug: \"qa-distributed-foundations\" difficulty: \"senior\" estimatedMinutes: 40 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"distributed-systems\", \"consistency\", \"consensus\", \"partitioning\", \"interview\"] references: - \"Martin Kleppmann, Designing Data-Intensive Applications (2017)\" - \"Diego Ongaro "
     },
     {
       "id": "track-17-lesson-09",
@@ -5777,7 +5777,7 @@
         "resilience",
         "interview"
       ],
-      "body": "In one minute Fifty interview questions on idempotency implementation, outbox and CDC operations, saga implementation, delivery semantics and ordering, backpressure and load shedding, resilience tuning, rate limiting, caching and integration patterns, each with a concise answer that covers the trade-off, the edge case or the production failure mode an interviewer is listening for. The answers are hidden: read the question, answer aloud in about 30 seconds, then open it and compare. Budget: 40 mi"
+      "body": "--- id: \"track-17-lesson-09\" title: \"الأسئلة 351-400: أنماط الأنظمة الموزعة عمليًا\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 9 slug: \"qa-distributed-patterns\" difficulty: \"senior\" estimatedMinutes: 40 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"idempotency\", \"outbox\", \"saga\", \"resilience\", \"interview\"] references: - \"Chris Richardson, Microservices Patterns (2018): Saga and Transactional Outbox\" - \"Debezium Do"
     },
     {
       "id": "track-17-lesson-10",
@@ -5798,7 +5798,7 @@
         "replication",
         "interview"
       ],
-      "body": "In one minute Fifty interview questions on PostgreSQL MVCC, vacuum and locks, indexing and query plans, schema design for money, partitioning, replication and high availability, choosing data stores, and correctness under concurrency, each with a concise answer that covers the trade-off, the edge case or the production failure mode an interviewer is listening for. The answers are hidden: read the question, answer aloud in about 30 seconds, then open it and compare. Budget: 40 minutes (about 45 s"
+      "body": "--- id: \"track-17-lesson-10\" title: \"الأسئلة 401-450: قواعد البيانات وهندسة البيانات\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 10 slug: \"qa-databases\" difficulty: \"senior\" estimatedMinutes: 40 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"postgresql\", \"indexing\", \"mvcc\", \"replication\", \"interview\"] references: - \"PostgreSQL 18 Documentation: Concurrency Control, Indexes, Routine Vacuuming (postgresql.org)\" - \"Ma"
     },
     {
       "id": "track-17-lesson-11",
@@ -5820,7 +5820,7 @@
         "leadership",
         "interview"
       ],
-      "body": "In one minute Fifty interview questions on architecture styles and DDD, the system design interview, Kubernetes and cloud, SRE and incidents, security architecture, and technical leadership at staff level, each with a concise answer that covers the trade-off, the edge case or the production failure mode an interviewer is listening for. The answers are hidden: read the question, answer aloud in about 30 seconds, then open it and compare. Budget: 40 minutes (about 45 seconds per question, plus mar"
+      "body": "--- id: \"track-17-lesson-11\" title: \"الأسئلة 451-500: البنية الحديثة والتشغيل والقيادة\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 11 slug: \"qa-architecture-operations\" difficulty: \"senior\" estimatedMinutes: 40 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"architecture\", \"ddd\", \"kubernetes\", \"sre\", \"leadership\", \"interview\"] references: - \"Eric Evans, Domain-Driven Design (2003)\" - \"Google SRE Workbook: Alerting o"
     },
     {
       "id": "track-17-lesson-12",
@@ -5842,7 +5842,7 @@
         "money",
         "interview"
       ],
-      "body": "In one minute Five coding problems that come up in fintech interviews, each with a problem statement, edge cases, a clean reference solution in plain Java 21, and notes on complexity and concurrency. Every solution here is copied from and tested by , including concurrency tests that race 20 to 50 threads. Budget: 60 minutes. Pick one challenge and solve it from scratch in 25 minutes with a test, then read the other four (about 7 minutes each). Run the tests yourself: . How to practise Read the p"
+      "body": "--- id: \"track-17-lesson-12\" title: \"التحديات البرمجية C01-C05: المال، وعدم التكرار، والتحويلات، وتحديد المعدل، ودفتر الأستاذ\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 12 slug: \"coding-challenges-1\" difficulty: \"senior\" estimatedMinutes: 60 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"coding\", \"java\", \"concurrency\", \"idempotency\", \"money\", \"interview\"] references: - \"Java SE 25 API: java.util.concurrent, java.m"
     },
     {
       "id": "track-17-lesson-13",
@@ -5864,7 +5864,7 @@
         "reconciliation",
         "interview"
       ],
-      "body": "In one minute Five more problems, now at the boundary between code and distributed systems: matching bank lines to the ledger, a fraud velocity rule, retries with backoff and jitter, consistent hashing, and a circuit breaker. As in lesson 12, every solution is tested in . Budget: 60 minutes. Solve one from scratch in 25 minutes (C08 or C10 are classic interview picks), then read the other four. C06: Reconciliation matcher Problem. Match bank statement lines to ledger items and classify everythin"
+      "body": "--- id: \"track-17-lesson-13\" title: \"التحديات البرمجية C06-C10: المطابقة، والسرعة، وإعادة المحاولة، والتجزئة المتسقة، وقاطع الدائرة\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 13 slug: \"coding-challenges-2\" difficulty: \"senior\" estimatedMinutes: 60 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-12\"] tags: [\"coding\", \"java\", \"distributed-systems\", \"resilience\", \"reconciliation\", \"interview\"] references: - \"Marc Brooker, Exponent"
     },
     {
       "id": "track-17-lesson-14",
@@ -5884,7 +5884,7 @@
         "interview",
         "scenarios"
       ],
-      "body": "In one minute Fifty scenario-based multiple-choice questions (1-50 of 100), mixed across payments, Java, Spring, distributed systems, databases, operations and interviewing. Each has one best answer and a short explanation that appears after you answer. Budget: 30 minutes, closed book (about 35 seconds per question). Your score appears at the end of the quiz. Rules for an honest score No lessons open, no searching. The point is to find what you don't know. Answer every question; if unsure, pick "
+      "body": "--- id: \"track-17-lesson-14\" title: \"الاختبار الذاتي 1-50: أسئلة اختيار من متعدد قائمة على سيناريوهات\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 14 slug: \"self-test-1\" difficulty: \"senior\" estimatedMinutes: 30 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"self-test\", \"multiple-choice\", \"interview\", \"scenarios\"] references: - \"Henry L. Roediger and Jeffrey D. Karpicke, Test-Enhanced Learning (Psychological Science"
     },
     {
       "id": "track-17-lesson-15",
@@ -5904,7 +5904,7 @@
         "interview",
         "scenarios"
       ],
-      "body": "In one minute Fifty scenario-based multiple-choice questions (51-100 of 100), mixed across payments, Java, Spring, distributed systems, databases, operations and interviewing. Each has one best answer and a short explanation that appears after you answer. Budget: 30 minutes, closed book (about 35 seconds per question). Your score appears at the end of the quiz. Rules for an honest score No lessons open, no searching. The point is to find what you don't know. Answer every question; if unsure, pic"
+      "body": "--- id: \"track-17-lesson-15\" title: \"الاختبار الذاتي 51-100: أسئلة اختيار من متعدد قائمة على سيناريوهات\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 15 slug: \"self-test-2\" difficulty: \"senior\" estimatedMinutes: 30 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-01\"] tags: [\"self-test\", \"multiple-choice\", \"interview\", \"scenarios\"] references: - \"Henry L. Roediger and Jeffrey D. Karpicke, Test-Enhanced Learning (Psychological Scien"
     },
     {
       "id": "track-17-lesson-16",
@@ -5925,7 +5925,7 @@
         "senior",
         "staff"
       ],
-      "body": "In one minute 150 short, actionable tips (1-150 of 300) on system design framing, architecture trade-offs, fintech correctness, Java and Spring answers, and the coding round. They're written to be skimmed: about 12 seconds each. Budget: 30 minutes. Don't try to memorise them all: copy the ten that hit your weak spots onto one page and re-read that page in the final review. How to use these tips Skim a section, and when a tip makes you think \"I wouldn't have said that\", copy it. Turn each copied "
+      "body": "--- id: \"track-17-lesson-16\" title: \"النصائح 1-150: تأطير التصميم، والمقايضات، وصحة التقنية المالية، وإجابات Java/Spring، والبرمجة\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 16 slug: \"tips-1\" difficulty: \"senior\" estimatedMinutes: 30 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-15\"] tags: [\"tips\", \"interview\", \"communication\", \"senior\", \"staff\"] references: - \"Gergely Orosz, The Software Engineer's Guidebook (2023): intervie"
     },
     {
       "id": "track-17-lesson-17",
@@ -5946,7 +5946,7 @@
         "senior",
         "staff"
       ],
-      "body": "In one minute 150 short, actionable tips (151-300 of 300) on debugging live failures, behavioural and ownership answers, common interview traps, communication and staff-level signals, and the interview day itself. They're written to be skimmed: about 12 seconds each. Budget: 30 minutes. Don't try to memorise them all: copy the ten that hit your weak spots onto one page and re-read that page in the final review. How to use these tips Skim a section, and when a tip makes you think \"I wouldn't have"
+      "body": "--- id: \"track-17-lesson-17\" title: \"النصائح 151-300: التصحيح الحي، والسلوك، والفخاخ، والتواصل، ويوم المقابلة\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 17 slug: \"tips-2\" difficulty: \"senior\" estimatedMinutes: 30 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-16\"] tags: [\"tips\", \"interview\", \"communication\", \"senior\", \"staff\"] references: - \"Gergely Orosz, The Software Engineer's Guidebook (2023): interviewing chapters\" - \"Wil"
     },
     {
       "id": "track-17-lesson-18",
@@ -5968,7 +5968,7 @@
         "senior",
         "staff"
       ],
-      "body": "In one minute The last 65 minutes of the 12-hour plan, built from your own results: re-test what you missed, say your design pitches and stories aloud, re-read your one-page tip sheet, and run the day-before checklist. Nothing new is learned here: this block turns \"I've read it\" into \"I can say it\". The 65-minute block | Minutes | Activity | Input | |---|---|---| | 0-20 | Re-answer every ✗ and ~ Q&A aloud, answers hidden; re-mark them | Your marks from lessons 2-11 | | 20-30 | Re-take only the M"
+      "body": "--- id: \"track-17-lesson-18\" title: \"المراجعة النهائية: أخطاؤك، والعروض، والقصص، وقائمة اليوم السابق\" track: \"track-17\" trackName: \"التحضير النهائي للمقابلات\" sequence: 18 slug: \"final-review\" difficulty: \"senior\" estimatedMinutes: 65 status: \"published\" lastUpdated: \"2026-11-28\" tier: \"core\" prerequisites: [\"track-17-lesson-17\"] tags: [\"final-review\", \"interview\", \"checklist\", \"triage\", \"senior\", \"staff\"] references: - \"Henry L. Roediger and Jeffrey D. Karpicke, Test-Enhanced Learning (Psycholo"
     },
     {
       "id": "lab-01",
